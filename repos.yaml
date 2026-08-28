@@ -53,6 +53,25 @@ verify_commands: &verify_commands >-
   Bash(ruff:*) Bash(eslint:*) Bash(prettier:*)
   Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
 
+# Read-only GitHub access for the community track. Deliberately excludes bare
+# `gh` and `gh api` -- `gh api` can POST, and the community track's hardest rule
+# is that nothing it does reaches the project. Verified: the permission layer
+# parses compound commands, so an allowlisted prefix cannot smuggle a chained
+# `gh pr create` past the gate.
+gh_read_commands: &gh_read >-
+  Bash(gh issue list:*) Bash(gh issue view:*) Bash(gh pr list:*)
+  Bash(gh pr view:*) Bash(gh label list:*) Bash(gh search issues:*)
+  Bash(gh repo view:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
+
+# Verify commands plus read-only gh, for the stages that both build and read issues.
+verify_and_gh: &verify_and_gh >-
+  Bash(pytest:*) Bash(python3 -m pytest:*) Bash(python -m pytest:*)
+  Bash(npm test:*) Bash(npm run test:*) Bash(npm ci:*) Bash(npm install:*)
+  Bash(cargo test:*) Bash(cargo build:*) Bash(go test:*) Bash(make test:*)
+  Bash(./gradlew test:*) Bash(pip install:*) Bash(ruff:*) Bash(eslint:*)
+  Bash(gh issue view:*) Bash(gh issue list:*) Bash(gh pr list:*)
+  Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
+
 # ---------------------------------------------------------------------------
 # Tiers define the blast radius of a task: which tools exist at all, whether the
 # engine may accept its own edits, and whether the scratch branch is committed.
@@ -70,6 +89,12 @@ tiers:
     description: Autonomous reports for async reading. Never touches the repo.
     tools: "Read,Grep,Glob"
     permission_mode: dontAsk
+    writes_code: false
+  tier2-scout:
+    description: Reads GitHub through gh. Never modifies a repo, never writes to a project.
+    tools: "Read,Grep,Glob,Bash"
+    permission_mode: dontAsk
+    allowed_tools: *gh_read
     writes_code: false
   tier3:
     description: Drafts behind a human gate. Specced tickets only, capped in flight.
@@ -107,6 +132,31 @@ tasks:
     requires_specced_ticket: true
     model: opus            # changing production code unattended — use the best model
 
+  # ---- community track: scout -> reproduce -> [human gate] -> draft --------
+  # Each stage refuses to run on work the previous stage did not clear.
+  scout:
+    tier: tier2-scout
+    template: tasks/scout.md
+    slots: [weekly]
+
+  # Candidates only: tickets that exist but are NOT yet specced: true.
+  reproduce:
+    tier: tier1
+    template: tasks/reproduce.md
+    slots: [weekly]
+    requires_candidate_ticket: true
+    allowed_tools: *verify_and_gh
+
+  # Specced tickets only. A human flips specced: true after reading the
+  # reproduce report -- contributing to someone else's project is never automatic.
+  draft:
+    tier: tier3
+    template: tasks/draft.md
+    slots: [weekly]
+    requires_specced_ticket: true
+    model: opus
+    allowed_tools: *verify_and_gh
+
   # ---- phase 2: uncomment as the templates land ---------------------------
   # lint-sweep:        { tier: tier1, template: tasks/lint-sweep.md,        slots: [daily] }
   # doc-regen:         { tier: tier1, template: tasks/doc-regen.md,         slots: [weekly] }
@@ -115,9 +165,6 @@ tasks:
   # review-arch:       { tier: tier2, template: tasks/review-arch.md,       slots: [weekly] }
   # market-compare:    { tier: tier2, template: tasks/market-compare.md,    slots: [weekly] }
   # feature-brainstorm:{ tier: tier2, template: tasks/feature-brainstorm.md,slots: [weekly] }
-  # scout:             { tier: tier2, template: tasks/scout.md,             slots: [weekly] }
-  # reproduce:         { tier: tier1, template: tasks/reproduce.md,         slots: [weekly] }
-  # draft:             { tier: tier3, template: tasks/draft.md,             slots: [weekly], requires_specced_ticket: true }
 
 # ---------------------------------------------------------------------------
 # My repos. First claim on every slot.
@@ -150,11 +197,12 @@ community: []
 
 # - name: ripgrep                      # local shorthand
 #   repo: BurntSushi/ripgrep           # owner/name, used for `gh` queries
-#   path: ~/src/community/ripgrep      # local clone; the reproduce stage creates it
+#   path: ~/src/community/ripgrep      # clone this yourself first; every stage
+#                                      # runs in a worktree of it
 #   spec: "Recursive line-oriented search tool. I use it hourly; small fixes only."
 #   default_branch: master
 #   etiquette: etiquette/ripgrep.yaml  # required for anything in this section
-#   tasks: [audit-security]            # phase 2: [scout, reproduce, draft]
+#   tasks: [scout, reproduce, draft]
 #   tickets:
 #     - id: 2891
 #       title: "--glob with a trailing slash silently matches nothing"

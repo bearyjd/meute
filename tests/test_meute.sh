@@ -242,6 +242,109 @@ test_real_repo_untouched() {
   is "the real state/ and reports/ were never touched" "$now" "$REAL_STATE_BEFORE"
 }
 
+
+# The community track's gates: no etiquette file means no contribution, and the
+# reproduce/draft stages sit on opposite sides of the human specced: true gate.
+test_community_gates() {
+  local root="$FIXTURE/community"
+  mkdir -p "$root"/{etiquette,tasks,state}
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  cp "$REPO/etiquette/example-project.yaml" "$root/etiquette/upstream.yaml"
+  mkdir -p "$root/clone"; git -C "$root/clone" init -q -b main
+  echo x > "$root/clone/f.txt"; git -C "$root/clone" add -A
+  git -C "$root/clone" -c user.email=t@t -c user.name=t commit -qm init
+
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+base = yaml.safe_load(pathlib.Path(sys.argv[1], "..", "repos.yaml").read_text()) \
+       if (root/".."/"repos.yaml").exists() else {}
+doc = {
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {
+        "tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
+        "tier2-scout": {"tools": "Read,Bash", "permission_mode": "dontAsk", "writes_code": False},
+        "tier3": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
+    },
+    "tasks": {
+        "scout": {"tier": "tier2-scout", "template": "tasks/scout.md", "slots": ["weekly"]},
+        "reproduce": {"tier": "tier1", "template": "tasks/reproduce.md",
+                      "slots": ["weekly"], "requires_candidate_ticket": True},
+        "draft": {"tier": "tier3", "template": "tasks/draft.md",
+                  "slots": ["weekly"], "requires_specced_ticket": True},
+    },
+    "repos": [],
+    "community": [{
+        "name": "upstream", "repo": "owner/upstream", "path": str(root/"clone"),
+        "spec": "fixture upstream", "etiquette": "etiquette/upstream.yaml",
+        "tasks": ["scout", "reproduce", "draft"],
+        "tickets": [{"id": "101", "title": "candidate, not yet reproduced", "specced": False},
+                    {"id": "202", "title": "reproduced and cleared", "specced": True}],
+    }],
+}
+yaml.safe_dump(doc, open(root/"repos.yaml", "w"), sort_keys=False)
+PY
+
+  local keys
+  keys="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -r .key | sort | tr '\n' ' ')"
+  has "community: scout is ticket-independent"      "$keys" "upstream/scout"
+  has "community: reproduce takes the candidate"    "$keys" "upstream/reproduce/101"
+  hasnt "community: reproduce skips the specced one" "$keys" "upstream/reproduce/202"
+  has "community: draft takes the specced one"      "$keys" "upstream/draft/202"
+  hasnt "community: draft skips the candidate"      "$keys" "upstream/draft/101"
+
+  # scout must not be able to write to the project
+  local scout_tools
+  scout_tools="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly \
+                 | jq -r 'select(.task=="scout") | "\(.writes_code) \(.tools)"')"
+  has "community: scout is writes_code=false" "$scout_tools" "false"
+
+  # the etiquette gate
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+d = yaml.safe_load((root/"repos.yaml").read_text())
+d["community"][0].pop("etiquette")
+yaml.safe_dump(d, open(root/"no-etiquette.yaml", "w"), sort_keys=False)
+PY
+  local err
+  err="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/no-etiquette.yaml" 2>&1 || true)"
+  has "community: no etiquette file, no contribution" "$err" "etiquette: required"
+
+  # A project that bans autonomous agents keeps scouting but loses every
+  # contribution stage -- enforced by the queue builder, not by prompt text.
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+e = yaml.safe_load((root/"etiquette"/"upstream.yaml").read_text())
+e["autonomous_agents"] = "banned"
+yaml.safe_dump(e, open(root/"etiquette"/"banned.yaml", "w"), sort_keys=False)
+d = yaml.safe_load((root/"repos.yaml").read_text())
+d["community"][0]["etiquette"] = "etiquette/banned.yaml"
+yaml.safe_dump(d, open(root/"banned.yaml", "w"), sort_keys=False)
+PY
+  local banned
+  banned="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/banned.yaml" weekly | jq -r .key | sort | tr '\n' ' ')"
+  has   "agent ban: scouting still allowed"      "$banned" "upstream/scout"
+  hasnt "agent ban: reproduce refused"           "$banned" "upstream/reproduce"
+  hasnt "agent ban: draft refused"               "$banned" "upstream/draft"
+
+  # the policy must travel in the prompt, not as an unreachable path
+  local rendered
+  rendered="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" render "$root/tasks/scout.md" \
+      REPO_NAME=x REPO_SPEC=x REPO_PATH=x TASK=x TIER=x DATE=x BRANCH=x FILE_BUDGET=5 \
+      LENS=none REPORT_PATH=x DEFAULT_BRANCH=main ALLOWED_COMMANDS=x UPSTREAM=x \
+      ETIQUETTE=etiquette/upstream.yaml \
+      "ETIQUETTE_CONTENT=$(cat "$root/etiquette/upstream.yaml")" \
+      TICKET_ID= TICKET_TITLE= TICKET_NOTES=)"
+  has "etiquette content is injected into the prompt" "$rendered" "ai_policy: required"
+  has "etiquette content carries the agent axis"      "$rendered" "autonomous_agents"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
@@ -252,6 +355,7 @@ test_show_marks_read
 test_promote
 test_cap
 test_dismiss_and_edges
+test_community_gates
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

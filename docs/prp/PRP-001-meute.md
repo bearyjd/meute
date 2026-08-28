@@ -155,7 +155,28 @@ Three stages, each its own template, gated by `policy.community_share`:
   `comment_before_pr`). **Never pushes and never opens a PR** — it stops at the
   local branch; submission is manual and human.
 
-No etiquette file, no contribution. That is a hard gate, not a warning.
+No etiquette file, no contribution. That is a hard gate, not a warning — the
+manifest refuses to validate a community project without one.
+
+**`autonomous_agents` is a second, separate axis, and it is the one that gates
+meute.** A project can welcome AI-assisted contributions from a human while
+forbidding agent-authored ones; `ai_policy` alone cannot express that. The
+motivating case is real and was found by a live scout run: ripgrep's
+`AI_POLICY.md` welcomes AI-assisted coding with a human in the loop and then says
+"Autonomous agents are not allowed to be used for contributing to this project."
+
+When `autonomous_agents: banned`, the **queue builder** — not the prompt — refuses
+every task whose tier writes code. Scouting stays available, because read-only
+analysis is not a contribution. Enforcing this in code rather than in template
+text matters: a rule that only exists as instructions is a rule an unattended
+agent can rationalise past.
+
+The etiquette file's **contents** are injected into the prompt, not its path. The
+agent runs inside a worktree of the target repo and cannot read a file under
+`MEUTE_ROOT` by construction — a live run proved the earlier path-only version
+was unreadable, and the agent fell back to reading the project's own
+`AI_POLICY.md`. Templates now also instruct that where the project's own
+documents are stricter than the etiquette file, the project wins.
 
 ## 10. Design decisions
 
@@ -256,9 +277,12 @@ Built and accepted:
   runner and the review CLI share one implementation of the 80/20 and cap arithmetic
 - `lib/report.py` — report parsing; `tests/test_meute.sh` — the first test suite
 
+- `tasks/scout.md`, `tasks/reproduce.md`, `tasks/draft.md` — the community track,
+  with the `tier2-scout` tier (read-only `gh`, no `gh api`, no bare `gh`) and the
+  candidate/specced ticket gates that separate reproduce from draft
+
 Phase 2, in rough priority order:
 
-- Community templates: `scout.md`, `reproduce.md`, `draft.md`
 - Remaining tier-1 templates: lint sweep, doc regen, dependency audit, conventions
 - Remaining tier-2 templates: architecture review, market comparison (needs
   WebSearch in the tier tool set), feature brainstorm

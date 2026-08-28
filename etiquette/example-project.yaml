@@ -16,6 +16,14 @@ sources:                        # where these answers came from, so they can be 
 #   discouraged - tolerated but frowned on; prefer not to submit
 #   banned    - do not contribute at all; scout.md must skip this project
 ai_policy: required
+
+# Separate axis, and the one that actually gates meute. A project can welcome
+# AI-assisted contributions from a human while forbidding agent-authored ones.
+# ripgrep is the motivating real case: its AI_POLICY.md says "Autonomous agents
+# are not allowed to be used for contributing to this project."
+#   allowed - meute may run reproduce and draft for this project
+#   banned  - scouting only; the queue builder refuses every contribution stage
+autonomous_agents: allowed
 ai_disclosure_text: >-
   This patch was drafted with AI assistance and reviewed by me before
   submission. I can explain and defend every line of it.

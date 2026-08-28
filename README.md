@@ -188,8 +188,33 @@ Each allowlisted project needs `etiquette/<project>.yaml`
 `ai_policy`, `cla`, `pr_size_preference`, `comment_before_pr`. No etiquette file,
 no contribution.
 
-The three stages — scout, reproduce, draft — land in phase 2. `draft` stops at a
-local branch; it never pushes and never opens a PR. You submit, manually.
+Three stages, each refusing work the previous one did not clear:
+
+| Stage | Runs on | Produces |
+|---|---|---|
+| `scout` | any allowlisted project | ranked shortlist of issues, plus rejects with reasons |
+| `reproduce` | tickets **not** yet `specced: true` | a failing test, or a verdict that it does not reproduce |
+| `draft` | tickets you marked `specced: true` | a minimal fix on a local branch, plus a draft PR body |
+
+`draft` **never pushes and never opens a PR** — it stops at the local branch and
+you submit by hand. The `gh` allowlist excludes bare `gh` and `gh api` (which can
+POST); the permission layer parses compound commands, so an allowlisted prefix
+cannot smuggle a chained `gh pr create` past the gate.
+
+Flipping a ticket to `specced: true` after reading the reproduce report is a
+deliberate manual step. Contributing to someone else's project should not be
+something that happens while you are asleep.
+
+### `autonomous_agents` — the gate that matters
+
+Set it in the etiquette file. Some projects welcome AI-assisted contributions
+from a human but forbid agent-authored ones — ripgrep's `AI_POLICY.md` says
+exactly that. With `autonomous_agents: banned`, the queue builder refuses every
+contribution stage for that project and leaves only scouting. It is enforced in
+code, not in prompt text.
+
+Clone the project yourself before adding it; every stage runs in a worktree of
+that clone.
 
 ## Engines
 

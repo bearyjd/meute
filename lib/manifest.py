@@ -141,7 +141,7 @@ def checked_tasks(data: dict, tiers: dict, root: str) -> dict:
     return tasks
 
 
-def checked_projects(data: dict, key: str, tasks: dict) -> list:
+def checked_projects(data: dict, key: str, tasks: dict, root: str = "") -> list:
     projects = data.get(key) or []
     if not isinstance(projects, list):
         raise ManifestError(f"{key}: must be a list")
@@ -159,6 +159,19 @@ def checked_projects(data: dict, key: str, tasks: dict) -> list:
             raise ManifestError(f"{key}.{name}.path: required")
         if not project.get("spec"):
             raise ManifestError(f"{key}.{name}.spec: required (one line, injected into prompts)")
+        if key == "community":
+            # PRP-001 s9: no etiquette file, no contribution. A hard gate, not a
+            # warning -- contributing to someone else's project without knowing
+            # their AI policy is how contributors get banned.
+            etiquette = project.get("etiquette")
+            if not etiquette:
+                raise ManifestError(
+                    f"community.{name}.etiquette: required - write "
+                    f"etiquette/{name}.yaml before adding this project")
+            if not os.path.isfile(os.path.join(root, etiquette)):
+                raise ManifestError(f"community.{name}.etiquette: file not found: {etiquette}")
+            if not project.get("repo"):
+                raise ManifestError(f"community.{name}.repo: required (owner/name, for gh queries)")
         for task_name in project.get("tasks") or []:
             if task_name not in tasks:
                 raise ManifestError(f"{key}.{name}.tasks: undeclared task {task_name!r}")
@@ -219,6 +232,34 @@ def derive_ticket_id(repo: str, existing: list) -> str:
     return f"{initials}-{highest + 1}"
 
 
+def load_etiquette(root: str, project: dict) -> dict:
+    """A community project's contribution policy. Absent file is a hard error."""
+    rel = project.get("etiquette")
+    if not rel:
+        return {}
+    path = os.path.join(root, rel)
+    with open(path, "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ManifestError(f"{rel}: must be a mapping")
+    policy = data.get("autonomous_agents", "allowed")
+    if policy not in ("allowed", "banned"):
+        raise ManifestError(f"{rel}.autonomous_agents: must be 'allowed' or 'banned'")
+    return data
+
+
+def bans_autonomous_agents(etiquette: dict) -> bool:
+    """Some projects welcome AI-assisted work but forbid agent-authored contributions.
+
+    ripgrep's AI_POLICY.md is the motivating case: 'Autonomous agents are not
+    allowed to be used for contributing to this project.' Those are two separate
+    axes, so `ai_policy` alone cannot express it. When agents are banned the
+    project still permits read-only analysis, so scouting stays legal -- but
+    nothing that authors a contribution may run.
+    """
+    return etiquette.get("autonomous_agents") == "banned"
+
+
 def build_entry(kind: str, project: dict, task_name: str, task: dict,
                 tier_name: str, tier: dict, defaults: dict, root: str) -> dict:
     """Flatten manifest layers into the single record run.sh consumes."""
@@ -265,18 +306,26 @@ def build_queue(data: dict, slot: str, root: str) -> list:
     entries = []
     machine = load_machine_tickets(root)
     for kind, key in (("personal", "repos"), ("community", "community")):
-        for project in checked_projects(data, key, tasks):
+        for project in checked_projects(data, key, tasks, root):
             project = with_machine_tickets(project, machine)
+            etiquette = load_etiquette(root, project) if kind == "community" else {}
             for task_name in project.get("tasks") or []:
                 task = tasks[task_name]
                 slots = task.get("slots") or list(VALID_SLOTS)
                 if slot not in slots:
                     continue
                 tier_name = task["tier"]
+                # Enforced here, not asked of the model: a project that bans
+                # autonomous agents never gets a contribution-authoring task in
+                # the queue at all.
+                if bans_autonomous_agents(etiquette) and tiers[tier_name]["writes_code"]:
+                    continue
                 entry = build_entry(kind, project, task_name, task, tier_name,
                                     tiers[tier_name], defaults, root)
                 if task.get("requires_specced_ticket"):
-                    entries.extend(expand_tickets(entry, project))
+                    entries.extend(expand_tickets(entry, project, want_specced=True))
+                elif task.get("requires_candidate_ticket"):
+                    entries.extend(expand_tickets(entry, project, want_specced=False))
                 else:
                     entry["key"] = f"{entry['repo']}/{task_name}"
                     entry["ticket_id"] = ""
@@ -286,11 +335,15 @@ def build_queue(data: dict, slot: str, root: str) -> list:
     return entries
 
 
-def expand_tickets(entry: dict, project: dict) -> list:
-    """Tier 3 only touches tickets the human explicitly marked specced: true."""
+def expand_tickets(entry: dict, project: dict, want_specced: bool = True) -> list:
+    """One queue entry per ticket on the right side of the human gate.
+
+    want_specced=True  -- tier 3: only tickets a human marked specced: true.
+    want_specced=False -- the reproduce stage: candidates awaiting that decision.
+    """
     out = []
     for ticket in project.get("tickets") or []:
-        if not ticket.get("specced"):
+        if bool(ticket.get("specced")) is not want_specced:
             continue
         item = dict(entry)
         item["ticket_id"] = str(ticket["id"])
@@ -356,7 +409,7 @@ def cmd_add_ticket(args: list) -> int:
 
     project = None
     for key in ("repos", "community"):
-        for candidate in checked_projects(data, key, tasks):
+        for candidate in checked_projects(data, key, tasks, root):
             if candidate["name"] == repo_name:
                 project = candidate
     if project is None:

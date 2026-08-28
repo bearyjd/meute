@@ -275,6 +275,7 @@ run_entry() {
     "ALLOWED_COMMANDS=${ALLOWED_TOOLS:-<none: no shell command is pre-approved>}" \
     "DEFAULT_BRANCH=${base_ref}" "UPSTREAM=$(jq -r '.upstream' <<< "$entry")" \
     "ETIQUETTE=$(jq -r '.etiquette' <<< "$entry")" \
+    "ETIQUETTE_CONTENT=$(etiquette_content "$entry")" \
     "TICKET_ID=$(jq -r '.ticket_id' <<< "$entry")" \
     "TICKET_TITLE=$(jq -r '.ticket_title' <<< "$entry")" \
     "TICKET_NOTES=$(jq -r '.ticket_notes' <<< "$entry")" \
@@ -326,6 +327,18 @@ run_entry() {
   # Last, so the log line written above is included in the same commit.
   commit_state "$repo" "$task"
   [[ "$ENGINE_STATUS" == "ok" ]]
+}
+
+# The agent runs inside a worktree of the TARGET repo, so a path under MEUTE_ROOT
+# is unreachable to it by construction. The policy that governs a contribution
+# has to travel in the prompt, not as a filename.
+etiquette_content() {
+  local rel; rel="$(jq -r '.etiquette' <<< "$1")"
+  if [[ -z "$rel" || ! -f "${MEUTE_ROOT}/${rel}" ]]; then
+    printf '(no etiquette file — this project must not receive a contribution)\n'
+    return 0
+  fi
+  cat "${MEUTE_ROOT}/${rel}"
 }
 
 # The report is written by the runner, not the subprocess: reports/ lives in
