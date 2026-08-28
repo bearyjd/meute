@@ -1,0 +1,6 @@
+# Scratch checkouts; created and removed within a single run.
+.worktrees/
+# Lock and temp files; state/cursor, state/log and reports/ ARE committed.
+state/.lock
+state/.cursor.*
+.omc/

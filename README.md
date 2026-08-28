@@ -1,0 +1,160 @@
+# meute
+
+Spends leftover Claude Code / Codex **subscription** quota on scheduled,
+unattended work across a portfolio of local git repositories, plus a small
+capped track of contributions to open-source projects.
+
+No daemon, no database, no web UI. `bin/run.sh` does one unit of work and exits.
+Scheduling is your cron's job.
+
+Licence: AGPL-3.0. Spec: [`docs/prp/PRP-001-meute.md`](docs/prp/PRP-001-meute.md).
+
+## Requirements
+
+`bash` 4+, `git`, `jq`, `python3` with PyYAML, and `claude` and/or `codex`
+signed in to a subscription.
+
+## Quick start
+
+```sh
+# 1. Fill in repos.yaml — it ships inert, with commented examples.
+$EDITOR repos.yaml
+
+# 2. Check the manifest parses and every template resolves.
+./bin/run.sh --validate
+
+# 3. See what the next run would pick, without invoking anything.
+./bin/run.sh daily --dry-run
+
+# 4. Run it.
+./bin/run.sh daily
+```
+
+Then schedule it:
+
+```cron
+17 3 * * *   cd /path/to/meute && ./bin/run.sh daily  >> state/cron.log 2>&1
+41 4 * * 6   cd /path/to/meute && ./bin/run.sh weekly >> state/cron.log 2>&1
+```
+
+Overlapping fires are safe: the runner takes a non-blocking `flock` and exits 0
+if another run holds it.
+
+## Subscription-only
+
+meute never runs on metered API billing. Claude Code silently prefers an API key
+over subscription auth when one is present in the environment, so every
+invocation is scrubbed of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+`OPENAI_API_KEY` (with a warning if any were set), and a zero-cost preflight
+refuses to start unless the engine resolves to a real subscription:
+
+```
+meute: preflight: claude is not logged in. Run:  claude auth login
+```
+
+There is no API-key mode.
+
+## Quota gate
+
+"Quota" is your plan's rolling 5-hour and weekly allowance, not a dollar budget.
+`bin/quota.sh` prints one integer 0–100; below `policy.quota_floor_percent` the
+runner exits 0 without doing anything. Scheduled chores must never eat the window
+you wanted for interactive work.
+
+There is no machine-readable balance on the CLI today, so the probe ships as a
+stub. Point it at whatever source you trust:
+
+```sh
+MEUTE_QUOTA_CMD='my-quota-probe --percent' ./bin/run.sh daily
+echo 45 > state/quota-override      # or just pin it by hand
+```
+
+## How work is chosen
+
+`repos.yaml` flattens into an ordered queue. Everything under `repos:` comes
+before anything under `community:`, so your own projects always have first claim;
+the community track runs only while it stays under `policy.community_share`
+(0.20) of the week's runs. `state/cursor` remembers the last item executed per
+slot and the next run resumes after it.
+
+Each run creates a worktree on `meute/<task>-<date>`, so your working checkout is
+never touched. Read-only tiers leave nothing behind. Write tiers commit to the
+scratch branch and **never push** — the branch is the deliverable, and you decide
+what happens to it.
+
+## Tiers
+
+| Tier | What it does | Touches code |
+|---|---|---|
+| 1 | Tests, lint sweeps, doc regen, dependency audits — self-verifying | yes, scratch branch |
+| 2 | Security audits, architecture reviews, market comparisons — reports only | no |
+| 3 | Bug fixes and features, `specced: true` tickets only, 3 in flight max | yes, scratch branch |
+
+Tier tool lists are hard availability filters: a tier-2 session has no Write tool
+and physically cannot modify the repo.
+
+Write tiers additionally get an `allowed_tools` allowlist of pre-approved command
+prefixes, because `acceptEdits` alone denies shell execution — without it a
+"self-verifying" task cannot run the suite it just wrote. Treat the allowlist as
+a blast-radius reducer, not a sandbox: `pytest` runs test code the agent wrote
+seconds ago. What it buys you is no network, no installs, no `git push`, and no
+writes outside the worktree.
+
+## Output
+
+- `reports/<repo>/<task>-<date>.md` — the report, with a metadata header
+- `state/log` — one line per invocation, including every skip
+- `state/cursor` — round-robin position and lens rotation counters
+
+```
+2026-08-28T15:22:54-04:00	week=2026-35	slot=weekly	status=ok	kind=personal
+repo=sample-repo	task=gen-tests	tier=tier1	engine=claude	auth=claude.ai/max
+branch=meute/gen-tests-2026-08-28	commit=64c180d	report=reports/...	cost=0.31	turns=29	dur=263s
+```
+
+A failed run still writes a report (with the engine's stderr tail) and still
+advances the cursor — a poisoned entry must not stall the whole fleet.
+
+**The runner commits its own `state/` and `reports/` at the end of each run**,
+scoped to those paths, so a cron-driven fleet doesn't leave you with a
+permanently dirty checkout. It never pushes. Set `MEUTE_NO_AUTOCOMMIT=1` if you
+would rather commit the audit trail yourself.
+
+Skipped runs (quota floor, empty queue, lock held) append their log line but do
+not commit — otherwise a quota-starved week would produce a commit per cron fire.
+Those lines are folded into the next real run's commit.
+
+## Adding a task
+
+1. Write `tasks/<name>.md`. It must define the job, stop conditions
+   (file budget, scope boundaries), falsifiability requirements (concrete exploit
+   payloads or run-it-then-break-it checks, never vibes), and an output contract
+   naming the exact sections — including what to say when nothing was found.
+2. Register it under `tasks:` in `repos.yaml` with a tier and its slots.
+3. Add it to a repo's `tasks:` list.
+
+Templates are rendered with `{{REPO_NAME}}`, `{{REPO_SPEC}}`, `{{REPO_PATH}}`,
+`{{TASK}}`, `{{TIER}}`, `{{DATE}}`, `{{BRANCH}}`, `{{FILE_BUDGET}}`, `{{LENS}}`,
+`{{REPORT_PATH}}`, `{{DEFAULT_BRANCH}}`, `{{ALLOWED_COMMANDS}}`, `{{UPSTREAM}}`,
+`{{ETIQUETTE}}`, `{{TICKET_ID}}`, `{{TICKET_TITLE}}`, `{{TICKET_NOTES}}`.
+Rendering fails loudly on an unknown placeholder.
+
+Reports are the engine's **final message** — templates must tell it not to write
+the file itself. That is what lets a read-only tier produce a report at all.
+
+## Community track
+
+Each allowlisted project needs `etiquette/<project>.yaml`
+(see [`etiquette/example-project.yaml`](etiquette/example-project.yaml)):
+`ai_policy`, `cla`, `pr_size_preference`, `comment_before_pr`. No etiquette file,
+no contribution.
+
+The three stages — scout, reproduce, draft — land in phase 2. `draft` stops at a
+local branch; it never pushes and never opens a PR. You submit, manually.
+
+## Engines
+
+`--engine codex` swaps `claude -p` for `codex exec` with equivalent semantics:
+read-only tiers map to `-s read-only`, write tiers to `-s workspace-write`, and
+the final message is read from `-o` rather than a JSON envelope. Set
+`MEUTE_CODEX_MODEL` to pin a model.

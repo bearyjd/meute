@@ -1,0 +1,152 @@
+# meute — fleet manifest
+#
+# The runner reads this file, flattens it into a work queue, and executes ONE
+# item per invocation. Order is structural: everything under `repos:` is
+# considered before anything under `community:`.
+#
+# Validate after editing:   ./bin/run.sh --validate
+# Dry-run the selection:    ./bin/run.sh daily --dry-run
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Fleet-wide defaults. Any repo entry or task entry may override these.
+# Precedence: task > repo/project > defaults.
+# ---------------------------------------------------------------------------
+defaults:
+  engine: claude          # claude | codex  (CLI --engine overrides this)
+  model: sonnet           # alias or full model id; sonnet is the cost/quality default
+  file_budget: 25         # max files a task may open; injected into every prompt
+  timeout_seconds: 1800   # hard wall-clock kill for a single engine invocation
+
+# ---------------------------------------------------------------------------
+# Scheduling policy.
+# ---------------------------------------------------------------------------
+policy:
+  quota_floor_percent: 30   # below this much remaining weekly quota, the runner exits 0
+  community_share: 0.20     # max share of this ISO week's runs spent on the community track
+  tier3_max_in_flight: 3    # max undelivered tier-3 draft branches across the whole fleet
+  branch_prefix: meute      # scratch branches are <prefix>/<task>-<date>
+
+# ---------------------------------------------------------------------------
+# Commands a write tier may run without an approver present.
+#
+# This exists because `acceptEdits` auto-approves *edits* but still denies
+# arbitrary shell execution — so without an allowlist a "self-verifying" tier
+# cannot run the suite it just wrote, and reports itself unverified.
+#
+# Read this as a blast-radius reducer, NOT a sandbox: `pytest` happily executes
+# test code the agent wrote seconds ago. What the list does buy you is that an
+# unattended run cannot reach the network, install packages, push a branch, or
+# write outside its worktree. Interpreters (`python3 -c`, `node -e`, `bash -c`)
+# are deliberately absent — pre-approving one is equivalent to full execution.
+# Add them per-repo only if you accept that.
+# ---------------------------------------------------------------------------
+verify_commands: &verify_commands >-
+  Bash(pytest:*) Bash(python3 -m pytest:*) Bash(python -m pytest:*)
+  Bash(npm test:*) Bash(npm run test:*) Bash(npm run lint:*) Bash(pnpm test:*)
+  Bash(yarn test:*) Bash(npx vitest:*) Bash(npx jest:*)
+  Bash(cargo test:*) Bash(cargo clippy:*) Bash(cargo fmt:*)
+  Bash(go test:*) Bash(go vet:*) Bash(gofmt:*)
+  Bash(./gradlew test:*) Bash(./gradlew lint:*)
+  Bash(make test:*) Bash(make lint:*)
+  Bash(ruff:*) Bash(eslint:*) Bash(prettier:*)
+  Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
+
+# ---------------------------------------------------------------------------
+# Tiers define the blast radius of a task: which tools exist at all, whether the
+# engine may accept its own edits, and whether the scratch branch is committed.
+# `tools` is a hard availability filter, not a permission prompt — a tier
+# without Write/Edit/Bash physically cannot modify the worktree.
+# ---------------------------------------------------------------------------
+tiers:
+  tier1:
+    description: Autonomous and self-verifying. Commits to a scratch branch.
+    tools: "Read,Grep,Glob,Edit,Write,Bash,TodoWrite"
+    permission_mode: acceptEdits
+    allowed_tools: *verify_commands
+    writes_code: true
+  tier2:
+    description: Autonomous reports for async reading. Never touches the repo.
+    tools: "Read,Grep,Glob"
+    permission_mode: dontAsk
+    writes_code: false
+  tier3:
+    description: Drafts behind a human gate. Specced tickets only, capped in flight.
+    tools: "Read,Grep,Glob,Edit,Write,Bash,TodoWrite"
+    permission_mode: acceptEdits
+    allowed_tools: *verify_commands
+    writes_code: true
+
+# ---------------------------------------------------------------------------
+# Task registry. `template` is resolved relative to this file.
+# A task is only scheduled in the slots it lists.
+# ---------------------------------------------------------------------------
+tasks:
+  gen-tests:
+    tier: tier1
+    template: tasks/gen-tests.md
+    slots: [weekly]
+
+  audit-security:
+    tier: tier2
+    template: tasks/audit-security.md
+    slots: [daily, weekly]
+    model: opus            # narrow lens, high stakes — worth the better model
+    # One lens per run, rotated per (repo, task) via state/cursor. Keeping the
+    # lens narrow is what makes the finding density worth reading.
+    lenses: [auth, input-parsing, injection, dependency-risk]
+
+  # ---- phase 2: uncomment as the templates land ---------------------------
+  # lint-sweep:        { tier: tier1, template: tasks/lint-sweep.md,        slots: [daily] }
+  # doc-regen:         { tier: tier1, template: tasks/doc-regen.md,         slots: [weekly] }
+  # dep-audit:         { tier: tier1, template: tasks/dep-audit.md,         slots: [weekly] }
+  # conventions:       { tier: tier1, template: tasks/conventions.md,       slots: [weekly] }
+  # review-arch:       { tier: tier2, template: tasks/review-arch.md,       slots: [weekly] }
+  # market-compare:    { tier: tier2, template: tasks/market-compare.md,    slots: [weekly] }
+  # feature-brainstorm:{ tier: tier2, template: tasks/feature-brainstorm.md,slots: [weekly] }
+  # draft-ticket:      { tier: tier3, template: tasks/draft-ticket.md,      slots: [weekly], requires_specced_ticket: true }
+  # scout:             { tier: tier2, template: tasks/scout.md,             slots: [weekly] }
+  # reproduce:         { tier: tier1, template: tasks/reproduce.md,         slots: [weekly] }
+  # draft:             { tier: tier3, template: tasks/draft.md,             slots: [weekly], requires_specced_ticket: true }
+
+# ---------------------------------------------------------------------------
+# My repos. First claim on every slot.
+# Uncomment and fill in real paths — the fleet is inert until you do.
+# ---------------------------------------------------------------------------
+repos: []
+
+# - name: netlens-android              # [a-z0-9._-]; used in branch and report paths
+#   path: ~/Documents/vibe-code/netlens-android
+#   spec: "Android app that shows which installed apps are talking to which hosts, on-device, no cloud."
+#   default_branch: main               # worktrees branch from here; omit to use current HEAD
+#   tasks: [audit-security, gen-tests]
+#   file_budget: 20                    # optional per-repo override
+#   model: sonnet                      # optional per-repo override
+#   tickets:                           # only consumed by tier-3 tasks
+#     - id: NL-14
+#       title: "Capture service leaks a wakelock when Wi-Fi drops mid-capture"
+#       specced: true                  # tier 3 refuses to touch a ticket without this
+#       notes: >
+#         Repro: start a capture, toggle airplane mode. Expected: capture stops
+#         cleanly and the wakelock is released. Fix belongs in CaptureService,
+#         not in the UI layer.
+
+# ---------------------------------------------------------------------------
+# Community track. Runs only when the personal track has left headroom under
+# policy.community_share. Every entry needs an etiquette file — no etiquette,
+# no contribution.
+# ---------------------------------------------------------------------------
+community: []
+
+# - name: ripgrep                      # local shorthand
+#   repo: BurntSushi/ripgrep           # owner/name, used for `gh` queries
+#   path: ~/src/community/ripgrep      # local clone; the reproduce stage creates it
+#   spec: "Recursive line-oriented search tool. I use it hourly; small fixes only."
+#   default_branch: master
+#   etiquette: etiquette/ripgrep.yaml  # required for anything in this section
+#   tasks: [audit-security]            # phase 2: [scout, reproduce, draft]
+#   tickets:
+#     - id: 2891
+#       title: "--glob with a trailing slash silently matches nothing"
+#       specced: false                 # flips to true only after reproduce.md succeeds

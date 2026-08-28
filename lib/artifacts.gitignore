@@ -1,0 +1,25 @@
+# Build and test artifacts that an unattended run generates as a side effect of
+# verifying its own work. Layered under the target repo's own .gitignore via
+# `git -c core.excludesFile=` at commit time, so a repo with a thin .gitignore
+# does not end up with __pycache__ or node_modules committed to a scratch branch.
+# The repo's own rules still win; this only catches what they miss.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+*.egg-info/
+node_modules/
+.next/
+.turbo/
+.gradle/
+build/
+target/
+dist/
+.DS_Store
+*.log
+coverage/
+.coverage
+htmlcov/
+.nyc_output/

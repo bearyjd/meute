@@ -1,0 +1,46 @@
+# Per-project contribution etiquette. One file per entry in the `community:`
+# section of repos.yaml. No etiquette file, no contribution — the draft stage
+# refuses to run without one.
+#
+# Fill these in by reading the project's CONTRIBUTING.md, PR template, and a
+# few recently merged PRs. Guessing here is how contributors get banned.
+
+project: example-project
+upstream: owner/example-project
+sources:                        # where these answers came from, so they can be rechecked
+  - https://github.com/owner/example-project/blob/main/CONTRIBUTING.md
+
+# How the project treats AI-assisted contributions.
+#   required  - disclosure is mandatory; draft.md puts it in the PR body
+#   welcome   - allowed, disclosure appreciated
+#   discouraged - tolerated but frowned on; prefer not to submit
+#   banned    - do not contribute at all; scout.md must skip this project
+ai_policy: required
+ai_disclosure_text: >-
+  This patch was drafted with AI assistance and reviewed by me before
+  submission. I can explain and defend every line of it.
+
+# Contributor licence agreement, if any.
+cla:
+  required: true
+  type: individual              # individual | corporate | dco
+  url: https://cla.example.org/example-project
+  signed: false                 # flip to true once YOU have signed it
+
+# Keep drafts inside what this project will actually review.
+pr_size_preference:
+  max_lines: 100
+  one_concern_per_pr: true
+  tests_required: true
+  changelog_entry: false
+
+# Many projects want a comment on the issue before a PR appears.
+comment_before_pr: true
+comment_template: >-
+  I can reproduce this and have a small fix in mind. Happy to open a PR if
+  no one else is already on it.
+
+# Anything else the runner should respect.
+notes: >-
+  Maintainer prefers a failing test in the first commit and the fix in the
+  second. Do not squash before review.
