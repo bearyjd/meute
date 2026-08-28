@@ -97,6 +97,16 @@ tasks:
     # lens narrow is what makes the finding density worth reading.
     lenses: [auth, input-parsing, injection, dependency-risk]
 
+  # Tier 3. Only touches tickets marked `specced: true` — either hand-written
+  # below, or promoted from a report by `meute promote`. Capped in flight by
+  # policy.tier3_max_in_flight.
+  draft-ticket:
+    tier: tier3
+    template: tasks/draft-ticket.md
+    slots: [weekly]
+    requires_specced_ticket: true
+    model: opus            # changing production code unattended — use the best model
+
   # ---- phase 2: uncomment as the templates land ---------------------------
   # lint-sweep:        { tier: tier1, template: tasks/lint-sweep.md,        slots: [daily] }
   # doc-regen:         { tier: tier1, template: tasks/doc-regen.md,         slots: [weekly] }
@@ -105,7 +115,6 @@ tasks:
   # review-arch:       { tier: tier2, template: tasks/review-arch.md,       slots: [weekly] }
   # market-compare:    { tier: tier2, template: tasks/market-compare.md,    slots: [weekly] }
   # feature-brainstorm:{ tier: tier2, template: tasks/feature-brainstorm.md,slots: [weekly] }
-  # draft-ticket:      { tier: tier3, template: tasks/draft-ticket.md,      slots: [weekly], requires_specced_ticket: true }
   # scout:             { tier: tier2, template: tasks/scout.md,             slots: [weekly] }
   # reproduce:         { tier: tier1, template: tasks/reproduce.md,         slots: [weekly] }
   # draft:             { tier: tier3, template: tasks/draft.md,             slots: [weekly], requires_specced_ticket: true }

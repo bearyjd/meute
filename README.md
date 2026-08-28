@@ -90,6 +90,10 @@ what happens to it.
 | 2 | Security audits, architecture reviews, market comparisons — reports only | no |
 | 3 | Bug fixes and features, `specced: true` tickets only, 3 in flight max | yes, scratch branch |
 
+Tier 3 (`tasks/draft-ticket.md`) must reproduce the defect with a failing test
+before it may change anything. If it cannot reproduce, it changes nothing and
+reports why — a run that guesses at a fix is a failed run, not a productive one.
+
 Tier tool lists are hard availability filters: a tier-2 session has no Write tool
 and physically cannot modify the repo.
 

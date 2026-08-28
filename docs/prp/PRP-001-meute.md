@@ -246,7 +246,8 @@ Built and accepted:
 - `lib/engines.sh`, `lib/preflight.sh` — engine adapters and the
   subscription-only guarantees, split out as coherent units
 - `bin/quota.sh` — pluggable probe with a stub default
-- `tasks/audit-security.md` (tier 2, rotating lens), `tasks/gen-tests.md` (tier 1)
+- `tasks/audit-security.md` (tier 2, rotating lens), `tasks/gen-tests.md` (tier 1),
+  `tasks/draft-ticket.md` (tier 3, specced tickets only)
 - `lib/artifacts.gitignore`
 - `bin/meute` — review and triage CLI: report lifecycle (new/read/actioned/
   dismissed) and `promote`, which converts a tier-2 finding into a tier-3
@@ -261,7 +262,6 @@ Phase 2, in rough priority order:
 - Remaining tier-1 templates: lint sweep, doc regen, dependency audit, conventions
 - Remaining tier-2 templates: architecture review, market comparison (needs
   WebSearch in the tier tool set), feature brainstorm
-- `draft-ticket.md` for tier 3
 - A real `MEUTE_QUOTA_CMD` source once a machine-readable balance exists
 
 ## 13. Acceptance
