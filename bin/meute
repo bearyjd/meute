@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+#
+# meute — review and triage what the fleet produced.
+#
+#   bin/meute <command> [args]
+#
+# Commands:
+#   status                        quota, what runs next, this week's activity
+#   reports [--new|--all]         list reports with their triage state
+#   show <id>                     print a report to stdout and mark it read
+#   promote <id> -f <n> [-t T]    turn finding <n> into a tier-3 specced ticket
+#   dismiss <id> [-m <reason>]    mark a report handled with no action taken
+#   branches                      tier-3 drafts currently in flight
+#   help
+#
+# A report id is its path under reports/ without the .md, e.g.
+#   netlens-android/audit-security-2026-08-28
+# Anything this tool prints as an id can be passed straight back to it.
+#
+# This tool never invokes an engine, never edits repos.yaml, and never pushes.
+#
+set -Eeuo pipefail
+
+readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export MEUTE_ROOT
+readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
+readonly REPORT_PY="${MEUTE_ROOT}/lib/report.py"
+readonly MANIFEST="${MEUTE_MANIFEST:-${MEUTE_ROOT}/repos.yaml}"
+readonly STATE_DIR="${MEUTE_ROOT}/state"
+readonly REPORTS_DIR="${MEUTE_ROOT}/reports"
+readonly LOG_FILE="${STATE_DIR}/log"
+readonly CURSOR_FILE="${STATE_DIR}/cursor"
+readonly REPORT_STATE="${STATE_DIR}/reports"
+readonly LOCK_FILE="${STATE_DIR}/.lock"
+readonly THIS_WEEK="$(date +%G-%V)"
+
+source "${MEUTE_ROOT}/lib/state.sh"
+source "${MEUTE_ROOT}/lib/fleet.sh"
+
+note() { printf 'meute: %s\n' "$*" >&2; }
+die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+
+# --------------------------------------------------------------------------
+# Reports on disk are the source of truth. state/reports only annotates them:
+# a report with no row is `new`, and a row whose file is gone is ignored.
+# --------------------------------------------------------------------------
+report_path()  { printf '%s/%s.md\n' "$REPORTS_DIR" "$1"; }
+
+report_ids() {
+  [[ -d "$REPORTS_DIR" ]] || return 0
+  find "$REPORTS_DIR" -mindepth 2 -maxdepth 2 -name '*.md' -type f 2>/dev/null \
+    | sed "s|^${REPORTS_DIR}/||; s|\.md$||" | sort
+}
+
+report_state() {
+  local row; row="$(kv_row "$REPORT_STATE" "$1")"
+  [[ -n "$row" ]] && awk -F'\t' '{print $2}' <<< "$row" || printf 'new\n'
+}
+
+mark() {
+  local id="$1" state="$2" note_text="${3:-}"
+  kv_set_row "$REPORT_STATE" "$id" "$state" "$(date --iso-8601=seconds)" "$note_text"
+}
+
+require_report() {
+  local id="$1"
+  [[ -n "$id" ]] || die "missing report id (try: meute reports)"
+  [[ -f "$(report_path "$id")" ]] || die "no such report: ${id}"
+}
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+cmd_status() {
+  fleet_load_policy || die "could not read policy from ${MANIFEST}"
+  local quota; quota="$("${MEUTE_ROOT}/bin/quota.sh" 2>/dev/null || echo '?')"
+
+  local gate="ok"
+  [[ "$quota" != "?" ]] && (( quota < QUOTA_FLOOR )) && gate="BELOW FLOOR ${QUOTA_FLOOR}%"
+  printf 'quota %s%%  ·  %s\n' "$quota" "$gate"
+
+  local slot
+  for slot in daily weekly; do
+    printf '  next %-7s %s\n' "$slot" "$(next_for_slot "$slot")"
+  done
+
+  local total community cost
+  total="$(week_runs)"; community="$(week_runs community)"
+  cost="$(awk -F'\t' -v wk="week=${THIS_WEEK}" '
+      index($0, wk) == 0 { next }
+      { for (i = 1; i <= NF; i++) if ($i ~ /^cost=/) { split($i, a, "="); if (a[2] + 0 > 0) s += a[2] } }
+      END { printf "%.2f", s + 0 }' "$LOG_FILE" 2>/dev/null || echo 0)"
+  printf '  week %s   %s runs (%s personal · %s community) · $%s\n' \
+    "$THIS_WEEK" "$total" "$(( total - community ))" "$community" "$cost"
+
+  local in_flight=0
+  if fleet_load_scope 2>/dev/null; then in_flight="$(tier3_in_flight 2>/dev/null || echo 0)"; fi
+  printf '  tier-3 in flight  %s of %s\n' "${in_flight:-0}" "${TIER3_CAP}"
+
+  local new_count; new_count="$(cmd_reports --new 2>/dev/null | grep -c '^NEW' || true)"
+  printf '  reports unread    %s\n' "${new_count:-0}"
+}
+
+# What the round-robin would pick next, without running anything.
+next_for_slot() {
+  local slot="$1" cursor start=0 index total
+  local -a queue
+  mapfile -t queue < <(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null || true)
+  total=${#queue[@]}
+  (( total )) || { printf -- '-\n'; return 0; }
+  cursor="$(kv_get "$CURSOR_FILE" "cursor.${slot}")"
+  if [[ -n "$cursor" ]]; then
+    for (( index = 0; index < total; index++ )); do
+      if [[ "$(jq -r '.key' <<< "${queue[index]}")" == "$cursor" ]]; then start=$(( (index + 1) % total )); break; fi
+    done
+  fi
+  jq -r '.key' <<< "${queue[start]}"
+}
+
+cmd_reports() {
+  local filter="${1:---new}"
+  local id state summary meta line found=0
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    state="$(report_state "$id")"
+    [[ "$filter" == "--new" && "$state" != "new" ]] && continue
+    found=1
+    meta="$(python3 "$REPORT_PY" meta "$(report_path "$id")" 2>/dev/null || echo '{}')"
+    summary="$(python3 "$REPORT_PY" summary "$(report_path "$id")" 2>/dev/null || echo '-')"
+    printf '%-10s %-24s %-16s %-12s %s\n' \
+      "$([[ "$state" == new ]] && echo NEW || echo "$state")" \
+      "$(jq -r '.repo // "?"' <<< "$meta")" \
+      "$(jq -r '.task // "?"' <<< "$meta")" \
+      "$(jq -r '.started // "" | split("T")[0]' <<< "$meta")" \
+      "$summary"
+  done < <(report_ids)
+  (( found )) || note "no ${filter#--} reports"
+}
+
+# stdout carries the report and nothing else, so `meute show x | bat` works.
+cmd_show() {
+  local id="${1:-}"; require_report "$id"
+  cat "$(report_path "$id")"
+  [[ "$(report_state "$id")" == "new" ]] && mark "$id" "read"
+  return 0
+}
+
+cmd_dismiss() {
+  local id="${1:-}"; shift || true
+  local reason=""
+  while (( $# )); do
+    case "$1" in
+      -m|--message) reason="${2:?-m needs a reason}"; shift ;;
+      *) die "dismiss: unknown argument $1" ;;
+    esac
+    shift
+  done
+  require_report "$id"
+  mark "$id" "dismissed" "$reason"
+  note "dismissed ${id}${reason:+ (${reason})}"
+}
+
+cmd_promote() {
+  local id="${1:-}"; shift || true
+  local number="" title=""
+  while (( $# )); do
+    case "$1" in
+      -f|--finding) number="${2:?-f needs a finding number}"; shift ;;
+      -t|--title)   title="${2:?-t needs a title}"; shift ;;
+      *) die "promote: unknown argument $1" ;;
+    esac
+    shift
+  done
+  require_report "$id"
+  [[ "$number" =~ ^[0-9]+$ ]] || die "promote: -f <n> is required (see: meute show ${id})"
+
+  fleet_load_policy || die "could not read policy from ${MANIFEST}"
+  fleet_load_scope  || die "could not read the fleet from ${MANIFEST}"
+  local in_flight; in_flight="$(tier3_in_flight)"
+  (( in_flight < TIER3_CAP )) \
+    || die "promote: ${in_flight} tier-3 drafts already in flight (cap ${TIER3_CAP}); merge or drop one first"
+
+  local path meta repo finding
+  path="$(report_path "$id")"
+  meta="$(python3 "$REPORT_PY" meta "$path")"
+  repo="$(jq -r '.repo' <<< "$meta")"
+  finding="$(python3 "$REPORT_PY" findings "$path" | jq -c --argjson n "$number" '.[] | select(.n == $n)')"
+  [[ -n "$finding" ]] || die "promote: no finding ${number} in ${id}"
+
+  # Take the lock: promote and a concurrent run both write under state/.
+  exec 9>"$LOCK_FILE"
+  flock -w 10 9 || die "promote: a run holds the lock; try again shortly"
+
+  local payload ticket_id
+  payload="$(jq -c -n --arg t "${title:-$(jq -r '.title' <<< "$finding")}" \
+    --arg loc "$(jq -r '.location' <<< "$finding")" \
+    --arg sev "$(jq -r '.severity' <<< "$finding")" \
+    --arg src "$id" \
+    --arg created "$(date --iso-8601=seconds)" \
+    '{title: $t, specced: true, source: $src, created: $created,
+      notes: ("[\($sev)] at \($loc). Promoted from \($src); read that report for the exploit path and consequence before fixing.")}')"
+  ticket_id="$(python3 "$MANIFEST_PY" add-ticket "$MANIFEST" "$repo" "$payload")" \
+    || die "promote: could not write the ticket"
+
+  mark "$id" "actioned" "promoted finding ${number} -> ${ticket_id}"
+  note "ticket ${ticket_id} written to state/tickets.yaml (specced: true)"
+  note "tier-3 will pick it up next weekly slot ($(( TIER3_CAP - in_flight - 1 )) of ${TIER3_CAP} slots left)"
+}
+
+cmd_branches() {
+  fleet_load_policy || die "could not read policy from ${MANIFEST}"
+  fleet_load_scope  || die "could not read the fleet from ${MANIFEST}"
+  local path branch found=0
+  while read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ -d "$path/.git" || -f "$path/.git" ]] || continue
+    while read -r branch; do
+      [[ -n "$branch" ]] || continue
+      found=1
+      printf '%-28s %s\n' "$(basename "$path")" "$branch"
+    done < <(git -C "$path" for-each-ref --format='%(refname:short)  %(committerdate:short)  %(subject)' \
+               "refs/heads/${BRANCH_PREFIX}/*" 2>/dev/null)
+  done <<< "$REPO_PATHS"
+  (( found )) || note "no scratch branches in flight"
+}
+
+main() {
+  local command="${1:-help}"; shift || true
+  command -v jq >/dev/null || die "jq is required"
+  case "$command" in
+    status)   cmd_status "$@" ;;
+    reports)  cmd_reports "$@" ;;
+    show)     cmd_show "$@" ;;
+    promote)  cmd_promote "$@" ;;
+    dismiss)  cmd_dismiss "$@" ;;
+    branches) cmd_branches "$@" ;;
+    help|--help|-h) usage ;;
+    *) die "unknown command: ${command} (try: meute help)" ;;
+  esac
+}
+
+main "$@"

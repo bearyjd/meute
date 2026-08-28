@@ -29,6 +29,8 @@ set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
+source "${MEUTE_ROOT}/lib/state.sh"
+source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
@@ -62,23 +64,11 @@ note() { printf 'meute: %s\n' "$*" >&2; }
 die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
-# state/cursor is a tab-separated key/value store holding both the round-robin
-# cursor (one key per slot) and the per-(repo,task) lens rotation counters.
+# state/cursor holds both the round-robin cursor (one key per slot) and the
+# per-(repo,task) lens rotation counters. Storage lives in lib/state.sh.
 # --------------------------------------------------------------------------
-state_get() {
-  [[ -f "$CURSOR_FILE" ]] || return 0
-  awk -F'\t' -v key="$1" '$1 == key { print $2; exit }' "$CURSOR_FILE"
-}
-
-state_set() {
-  local key="$1" value="$2" tmp
-  tmp="$(mktemp "${STATE_DIR}/.cursor.XXXXXX")"
-  if [[ -f "$CURSOR_FILE" ]]; then
-    awk -F'\t' -v key="$1" '$1 != key' "$CURSOR_FILE" > "$tmp"
-  fi
-  printf '%s\t%s\n' "$key" "$value" >> "$tmp"
-  mv "$tmp" "$CURSOR_FILE"
-}
+state_get() { kv_get "$CURSOR_FILE" "$1"; }
+state_set() { kv_set "$CURSOR_FILE" "$1" "$2"; }
 
 # One line per invocation, always, including every skip path. This file is the
 # audit trail for unattended runs — if it is silent, the runner did not fire.
@@ -138,42 +128,6 @@ parse_args() {
     || die "unknown engine: $ENGINE_OVERRIDE"
 }
 
-# --------------------------------------------------------------------------
-# Gates
-# --------------------------------------------------------------------------
-week_runs() {
-  local kind="${1:-}"
-  [[ -f "$LOG_FILE" ]] || { printf '0\n'; return 0; }
-  awk -v wk="week=${THIS_WEEK}" -v kf="$kind" '
-    index($0, wk) == 0        { next }
-    index($0, "status=skipped") { next }
-    kf != "" && index($0, "kind=" kf) == 0 { next }
-    { n++ } END { print n + 0 }' "$LOG_FILE"
-}
-
-# 80/20 by design: a community run is allowed only while it keeps the community
-# share of this ISO week's runs at or under policy.community_share.
-community_allowed() {
-  local total community
-  total="$(week_runs)"
-  community="$(week_runs community)"
-  awk -v c="$community" -v t="$total" -v s="$COMMUNITY_SHARE" \
-      'BEGIN { exit !((c + 1) <= s * (t + 1)) }'
-}
-
-# In-flight tier-3 work is measured by counting surviving scratch branches for
-# tier-3 tasks across the whole fleet. Merging or deleting a branch frees a slot.
-tier3_in_flight() {
-  local count=0 path task
-  while read -r path; do
-    [[ -d "$path/.git" || -f "$path/.git" ]] || continue
-    while read -r task; do
-      [[ -n "$task" ]] || continue
-      count=$(( count + $(git -C "$path" branch --list "${BRANCH_PREFIX}/${task}-*" | wc -l) ))
-    done <<< "$TIER3_TASKS"
-  done <<< "$REPO_PATHS"
-  printf '%s\n' "$count"
-}
 
 eligible() {
   local entry="$1" kind path tier
@@ -233,28 +187,18 @@ main() {
 
   python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "manifest failed validation"
 
-  local policy
-  policy="$(python3 "$MANIFEST_PY" policy "$MANIFEST")"
-  QUOTA_FLOOR="$(jq -r '.quota_floor_percent' <<< "$policy")"
-  COMMUNITY_SHARE="$(jq -r '.community_share' <<< "$policy")"
-  TIER3_CAP="$(jq -r '.tier3_max_in_flight' <<< "$policy")"
-  BRANCH_PREFIX="$(jq -r '.branch_prefix' <<< "$policy")"
+  fleet_load_policy || die "could not read policy from ${MANIFEST}"
 
   local remaining
   remaining="$("${MEUTE_ROOT}/bin/quota.sh")" || skip "quota probe failed"
   (( remaining < QUOTA_FLOOR )) \
     && skip "quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}"
 
-  local queue_file all_file
-  queue_file="$(mktemp)"; all_file="$(mktemp)"
-  trap 'rm -f "$queue_file" "$all_file"' RETURN
+  local queue_file
+  queue_file="$(mktemp)"
+  trap 'rm -f "$queue_file"' RETURN
   python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
-
-  # Tier-3 accounting spans both slots, so gather the whole fleet once.
-  python3 "$MANIFEST_PY" queue "$MANIFEST" daily  >  "$all_file"
-  python3 "$MANIFEST_PY" queue "$MANIFEST" weekly >> "$all_file"
-  TIER3_TASKS="$(jq -rs 'map(select(.tier == "tier3") | .task) | unique | .[]' "$all_file")"
-  REPO_PATHS="$(jq -rs 'map(.path) | unique | .[]' "$all_file")"
+  fleet_load_scope || die "queue build failed"
 
   FORCED=0
   if [[ -n "$FORCE_REPO" || -n "$FORCE_TASK" ]]; then

@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+#
+# Tests for bin/meute and its helpers.
+#
+#   bash tests/test_meute.sh
+#
+# Builds a throwaway MEUTE_ROOT in a temp dir: bin/ and lib/ are symlinked back
+# to the real ones, so MEUTE_ROOT resolves to the fixture via BASH_SOURCE and no
+# code needs an environment override to be testable. The real state/ and
+# reports/ are never touched; the last assertion proves it.
+#
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PASS=0; FAILED=0
+FIXTURE="$(mktemp -d)"
+trap 'rm -rf "$FIXTURE"' EXIT
+
+ok()   { printf '  ok    %s\n' "$1"; PASS=$(( PASS + 1 )); }
+bad()  { printf '  FAIL  %s\n        %s\n' "$1" "$2"; FAILED=$(( FAILED + 1 )); }
+is()   { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "expected [$3], got [$2]"; }
+has()  { [[ "$2" == *"$3"* ]] && ok "$1" || bad "$1" "[$2] does not contain [$3]"; }
+hasnt(){ [[ "$2" != *"$3"* ]] && ok "$1" || bad "$1" "[$2] unexpectedly contains [$3]"; }
+
+meute() { "$FIXTURE/bin/meute" "$@"; }
+report() { python3 "$REPO/lib/report.py" "$@"; }
+
+# ---------------------------------------------------------------- fixture ---
+setup() {
+  mkdir -p "$FIXTURE"/{state,tasks,reports/alpha,reports/beta}
+  ln -s "$REPO/bin" "$FIXTURE/bin"
+  ln -s "$REPO/lib" "$FIXTURE/lib"
+  cp "$REPO"/tasks/*.md "$FIXTURE/tasks/"
+  printf 'Ticket {{TICKET_ID}} {{TICKET_TITLE}} {{TICKET_NOTES}} {{REPO_NAME}} {{REPO_SPEC}} {{REPO_PATH}} {{TASK}} {{TIER}} {{DATE}} {{BRANCH}} {{FILE_BUDGET}} {{LENS}} {{REPORT_PATH}} {{DEFAULT_BRANCH}} {{ALLOWED_COMMANDS}} {{UPSTREAM}} {{ETIQUETTE}}\n' \
+    > "$FIXTURE/tasks/draft-ticket.md"
+
+  local repo
+  for repo in alpha beta; do
+    mkdir -p "$FIXTURE/git-$repo"
+    git -C "$FIXTURE/git-$repo" init -q -b main
+    echo x > "$FIXTURE/git-$repo/f.txt"
+    git -C "$FIXTURE/git-$repo" add -A
+    git -C "$FIXTURE/git-$repo" -c user.email=t@t -c user.name=t commit -qm init
+  done
+
+  python3 - "$FIXTURE" <<'PY'
+import sys, pathlib, yaml
+fx = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {
+        "tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
+        "tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False},
+        "tier3": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
+    },
+    "tasks": {
+        "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
+                           "slots": ["daily"], "lenses": ["injection", "auth"]},
+        "gen-tests": {"tier": "tier1", "template": "tasks/gen-tests.md", "slots": ["weekly"]},
+        "draft-ticket": {"tier": "tier3", "template": "tasks/draft-ticket.md",
+                         "slots": ["weekly"], "requires_specced_ticket": True},
+    },
+    "repos": [
+        {"name": "alpha", "path": str(fx / "git-alpha"), "spec": "fixture alpha",
+         "tasks": ["audit-security", "draft-ticket"]},
+        {"name": "beta", "path": str(fx / "git-beta"), "spec": "fixture beta",
+         "tasks": ["gen-tests"]},
+    ],
+    "community": [],
+}, open(fx / "repos.yaml", "w"), sort_keys=False)
+PY
+
+  cat > "$FIXTURE/reports/alpha/audit-security-2026-08-28.md" <<'MD'
+---
+repo: alpha
+task: audit-security
+tier: tier2
+lens: injection
+started: 2026-08-28T03:00:00-04:00
+status: ok
+---
+
+## Summary
+Findings present.
+
+## Findings
+
+### [CRITICAL] SQL injection in lookup
+- **Location:** `src/db.py:88`
+
+### [HIGH] Path traversal in export
+- **Location:** `src/export.py:22`
+
+### [HIGH] Unvalidated header
+- **Location:** `src/web.py:14`
+MD
+
+  cat > "$FIXTURE/reports/beta/gen-tests-2026-08-27.md" <<'MD'
+---
+repo: beta
+task: gen-tests
+tier: tier1
+started: 2026-08-27T04:00:00-04:00
+status: ok
+---
+
+## Summary
+Coverage added.
+
+## Environment
+- Suite status when I left: green, 4 passed.
+
+## Tests added
+### 1. `test_a`
+### 2. `test_b`
+### 3. `test_c`
+### 4. `test_d`
+MD
+
+  cat > "$FIXTURE/reports/alpha/audit-security-2026-08-20.md" <<'MD'
+---
+repo: alpha
+task: audit-security
+lens: auth
+started: 2026-08-20T03:00:00-04:00
+status: ok
+---
+
+## Summary
+Clean.
+
+## Findings
+
+No findings under the auth lens within this run's budget.
+MD
+
+  cat > "$FIXTURE/reports/beta/gen-tests-2026-08-10.md" <<'MD'
+---
+repo: beta
+task: gen-tests
+started: 2026-08-10T04:00:00-04:00
+status: error
+---
+
+# Run produced no report
+
+**Status:** error — engine exited 124
+MD
+  : > "$FIXTURE/state/log"
+}
+
+# ------------------------------------------------------------------ tests ---
+test_summaries() {
+  is "summary: audit with findings"  "$(report summary "$FIXTURE/reports/alpha/audit-security-2026-08-28.md")" "CRIT×1 HIGH×2"
+  is "summary: audit with none"      "$(report summary "$FIXTURE/reports/alpha/audit-security-2026-08-20.md")" "no findings"
+  is "summary: gen-tests green"      "$(report summary "$FIXTURE/reports/beta/gen-tests-2026-08-27.md")"       "+4 tests, green"
+  is "summary: failed run"           "$(report summary "$FIXTURE/reports/beta/gen-tests-2026-08-10.md")"       "run failed (error)"
+
+  local findings; findings="$(report findings "$FIXTURE/reports/alpha/audit-security-2026-08-28.md")"
+  is "findings: count"    "$(jq 'length' <<< "$findings")" "3"
+  is "findings: severity" "$(jq -r '.[0].severity' <<< "$findings")" "CRITICAL"
+  is "findings: location" "$(jq -r '.[0].location' <<< "$findings")" "src/db.py:88"
+
+  report findings "$FIXTURE/reports/beta/gen-tests-2026-08-27.md" >/dev/null 2>&1
+  is "findings: refused on gen-tests" "$?" "2"
+}
+
+test_listing() {
+  local out; out="$(meute reports --new 2>&1)"
+  has "reports: lists new audit"  "$out" "alpha"
+  has "reports: lists new tests"  "$out" "beta"
+  is  "reports: 4 unread"         "$(meute reports --new 2>/dev/null | grep -c '^NEW')" "4"
+}
+
+test_show_marks_read() {
+  local out; out="$(meute show alpha/audit-security-2026-08-28 2>/dev/null)"
+  is   "show: stdout starts with front-matter" "$(head -1 <<< "$out")" "---"
+  hasnt "show: stdout carries no chatter"      "$out" "meute:"
+  has  "show: marks read" "$(meute reports --all 2>/dev/null | grep 'audit-security   2026-08-28')" "read"
+  is   "show: unknown id fails" "$(meute show alpha/nope >/dev/null 2>&1; echo $?)" "1"
+}
+
+test_promote() {
+  local before after ticket
+  before="$(md5sum "$FIXTURE/repos.yaml" | cut -d' ' -f1)"
+  meute promote alpha/audit-security-2026-08-28 -f 1 >/dev/null 2>&1
+  after="$(md5sum "$FIXTURE/repos.yaml" | cut -d' ' -f1)"
+  is "promote: repos.yaml never written" "$after" "$before"
+
+  ticket="$(python3 -c "
+import yaml; d = yaml.safe_load(open('$FIXTURE/state/tickets.yaml'))
+t = d['tickets']['alpha'][0]; print(t['id'], t['specced'], t['source'])")"
+  is  "promote: ticket id derived"  "$(cut -d' ' -f1 <<< "$ticket")" "AL-1"
+  is  "promote: specced is true"    "$(cut -d' ' -f2 <<< "$ticket")" "True"
+  has "promote: records its source" "$ticket" "alpha/audit-security-2026-08-28"
+  has "promote: report is actioned" "$(meute reports --all 2>/dev/null | grep '2026-08-28')" "actioned"
+
+  local queued
+  queued="$(MEUTE_ROOT="$FIXTURE" python3 "$REPO/lib/manifest.py" queue "$FIXTURE/repos.yaml" weekly \
+            | jq -r 'select(.tier=="tier3") | .key')"
+  is "promote: ticket reaches the tier-3 queue" "$queued" "alpha/draft-ticket/AL-1"
+
+  is "promote: bad finding number fails" \
+     "$(meute promote alpha/audit-security-2026-08-28 -f 99 >/dev/null 2>&1; echo $?)" "1"
+}
+
+test_cap() {
+  git -C "$FIXTURE/git-alpha" branch meute/draft-ticket-2026-08-01 >/dev/null 2>&1
+  git -C "$FIXTURE/git-alpha" branch meute/draft-ticket-2026-08-02 >/dev/null 2>&1
+  git -C "$FIXTURE/git-alpha" branch meute/draft-ticket-2026-08-03 >/dev/null 2>&1
+  local count_before out
+  count_before="$(python3 -c "
+import yaml; print(len(yaml.safe_load(open('$FIXTURE/state/tickets.yaml'))['tickets']['alpha']))")"
+  out="$(meute promote alpha/audit-security-2026-08-28 -f 2 2>&1)"
+  has "cap: promote refused at the cap" "$out" "already in flight"
+  is  "cap: nothing was written" "$(python3 -c "
+import yaml; print(len(yaml.safe_load(open('$FIXTURE/state/tickets.yaml'))['tickets']['alpha']))")" "$count_before"
+  has "branches: lists drafts in flight" "$(meute branches 2>&1)" "meute/draft-ticket-2026-08-01"
+}
+
+test_dismiss_and_edges() {
+  meute dismiss beta/gen-tests-2026-08-27 -m "not worth it" >/dev/null 2>&1
+  has "dismiss: state recorded" "$(meute reports --all 2>/dev/null | grep 'gen-tests        2026-08-27')" "dismissed"
+  has "dismiss: reason kept"    "$(cat "$FIXTURE/state/reports")" "not worth it"
+
+  rm "$FIXTURE/reports/alpha/audit-security-2026-08-20.md"
+  local out; out="$(meute reports --all 2>&1)"
+  hasnt "stale row for a deleted report is skipped" "$out" "2026-08-20"
+
+  has "status: runs without error" "$(meute status 2>&1)" "tier-3 in flight"
+  is  "unknown command exits 1"    "$(meute frobnicate >/dev/null 2>&1; echo $?)" "1"
+}
+
+# Compares against a snapshot taken before the suite ran, rather than demanding a
+# clean tree: the operator may legitimately have uncommitted state, and this must
+# still catch the suite itself writing outside its fixture.
+test_real_repo_untouched() {
+  local now; now="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
+  is "the real state/ and reports/ were never touched" "$now" "$REAL_STATE_BEFORE"
+}
+
+# ------------------------------------------------------------------- main ---
+printf 'meute test suite\n'
+REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
+setup
+test_summaries
+test_listing
+test_show_marks_read
+test_promote
+test_cap
+test_dismiss_and_edges
+test_real_repo_untouched
+printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
+(( FAILED == 0 ))

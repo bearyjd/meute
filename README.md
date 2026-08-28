@@ -124,6 +124,41 @@ Skipped runs (quota floor, empty queue, lock held) append their log line but do
 not commit — otherwise a quota-starved week would produce a commit per cron fire.
 Those lines are folded into the next real run's commit.
 
+## Reviewing the output — `bin/meute`
+
+The runner produces; `bin/meute` is how you consume. The failure mode of a fleet
+like this was never "the runner breaks" — it's forty unread audits rotting in
+`reports/`. So reports carry triage state, and `--new` is the default view.
+
+```sh
+./bin/meute status              # quota, what runs next, this week, unread count
+./bin/meute reports             # unread reports (--all for everything)
+./bin/meute show <id>           # print a report, mark it read
+./bin/meute promote <id> -f 1   # finding 1 becomes a tier-3 specced ticket
+./bin/meute dismiss <id> -m "no reachable sink"
+./bin/meute branches            # tier-3 drafts in flight
+```
+
+A report id is its path under `reports/` without the `.md`
+(`netlens-android/audit-security-2026-08-28`). Anything printed as an id can be
+passed straight back in. `show` writes only the report to stdout, so
+`./bin/meute show <id> | bat` works.
+
+`promote` is the loop that makes the tier system worth having: a tier-2 audit
+finds something, one command turns it into the `specced: true` ticket that tier 3
+is allowed to fix. It refuses when the tier-3 in-flight cap is already reached.
+
+### Where tickets live
+
+`promote` writes to `state/tickets.yaml`, never to `repos.yaml`. The manifest
+merges both sources through the same `specced: true` gate, and a ticket id
+present in both is a hard error.
+
+The reason is narrow and worth stating: PyYAML cannot round-trip a file without
+destroying its comments, and `repos.yaml` is mostly hand-written documentation.
+Rather than take a dependency so a machine can rewrite hand-curated config,
+machine-written state gets its own file. `repos.yaml` is yours alone.
+
 ## Adding a task
 
 1. Write `tasks/<name>.md`. It must define the job, stop conditions

@@ -168,6 +168,57 @@ def checked_projects(data: dict, key: str, tasks: dict) -> list:
     return projects
 
 
+def tickets_path(root: str) -> str:
+    return os.path.join(root, "state", "tickets.yaml")
+
+
+def load_machine_tickets(root: str) -> dict:
+    """Tickets written by `meute promote`.
+
+    These live in state/tickets.yaml rather than repos.yaml on purpose: PyYAML
+    cannot round-trip a file without destroying its comments, and repos.yaml is
+    mostly hand-written documentation. Machine-written state gets its own file.
+    """
+    path = tickets_path(root)
+    if not os.path.isfile(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    tickets = data.get("tickets") or {}
+    if not isinstance(tickets, dict):
+        raise ManifestError("state/tickets.yaml: 'tickets' must map repo name -> list")
+    return tickets
+
+
+def with_machine_tickets(project: dict, machine: dict) -> dict:
+    """Copy of `project` whose ticket list also carries the machine-written ones."""
+    extra = machine.get(project["name"]) or []
+    if not extra:
+        return project
+    own = list(project.get("tickets") or [])
+    seen = {str(ticket.get("id")) for ticket in own}
+    for ticket in extra:
+        identifier = str(ticket.get("id"))
+        if identifier in seen:
+            raise ManifestError(
+                f"ticket id {identifier!r} for {project['name']} exists in both "
+                "repos.yaml and state/tickets.yaml - resolve the clash by hand")
+        seen.add(identifier)
+    return {**project, "tickets": own + list(extra)}
+
+
+def derive_ticket_id(repo: str, existing: list) -> str:
+    """<INITIALS>-<n>, continuing from the highest n already used for this repo."""
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", repo) if p]
+    initials = "".join(p[0] for p in parts[:2]).upper() if len(parts) > 1 else repo[:2].upper()
+    highest = 0
+    for ticket in existing:
+        match = re.search(r"(\d+)$", str(ticket.get("id", "")))
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return f"{initials}-{highest + 1}"
+
+
 def build_entry(kind: str, project: dict, task_name: str, task: dict,
                 tier_name: str, tier: dict, defaults: dict, root: str) -> dict:
     """Flatten manifest layers into the single record run.sh consumes."""
@@ -212,8 +263,10 @@ def build_queue(data: dict, slot: str, root: str) -> list:
     tiers = checked_tiers(data)
     tasks = checked_tasks(data, tiers, root)
     entries = []
+    machine = load_machine_tickets(root)
     for kind, key in (("personal", "repos"), ("community", "community")):
         for project in checked_projects(data, key, tasks):
+            project = with_machine_tickets(project, machine)
             for task_name in project.get("tasks") or []:
                 task = tasks[task_name]
                 slots = task.get("slots") or list(VALID_SLOTS)
@@ -294,11 +347,59 @@ def cmd_render(args: list) -> int:
     return 0
 
 
+def cmd_add_ticket(args: list) -> int:
+    """Append one machine-written ticket. Never touches repos.yaml."""
+    manifest, repo_name, payload = args[0], args[1], args[2]
+    root = repo_root(manifest)
+    data = load(manifest)
+    tasks = checked_tasks(data, checked_tiers(data), root)
+
+    project = None
+    for key in ("repos", "community"):
+        for candidate in checked_projects(data, key, tasks):
+            if candidate["name"] == repo_name:
+                project = candidate
+    if project is None:
+        raise ManifestError(f"unknown repo {repo_name!r} - not in repos.yaml")
+
+    try:
+        ticket = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ManifestError(f"add-ticket: payload is not valid JSON: {error}") from error
+    if not isinstance(ticket, dict) or not ticket.get("title"):
+        raise ManifestError("add-ticket: ticket needs at least a title")
+
+    path = tickets_path(root)
+    stored = {}
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            stored = yaml.safe_load(handle) or {}
+    tickets = stored.get("tickets") or {}
+    existing = list(tickets.get(repo_name) or [])
+
+    known = existing + list(project.get("tickets") or [])
+    if not ticket.get("id"):
+        ticket["id"] = derive_ticket_id(repo_name, known)
+    if str(ticket["id"]) in {str(t.get("id")) for t in known}:
+        raise ManifestError(f"ticket id {ticket['id']!r} already exists for {repo_name}")
+    ticket.setdefault("specced", True)
+
+    updated = {**stored, "tickets": {**tickets, repo_name: existing + [ticket]}}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("# Tickets written by `meute promote`. Machine-owned - edit repos.yaml\n"
+                     "# for hand-authored tickets instead; this file is rewritten wholesale.\n")
+        yaml.safe_dump(updated, handle, sort_keys=False, default_flow_style=False)
+    print(ticket["id"])
+    return 0
+
+
 COMMANDS = {
     "validate": (cmd_validate, 1),
     "policy": (cmd_policy, 1),
     "queue": (cmd_queue, 2),
     "render": (cmd_render, 1),
+    "add-ticket": (cmd_add_ticket, 3),
 }
 
 

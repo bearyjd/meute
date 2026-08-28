@@ -183,6 +183,14 @@ for it. The commit is pathspec-scoped to `state` and `reports` so unrelated edit
 in the meute tree are never swept in, and it never pushes.
 `MEUTE_NO_AUTOCOMMIT=1` opts out.
 
+**Machine-written tickets never touch `repos.yaml`.** `meute promote` writes to
+`state/tickets.yaml`; `manifest.py` merges it with the hand-written tickets and
+applies the same `specced: true` gate to both. PyYAML destroys comments on
+round-trip (verified: `safe_dump(safe_load("# c\nk: 1"))` → `"k: 1\n"`), and this
+manifest's comments are its documentation. `ruamel.yaml` would round-trip, but
+taking a dependency so a machine can rewrite hand-curated config is the wrong
+trade — separate the files instead.
+
 **Engine results are normalised, not shared.** `claude -p --output-format json`
 returns one envelope with `.result`; `codex exec --json` streams JSONL events and
 writes the final message to a separate file via `-o`. Extraction paths are
@@ -240,6 +248,12 @@ Built and accepted:
 - `bin/quota.sh` — pluggable probe with a stub default
 - `tasks/audit-security.md` (tier 2, rotating lens), `tasks/gen-tests.md` (tier 1)
 - `lib/artifacts.gitignore`
+- `bin/meute` — review and triage CLI: report lifecycle (new/read/actioned/
+  dismissed) and `promote`, which converts a tier-2 finding into a tier-3
+  `specced: true` ticket. Plan: `.claude/PRPs/plans/meute-report-lifecycle-cli.plan.md`
+- `lib/state.sh`, `lib/fleet.sh` — kv store and fleet accounting, extracted so the
+  runner and the review CLI share one implementation of the 80/20 and cap arithmetic
+- `lib/report.py` — report parsing; `tests/test_meute.sh` — the first test suite
 
 Phase 2, in rough priority order:
 
