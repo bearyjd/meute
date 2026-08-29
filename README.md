@@ -120,6 +120,20 @@ Wire it up. Two sources ship, and they answer different questions:
 | `contrib/quota-self-budget.sh` | *has the fleet had enough this week?* | nothing — reads meute's own log |
 | `contrib/quota-llm-usage-tracker.sh` | *how much of my subscription pool is left?* | llm-usage-tracker with a claude.ai browser login |
 
+Observed cost per run, so you can calibrate rather than guess — it scales with
+repo size far more than with task type:
+
+| Repo | Files | Task | Cost | Turns |
+|---|---|---|---|---|
+| veille-finance | 124 | lint-sweep | $0.17 | 12 |
+| immich-journal | 79 | audit-security | $0.36 | 18 |
+| bascule-bluetooth | 201 | audit-security | $1.29 | 47 |
+| immich-journal | 79 | draft-ticket (opus) | $2.60 | 56 |
+
+Seven daily audits across mid-sized repos is comfortably $6–9, so a ceiling
+calibrated on your smallest repo will trip mid-week. `meute status` shows the
+week's burn against the ceiling.
+
 The self-budget source cannot see your interactive usage, so it is a cap on
 meute's footprint rather than a reading of your pool. That is most of what the
 gate is for, and a cap you actually have beats a true reading you do not:

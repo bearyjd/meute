@@ -107,8 +107,12 @@ cmd_status() {
       index($0, wk) == 0 { next }
       { for (i = 1; i <= NF; i++) if ($i ~ /^cost=/) { split($i, a, "="); if (a[2] + 0 > 0) s += a[2] } }
       END { printf "%.2f", s + 0 }' "$LOG_FILE" 2>/dev/null || echo 0)"
-  printf '  week %s   %s runs (%s personal · %s community) · $%s\n' \
-    "$THIS_WEEK" "$total" "$(( total - community ))" "$community" "$cost"
+  local ceiling=""
+  fleet_wire_self_budget >/dev/null 2>&1 || true
+  [[ -n "${MEUTE_WEEKLY_COST_USD:-}" ]] && ceiling=" of \$${MEUTE_WEEKLY_COST_USD}"
+  [[ -n "${MEUTE_WEEKLY_RUNS:-}" ]] && ceiling=" (ceiling ${MEUTE_WEEKLY_RUNS} runs)"
+  printf '  week %s   %s runs (%s personal · %s community) · $%s%s\n' \
+    "$THIS_WEEK" "$total" "$(( total - community ))" "$community" "$cost" "$ceiling"
 
   local in_flight=0
   if fleet_load_scope 2>/dev/null; then in_flight="$(tier3_in_flight 2>/dev/null || echo 0)"; fi
