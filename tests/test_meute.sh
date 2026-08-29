@@ -374,7 +374,9 @@ test_quota_gate() {
   is "quota: --with-source names the source" "$out" "55 stub"
 
   out="$(MEUTE_QUOTA_CMD='echo 42' "$REPO/bin/quota.sh" --with-source)"
-  is "quota: configured probe wins" "$out" "42 MEUTE_QUOTA_CMD"
+  # The source is the probe's basename, not the variable name: state/log should
+  # say WHICH probe answered (quota-self-budget.sh vs a real pool reader).
+  is "quota: configured probe wins, named by its command" "$out" "42 echo"
 
   # the safety property: a configured probe that fails must NOT fall back
   MEUTE_QUOTA_CMD='exit 3' "$REPO/bin/quota.sh" >/dev/null 2>&1; rc=$?
@@ -441,6 +443,55 @@ test_self_budget() {
   is "budget: refuses two budgets at once" "$rc" "1"
 }
 
+
+# A ceiling declared in the manifest must apply with no env vars, or it silently
+# reverts to the stub the moment someone forgets a line in their crontab.
+test_manifest_ceiling() {
+  local root="$FIXTURE/ceiling"
+  mkdir -p "$root/state" "$root/tasks"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/contrib" "$root/contrib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute",
+               "weekly_cost_usd": 10.0},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
+                                 "slots": ["daily"]}},
+    "repos": [], "community": [],
+}, open(root/"repos.yaml", "w"), sort_keys=False)
+PY
+  local wk; wk="$(date +%G-%V)"; : > "$root/state/log"
+
+  # the ceiling must be readable as policy, and reject a double ceiling
+  is "ceiling: parsed from the manifest" \
+     "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" policy "$root/repos.yaml" | jq -r .weekly_cost_usd)" "10.0"
+
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1]); d = yaml.safe_load((root/"repos.yaml").read_text())
+d["policy"]["weekly_runs"] = 5
+yaml.safe_dump(d, open(root/"both.yaml", "w"), sort_keys=False)
+PY
+  local err; err="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/both.yaml" 2>&1 || true)"
+  has "ceiling: refuses two ceilings at once" "$err" "not both"
+
+  # the self-budget adapter must compute against the declared ceiling
+  local i
+  for i in 1 2 3; do printf 'ts\tweek=%s\tstatus=ok\tcost=2.00\n' "$wk" >> "$root/state/log"; done
+  is "ceiling: \$6 of \$10 leaves 40%" \
+     "$(MEUTE_WEEKLY_COST_USD=10.0 MEUTE_ROOT="$root" "$REPO/contrib/quota-self-budget.sh")" "40"
+  for i in 1 2; do printf 'ts\tweek=%s\tstatus=ok\tcost=2.00\n' "$wk" >> "$root/state/log"; done
+  is "ceiling: exhausted reads 0%" \
+     "$(MEUTE_WEEKLY_COST_USD=10.0 MEUTE_ROOT="$root" "$REPO/contrib/quota-self-budget.sh")" "0"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
@@ -455,6 +506,7 @@ test_community_gates
 test_quota_gate
 test_doctor
 test_self_budget
+test_manifest_ceiling
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

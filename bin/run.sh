@@ -200,6 +200,12 @@ main() {
 
   fleet_load_policy || die "could not read policy from ${MANIFEST}"
 
+  # Not `|| true`: if this function goes missing the ceiling lapses silently,
+  # which is the exact failure this change exists to prevent. It returns 1
+  # legitimately when no ceiling is declared, so only a *missing* function
+  # (127) is fatal.
+  fleet_wire_self_budget; (( $? == 127 )) && die "lib/fleet.sh is missing fleet_wire_self_budget"
+
   local remaining probe
   probe="$("${MEUTE_ROOT}/bin/quota.sh" --with-source)" || skip "quota probe failed"
   remaining="${probe%% *}"

@@ -34,6 +34,8 @@ REQUIRED_TIER_KEYS = ("tools", "permission_mode", "writes_code")
 
 POLICY_DEFAULTS = {
     "quota_floor_percent": 30,
+    "weekly_runs": None,
+    "weekly_cost_usd": None,
     "community_share": 0.20,
     "tier3_max_in_flight": 3,
     "branch_prefix": "meute",
@@ -89,6 +91,15 @@ def merged_policy(data: dict) -> dict:
     cap = policy["tier3_max_in_flight"]
     if not isinstance(cap, int) or cap < 0:
         raise ManifestError("policy.tier3_max_in_flight: must be a non-negative integer")
+    runs, cost = policy["weekly_runs"], policy["weekly_cost_usd"]
+    if runs is not None and cost is not None:
+        raise ManifestError(
+            "policy: set weekly_runs or weekly_cost_usd, not both - "
+            "two ceilings means neither is the ceiling")
+    if runs is not None and (not isinstance(runs, int) or runs < 1):
+        raise ManifestError("policy.weekly_runs: must be a positive integer")
+    if cost is not None and (not isinstance(cost, (int, float)) or float(cost) <= 0):
+        raise ManifestError("policy.weekly_cost_usd: must be a positive number")
     if not SAFE_NAME.match(str(policy["branch_prefix"])):
         raise ManifestError("policy.branch_prefix: must be a safe identifier")
     return policy

@@ -312,11 +312,18 @@ cmd_doctor() {
   fi
 
   printf '\n  quota gate\n'
+  local self_budget=0
+  # doctor must not die on a broken manifest — it exists to report one.
+  fleet_load_policy 2>/dev/null || true
+  fleet_wire_self_budget && self_budget=1
   local probe
   if probe="$("${MEUTE_ROOT}/bin/quota.sh" --with-source 2>/dev/null)"; then
     if [[ "${probe#* }" == "stub" ]]; then
       d_warn "${probe%% *}% from the stub — the gate does NOT fire yet"
-      d_warn "set MEUTE_QUOTA_CMD (see contrib/) or the fleet ignores your quota entirely"
+      d_warn "declare policy.weekly_cost_usd in the manifest, or set MEUTE_QUOTA_CMD"
+    elif (( self_budget )); then
+      d_ok "${probe%% *}% of meute's own weekly ceiling remaining (${probe#* })"
+      d_ok "ceiling: ${MEUTE_WEEKLY_COST_USD:+\$${MEUTE_WEEKLY_COST_USD}}${MEUTE_WEEKLY_RUNS:+${MEUTE_WEEKLY_RUNS} runs}/week, from the manifest"
     else
       d_ok "${probe%% *}% remaining, from ${probe#* }"
     fi

@@ -26,6 +26,21 @@ policy:
   quota_floor_percent: 30   # below this much remaining weekly quota, the runner exits 0
   community_share: 0.20     # max share of this ISO week's runs spent on the community track
   tier3_max_in_flight: 3    # max undelivered tier-3 draft branches across the whole fleet
+
+  # A ceiling on meute's OWN weekly consumption, computed from state/log. Set one
+  # or the other, never both. With either set, the runner wires
+  # contrib/quota-self-budget.sh automatically — no env vars needed in cron — and
+  # the declared number is the stop point (quota_floor_percent does not apply to
+  # it, since a self-budget is already meute's allocation and reserving headroom
+  # inside it would double-count).
+  #
+  # Prefer cost over runs: task cost varies about 7x, from ~$0.15 for a lint
+  # sweep to ~$2.50 for a tier-3 fix on opus, so a run count is a poor ceiling.
+  # These are list-price equivalents of work the subscription already paid for —
+  # a measure of effort, not money owed.
+  #
+  # weekly_cost_usd: 10.00
+  # weekly_runs: 20
   branch_prefix: meute      # scratch branches are <prefix>/<task>-<date>
 
 # ---------------------------------------------------------------------------

@@ -76,7 +76,7 @@ emit() {
 # the fleet run at full speed exactly when the operator asked it not to.
 if [[ -n "${MEUTE_QUOTA_CMD:-}" ]]; then
   if raw="$(eval "${MEUTE_QUOTA_CMD}" 2>/dev/null)"; then
-    emit "${raw//[[:space:]]/}" "MEUTE_QUOTA_CMD"
+    emit "${raw//[[:space:]]/}" "$(basename "${MEUTE_QUOTA_CMD%% *}")"
     exit $?
   fi
   printf 'quota.sh: MEUTE_QUOTA_CMD failed. Refusing to guess — the runner will\n' >&2

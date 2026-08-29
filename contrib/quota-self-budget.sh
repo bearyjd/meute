@@ -24,7 +24,11 @@
 # paid for by the subscription. They are a proxy for effort, not money owed.
 set -Eeuo pipefail
 
-readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Honour MEUTE_ROOT when the runner exports it, matching lib/manifest.py. Without
+# this the adapter always reads the log next to its own file, which is right in
+# production and wrong everywhere else — a symlinked or relocated checkout would
+# silently budget against the wrong log.
+readonly MEUTE_ROOT="${MEUTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 readonly LOG="${MEUTE_ROOT}/state/log"
 readonly WEEK="$(date +%G-%V)"
 

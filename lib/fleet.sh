@@ -18,6 +18,8 @@ fleet_load_policy() {
   COMMUNITY_SHARE="$(jq -r '.community_share' <<< "$policy")"
   TIER3_CAP="$(jq -r '.tier3_max_in_flight' <<< "$policy")"
   BRANCH_PREFIX="$(jq -r '.branch_prefix' <<< "$policy")"
+  POLICY_WEEKLY_RUNS="$(jq -r '.weekly_runs' <<< "$policy")"
+  POLICY_WEEKLY_COST="$(jq -r '.weekly_cost_usd' <<< "$policy")"
 }
 
 # Tier-3 accounting spans both slots, so gather the whole fleet, not one slot.
@@ -63,4 +65,28 @@ tier3_in_flight() {
     done <<< "$TIER3_TASKS"
   done <<< "$REPO_PATHS"
   printf '%s\n' "$count"
+}
+
+# Wire the manifest-declared ceiling, if there is one and the operator has not
+# pointed us at a real subscription probe. Returns 0 if a self-budget is now in
+# force, 1 if none applies.
+#
+# quota_floor_percent reserves headroom for the human against a real pool
+# reading. A self-budget is already meute's own allocation, so the floor would
+# double-count and make the declared number lie — budget 10 with a 30% floor
+# would stop at 7. Against a self-budget the declared ceiling IS the stop point;
+# floor 1 rather than 0, so an exhausted budget (remaining 0) still trips the
+# `remaining < floor` comparison.
+fleet_wire_self_budget() {
+  [[ -z "${MEUTE_QUOTA_CMD:-}" ]] || return 1
+  if [[ "${POLICY_WEEKLY_RUNS:-null}" != "null" && -n "${POLICY_WEEKLY_RUNS:-}" ]]; then
+    export MEUTE_WEEKLY_RUNS="$POLICY_WEEKLY_RUNS"
+  elif [[ "${POLICY_WEEKLY_COST:-null}" != "null" && -n "${POLICY_WEEKLY_COST:-}" ]]; then
+    export MEUTE_WEEKLY_COST_USD="$POLICY_WEEKLY_COST"
+  else
+    return 1
+  fi
+  export MEUTE_QUOTA_CMD="${MEUTE_ROOT}/contrib/quota-self-budget.sh"
+  QUOTA_FLOOR=1
+  return 0
 }
