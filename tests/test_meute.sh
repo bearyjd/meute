@@ -391,6 +391,39 @@ test_doctor() {
   has "doctor: warns an unwired quota gate"   "$out" "does NOT fire"
 }
 
+
+# The self-budget source: a cap on meute's own footprint, computed from its own
+# log. This is the first quota source that actually makes the gate fire.
+test_self_budget() {
+  local log="$FIXTURE/budget/state/log" adapter="$REPO/contrib/quota-self-budget.sh"
+  mkdir -p "$FIXTURE/budget/state" "$FIXTURE/budget/bin" "$FIXTURE/budget/contrib"
+  ln -sfn "$REPO/contrib/quota-self-budget.sh" "$FIXTURE/budget/contrib/q.sh"
+  local run="$FIXTURE/budget/contrib/q.sh" wk; wk="$(date +%G-%V)"
+  : > "$log"
+
+  is "budget: empty log is 100%" "$(MEUTE_WEEKLY_RUNS=10 "$run")" "100"
+
+  local i
+  for i in 1 2 3 4 5; do printf 'ts\tweek=%s\tstatus=ok\tcost=0.20\n' "$wk" >> "$log"; done
+  is "budget: 5 of 10 runs leaves 50%"  "$(MEUTE_WEEKLY_RUNS=10 "$run")" "50"
+  is "budget: 5 of 5 runs leaves 0%"    "$(MEUTE_WEEKLY_RUNS=5 "$run")"  "0"
+  is "budget: \$1.00 of \$2.00 leaves 50%" "$(MEUTE_WEEKLY_COST_USD=2.00 "$run")" "50"
+
+  # skips consumed nothing and must not count
+  printf 'ts\tweek=%s\tstatus=skipped\treason=x\n' "$wk" >> "$log"
+  is "budget: skipped runs do not consume budget" "$(MEUTE_WEEKLY_RUNS=10 "$run")" "50"
+
+  # a different ISO week must not count
+  printf 'ts\tweek=1999-01\tstatus=ok\tcost=9.00\n' >> "$log"
+  is "budget: other weeks are excluded" "$(MEUTE_WEEKLY_RUNS=10 "$run")" "50"
+
+  local rc
+  "$run" >/dev/null 2>&1; rc=$?
+  is "budget: refuses to guess when unconfigured" "$rc" "1"
+  MEUTE_WEEKLY_RUNS=5 MEUTE_WEEKLY_COST_USD=5 "$run" >/dev/null 2>&1; rc=$?
+  is "budget: refuses two budgets at once" "$rc" "1"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
@@ -404,6 +437,7 @@ test_dismiss_and_edges
 test_community_gates
 test_quota_gate
 test_doctor
+test_self_budget
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

@@ -97,7 +97,28 @@ quota=77:stub          ← the gate is not real yet
 quota=41:MEUTE_QUOTA_CMD   ← the gate is real
 ```
 
-Wire it up:
+Wire it up. Two sources ship, and they answer different questions:
+
+| Source | Answers | Needs |
+|---|---|---|
+| `contrib/quota-self-budget.sh` | *has the fleet had enough this week?* | nothing — reads meute's own log |
+| `contrib/quota-llm-usage-tracker.sh` | *how much of my subscription pool is left?* | llm-usage-tracker with a claude.ai browser login |
+
+The self-budget source cannot see your interactive usage, so it is a cap on
+meute's footprint rather than a reading of your pool. That is most of what the
+gate is for, and a cap you actually have beats a true reading you do not:
+
+```sh
+MEUTE_WEEKLY_RUNS=20 MEUTE_QUOTA_CMD='contrib/quota-self-budget.sh' ./bin/run.sh daily
+# or budget by list-price-equivalent effort instead of run count:
+MEUTE_WEEKLY_COST_USD=5.00 MEUTE_QUOTA_CMD='contrib/quota-self-budget.sh' ./bin/run.sh daily
+```
+
+The real pool needs a claude.ai session cookie, which means an interactive
+browser login (`llm-tracker auth claude`); `~/.claude/.credentials.json` alone
+yields the plan tier and no message counts.
+
+Other options:
 
 ```sh
 # llm-usage-tracker (https://github.com/bearyjd/llm-usage-tracker) — adapter included

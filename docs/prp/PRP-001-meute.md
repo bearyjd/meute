@@ -142,6 +142,18 @@ is wired. That is easy to forget, so the quota and its source are recorded on
 every run line — `quota=77:stub` versus `quota=41:MEUTE_QUOTA_CMD` — making an
 unconfigured gate permanently visible rather than silently absent.
 
+Two sources ship, answering different questions. `contrib/quota-self-budget.sh`
+caps meute's own footprint from its own run log and needs nothing external; it
+cannot see interactive usage, so it is a self-cap, not a pool reading. It is the
+first source that makes the gate actually fire, and it is honest about what it
+measures.
+
+The real rolling 5-hour / weekly pool is only reachable with a claude.ai session
+cookie, which requires an interactive browser login. `~/.claude/.credentials.json`
+alone yields the subscription tier and no message counts — verified in
+llm-usage-tracker's own Claude collector, which documents exactly that split. So
+the true pool reading cannot be wired unattended, by anyone, today.
+
 `contrib/quota-llm-usage-tracker.sh` adapts llm-usage-tracker, whose Claude
 collector already reduces the 5-hour and 7-day windows to whichever is more
 restrictive and stores it as `messages_used` against `messages_limit == 100`.
