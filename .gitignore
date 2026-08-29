@@ -7,3 +7,14 @@ state/.cursor.*
 # Your real fleet config: names your projects and describes what they do.
 # The harness is public; that list is yours.
 repos.local.yaml
+
+# Everything about YOUR fleet stays local. The harness is public; what it
+# found in your private code, and which repos it even looks at, is not.
+# reports/ carries verbatim file paths, config values and unfixed vulnerability
+# detail. state/ names your repos and their tasks.
+reports/*/
+state/log
+state/cursor
+state/reports
+state/tickets.yaml
+state/quota-override
