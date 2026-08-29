@@ -237,9 +237,10 @@ like this was never "the runner breaks" — it's forty unread audits rotting in
 ./bin/meute doctor              # is this deployable? checks cron's real environment
 ./bin/meute status              # quota, what runs next, this week, unread count
 ./bin/meute reports             # unread reports (--all for everything)
+./bin/meute findings            # one row per FINDING — the actual unit of decision
 ./bin/meute show <id>           # print a report, mark it read
 ./bin/meute promote <id> -f 1   # finding 1 becomes a tier-3 specced ticket
-./bin/meute dismiss <id> -m "no reachable sink"
+./bin/meute dismiss <id> -f 2 -r false-positive -m "guarded upstream"
 ./bin/meute branches            # scratch branches, with what each still holds
 ./bin/meute branches --prune    # delete only the ones whose work is already in the base
 ```
@@ -305,6 +306,22 @@ cannot smuggle a chained `gh pr create` past the gate.
 Flipping a ticket to `specced: true` after reading the reproduce report is a
 deliberate manual step. Contributing to someone else's project should not be
 something that happens while you are asleep.
+
+### Findings, not reports
+
+A report is a row; a decision is made per finding. An audit that turns up a
+CRITICAL and two HIGHs is three decisions, and acting on one must not hide the
+other two — which is exactly what report-level state did.
+
+`meute findings` lists them grouped by repo, most severe first inside each group,
+because three findings in one codebase cost less to review than three context
+switches. A report closes only once every finding in it has a decision.
+
+Dismissing takes a reason from a fixed set — `false-positive`, `wont-fix`,
+`out-of-scope`, `duplicate`, `too-large`, `other` — plus optional free text. The
+enum is not bureaucracy: it is the only signal for which audit lens to retire.
+Twenty-eight dismissals tell you nothing if they are all free text, but twenty-
+eight `false-positive` under one lens says stop running it.
 
 ### Pruning scratch branches
 

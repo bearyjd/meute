@@ -41,6 +41,17 @@ data model should not be decided.
   the fixed enum is small and starts accumulating the promoted-versus-dismissed
   signal immediately — which is the input the lens-retirement chart later needs.
 
+**Built 2026-08-29, as a CLI rather than a TUI:** `meute findings` is screen 1's
+substance — findings grouped by repo, severity-first inside a group, with
+per-finding state and the fixed dismiss-reason enum. It needed no uv, no Textual
+and no new dependency, and it exposed a real defect on the way: report-level
+state meant promoting one finding marked the whole report actioned and hid its
+siblings. A report now closes only when every finding in it has a decision.
+
+What Textual would still add is rendering and keybindings, not capability. That
+is worth having, but it is worth having *after* the work-order schema exists,
+not instead of it.
+
 Recommended sequencing: build the inbox against reports and tickets now, and
 treat the work-order screens as PRP-002's second phase. That preserves the
 document's own priority (the inbox is the bottleneck) without inventing a schema.

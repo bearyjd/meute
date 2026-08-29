@@ -9,9 +9,12 @@
 #   install-timers                write and enable systemd user timers for both slots
 #   status                        quota, what runs next, this week's activity
 #   reports [--new|--all]         list reports with their triage state
+#   findings [--new|--all]        one row per finding — the actual unit of decision
 #   show <id>                     print a report to stdout and mark it read
 #   promote <id> -f <n> [-t T]    turn finding <n> into a tier-3 specced ticket
-#   dismiss <id> [-m <reason>]    mark a report handled with no action taken
+#   dismiss <id> [-f <n>] -r <reason> [-m <text>]
+#                                 record a decision; -r is required and is one of
+#                                 false-positive wont-fix out-of-scope duplicate too-large other
 #   branches                      tier-3 drafts currently in flight
 #   help
 #
@@ -52,7 +55,7 @@ ENGINE_ENV=()
 
 note() { printf 'meute: %s\n' "$*" >&2; }
 die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
 
 # --------------------------------------------------------------------------
 # Reports on disk are the source of truth. state/reports only annotates them:
@@ -131,6 +134,57 @@ next_for_slot() {
   jq -r '.key' <<< "${queue[start]}"
 }
 
+# A report is a row; a decision is made per finding. Promoting one finding used
+# to mark the whole report actioned, which hid every other finding in it — the
+# CRITICAL and the HIGH in the same audit are two separate decisions.
+readonly SEVERITY_RANK='CRITICAL 0 HIGH 1 MEDIUM 2 LOW 3'
+
+finding_key()   { printf '%s#%s\n' "$1" "$2"; }
+finding_state() {
+  local row; row="$(kv_row "$REPORT_STATE" "$(finding_key "$1" "$2")")"
+  [[ -n "$row" ]] && awk -F'\t' '{print $2}' <<< "$row" || printf 'new\n'
+}
+mark_finding() {
+  kv_set_row "$REPORT_STATE" "$(finding_key "$1" "$2")" "$3" "$(date --iso-8601=seconds)" "${4:-}"
+}
+
+# Reasons are a fixed set because they are the only signal for which audit lens
+# to retire. Free text alone cannot answer "is this lens noisy or is this repo
+# noisy" -- 28 dismissals of "not relevant" and 28 of "false-positive" mean very
+# different things.
+readonly DISMISS_REASONS="false-positive wont-fix out-of-scope duplicate too-large other"
+
+cmd_findings() {
+  local filter="${1:---new}"
+  local tmp; tmp="$(mktemp)"
+  local id path meta repo n total state sev title loc
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    path="$(report_path "$id")"
+    meta="$(python3 "$REPORT_PY" meta "$path" 2>/dev/null || echo '{}')"
+    [[ "$(jq -r '.task // ""' <<< "$meta")" == "audit-security" ]] || continue
+    repo="$(jq -r '.repo // "?"' <<< "$meta")"
+    total="$(python3 "$REPORT_PY" findings "$path" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+    for (( n = 1; n <= total; n++ )); do
+      state="$(finding_state "$id" "$n")"
+      [[ "$filter" == "--new" && "$state" != "new" ]] && continue
+      local f; f="$(python3 "$REPORT_PY" findings "$path" | jq -r --argjson n "$n" '.[] | select(.n == $n) | "\(.severity)\t\(.location)\t\(.title)"')"
+      sev="$(cut -f1 <<< "$f")"; loc="$(cut -f2 <<< "$f")"; title="$(cut -f3 <<< "$f")"
+      printf '%s\t%s\t%s\t%s#%s\t%s\t%s\n' \
+        "$repo" "$(awk -v s="$sev" '{for(i=1;i<=NF;i+=2) if($i==s) print $(i+1)}' <<< "$SEVERITY_RANK")" \
+        "$sev" "$id" "$n" "$([[ "$state" == new ]] && echo NEW || echo "$state")" "$title" >> "$tmp"
+    done
+  done < <(report_ids)
+
+  if [[ ! -s "$tmp" ]]; then rm -f "$tmp"; note "no ${filter#--} findings"; return 0; fi
+  # grouped by repo, most severe first inside each group
+  sort -t"$(printf '\t')" -k1,1 -k2,2n "$tmp" | awk -F'\t' '
+    $1 != last { if (NR > 1) printf "\n"; printf "  %s\n", $1; last = $1 }
+    { printf "    %-9s %-9s %-46s %s\n", $5, $3, $4, substr($6, 1, 62) }'
+  rm -f "$tmp"
+  note "act with: meute promote <id> -f <n>   |   meute dismiss <id> -f <n> -r <reason>"
+}
+
 cmd_reports() {
   local filter="${1:---new}"
   local id state summary meta line found=0
@@ -161,17 +215,42 @@ cmd_show() {
 
 cmd_dismiss() {
   local id="${1:-}"; shift || true
-  local reason=""
+  local reason="" note_text="" number=""
   while (( $# )); do
     case "$1" in
-      -m|--message) reason="${2:?-m needs a reason}"; shift ;;
+      -r|--reason)  reason="${2:?-r needs a reason}"; shift ;;
+      -m|--message) note_text="${2:?-m needs text}"; shift ;;
+      -f|--finding) number="${2:?-f needs a finding number}"; shift ;;
       *) die "dismiss: unknown argument $1" ;;
     esac
     shift
   done
   require_report "$id"
-  mark "$id" "dismissed" "$reason"
-  note "dismissed ${id}${reason:+ (${reason})}"
+  [[ -n "$reason" ]] || die "dismiss: -r <reason> is required, one of: ${DISMISS_REASONS}"
+  grep -qw -- "$reason" <<< "$DISMISS_REASONS" \
+    || die "dismiss: unknown reason '${reason}'. One of: ${DISMISS_REASONS}"
+
+  if [[ -n "$number" ]]; then
+    [[ "$number" =~ ^[0-9]+$ ]] || die "dismiss: -f takes a finding number"
+    mark_finding "$id" "$number" "dismissed" "${reason}${note_text:+: ${note_text}}"
+    close_report_if_settled "$id"
+    note "dismissed finding ${number} of ${id} (${reason})"
+  else
+    mark "$id" "dismissed" "${reason}${note_text:+: ${note_text}}"
+    note "dismissed ${id} (${reason})"
+  fi
+}
+
+# A report is settled when every finding in it has a decision. Closing it earlier
+# hides the findings still waiting.
+close_report_if_settled() {
+  local id="$1" total n
+  total="$(python3 "$REPORT_PY" findings "$(report_path "$id")" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  (( total )) || { mark "$id" "actioned"; return 0; }
+  for (( n = 1; n <= total; n++ )); do
+    [[ "$(finding_state "$id" "$n")" == "new" ]] && { mark "$id" "read"; return 0; }
+  done
+  mark "$id" "actioned"
 }
 
 cmd_promote() {
@@ -216,7 +295,8 @@ cmd_promote() {
   ticket_id="$(python3 "$MANIFEST_PY" add-ticket "$MANIFEST" "$repo" "$payload")" \
     || die "promote: could not write the ticket"
 
-  mark "$id" "actioned" "promoted finding ${number} -> ${ticket_id}"
+  mark_finding "$id" "$number" "actioned" "promoted -> ${ticket_id}"
+  close_report_if_settled "$id"
   note "ticket ${ticket_id} written to state/tickets.yaml (specced: true)"
   note "tier-3 will pick it up next weekly slot ($(( TIER3_CAP - in_flight - 1 )) of ${TIER3_CAP} slots left)"
 }
@@ -496,6 +576,7 @@ main() {
     doctor)   cmd_doctor "$@" ;;
     install-timers) cmd_install_timers "$@" ;;
     reports)  cmd_reports "$@" ;;
+    findings) cmd_findings "$@" ;;
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;
     dismiss)  cmd_dismiss "$@" ;;

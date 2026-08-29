@@ -196,7 +196,12 @@ t = d['tickets']['alpha'][0]; print(t['id'], t['specced'], t['source'])")"
   is  "promote: ticket id derived"  "$(cut -d' ' -f1 <<< "$ticket")" "AL-1"
   is  "promote: specced is true"    "$(cut -d' ' -f2 <<< "$ticket")" "True"
   has "promote: records its source" "$ticket" "alpha/audit-security-2026-08-28"
-  has "promote: report is actioned" "$(meute reports --all 2>/dev/null | grep '2026-08-28')" "actioned"
+  # The FINDING is actioned; the report is not, because two findings in it still
+  # await a decision. Closing the report here is what used to hide them.
+  has "promote: the finding is actioned" \
+      "$(grep 'audit-security-2026-08-28#1' "$FIXTURE/state/reports")" "actioned"
+  has "promote: the report stays open while siblings await a decision" \
+      "$(meute reports --all 2>/dev/null | grep '2026-08-28')" "read"
 
   local queued
   queued="$(MEUTE_ROOT="$FIXTURE" python3 "$REPO/lib/manifest.py" queue "$FIXTURE/repos.yaml" weekly \
@@ -222,9 +227,15 @@ import yaml; print(len(yaml.safe_load(open('$FIXTURE/state/tickets.yaml'))['tick
 }
 
 test_dismiss_and_edges() {
-  meute dismiss beta/gen-tests-2026-08-27 -m "not worth it" >/dev/null 2>&1
+  local rc
+  meute dismiss beta/gen-tests-2026-08-27 -m "not worth it" >/dev/null 2>&1; rc=$?
+  is "dismiss: refuses without a reason"  "$rc" "1"
+  meute dismiss beta/gen-tests-2026-08-27 -r nonsense >/dev/null 2>&1; rc=$?
+  is "dismiss: refuses an unknown reason" "$rc" "1"
+  meute dismiss beta/gen-tests-2026-08-27 -r wont-fix -m "not worth it" >/dev/null 2>&1
   has "dismiss: state recorded" "$(meute reports --all 2>/dev/null | grep 'gen-tests        2026-08-27')" "dismissed"
-  has "dismiss: reason kept"    "$(cat "$FIXTURE/state/reports")" "not worth it"
+  has "dismiss: enum reason kept" "$(cat "$FIXTURE/state/reports")" "wont-fix"
+  has "dismiss: free text kept"   "$(cat "$FIXTURE/state/reports")" "not worth it"
 
   rm "$FIXTURE/reports/alpha/audit-security-2026-08-20.md"
   local out; out="$(meute reports --all 2>&1)"
@@ -560,6 +571,24 @@ PY
   has  "prune: is idempotent"                      "$out" "pruned 0"
 }
 
+
+# A report is a row; a decision is made per finding. Acting on one finding must
+# not hide the others in the same report.
+test_finding_level_triage() {
+  local out
+  out="$(meute findings --all 2>&1)"
+  has "findings: lists per finding, not per report" "$out" "audit-security-2026-08-28#1"
+  has "findings: shows the second finding too"      "$out" "audit-security-2026-08-28#2"
+  has "findings: severity-first inside a repo"      "$out" "CRITICAL"
+
+  # dismiss one finding; the other must stay visible
+  meute dismiss alpha/audit-security-2026-08-28 -f 2 -r false-positive >/dev/null 2>&1
+  out="$(meute findings 2>&1)"
+  hasnt "findings: a dismissed finding leaves the list" "$out" "audit-security-2026-08-28#2"
+  has   "findings: its siblings remain"                 "$out" "audit-security-2026-08-28#3"
+  has   "reports: the report is not closed early"       "$(meute reports --all 2>/dev/null | grep '2026-08-28')" "read"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
@@ -576,6 +605,7 @@ test_doctor
 test_self_budget
 test_manifest_ceiling
 test_branch_prune
+test_finding_level_triage
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))
