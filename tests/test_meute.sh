@@ -618,6 +618,15 @@ test_pause() {
   is  "resume: the hold is gone"       "$(held 1000001)" "no"
   out="$("${M[@]}" MEUTE_NOW=1000001 "$root/bin/meute" resume 2>&1)"
   has "resume: is idempotent"          "$out" "no hold in force"
+  [[ ! -e "$root/state/hold" ]] \
+    && ok "resume: leaves nothing behind" \
+    || bad "resume: leaves nothing behind" "$root/state/hold still exists"
+
+  # The help text promises a hold is local to this machine. state/ is ignored
+  # file by file, so a new file there is committed unless someone says otherwise.
+  git -C "$REPO" check-ignore -q state/hold \
+    && ok "pause: the hold is gitignored, as the help text promises" \
+    || bad "pause: the hold is gitignored, as the help text promises" "state/hold is tracked"
 }
 
 

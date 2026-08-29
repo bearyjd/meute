@@ -52,6 +52,13 @@ hold_duration_seconds() {
   printf '%s\n' "$secs"
 }
 
+# An emptied file reads as "a hold was set here" to anyone looking at the
+# directory, so lifting one leaves nothing behind.
+hold_clear() {
+  kv_del "$HOLD_FILE" hold
+  [[ -s "$HOLD_FILE" ]] || rm -f "$HOLD_FILE"
+}
+
 # Sets HOLD_UNTIL / HOLD_REASON and returns 0 when a hold is in force. An
 # expired hold answers no, so it lifts itself without anyone running `resume`.
 hold_active() {

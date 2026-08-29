@@ -18,3 +18,4 @@ state/cursor
 state/reports
 state/tickets.yaml
 state/quota-override
+state/hold

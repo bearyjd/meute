@@ -408,10 +408,10 @@ cmd_pause() {
 cmd_resume() {
   if hold_active; then
     local was="$HOLD_UNTIL"
-    kv_del "$HOLD_FILE" hold
+    hold_clear
     note "hold lifted (would have run out $(hold_until_human "$was")); the fleet runs at its next slot"
   else
-    kv_del "$HOLD_FILE" hold
+    hold_clear
     note "no hold in force; the fleet was already free to run"
   fi
 }
