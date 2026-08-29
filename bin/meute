@@ -221,21 +221,70 @@ cmd_promote() {
   note "tier-3 will pick it up next weekly slot ($(( TIER3_CAP - in_flight - 1 )) of ${TIER3_CAP} slots left)"
 }
 
+# Is every change on this branch already present in the base?
+#
+# Three signals, cheapest first. The third exists because squash-merge — the
+# normal way these branches land — rewrites the commit, so the branch is not an
+# ancestor of the base and `git branch --merged` will never list it even though
+# its content is fully absorbed. Content is the only reliable evidence.
+#
+# Conservative by construction: a branch is prunable only when it adds NOTHING
+# the base lacks. Anything else is kept and reported for a human to look at.
+branch_is_absorbed() {
+  local repo="$1" branch="$2" base="$3"
+  git -C "$repo" merge-base --is-ancestor "$branch" "$base" 2>/dev/null && return 0
+  [[ -z "$(git -C "$repo" diff "$base".."$branch" 2>/dev/null)" ]] && return 0
+  local unique
+  unique="$(git -C "$repo" diff "$base".."$branch" 2>/dev/null | grep -c '^+[^+]' || true)"
+  [[ "${unique:-1}" -eq 0 ]]
+}
+
+branch_unique_lines() {
+  git -C "$1" diff "$3".."$2" 2>/dev/null | grep -c '^+[^+]' || true
+}
+
 cmd_branches() {
   fleet_load_policy || die "could not read policy from ${MANIFEST}"
   fleet_load_scope  || die "could not read the fleet from ${MANIFEST}"
-  local path branch found=0
+  local prune=0
+  [[ "${1:-}" == "--prune" ]] && prune=1
+
+  local path branch base found=0 pruned=0 kept=0
   while read -r path; do
     [[ -n "$path" ]] || continue
     [[ -d "$path/.git" || -f "$path/.git" ]] || continue
-    while read -r branch; do
+    # `|| true` is load-bearing: a repo with no origin/HEAD makes this pipeline
+    # fail, and under `set -e` with pipefail a failing substitution in an
+    # assignment aborts the whole command with no output at all.
+    base="$(git -C "$path" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+    [[ -n "$base" ]] || base="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    [[ -n "$base" ]] || { note "skipping $(basename "$path"): cannot determine a base branch"; continue; }
+    while read -r branch date subject; do
       [[ -n "$branch" ]] || continue
       found=1
-      printf '%-28s %s\n' "$(basename "$path")" "$branch"
-    done < <(git -C "$path" for-each-ref --format='%(refname:short)  %(committerdate:short)  %(subject)' \
+      if branch_is_absorbed "$path" "$branch" "$base"; then
+        if (( prune )); then
+          git -C "$path" branch -D "$branch" >/dev/null 2>&1 \
+            && { printf '  %-22s %-34s pruned (absorbed into %s)\n' "$(basename "$path")" "$branch" "$base"; pruned=$(( pruned + 1 )); }
+        else
+          printf '  %-22s %-34s %s  ABSORBED - prunable\n' "$(basename "$path")" "$branch" "$date"
+        fi
+      else
+        printf '  %-22s %-34s %s  %s line(s) not in %s\n' \
+          "$(basename "$path")" "$branch" "$date" "$(branch_unique_lines "$path" "$branch" "$base")" "$base"
+        kept=$(( kept + 1 ))
+      fi
+    done < <(git -C "$path" for-each-ref --format='%(refname:short) %(committerdate:short) %(subject)' \
                "refs/heads/${BRANCH_PREFIX}/*" 2>/dev/null)
   done <<< "$REPO_PATHS"
-  (( found )) || note "no scratch branches in flight"
+
+  (( found )) || { note "no scratch branches in flight"; return 0; }
+  if (( prune )); then
+    note "pruned ${pruned}; kept ${kept} that still carry unique work"
+  elif (( kept )); then
+    note "${kept} branch(es) hold work not in their base — review before pruning"
+    note "run 'meute branches --prune' to delete only the absorbed ones"
+  fi
 }
 
 # --------------------------------------------------------------------------

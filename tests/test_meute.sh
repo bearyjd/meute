@@ -506,6 +506,60 @@ PY
      "$(MEUTE_WEEKLY_COST_USD=10.0 MEUTE_ROOT="$root" "$REPO/contrib/quota-self-budget.sh")" "0"
 }
 
+
+# Pruning deletes branches. The property that matters is not "does it prune"
+# but "does it ever delete work that exists nowhere else".
+test_branch_prune() {
+  local root="$FIXTURE/prune" repo="$FIXTURE/prune/repo"
+  mkdir -p "$repo"; ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"
+  mkdir -p "$root/tasks" "$root/state"; cp "$REPO"/tasks/*.md "$root/tasks/"
+  git -C "$repo" init -q -b main
+  local G=(git -C "$repo" -c user.email=t@t -c user.name=t)
+  echo base > "$repo/f.txt"; git -C "$repo" add -A; "${G[@]}" commit -qm init
+  git -C "$repo" branch meute/ancestor                      # true ancestor
+  git -C "$repo" checkout -q -b meute/squashed
+  echo feature >> "$repo/f.txt"; git -C "$repo" add -A; "${G[@]}" commit -qm feat
+  git -C "$repo" checkout -q main
+  echo feature >> "$repo/f.txt"; git -C "$repo" add -A; "${G[@]}" commit -qm "squashed feat"
+  echo later > "$repo/other.txt"; git -C "$repo" add -A; "${G[@]}" commit -qm later
+  git -C "$repo" checkout -q -b meute/unique main~2
+  echo irreplaceable > "$repo/new.txt"; git -C "$repo" add -A; "${G[@]}" commit -qm unique
+  git -C "$repo" checkout -q main; git -C "$repo" branch meute/identical
+
+  python3 - "$root" "$repo" <<'PY'
+import sys, pathlib, yaml
+root, repo = pathlib.Path(sys.argv[1]), sys.argv[2]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
+                                 "slots": ["daily"]}},
+    "repos": [{"name": "prunefix", "path": repo, "spec": "fixture",
+               "default_branch": "main", "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root/"repos.yaml", "w"), sort_keys=False)
+PY
+
+  local out
+  out="$(MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" branches 2>&1)"
+  has  "prune: an ancestor branch reads absorbed"  "$out" "meute/ancestor"
+  has  "prune: report flags unique work"           "$out" "not in main"
+
+  out="$(MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" branches --prune 2>&1)"
+  local left; left="$(git -C "$repo" branch --list 'meute/*' | tr -d ' ' | tr '\n' ' ')"
+  is   "prune: only the unique branch survives"    "${left% }" "meute/unique"
+  # squash-merge rewrites the commit, so git's own --merged never lists it;
+  # content comparison is the only thing that catches this case.
+  hasnt "prune: a squash-absorbed branch is removed" "$left" "meute/squashed"
+  is   "prune: the unique work is still readable"  "$(git -C "$repo" show meute/unique:new.txt 2>/dev/null)" "irreplaceable"
+
+  out="$(MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" branches --prune 2>&1)"
+  has  "prune: is idempotent"                      "$out" "pruned 0"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
@@ -521,6 +575,7 @@ test_quota_gate
 test_doctor
 test_self_budget
 test_manifest_ceiling
+test_branch_prune
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

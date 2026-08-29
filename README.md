@@ -240,7 +240,8 @@ like this was never "the runner breaks" — it's forty unread audits rotting in
 ./bin/meute show <id>           # print a report, mark it read
 ./bin/meute promote <id> -f 1   # finding 1 becomes a tier-3 specced ticket
 ./bin/meute dismiss <id> -m "no reachable sink"
-./bin/meute branches            # tier-3 drafts in flight
+./bin/meute branches            # scratch branches, with what each still holds
+./bin/meute branches --prune    # delete only the ones whose work is already in the base
 ```
 
 A report id is its path under `reports/` without the `.md`
@@ -304,6 +305,19 @@ cannot smuggle a chained `gh pr create` past the gate.
 Flipping a ticket to `specced: true` after reading the reproduce report is a
 deliberate manual step. Contributing to someone else's project should not be
 something that happens while you are asleep.
+
+### Pruning scratch branches
+
+Tier-1 tasks commit to a branch and nothing deletes it, so unreviewed lint sweeps
+and doc regens accumulate. `--prune` removes only branches that add nothing their
+base lacks, and reports the rest with a line count so you can look before
+deciding.
+
+The check is content-based on purpose. Squash-merge — the normal way these land —
+rewrites the commit, so the branch is not an ancestor of the base and
+`git branch --merged` will never list it, however completely its work was
+absorbed. Asking "does this branch add any line the base lacks" is the only
+question with a reliable answer.
 
 ### `autonomous_agents` — the gate that matters
 
