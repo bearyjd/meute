@@ -473,6 +473,18 @@ UnitFileState=enabled
 NextElapseUSecRealtime=' probe timer_state meute-daily.timer)"
   is "timer: enabled with no next elapse is idle, not armed" "$out" "$(printf 'idle\tenabled')"
 
+  # Not every systemd leaves this empty for an inert timer; "0" and "n/a" are
+  # the other spellings, and reading either as a time is the false positive
+  # this whole helper exists to prevent.
+  local spelling
+  for spelling in 0 n/a; do
+    out="$(STUB_SHOW="LoadState=loaded
+ActiveState=inactive
+UnitFileState=enabled
+NextElapseUSecRealtime=${spelling}" probe timer_state meute-daily.timer)"
+    is "timer: a next elapse of '${spelling}' is idle, not armed" "$out" "$(printf 'idle\tenabled')"
+  done
+
   out="$(STUB_SHOW='LoadState=not-found
 ActiveState=inactive
 UnitFileState=

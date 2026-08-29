@@ -89,9 +89,22 @@ would otherwise print cannot run there. Check it on the host:
 
 ```sh
 loginctl show-user "$USER" --property=Linger
-# and confirm the units see the engines the host has, not the ones you have:
-systemd-run --user --wait --pipe /bin/sh -c 'command -v claude codex'
 ```
+
+And confirm the host has everything a run needs, under the `PATH` the *unit*
+sets — not the wider one the user manager hands out, which is how you verify a
+more permissive environment than the one that runs:
+
+```sh
+systemd-run --user --wait --pipe \
+  --setenv=PATH=$HOME/.local/bin:$HOME/.npm-global/bin:/usr/bin:/bin \
+  /bin/sh -c 'command -v jq python3 git claude codex; python3 -c "import yaml"'
+```
+
+`jq`, `python3` and `PyYAML` are as load-bearing as the engines — `meute` exits
+immediately without `jq`, and the manifest will not parse without `PyYAML`. On
+an immutable host those are exactly the packages that tend to live in the
+container and not outside it.
 
 **Set `PATH` in your crontab.** `claude` and `codex` are usually installed
 outside cron's default `PATH` (`/usr/bin:/bin`), so a crontab without it fails

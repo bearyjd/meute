@@ -409,7 +409,13 @@ timer_state() {
   file="$(sed -n 's/^UnitFileState=//p'         <<<"$out")"
   next="$(sed -n 's/^NextElapseUSecRealtime=//p' <<<"$out")"
   if [[ "$load" == "not-found" || -z "$load" ]]; then printf 'absent\t\n'; return 0; fi
-  if [[ -n "$next" ]]; then printf 'armed\t%s\n' "$next"; return 0; fi
+  # systemd 258 leaves this empty for an inert timer; other versions answer "0"
+  # or "n/a". Reading any of them as a time is the false positive this exists
+  # to prevent, so all three mean the same thing: nothing is scheduled.
+  case "$next" in
+    ""|0|n/a) ;;
+    *) printf 'armed\t%s\n' "$next"; return 0 ;;
+  esac
   printf 'idle\t%s\n' "${file:-unknown}"
 }
 
