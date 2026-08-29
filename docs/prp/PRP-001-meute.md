@@ -377,6 +377,32 @@ the same task ran its suite green and performed four genuine mutation checks.
 The general lesson, worth applying to every future template: **a restriction the
 agent cannot observe is indistinguishable from a broken environment.**
 
+**`doctor` asserted the wrong claim about scheduling.** Both timers were
+installed by `install-timers` and reported by `doctor` as `enabled`. Neither
+would ever have fired. `systemctl --user show` gave the real state:
+
+```
+UnitFileState=enabled   ActiveState=inactive   NextElapseUSecRealtime=
+```
+
+`enable` writes the `timers.target.wants` symlink; `--now` is what starts the
+unit, and the two halves fail independently — so a unit can be enabled and inert
+at the same moment. `is-enabled` reads the symlink, so it answers *enabled* for a
+timer with no next firing. `install-timers` compounded it by sending its own
+verification to `/dev/null`: it printed `0 timers listed` and reported success.
+
+Both now assert the next elapse, which is the only property the scheduler acts
+on. The same run surfaced a second conflation: `loginctl` needs the *system* bus,
+absent inside a container even when the user bus works, and a failed query was
+being reported as `lingering is OFF` — sending you to a remedy that errors with
+`Host is down`. It is now a third state, *cannot tell*.
+
+The lesson generalises past systemd: **check the property the system acts on, not
+the one that is easiest to read.** `enabled` is configuration; `next elapse` is
+behaviour. A green check on the first is how a fleet reports itself deployable
+and then quietly never runs — the same failure class as a crontab on a machine
+with no cron, one layer further in.
+
 ## 12. Phase status
 
 Built and accepted:

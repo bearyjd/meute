@@ -383,6 +383,45 @@ d_ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
 d_warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; DOCTOR_WARNINGS=$(( DOCTOR_WARNINGS + 1 )); }
 d_err()  { printf '    \033[31mFAIL\033[0m %s\n' "$*"; DOCTOR_ERRORS=$(( DOCTOR_ERRORS + 1 )); }
 
+# --------------------------------------------------------------------------
+# Whether a timer will actually fire. A unit can be `enabled` and inert at the
+# same moment: `enable` writes the timers.target.wants symlink, `--now` is what
+# starts it, and an `enable --now` whose start half failed leaves exactly that
+# state — as does enabling from a shell that cannot reach the user manager.
+# `is-enabled` reads the symlink, so it answers "enabled" for a timer with no
+# next firing, which is how a fleet reports itself deployable and then never
+# runs. The only claim worth checking is the one the scheduler acts on: is
+# there a next elapse, and when.
+#
+# Echoes "<state>\t<detail>":
+#   armed  <when>   there is a next firing
+#   idle   <state>  loaded, but nothing scheduled — will not run
+#   absent          systemd has no such unit
+#   nobus           systemd could not be asked
+# --------------------------------------------------------------------------
+timer_state() {
+  local unit="$1" out
+  out="$(systemctl --user show "$unit" \
+           -p LoadState -p UnitFileState -p ActiveState -p NextElapseUSecRealtime \
+           2>/dev/null)" || { printf 'nobus\t\n'; return 0; }
+  local load file next
+  load="$(sed -n 's/^LoadState=//p'             <<<"$out")"
+  file="$(sed -n 's/^UnitFileState=//p'         <<<"$out")"
+  next="$(sed -n 's/^NextElapseUSecRealtime=//p' <<<"$out")"
+  if [[ "$load" == "not-found" || -z "$load" ]]; then printf 'absent\t\n'; return 0; fi
+  if [[ -n "$next" ]]; then printf 'armed\t%s\n' "$next"; return 0; fi
+  printf 'idle\t%s\n' "${file:-unknown}"
+}
+
+# yes / no / unknown. `loginctl` needs the *system* bus, which a container does
+# not have even when the user bus works; a failed query is not a "no", and
+# reporting it as one sends you to a remedy that errors out.
+linger_state() {
+  local v
+  v="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null)" || { printf 'unknown\n'; return 0; }
+  case "$v" in yes|no) printf '%s\n' "$v" ;; *) printf 'unknown\n' ;; esac
+}
+
 # Writes and enables systemd user timers. Chosen over cron where cron is absent,
 # and better regardless: Persistent=true means a slot missed while the machine
 # was off runs at next boot, which plain cron does not do.
@@ -423,12 +462,31 @@ WantedBy=timers.target
 UNIT
     note "wrote ${unit_dir}/meute-${slot}.{service,timer}"
   done
-  systemctl --user daemon-reload
-  systemctl --user enable --now meute-daily.timer meute-weekly.timer
-  note "enabled. next firings:"
-  systemctl --user list-timers 'meute-*' --no-pager 2>/dev/null | head -4 >&2
-  local linger; linger="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || echo unknown)"
-  [[ "$linger" == "yes" ]] || note "WARNING: lingering is off - run 'loginctl enable-linger $USER' or timers only fire while you are logged in"
+  systemctl --user daemon-reload || true
+  systemctl --user enable --now meute-daily.timer meute-weekly.timer || true
+
+  # Assert the arming rather than trusting the exit code. The previous version
+  # sent this listing to /dev/null, so it printed "0 timers listed" and reported
+  # success over two timers that had never been started.
+  local slot state detail inert=()
+  for slot in daily weekly; do
+    IFS=$'\t' read -r state detail <<<"$(timer_state "meute-${slot}.timer")"
+    case "$state" in
+      armed) note "meute-${slot}.timer armed - next ${detail}" ;;
+      *)     note "meute-${slot}.timer is NOT armed (${state}) - it will not fire"
+             inert+=( "meute-${slot}.timer" ) ;;
+    esac
+  done
+
+  case "$(linger_state)" in
+    yes) : ;;
+    no)  note "WARNING: lingering is off - run 'loginctl enable-linger $USER' or timers only fire while you are logged in" ;;
+    *)   note "WARNING: cannot tell whether lingering is on - no system bus reachable from here (a container?)"
+         note "         check on the host with:  loginctl show-user $USER --property=Linger" ;;
+  esac
+
+  (( ${#inert[@]} == 0 )) || \
+    die "units written, but ${inert[*]} not armed. Start them where systemd can be reached:  systemctl --user start ${inert[*]}"
 }
 
 cmd_doctor() {
@@ -547,20 +605,27 @@ cmd_doctor() {
     printf '    41 4 * * 6  cd %s && ./bin/run.sh weekly >> state/cron.log 2>&1\n' "$MEUTE_ROOT"
   elif systemctl --user --version >/dev/null 2>&1; then
     d_warn "no cron on this machine - use systemd user timers"
-    local linger; linger="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || echo unknown)"
-    if [[ "$linger" == "yes" ]]; then
-      d_ok "lingering enabled - timers fire while you are logged out"
-    else
-      d_warn "lingering is OFF: user timers will NOT fire unless you are logged in"
-      d_warn "enable with:  loginctl enable-linger $USER"
-    fi
+    case "$(linger_state)" in
+      yes) d_ok "lingering enabled - timers fire while you are logged out" ;;
+      no)  d_warn "lingering is OFF: user timers will NOT fire unless you are logged in"
+           d_warn "enable with:  loginctl enable-linger $USER" ;;
+      *)   d_warn "lingering: cannot tell - no system bus reachable from here (a container?)"
+           d_warn "check on the host with:  loginctl show-user $USER --property=Linger" ;;
+    esac
     local unit_dir="${HOME}/.config/systemd/user"
     if [[ -f "${unit_dir}/meute-daily.timer" ]]; then
       d_ok "units installed in ${unit_dir}"
-      systemctl --user is-enabled meute-daily.timer >/dev/null 2>&1 \
-        && d_ok "meute-daily.timer enabled" || d_warn "meute-daily.timer not enabled"
-      systemctl --user is-enabled meute-weekly.timer >/dev/null 2>&1 \
-        && d_ok "meute-weekly.timer enabled" || d_warn "meute-weekly.timer not enabled"
+      local slot state detail
+      for slot in daily weekly; do
+        IFS=$'\t' read -r state detail <<<"$(timer_state "meute-${slot}.timer")"
+        case "$state" in
+          armed)  d_ok   "meute-${slot}.timer armed - next ${detail}" ;;
+          idle)   d_warn "meute-${slot}.timer is ${detail} on disk but NOT armed: no next firing, so the ${slot} slot will not run"
+                  d_warn "arm it with:  systemctl --user start meute-${slot}.timer" ;;
+          absent) d_warn "meute-${slot}.timer is not loaded - run:  ./bin/meute install-timers" ;;
+          *)      d_warn "meute-${slot}.timer: cannot ask systemd whether it is armed" ;;
+        esac
+      done
     else
       d_warn "units not installed - run:  ./bin/meute install-timers"
     fi
@@ -590,4 +655,6 @@ main() {
   esac
 }
 
-main "$@"
+# Sourcing this file exposes its helpers without running a command, which is
+# how the timer and linger logic is tested against a stubbed systemctl.
+[[ "${BASH_SOURCE[0]}" != "$0" ]] || main "$@"

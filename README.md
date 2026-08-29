@@ -57,7 +57,7 @@ crontab there is instructions that silently never fire. `meute doctor` detects
 which scheduler you actually have. For systemd:
 
 ```sh
-./bin/meute install-timers        # writes and enables meute-daily/weekly .timer units
+./bin/meute install-timers        # writes, enables *and arms* both .timer units
 loginctl enable-linger "$USER"    # REQUIRED, or timers only fire while you are logged in
 systemctl --user list-timers 'meute-*'
 ```
@@ -65,6 +65,33 @@ systemctl --user list-timers 'meute-*'
 The units set `Persistent=true`, so a slot missed while the machine was off runs
 at next boot rather than being skipped — which plain cron does not do. Output
 goes to the journal (`journalctl --user -u meute-daily`) as well as `state/log`.
+
+**Enabled is not armed.** `systemctl --user enable` writes a symlink;
+`--now` is what starts the timer, and a unit can hold both states at once —
+enabled on disk with no next firing, so it never runs. `is-enabled` reads the
+symlink and calls that "enabled". `install-timers` and `doctor` therefore assert
+the next elapse instead, and an enabled-but-inert timer is reported as such:
+
+```
+warn  meute-daily.timer is enabled on disk but NOT armed: no next firing, so the daily slot will not run
+warn  arm it with:  systemctl --user start meute-daily.timer
+```
+
+That state self-heals at your next login, when `systemd --user` restarts and
+pulls `timers.target.wants` in. Until then the slot is dead.
+
+**If you run meute from inside a container** (toolbox, distrobox, devcontainer),
+the *user* bus is usually reachable while the *system* bus is not — so
+`systemctl --user` works and `loginctl` fails with `Host is down`. The units then
+execute on the **host**, with the host's `PATH` and not the container's. `doctor`
+reports lingering as *cannot tell* rather than guessing, because the remedy it
+would otherwise print cannot run there. Check it on the host:
+
+```sh
+loginctl show-user "$USER" --property=Linger
+# and confirm the units see the engines the host has, not the ones you have:
+systemd-run --user --wait --pipe /bin/sh -c 'command -v claude codex'
+```
 
 **Set `PATH` in your crontab.** `claude` and `codex` are usually installed
 outside cron's default `PATH` (`/usr/bin:/bin`), so a crontab without it fails

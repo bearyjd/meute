@@ -436,6 +436,114 @@ test_doctor() {
 }
 
 
+# A timer can be `enabled` and inert at the same time. The doctor used to assert
+# `is-enabled`, which reads the on-disk symlink, so it printed "ok" over two
+# timers with no next firing — the fleet reported itself deployable and would
+# never have run. These pin the distinction, driven by recorded `systemctl show`
+# output so they hold on a machine with no systemd at all.
+test_timer_arming() {
+  local stub="$FIXTURE/stub"; mkdir -p "$stub"
+  cat > "$stub/systemctl" <<'SH'
+#!/usr/bin/env bash
+[[ "${STUB_SYSTEMCTL_FAIL:-}" == 1 ]] && { echo "Failed to connect to user scope bus" >&2; exit 1; }
+printf '%s\n' "${STUB_SHOW:-}"
+SH
+  cat > "$stub/loginctl" <<'SH'
+#!/usr/bin/env bash
+[[ "${STUB_LOGINCTL_FAIL:-}" == 1 ]] && { echo "Host is down" >&2; exit 1; }
+printf '%s\n' "${STUB_LINGER:-}"
+SH
+  chmod +x "$stub/systemctl" "$stub/loginctl"
+
+  # Sourced, not run: the helpers are the unit under test.
+  local call='source "$1"; shift; "$@"'
+  probe() { PATH="$stub:$PATH" bash -c "$call" _ "$FIXTURE/bin/meute" "$@"; }
+
+  local out
+  out="$(STUB_SHOW='LoadState=loaded
+ActiveState=active
+UnitFileState=enabled
+NextElapseUSecRealtime=Sun 2026-08-30 02:02:03 EDT' probe timer_state meute-daily.timer)"
+  is "timer: a unit with a next elapse is armed" "$out" "$(printf 'armed\tSun 2026-08-30 02:02:03 EDT')"
+
+  # The regression. `is-enabled` answers "enabled" for exactly this state.
+  out="$(STUB_SHOW='LoadState=loaded
+ActiveState=inactive
+UnitFileState=enabled
+NextElapseUSecRealtime=' probe timer_state meute-daily.timer)"
+  is "timer: enabled with no next elapse is idle, not armed" "$out" "$(printf 'idle\tenabled')"
+
+  out="$(STUB_SHOW='LoadState=not-found
+ActiveState=inactive
+UnitFileState=
+NextElapseUSecRealtime=' probe timer_state meute-daily.timer)"
+  is "timer: an unknown unit is absent" "$out" "$(printf 'absent\t')"
+
+  out="$(STUB_SYSTEMCTL_FAIL=1 probe timer_state meute-daily.timer)"
+  is "timer: an unreachable systemd is nobus, not a verdict" "$out" "$(printf 'nobus\t')"
+
+  # `loginctl` needs the system bus, which a container lacks even when the user
+  # bus works. A failed query is not a "no": it sent you to a remedy that errors.
+  is "linger: yes is reported"      "$(STUB_LINGER=yes probe linger_state)" "yes"
+  is "linger: no is reported"       "$(STUB_LINGER=no  probe linger_state)" "no"
+  is "linger: an unreachable system bus is unknown, not off" \
+     "$(STUB_LOGINCTL_FAIL=1 probe linger_state)" "unknown"
+  is "linger: an unparseable answer is unknown" \
+     "$(STUB_LINGER='Host is down' probe linger_state)" "unknown"
+
+  # Whatever the doctor says about a timer, it must be a claim about firing.
+  local d; d="$(meute doctor 2>&1)"
+  if [[ "$d" == *"meute-daily.timer"* ]]; then
+    [[ "$d" == *"armed"* ]] && ok "doctor: speaks about arming, not about symlinks" \
+      || bad "doctor: speaks about arming, not about symlinks" "[$d] never says armed"
+  else
+    ok "doctor: speaks about arming, not about symlinks (no units on this machine)"
+  fi
+}
+
+
+# install-timers used to pipe its own verification to /dev/null: it printed
+# "0 timers listed" and reported success over two timers it had not started.
+# Driven entirely by a stubbed systemctl and a throwaway HOME, so the real
+# units on the machine running the suite are never touched.
+test_install_timers() {
+  local home="$FIXTURE/fakehome" stub="$FIXTURE/stub2"
+  mkdir -p "$home" "$stub"
+  cat > "$stub/systemctl" <<'SH'
+#!/usr/bin/env bash
+[[ "$*" == *show* ]] && printf '%s\n' "${STUB_SHOW:-}"
+exit 0
+SH
+  printf '#!/usr/bin/env bash\nprintf "yes\\n"\n' > "$stub/loginctl"
+  chmod +x "$stub/systemctl" "$stub/loginctl"
+
+  install_with() {
+    HOME="$home" PATH="$stub:$PATH" STUB_SHOW="$1" \
+      "$FIXTURE/bin/meute" install-timers 2>&1
+  }
+
+  local out rc
+  out="$(install_with 'LoadState=loaded
+UnitFileState=enabled
+ActiveState=active
+NextElapseUSecRealtime=Sun 2026-08-30 03:17:00 EDT')"; rc=$?
+  is  "install-timers: exits 0 when both timers are armed" "$rc" "0"
+  has "install-timers: reports the next firing"            "$out" "armed - next Sun 2026-08-30 03:17:00 EDT"
+  [[ -f "$home/.config/systemd/user/meute-daily.timer" ]] \
+    && ok "install-timers: writes the unit files" \
+    || bad "install-timers: writes the unit files" "no meute-daily.timer under $home"
+
+  # The regression: enabled, and nothing scheduled.
+  out="$(install_with 'LoadState=loaded
+UnitFileState=enabled
+ActiveState=inactive
+NextElapseUSecRealtime=')"; rc=$?
+  is  "install-timers: fails when the timers were never armed" "$rc" "1"
+  has "install-timers: names the inert units"                  "$out" "meute-daily.timer is NOT armed"
+  has "install-timers: says how to arm them"                   "$out" "systemctl --user start meute-daily.timer meute-weekly.timer"
+}
+
+
 # The self-budget source: a cap on meute's own footprint, computed from its own
 # log. This is the first quota source that actually makes the gate fire.
 test_self_budget() {
@@ -602,6 +710,8 @@ test_dismiss_and_edges
 test_community_gates
 test_quota_gate
 test_doctor
+test_timer_arming
+test_install_timers
 test_self_budget
 test_manifest_ceiling
 test_branch_prune
