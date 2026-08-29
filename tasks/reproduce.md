@@ -56,6 +56,24 @@ In order:
 Step 4 is the deliverable. A prose description of a reproduction is not a
 reproduction.
 
+### Confirm you are testing *this worktree's* code
+
+Every run happens in a git worktree, not the original checkout. If the project is
+installed in development mode — `pip install -e`, `npm link`, a Gradle composite
+build, a `cargo` path override — the language's import resolution points at the
+**original checkout**, not at your worktree. Your edits then appear to have no
+effect, and tests you just wrote fail against unmodified code.
+
+Before trusting any test result, prove which source is loaded. In Python that is
+`python3 -c "import <pkg>; print(<pkg>.__file__)"`; the equivalent exists in every
+ecosystem. If it resolves outside this worktree, put the worktree first —
+`pytest -o pythonpath=src`, `NODE_PATH`, and so on — and say in your report which
+invocation you used and why.
+
+Reporting "the suite fails" when the cause is that you tested a different copy of
+the code is a false result, and it is indistinguishable from a real regression to
+whoever reads the report.
+
 ## Stop conditions
 
 - **File budget: {{FILE_BUDGET}} files** read in full.
