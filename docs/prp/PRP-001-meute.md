@@ -224,12 +224,27 @@ the deliverable, and the tier-3 in-flight cap is computed by counting surviving
 branches. An empty branch is deleted because it is pure noise and would inflate
 the cap.
 
-**The runner commits its own audit trail.** `state/cursor`, `state/log` and
-`reports/` are committed history by design. A runner that only wrote them would
-hand the operator a checkout that is permanently dirty with nobody responsible
-for it. The commit is pathspec-scoped to `state` and `reports` so unrelated edits
-in the meute tree are never swept in, and it never pushes.
-`MEUTE_NO_AUTOCOMMIT=1` opts out.
+**The runner commits its own audit trail — but not on a public harness.**
+`commit_state()` is pathspec-scoped to `state` and `reports`, never pushes, and
+`MEUTE_NO_AUTOCOMMIT=1` opts out. The original design committed both, so that a
+cron-driven runner would not hand the operator a permanently dirty checkout.
+
+That was right for a private harness and wrong for a public one, and the mistake
+was made before it was noticed: a verified, unfixed CRITICAL for a private
+project — the unauthenticated route inventory, the default `0.0.0.0` bind, exact
+file paths — was committed and pushed to a public repository by the runner's own
+autocommit. Removing it required rewriting history and recreating the remote,
+because GitHub keeps orphaned objects fetchable by SHA after a force-push.
+
+`reports/*/` and the fleet state files are therefore gitignored, alongside
+`repos.local.yaml`. `commit_state()` is consequently inert in the default
+configuration: `git status --porcelain -- state reports` is empty, so it returns
+early and commits nothing. It stays in the code because a privately-hosted meute
+should still commit its audit trail, and un-ignoring those paths is all it takes.
+
+**The rule the whole thing collapses to: the harness is public, everything about
+your fleet is local.** That covers which repos you run against, what the runner
+found in them, and what it decided to do about it.
 
 **Machine-written tickets never touch `repos.yaml`.** `meute promote` writes to
 `state/tickets.yaml`; `manifest.py` merges it with the hand-written tickets and
