@@ -106,6 +106,13 @@ test you add you MUST do this, and report it:
 If step 2 does not make the test fail, the test does not test anything. Delete it
 and say so in the report rather than shipping it.
 
+**A run that ERRORS is not a run that failed.** If breaking the code produces an
+import error or a syntax error, the suite never executed — a summary reading
+`3 errors` means your edit was invalid, not that the test is worthless. Make the
+mutant valid code that is wrong, and clear any cached bytecode between runs: a
+same-length edit does not invalidate a `.pyc`, so you may be running the mutant
+you believe you restored.
+
 **If you find nothing worth covering, say so explicitly and add no tests.** An
 honest empty run is a good outcome. Do not pad the branch with tests for trivia
 to look productive.

@@ -306,6 +306,36 @@ Two findings from building it, both measured rather than assumed:
   `loggedIn=true, authMethod=claude.ai, subscriptionType=max`. This was the
   larger risk and it is not one.
 
+## 10c. Proof standards, and why they differ per tier
+
+Every write tier must now break its own guard and confirm the suite goes red.
+This was uneven before: `gen-tests` demanded a mutation check while
+`draft-ticket` — the tier that changes production code unattended — asked only
+for red-green on the reproduction. The highest-risk task had the weakest proof
+standard.
+
+Red-green shows a test is sensitive to *the* defect. It does not show the guard
+would catch that defect arriving another way. For a fix that adds a check, only
+mutation shows the check is load-bearing.
+
+The requirement is fitted, not uniform. `reproduce` writes no fix and adds no
+guard, so mutation does not apply to it; what it gets instead is the warning
+below. `lint-sweep`, `conventions`, `dep-audit`, `doc-regen` and the audit tasks
+add no guards at all, and demanding a mutation there would be cargo cult.
+
+**A run that ERRORS is not a run that failed.** This is in the templates because
+it happened here, to me. Mutating an auth guard, two of three edits produced
+syntax errors; pytest reported `3 errors`; a classifier matching only on `failed`
+printed "GREEN — TEST IS DECORATIVE" for two guards that were entirely sound. A
+mutant must be valid code that is wrong. Adjacent hazards, both real: an edit that
+silently did not apply, and stale bytecode — a same-length change does not
+invalidate a `.pyc`, so the "restored" run can execute the mutant.
+
+The trigger for all of this was the `prove-it` skill. It is worth recording that
+the skill governs the operator and the templates govern the unattended runs, and
+that the two had drifted apart — applying the skill's standard to my own work is
+what exposed that the templates did not demand it.
+
 ## 11. Empirical findings from phase 1
 
 Two findings that changed the design. Both were caught by running the thing, not

@@ -120,6 +120,33 @@ Do not paraphrase output you did not see. If you could not run something, say so
 plainly. Fabricated terminal output is the worst possible failure of this task:
 it is the one error a reviewer cannot catch by reading the diff.
 
+### Prove the guard you added can fail
+
+Red-green on the reproduction shows your test is sensitive to *this* defect. It
+does not show the guard you added would catch the same defect arriving another
+way. Before reporting green:
+
+1. **Break the guard you just added** — delete the check, invert the comparison,
+   remove the argument that closes the hole.
+2. **Re-run. The suite must go red.** Record which tests failed and how many.
+3. **Restore, re-run, confirm the original green** and a clean `git diff`.
+
+Three ways this silently lies to you, all of which have happened:
+
+- **The mutation never applied.** An edit that missed because the line moved or
+  the indentation differed. Assert the text you are replacing actually exists
+  before replacing it; if it does not, that is a failed step, not a passed one.
+- **A mutation that ERRORS is not a mutation that failed.** If your edit produces
+  a syntax error, the suite never runs. A summary reading `3 errors` means your
+  mutant was invalid — it does *not* mean the test is decorative. A mutant must be
+  valid code that is wrong.
+- **Stale bytecode.** A same-length edit (`0o600` → `0o644`) does not invalidate a
+  cached `.pyc`: mtime and size both match. Clear the cache between runs, or you
+  may be testing the mutant you believe you restored.
+
+A guard that survives being broken is a finding about your test, not a green
+light. Report it as one.
+
 ## Output contract
 
 Two deliverables, and they are separate:
@@ -167,6 +194,8 @@ because the true cause sits outside this ticket's scope, say that explicitly.
 - **Passing after:** command + output
 - **Full suite before:** green, or the pre-existing failures verbatim
 - **Full suite after:** green, or unchanged pre-existing failures
+- **Guard mutation:** what you broke, how many tests went red, and
+  confirmation you restored it and the suite returned to green
 - **`git diff --stat`:** the actual output
 - **Budget:** N of {{FILE_BUDGET}} files used
 

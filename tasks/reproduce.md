@@ -109,6 +109,17 @@ Report, with output you actually saw:
 If any step did not happen, say so in that step's place. Never write output you
 did not see.
 
+### A test that errors is not a test that fails
+
+Your reproduction must **fail**, not **error**. An import error, a missing
+fixture, a misspelled helper — each produces a red summary that has nothing to do
+with the defect. Reporting one as a reproduction is a false positive, and it costs
+the fix stage its entire budget chasing a bug that was never demonstrated.
+
+Read the actual result, not the exit code. `3 errors` and `3 failed` mean
+different things. If the runner reports errors, fix your test until it reports a
+failure whose message names the issue's symptom.
+
 ## Output contract
 
 Emit the report as your **final message**, as Markdown, and nothing else. The very
