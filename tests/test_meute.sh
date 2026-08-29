@@ -378,6 +378,19 @@ test_quota_gate() {
   is "quota: llm-usage-tracker adapter fails closed when unreachable" "$rc" "1"
 }
 
+
+test_doctor() {
+  local out rc
+  out="$(meute doctor 2>&1)"; rc=$?
+  is  "doctor: exits 0 on a healthy checkout" "$rc" "0"
+  has "doctor: checks binaries"               "$out" "binaries"
+  has "doctor: probes auth"                   "$out" "auth"
+  has "doctor: reports the quota source"      "$out" "quota gate"
+  has "doctor: emits a crontab block"         "$out" "crontab -e"
+  has "doctor: the block sets PATH"           "$out" "PATH="
+  has "doctor: warns an unwired quota gate"   "$out" "does NOT fire"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
@@ -390,6 +403,7 @@ test_cap
 test_dismiss_and_edges
 test_community_gates
 test_quota_gate
+test_doctor
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

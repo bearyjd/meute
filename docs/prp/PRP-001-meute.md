@@ -258,6 +258,27 @@ that, an unattended agent under implicit pressure to look productive will find
 something to do — which for maintenance tasks means a large diff nobody asked
 for.
 
+## 10b. Deployability
+
+The runner is invoked by cron, so "works" means works in cron's environment, not
+in an interactive shell. `bin/meute doctor` checks that specific claim: it probes
+each required binary against cron's real default `PATH` (`/usr/bin:/bin`), runs
+the auth preflight through the same scrubbed environment the runner uses, reports
+whether the quota gate is real or still a stub, and prints a crontab block with
+`PATH` already filled in.
+
+Two findings from building it, both measured rather than assumed:
+
+- **`claude` and `codex` are not on cron's default `PATH`** (they install to
+  `~/.local/bin` and `~/.npm-global/bin`). The cron snippet this document's own
+  README shipped set no `PATH`, so following it would have failed on every run
+  with `the 'claude' CLI is not on PATH`. `git`, `jq`, `python3`, `flock`,
+  `timeout` and `gh` are all in `/usr/bin` and fine.
+- **Subscription auth survives a bare environment.** Credentials live in
+  `~/.claude/.credentials.json`, not a keychain agent, so `env -i` still reports
+  `loggedIn=true, authMethod=claude.ai, subscriptionType=max`. This was the
+  larger risk and it is not one.
+
 ## 11. Empirical findings from phase 1
 
 Two findings that changed the design. Both were caught by running the thing, not

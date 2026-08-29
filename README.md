@@ -30,15 +30,28 @@ $EDITOR repos.yaml
 ./bin/run.sh daily
 ```
 
-Then schedule it:
+Then check it will actually survive cron, and get a crontab block with the right
+`PATH` filled in for your machine:
+
+```sh
+./bin/meute doctor
+```
+
+**Set `PATH` in your crontab.** `claude` and `codex` are usually installed
+outside cron's default `PATH` (`/usr/bin:/bin`), so a crontab without it fails
+every run with `the 'claude' CLI is not on PATH`. `doctor` prints a block you can
+paste, along these lines:
 
 ```cron
+PATH=/home/you/.local/bin:/home/you/.npm-global/bin:/usr/bin:/bin
 17 3 * * *   cd /path/to/meute && ./bin/run.sh daily  >> state/cron.log 2>&1
 41 4 * * 6   cd /path/to/meute && ./bin/run.sh weekly >> state/cron.log 2>&1
 ```
 
 Overlapping fires are safe: the runner takes a non-blocking `flock` and exits 0
-if another run holds it.
+if another run holds it. Subscription auth works headless — credentials live in
+`~/.claude/.credentials.json`, not a keychain agent that a cron job could not
+reach.
 
 ## Subscription-only
 
@@ -171,6 +184,7 @@ like this was never "the runner breaks" — it's forty unread audits rotting in
 `reports/`. So reports carry triage state, and `--new` is the default view.
 
 ```sh
+./bin/meute doctor              # is this deployable? checks cron's real environment
 ./bin/meute status              # quota, what runs next, this week, unread count
 ./bin/meute reports             # unread reports (--all for everything)
 ./bin/meute show <id>           # print a report, mark it read

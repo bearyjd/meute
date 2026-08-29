@@ -5,6 +5,7 @@
 #   bin/meute <command> [args]
 #
 # Commands:
+#   doctor                        is this fleet deployable? checks cron's real environment
 #   status                        quota, what runs next, this week's activity
 #   reports [--new|--all]         list reports with their triage state
 #   show <id>                     print a report to stdout and mark it read
@@ -36,10 +37,15 @@ readonly THIS_WEEK="$(date +%G-%V)"
 
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
+source "${MEUTE_ROOT}/lib/preflight.sh"
+
+SCRUBBED=""
+AUTH_MODE=""
+ENGINE_ENV=()
 
 note() { printf 'meute: %s\n' "$*" >&2; }
 die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
 
 # --------------------------------------------------------------------------
 # Reports on disk are the source of truth. state/reports only annotates them:
@@ -225,11 +231,126 @@ cmd_branches() {
   (( found )) || note "no scratch branches in flight"
 }
 
+# --------------------------------------------------------------------------
+# Is this fleet actually deployable? Everything here is checked against the
+# environment cron will really provide, not the one you are typing in.
+# --------------------------------------------------------------------------
+readonly CRON_PATH_DEFAULT="/usr/bin:/bin"
+DOCTOR_ERRORS=0
+DOCTOR_WARNINGS=0
+
+d_ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+d_warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; DOCTOR_WARNINGS=$(( DOCTOR_WARNINGS + 1 )); }
+d_err()  { printf '    \033[31mFAIL\033[0m %s\n' "$*"; DOCTOR_ERRORS=$(( DOCTOR_ERRORS + 1 )); }
+
+cmd_doctor() {
+  local missing_from_cron=()
+
+  printf '\n  binaries\n'
+  local bin path
+  for bin in git jq python3 flock timeout; do
+    path="$(command -v "$bin" 2>/dev/null || true)"
+    if [[ -z "$path" ]]; then d_err "$bin not found — required"; continue; fi
+    if env -i PATH="$CRON_PATH_DEFAULT" sh -c "command -v $bin" >/dev/null 2>&1; then
+      d_ok "$(printf '%-8s %s' "$bin" "$path")"
+    else
+      d_warn "$(printf '%-8s %s  (outside cron PATH)' "$bin" "$path")"
+      missing_from_cron+=( "$(dirname "$path")" )
+    fi
+  done
+  for bin in claude codex gh; do
+    path="$(command -v "$bin" 2>/dev/null || true)"
+    if [[ -z "$path" ]]; then
+      [[ "$bin" == "gh" ]] && d_warn "gh not found — the community track needs it" \
+                           || d_warn "$bin not found — that engine is unavailable"
+      continue
+    fi
+    if env -i PATH="$CRON_PATH_DEFAULT" sh -c "command -v $bin" >/dev/null 2>&1; then
+      d_ok "$(printf '%-8s %s' "$bin" "$path")"
+    else
+      d_warn "$(printf '%-8s %s  ← NOT on cron PATH; the cron block below fixes this' "$bin" "$path")"
+      missing_from_cron+=( "$(dirname "$path")" )
+    fi
+  done
+
+  printf '\n  auth (probed through the same scrubbed environment the runner uses)\n'
+  scrub_env >/dev/null 2>&1
+  if command -v claude >/dev/null; then
+    if preflight_claude 2>/dev/null; then d_ok "claude   ${AUTH_MODE}"
+    else d_err "claude   not on a subscription — run: claude auth login"; fi
+  fi
+  if command -v codex >/dev/null; then
+    if preflight_codex 2>/dev/null; then d_ok "codex    ${AUTH_MODE}"
+    else d_warn "codex    not signed in — run: codex login  (only needed for --engine codex)"; fi
+  fi
+  [[ -n "${SCRUBBED:-}" ]] && d_warn "API keys present and scrubbed: ${SCRUBBED}"
+
+  printf '\n  manifest\n'
+  if python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null 2>&1; then
+    d_ok "$(basename "$MANIFEST") is valid"
+    local repos community
+    repos="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('repos') or []))" "$MANIFEST")"
+    community="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('community') or []))" "$MANIFEST")"
+    if (( repos == 0 && community == 0 )); then
+      d_warn "no projects configured — the fleet is inert until you fill in repos.yaml"
+    else
+      d_ok "${repos} repo(s), ${community} community project(s)"
+      local slot
+      for slot in daily weekly; do
+        d_ok "$(printf '%-7s queue: %s item(s), next: %s' "$slot" \
+          "$(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null | wc -l)" "$(next_for_slot "$slot")")"
+      done
+    fi
+  else
+    d_err "$(basename "$MANIFEST") failed validation — run: ./bin/run.sh --validate"
+  fi
+
+  printf '\n  quota gate\n'
+  local probe
+  if probe="$("${MEUTE_ROOT}/bin/quota.sh" --with-source 2>/dev/null)"; then
+    if [[ "${probe#* }" == "stub" ]]; then
+      d_warn "${probe%% *}% from the stub — the gate does NOT fire yet"
+      d_warn "set MEUTE_QUOTA_CMD (see contrib/) or the fleet ignores your quota entirely"
+    else
+      d_ok "${probe%% *}% remaining, from ${probe#* }"
+    fi
+  else
+    d_err "quota probe failed — the runner will decline every slot"
+  fi
+
+  printf '\n  state\n'
+  local dir
+  for dir in state reports .worktrees; do
+    mkdir -p "${MEUTE_ROOT}/${dir}" 2>/dev/null || true
+    [[ -w "${MEUTE_ROOT}/${dir}" ]] && d_ok "${dir}/ writable" || d_err "${dir}/ not writable"
+  done
+  if git -C "$MEUTE_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    d_ok "meute is a git repo (state and reports are auto-committed)"
+  else
+    d_warn "meute is not a git repo — state and reports will not be committed"
+  fi
+
+  printf '\n  cron\n'
+  local extra
+  extra="$(printf '%s\n' "${missing_from_cron[@]:-}" | sort -u | grep -v '^$' | paste -sd: -)"
+  if [[ -n "$extra" ]]; then
+    printf '    PATH must be set — %s is not on cron'"'"'s default PATH.\n' "$extra"
+  fi
+  printf '\n    # paste into `crontab -e`\n'
+  printf '    PATH=%s%s\n' "${extra:+${extra}:}" "$CRON_PATH_DEFAULT"
+  printf '    17 3 * * *  cd %s && ./bin/run.sh daily  >> state/cron.log 2>&1\n' "$MEUTE_ROOT"
+  printf '    41 4 * * 6  cd %s && ./bin/run.sh weekly >> state/cron.log 2>&1\n' "$MEUTE_ROOT"
+
+  printf '\n  %s error(s), %s warning(s)\n\n' "$DOCTOR_ERRORS" "$DOCTOR_WARNINGS"
+  (( DOCTOR_ERRORS == 0 ))
+}
+
 main() {
   local command="${1:-help}"; shift || true
   command -v jq >/dev/null || die "jq is required"
   case "$command" in
     status)   cmd_status "$@" ;;
+    doctor)   cmd_doctor "$@" ;;
     reports)  cmd_reports "$@" ;;
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;
