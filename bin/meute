@@ -16,6 +16,8 @@
 #                                 record a decision; -r is required and is one of
 #                                 false-positive wont-fix out-of-scope duplicate too-large other
 #   branches                      tier-3 drafts currently in flight
+#   pause [--for 3d] [-r why]     stand the fleet down; every slot declines until it expires
+#   resume                        lift the pause early
 #   help
 #
 # A report id is its path under reports/ without the .md, e.g.
@@ -43,6 +45,7 @@ readonly LOG_FILE="${STATE_DIR}/log"
 readonly CURSOR_FILE="${STATE_DIR}/cursor"
 readonly REPORT_STATE="${STATE_DIR}/reports"
 readonly LOCK_FILE="${STATE_DIR}/.lock"
+readonly HOLD_FILE="${STATE_DIR}/hold"
 readonly THIS_WEEK="$(date +%G-%V)"
 
 source "${MEUTE_ROOT}/lib/state.sh"
@@ -94,6 +97,12 @@ cmd_status() {
 
   local gate="ok"
   [[ "$quota" != "?" ]] && (( quota < QUOTA_FLOOR )) && gate="BELOW FLOOR ${QUOTA_FLOOR}%"
+  # A hold overrides the gate, so it is the first thing said. A paused fleet
+  # reading "quota 100% · ok" is how you conclude it is about to run.
+  if hold_active; then
+    printf 'PAUSED until %s%s\n' "$(hold_until_human "$HOLD_UNTIL")" "${HOLD_REASON:+ — ${HOLD_REASON}}"
+    printf '  every slot declines until then; lift it with: meute resume\n'
+  fi
   printf 'quota %s%%  ·  %s\n' "$quota" "$gate"
 
   local slot
@@ -372,6 +381,42 @@ cmd_branches() {
 }
 
 # --------------------------------------------------------------------------
+# Stand the fleet down. The quota gate measures meute's own spend, not yours —
+# see lib/fleet.sh — so when you need the week's capacity for your own work this
+# is the only thing that stops the next slot.
+# --------------------------------------------------------------------------
+cmd_pause() {
+  local spec="24h" reason=""
+  while (( $# )); do
+    case "$1" in
+      --for) spec="${2:-}"; [[ -n "$spec" ]] || die "--for needs a duration (45m, 6h, 3d, 2w)"; shift 2 ;;
+      -r|--reason) reason="${2:-}"; [[ -n "$reason" ]] || die "-r needs a reason"; shift 2 ;;
+      *) die "unknown option: $1 (try: meute pause --for 3d -r 'saving quota for my own work')" ;;
+    esac
+  done
+  local secs; secs="$(hold_duration_seconds "$spec")" \
+    || die "bad duration: ${spec} — use 45m, 6h, 3d or 2w, up to a year"
+
+  local until; until=$(( $(now_epoch) + secs ))
+  reason="${reason//$'\t'/ }"; reason="${reason//$'\n'/ }"
+  kv_set_row "$HOLD_FILE" hold "$until" "$reason"
+  note "fleet paused until $(hold_until_human "$until")${reason:+ — ${reason}}"
+  note "every slot declines until then. lift it early with:  meute resume"
+  note "this hold is local to this machine — state/ is not committed"
+}
+
+cmd_resume() {
+  if hold_active; then
+    local was="$HOLD_UNTIL"
+    kv_del "$HOLD_FILE" hold
+    note "hold lifted (would have run out $(hold_until_human "$was")); the fleet runs at its next slot"
+  else
+    kv_del "$HOLD_FILE" hold
+    note "no hold in force; the fleet was already free to run"
+  fi
+}
+
+# --------------------------------------------------------------------------
 # Is this fleet actually deployable? Everything here is checked against the
 # environment cron will really provide, not the one you are typing in.
 # --------------------------------------------------------------------------
@@ -595,6 +640,11 @@ cmd_doctor() {
     d_warn "meute is not a git repo — state and reports will not be committed"
   fi
 
+  if hold_active; then
+    d_warn "the fleet is PAUSED until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
+    d_warn "nothing will run until then; lift it with:  ./bin/meute resume"
+  fi
+
   # Not every machine has cron. Immutable Fedora variants ship without cronie,
   # and a crontab block there is instructions that silently never fire.
   printf '\n  scheduling\n'
@@ -656,6 +706,8 @@ main() {
     promote)  cmd_promote "$@" ;;
     dismiss)  cmd_dismiss "$@" ;;
     branches) cmd_branches "$@" ;;
+    pause)    cmd_pause "$@" ;;
+    resume)   cmd_resume "$@" ;;
     help|--help|-h) usage ;;
     *) die "unknown command: ${command} (try: meute help)" ;;
   esac

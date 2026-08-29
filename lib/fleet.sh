@@ -11,6 +11,60 @@
 # fleet_load_policy sets QUOTA_FLOOR / COMMUNITY_SHARE / TIER3_CAP / BRANCH_PREFIX.
 # fleet_load_scope  sets TIER3_TASKS / REPO_PATHS.
 
+# --------------------------------------------------------------------------
+# The pause.
+#
+# The quota gate cannot protect you from yourself. `quota-self-budget.sh` caps
+# meute against meute's own spend and says so in its own header: it cannot see
+# your interactive usage. So `meute status` can read 100% while your
+# subscription pool is nearly gone, and the 03:17 slot then spends the window
+# you wanted for real work — the one thing PRP-001 §1 forbids. This is the
+# manual override: you tell the fleet to stand down, and it declines every slot
+# until the hold expires.
+#
+# Bounded on purpose. An unbounded pause is a fleet that looks configured and
+# never runs, which is a failure this repo has already shipped once; a hold
+# always carries an expiry and lifts itself when it passes.
+#
+# The expiry is absolute epoch seconds, not a formatted local time, because the
+# timers execute on the host while the hold may well be set from a container.
+# state/ is gitignored, so a hold is local to this machine, not fleet config.
+#
+# Expects HOLD_FILE from the caller.
+# --------------------------------------------------------------------------
+now_epoch() { printf '%s\n' "${MEUTE_NOW:-$(date +%s)}"; }
+
+hold_until_human() { date -d "@$1" '+%a %Y-%m-%d %H:%M' 2>/dev/null || printf '%s\n' "$1"; }
+
+# 45m 6h 3d 2w -> seconds. Rejects 0 and anything past a year: a hold you cannot
+# remember setting is indistinguishable from a broken fleet.
+hold_duration_seconds() {
+  local spec="$1" n unit secs
+  [[ "$spec" =~ ^([0-9]+)([mhdw])$ ]] || return 1
+  n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+  case "$unit" in
+    m) secs=$(( n * 60 )) ;;
+    h) secs=$(( n * 3600 )) ;;
+    d) secs=$(( n * 86400 )) ;;
+    w) secs=$(( n * 604800 )) ;;
+  esac
+  (( secs > 0 && secs <= 31536000 )) || return 1
+  printf '%s\n' "$secs"
+}
+
+# Sets HOLD_UNTIL / HOLD_REASON and returns 0 when a hold is in force. An
+# expired hold answers no, so it lifts itself without anyone running `resume`.
+hold_active() {
+  HOLD_UNTIL=""; HOLD_REASON=""
+  local row until reason
+  row="$(kv_row "$HOLD_FILE" hold)"
+  [[ -n "$row" ]] || return 1
+  IFS=$'\t' read -r _ until reason <<< "$row"
+  [[ "$until" =~ ^[0-9]+$ ]] || return 1
+  (( until > $(now_epoch) )) || return 1
+  HOLD_UNTIL="$until"; HOLD_REASON="$reason"
+}
+
 fleet_load_policy() {
   local policy
   policy="$(python3 "$MANIFEST_PY" policy "$MANIFEST")" || return 1

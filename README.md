@@ -203,6 +203,33 @@ echo 45 > state/quota-override      # or just pin it by hand
 fall back to the stub — falling back would silently disable the gate at exactly
 the moment you asked for it. Fail closed, always.
 
+### `meute pause` — the gate cannot protect you from yourself
+
+`quota-self-budget.sh` caps meute against *meute's* spend. It cannot see your
+interactive usage, so `meute status` can read `quota 100% · ok` on a week you
+have nearly exhausted yourself — and then the 03:17 slot spends the window you
+wanted for real work, which is the one thing this project exists not to do.
+
+There is no fix for that inside the gate short of reading your real pool, which
+needs a browser session cookie (`contrib/quota-llm-usage-tracker.sh`). So there
+is a manual override:
+
+```sh
+./bin/meute pause --for 3d -r "saving the week for my own work"
+./bin/meute resume        # lift it early
+```
+
+Every slot then declines, logged as `status=skipped`, before it takes the lock
+or reads the manifest — and a declined run consumes none of the weekly budget.
+`status` and `doctor` both lead with the pause, because a paused fleet reading
+`quota 100% · ok` is how you conclude it is about to run.
+
+**A hold always expires** (default 24h; `45m`, `6h`, `3d`, `2w`, up to a year)
+and lifts itself when it does. There is deliberately no `forever`: a fleet
+paused into silence is indistinguishable from a broken one, and `resume` already
+says "indefinite, and I know I did it." The hold lives in `state/`, which is not
+committed, so it is local to the machine that set it.
+
 ## How work is chosen
 
 `repos.yaml` flattens into an ordered queue. Everything under `repos:` comes

@@ -48,6 +48,7 @@ readonly STATE_DIR="${MEUTE_ROOT}/state"
 readonly CURSOR_FILE="${STATE_DIR}/cursor"
 readonly LOG_FILE="${STATE_DIR}/log"
 readonly LOCK_FILE="${STATE_DIR}/.lock"
+readonly HOLD_FILE="${STATE_DIR}/hold"
 readonly WORKTREE_DIR="${MEUTE_ROOT}/.worktrees"
 readonly DATE="$(date +%F)"
 readonly STARTED_AT="$(date --iso-8601=seconds)"
@@ -191,6 +192,13 @@ main() {
   command -v jq >/dev/null || die "jq is required"
   scrub_env
   command -v git >/dev/null || die "git is required"
+
+  # Cheapest verdict first, and it depends on nothing: a fleet you have stood
+  # down should decline without needing a lock, a valid manifest or a quota
+  # probe. See lib/fleet.sh for why a manual hold exists at all.
+  if hold_active; then
+    skip "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
+  fi
 
   # One runner at a time. A slow run must not stack up under a tight timer.
   exec 9>"$LOCK_FILE"

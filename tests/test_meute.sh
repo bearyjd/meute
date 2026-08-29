@@ -556,6 +556,71 @@ NextElapseUSecRealtime=')"; rc=$?
 }
 
 
+# The quota gate measures meute's own spend, not yours: `meute status` can read
+# 100% while your subscription pool is nearly gone, and the next slot then
+# spends the window you wanted for your own work. `pause` is the only thing that
+# stops it. A hold carries an expiry so a fleet cannot be paused into silence.
+test_pause() {
+  local root="$FIXTURE/hold"
+  mkdir -p "$root/state"
+  ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$FIXTURE/repos.yaml" "$root/repos.yaml"
+  local M=( env MEUTE_MANIFEST="$root/repos.yaml" )
+
+  # hold_active is read by both binaries, so test it where they read it.
+  held() {  # $1 = MEUTE_NOW; echoes "yes"/"no"
+    MEUTE_NOW="$1" bash -c '
+      source "$1/lib/state.sh"; source "$1/lib/fleet.sh"
+      HOLD_FILE="$1/state/hold"
+      hold_active && echo yes || echo no' _ "$root"
+  }
+
+  local out rc
+  out="$("${M[@]}" MEUTE_NOW=1000000 "$root/bin/meute" pause --for 3d -r "saving quota" 2>&1)"; rc=$?
+  is  "pause: exits 0"                    "$rc" "0"
+  has "pause: names the expiry"           "$out" "fleet paused until"
+  has "pause: repeats the reason"         "$out" "saving quota"
+  has "pause: says the hold is not fleet config" "$out" "local to this machine"
+  is  "pause: the hold is in force"       "$(held 1000001)" "yes"
+
+  out="$("${M[@]}" MEUTE_NOW=1000001 "$root/bin/meute" status 2>&1)"
+  has "pause: status leads with the pause, not the quota" "$out" "PAUSED until"
+  has "pause: status says how to lift it"                 "$out" "meute resume"
+
+  # 3d from 1000000. One second before it lapses, and one second after.
+  is "pause: the hold holds right up to its expiry" "$(held $(( 1000000 + 259199 )))" "yes"
+  is "pause: an expired hold lifts itself"          "$(held $(( 1000000 + 259201 )))" "no"
+
+  # A run declines before it needs a lock, a manifest or a quota probe.
+  rm -f "$root/state/log"
+  out="$(MEUTE_NOW=1000001 "$root/bin/run.sh" daily 2>&1)"; rc=$?
+  is  "pause: a paused run exits 0 - declining is not a failure" "$rc" "0"
+  has "pause: the run is logged as skipped"   "$out" "status=skipped"
+  has "pause: the log says why"               "$out" "reason=paused until"
+  hasnt "pause: it never reached the engine"  "$out" "auth="
+
+  # A paused week must not eat the budget it was declared to protect.
+  local pct
+  pct="$(MEUTE_ROOT="$root" MEUTE_WEEKLY_COST_USD=15 "$REPO/contrib/quota-self-budget.sh")"
+  is "pause: a declined run consumes no budget" "$pct" "100"
+
+  # Bounded on purpose: no spelling of "forever".
+  for bad in banana 0h 500d 3 '' ; do
+    "${M[@]}" "$root/bin/meute" pause --for "$bad" >/dev/null 2>&1
+    is "pause: rejects --for '${bad}'" "$?" "1"
+  done
+  is "pause: a rejected duration left the hold alone" "$(held 1000001)" "yes"
+
+  out="$("${M[@]}" MEUTE_NOW=1000001 "$root/bin/meute" resume 2>&1)"; rc=$?
+  is  "resume: exits 0"                "$rc" "0"
+  has "resume: says the fleet is free" "$out" "hold lifted"
+  is  "resume: the hold is gone"       "$(held 1000001)" "no"
+  out="$("${M[@]}" MEUTE_NOW=1000001 "$root/bin/meute" resume 2>&1)"
+  has "resume: is idempotent"          "$out" "no hold in force"
+}
+
+
 # The self-budget source: a cap on meute's own footprint, computed from its own
 # log. This is the first quota source that actually makes the gate fire.
 test_self_budget() {
@@ -724,6 +789,7 @@ test_quota_gate
 test_doctor
 test_timer_arming
 test_install_timers
+test_pause
 test_self_budget
 test_manifest_ceiling
 test_branch_prune

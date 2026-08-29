@@ -24,6 +24,14 @@ kv_set() {
   mv "$tmp" "$file"
 }
 
+kv_del() {
+  local file="$1" key="$2" tmp
+  [[ -f "$file" ]] || return 0
+  tmp="$(mktemp "$(dirname "$file")/.kv.XXXXXX")"
+  awk -F'\t' -v key="$key" '$1 != key' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
 # Whole rows, for callers that keep more than one value per key.
 kv_row() {
   local file="$1" key="$2"

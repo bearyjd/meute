@@ -403,6 +403,23 @@ behaviour. A green check on the first is how a fleet reports itself deployable
 and then quietly never runs — the same failure class as a crontab on a machine
 with no cron, one layer further in.
 
+**The gate measures the wrong pool.** `quota-self-budget.sh` is a cap on meute's
+own footprint, which is most of what the gate is for — but its own header admits
+it cannot see interactive usage. The failure that follows is not hypothetical:
+on a week where the operator's subscription is nearly spent, `meute status`
+reads `quota 100% · ok`, because meute has spent none of *its* budget, and the
+next slot competes with exactly the work §1 says it must never compete with.
+
+Reading the real pool needs a browser session cookie, so the honest interim is
+a manual override rather than a better probe: `meute pause --for 3d`, checked
+before the lock, the manifest and the probe, logged as `status=skipped` so it
+consumes no budget. A hold always carries an expiry and lifts itself, and there
+is no unbounded form — a fleet paused into silence is the same failure as a
+timer that is enabled and inert.
+
+Open: the gate still cannot answer "how much is left?", only "has the fleet had
+enough?". `contrib/quota-llm-usage-tracker.sh` is the path to the real reading.
+
 ## 12. Phase status
 
 Built and accepted:
