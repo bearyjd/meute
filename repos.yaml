@@ -50,7 +50,8 @@ verify_commands: &verify_commands >-
   Bash(go test:*) Bash(go vet:*) Bash(gofmt:*)
   Bash(./gradlew test:*) Bash(./gradlew lint:*)
   Bash(make test:*) Bash(make lint:*)
-  Bash(ruff:*) Bash(eslint:*) Bash(prettier:*)
+  Bash(ruff:*) Bash(eslint:*) Bash(prettier:*) Bash(black:*)
+  Bash(rustfmt:*) Bash(ktlint:*) Bash(shfmt:*) Bash(pre-commit run:*)
   Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
 
 # Read-only GitHub access for the community track. Deliberately excludes bare
@@ -71,6 +72,19 @@ verify_and_gh: &verify_and_gh >-
   Bash(./gradlew test:*) Bash(pip install:*) Bash(ruff:*) Bash(eslint:*)
   Bash(gh issue view:*) Bash(gh issue list:*) Bash(gh pr list:*)
   Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
+
+# Dependency scanners. Read-only by construction: each of these reports, and
+# none of them writes a lockfile. Deliberately excludes `npm install`,
+# `pip install`, `cargo update` and friends -- an unattended upgrade is how a
+# working build stops working overnight.
+audit_commands: &audit_commands >-
+  Bash(npm audit:*) Bash(npm outdated:*) Bash(npm ls:*)
+  Bash(pnpm audit:*) Bash(yarn audit:*)
+  Bash(pip-audit:*) Bash(pip list:*) Bash(pip index:*)
+  Bash(cargo audit:*) Bash(cargo outdated:*) Bash(cargo tree:*)
+  Bash(go list:*) Bash(govulncheck:*)
+  Bash(osv-scanner:*) Bash(grype:*)
+  Bash(git log:*) Bash(ls:*) Bash(cat:*)
 
 # ---------------------------------------------------------------------------
 # Tiers define the blast radius of a task: which tools exist at all, whether the
@@ -132,6 +146,30 @@ tasks:
     requires_specced_ticket: true
     model: opus            # changing production code unattended — use the best model
 
+  # ---- tier 1: self-verifying maintenance --------------------------------
+  lint-sweep:
+    tier: tier1
+    template: tasks/lint-sweep.md
+    slots: [daily]
+
+  doc-regen:
+    tier: tier1
+    template: tasks/doc-regen.md
+    slots: [weekly]
+
+  # Writes nothing; it needs tier 1 only because it must RUN the scanners, which
+  # tier 2 has no Bash for. Its empty scratch branch is deleted automatically.
+  dep-audit:
+    tier: tier1
+    template: tasks/dep-audit.md
+    slots: [weekly]
+    allowed_tools: *audit_commands
+
+  conventions:
+    tier: tier1
+    template: tasks/conventions.md
+    slots: [weekly]
+
   # ---- community track: scout -> reproduce -> [human gate] -> draft --------
   # Each stage refuses to run on work the previous stage did not clear.
   scout:
@@ -158,10 +196,6 @@ tasks:
     allowed_tools: *verify_and_gh
 
   # ---- phase 2: uncomment as the templates land ---------------------------
-  # lint-sweep:        { tier: tier1, template: tasks/lint-sweep.md,        slots: [daily] }
-  # doc-regen:         { tier: tier1, template: tasks/doc-regen.md,         slots: [weekly] }
-  # dep-audit:         { tier: tier1, template: tasks/dep-audit.md,         slots: [weekly] }
-  # conventions:       { tier: tier1, template: tasks/conventions.md,       slots: [weekly] }
   # review-arch:       { tier: tier2, template: tasks/review-arch.md,       slots: [weekly] }
   # market-compare:    { tier: tier2, template: tasks/market-compare.md,    slots: [weekly] }
   # feature-brainstorm:{ tier: tier2, template: tasks/feature-brainstorm.md,slots: [weekly] }
@@ -176,7 +210,7 @@ repos: []
 #   path: ~/Documents/vibe-code/netlens-android
 #   spec: "Android app that shows which installed apps are talking to which hosts, on-device, no cloud."
 #   default_branch: main               # worktrees branch from here; omit to use current HEAD
-#   tasks: [audit-security, gen-tests]
+#   tasks: [audit-security, gen-tests, lint-sweep, dep-audit, conventions]
 #   file_budget: 20                    # optional per-repo override
 #   model: sonnet                      # optional per-repo override
 #   tickets:                           # only consumed by tier-3 tasks

@@ -237,6 +237,27 @@ itself generates `__pycache__`, `.pytest_cache`, `node_modules`. `git add -A` in
 repo with a thin `.gitignore` commits them. `lib/artifacts.gitignore` is layered
 under the repo's own rules via `core.excludesFile`; the repo's rules still win.
 
+## 10a. The decline path
+
+Every tier-1 maintenance template has a condition under which the correct
+behaviour is to change nothing and say why:
+
+| Template | Declines when | Because |
+|---|---|---|
+| `lint-sweep` | the repo configures no linter, or its formatter would exceed 300 lines | formatting a codebase to a standard its owner never chose is an opinion imposed at scale, and it destroys `git blame` |
+| `doc-regen` | there is no generator and no convention-derived block | an agent writing docs from scratch produces confident unchecked prose, which is worse than a stale doc — a stale doc at least looks old |
+| `dep-audit` | scanners are unavailable | fabricated scanner output is indistinguishable from real output |
+| `conventions` | the repo states no written conventions | with no stated rules an agent falls back on its own taste and calls it conformance |
+
+`conventions` is the sharpest case and was verified live against a repo with no
+conventions file: it checked every named location, reported what such a file
+would need to contain, and changed nothing.
+
+These declines are successful runs, and the templates say so explicitly. Without
+that, an unattended agent under implicit pressure to look productive will find
+something to do — which for maintenance tasks means a large diff nobody asked
+for.
+
 ## 11. Empirical findings from phase 1
 
 Two findings that changed the design. Both were caught by running the thing, not
@@ -297,9 +318,12 @@ Built and accepted:
   with the `tier2-scout` tier (read-only `gh`, no `gh api`, no bare `gh`) and the
   candidate/specced ticket gates that separate reproduce from draft
 
+- `tasks/lint-sweep.md`, `tasks/doc-regen.md`, `tasks/dep-audit.md`,
+  `tasks/conventions.md` — the tier-1 maintenance set. Each carries an explicit
+  decline path (see below).
+
 Phase 2, in rough priority order:
 
-- Remaining tier-1 templates: lint sweep, doc regen, dependency audit, conventions
 - Remaining tier-2 templates: architecture review, market comparison (needs
   WebSearch in the tier tool set), feature brainstorm
 

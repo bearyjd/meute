@@ -145,6 +145,25 @@ Skipped runs (quota floor, empty queue, lock held) append their log line but do
 not commit — otherwise a quota-starved week would produce a commit per cron fire.
 Those lines are folded into the next real run's commit.
 
+## Task catalogue
+
+| Task | Tier | Slot | What it does |
+|---|---|---|---|
+| `lint-sweep` | 1 | daily | runs the repo's **own** linter/formatter; caps the diff at 300 lines |
+| `gen-tests` | 1 | weekly | writes tests, then breaks the code to prove they have teeth |
+| `doc-regen` | 1 | weekly | regenerates *generated* docs; never writes prose |
+| `dep-audit` | 1 | weekly | dependency risk, sorted by whether the vulnerable path is actually reachable |
+| `conventions` | 1 | weekly | conformance against the repo's **written** conventions only |
+| `audit-security` | 2 | daily/weekly | security audit through one rotating lens |
+| `draft-ticket` | 3 | weekly | fixes a `specced: true` ticket, reproduction first |
+| `scout` / `reproduce` / `draft` | community | weekly | the contribution pipeline |
+
+Each maintenance task has a condition under which the right answer is to change
+nothing — no linter configured, no doc generator, no written conventions — and
+the templates state that declining is a successful run. Otherwise an unattended
+agent under implicit pressure to look productive finds something to do, and for
+maintenance work that means a large diff nobody asked for.
+
 ## Reviewing the output — `bin/meute`
 
 The runner produces; `bin/meute` is how you consume. The failure mode of a fleet
