@@ -405,8 +405,16 @@ test_doctor() {
   has "doctor: checks binaries"               "$out" "binaries"
   has "doctor: probes auth"                   "$out" "auth"
   has "doctor: reports the quota source"      "$out" "quota gate"
-  has "doctor: emits a crontab block"         "$out" "crontab -e"
-  has "doctor: the block sets PATH"           "$out" "PATH="
+  has "doctor: reports scheduling"            "$out" "scheduling"
+  # The guidance must match the machine. A crontab block on a host without cron
+  # is instructions that silently never fire, which is how this was found.
+  if command -v crontab >/dev/null 2>&1; then
+    has "doctor: cron host gets a crontab block" "$out" "crontab -e"
+    has "doctor: the block sets PATH"            "$out" "PATH="
+  else
+    has "doctor: cron-less host is told so"      "$out" "no cron on this machine"
+    has "doctor: and pointed at timers"          "$out" "install-timers"
+  fi
   has "doctor: warns an unwired quota gate"   "$out" "does NOT fire"
 }
 
