@@ -413,7 +413,13 @@ test_doctor() {
     has "doctor: the block sets PATH"            "$out" "PATH="
   else
     has "doctor: cron-less host is told so"      "$out" "no cron on this machine"
-    has "doctor: and pointed at timers"          "$out" "install-timers"
+    # Either state is correct: not yet installed and pointed at the installer, or
+    # installed and reported as such.
+    if [[ "$out" == *"units installed"* ]]; then
+      has "doctor: installed timers are reported" "$out" "units installed"
+    else
+      has "doctor: uninstalled timers point at the installer" "$out" "install-timers"
+    fi
   fi
   has "doctor: warns an unwired quota gate"   "$out" "does NOT fire"
 }
