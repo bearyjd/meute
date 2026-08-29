@@ -34,7 +34,16 @@ source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
-readonly MANIFEST="${MEUTE_MANIFEST:-${MEUTE_ROOT}/repos.yaml}"
+# The harness is public; a real fleet config names private projects and says what
+# they do. repos.local.yaml is gitignored and wins when present, so you never have
+# to choose between committing your project list and using the tool.
+if [[ -n "${MEUTE_MANIFEST:-}" ]]; then
+  readonly MANIFEST="$MEUTE_MANIFEST"
+elif [[ -f "${MEUTE_ROOT}/repos.local.yaml" ]]; then
+  readonly MANIFEST="${MEUTE_ROOT}/repos.local.yaml"
+else
+  readonly MANIFEST="${MEUTE_ROOT}/repos.yaml"
+fi
 readonly STATE_DIR="${MEUTE_ROOT}/state"
 readonly CURSOR_FILE="${STATE_DIR}/cursor"
 readonly LOG_FILE="${STATE_DIR}/log"

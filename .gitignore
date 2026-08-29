@@ -4,3 +4,6 @@
 state/.lock
 state/.cursor.*
 .omc/
+# Your real fleet config: names your projects and describes what they do.
+# The harness is public; that list is yours.
+repos.local.yaml

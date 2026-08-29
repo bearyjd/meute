@@ -26,7 +26,13 @@ readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 readonly REPORT_PY="${MEUTE_ROOT}/lib/report.py"
-readonly MANIFEST="${MEUTE_MANIFEST:-${MEUTE_ROOT}/repos.yaml}"
+if [[ -n "${MEUTE_MANIFEST:-}" ]]; then
+  readonly MANIFEST="$MEUTE_MANIFEST"
+elif [[ -f "${MEUTE_ROOT}/repos.local.yaml" ]]; then
+  readonly MANIFEST="${MEUTE_ROOT}/repos.local.yaml"
+else
+  readonly MANIFEST="${MEUTE_ROOT}/repos.yaml"
+fi
 readonly STATE_DIR="${MEUTE_ROOT}/state"
 readonly REPORTS_DIR="${MEUTE_ROOT}/reports"
 readonly LOG_FILE="${STATE_DIR}/log"

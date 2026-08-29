@@ -14,6 +14,19 @@ Licence: AGPL-3.0. Spec: [`docs/prp/PRP-001-meute.md`](docs/prp/PRP-001-meute.md
 `bash` 4+, `git`, `jq`, `python3` with PyYAML, and `claude` and/or `codex`
 signed in to a subscription.
 
+## Your fleet config is private
+
+The harness is public; the list of your projects and what they do is not.
+`repos.local.yaml` is gitignored and takes precedence over `repos.yaml`, so you
+never have to choose between committing your project list and using the tool.
+
+```
+MEUTE_MANIFEST  >  repos.local.yaml  >  repos.yaml
+```
+
+`reports/` is committed by default too — see the note under *Output* before you
+push a repo containing real audit findings.
+
 ## Quick start
 
 ```sh
