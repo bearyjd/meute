@@ -315,6 +315,23 @@ PY
   err="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/no-etiquette.yaml" 2>&1 || true)"
   has "community: no etiquette file, no contribution" "$err" "etiquette: required"
 
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+(root/"state").mkdir(exist_ok=True)
+yaml.safe_dump({"tickets": {"upstream": [
+    {"id": "303", "title": "machine ticket", "specced": True}]}},
+    open(root/"state"/"tickets.yaml", "w"), sort_keys=False)
+PY
+  local q1
+  q1="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -r .key | tr '\n' ' ')"
+  has "machine ticket reaches the tier-3 queue" "$q1" "upstream/draft/303"
+  MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" mark-delivered \
+    "$root/repos.yaml" upstream 303 meute/draft-ticket-test >/dev/null 2>&1
+  local q2
+  q2="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -r .key | tr '\n' ' ')"
+  hasnt "delivered ticket retires from the tier-3 queue" "$q2" "upstream/draft/303"
+
   # A project that bans autonomous agents keeps scouting but loses every
   # contribution stage -- enforced by the queue builder, not by prompt text.
   python3 - "$root" <<'PY'

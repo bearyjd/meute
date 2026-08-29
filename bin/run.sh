@@ -327,6 +327,14 @@ run_entry() {
   local committed="-"
   if (( WRITES_CODE )); then committed="$(commit_worktree "$repo" "$task" "$lens")"; fi
 
+  # A tier-3 ticket that produced a branch is delivered; retire it so the next
+  # weekly slot does not redo work already awaiting review.
+  local ticket_id; ticket_id="$(jq -r '.ticket_id' <<< "$entry")"
+  if [[ -n "$ticket_id" && "$committed" != "-" && "$committed" != "none" && "$ENGINE_STATUS" == "ok" ]]; then
+    python3 "$MANIFEST_PY" mark-delivered "$MANIFEST" "$repo" "$ticket_id" "$BRANCH" >/dev/null \
+      && note "ticket ${ticket_id} delivered on ${BRANCH}; retired from the queue"
+  fi
+
   # The cursor advances on failure too: a poisoned entry must not stall the
   # whole fleet under cron. The log line is where failures surface.
   state_set "cursor.${SLOT}" "$key"

@@ -17,6 +17,7 @@ community share, tier-3 in-flight cap, cursor position) belongs to run.sh.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -447,12 +448,49 @@ def cmd_add_ticket(args: list) -> int:
     return 0
 
 
+def cmd_mark_delivered(args: list) -> int:
+    """Retire a machine-written ticket once tier 3 has produced a branch for it.
+
+    Without this a ticket stays `specced: true` forever and every weekly slot
+    re-drafts work that is already sitting on a branch awaiting review.
+    Hand-written tickets in repos.yaml are left alone -- that file is yours.
+    """
+    manifest, repo_name, ticket_id, branch = args[0], args[1], args[2], args[3]
+    root = repo_root(manifest)
+    path = tickets_path(root)
+    if not os.path.isfile(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as handle:
+        stored = yaml.safe_load(handle) or {}
+    tickets = stored.get("tickets") or {}
+    entries = tickets.get(repo_name) or []
+    found = False
+    updated = []
+    for ticket in entries:
+        if str(ticket.get("id")) == str(ticket_id) and ticket.get("specced"):
+            ticket = {**ticket, "specced": False,
+                      "delivered_branch": branch,
+                      "delivered": datetime.date.today().isoformat()}
+            found = True
+        updated.append(ticket)
+    if not found:
+        return 0
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("# Tickets written by `meute promote`. Machine-owned - edit repos.yaml\n"
+                     "# for hand-authored tickets instead; this file is rewritten wholesale.\n")
+        yaml.safe_dump({**stored, "tickets": {**tickets, repo_name: updated}},
+                       handle, sort_keys=False, default_flow_style=False)
+    print(ticket_id)
+    return 0
+
+
 COMMANDS = {
     "validate": (cmd_validate, 1),
     "policy": (cmd_policy, 1),
     "queue": (cmd_queue, 2),
     "render": (cmd_render, 1),
     "add-ticket": (cmd_add_ticket, 3),
+    "mark-delivered": (cmd_mark_delivered, 4),
 }
 
 
