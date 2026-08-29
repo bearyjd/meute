@@ -50,6 +50,22 @@ Then check it will actually survive cron, and get a crontab block with the right
 ./bin/meute doctor
 ```
 
+### If your machine has no cron
+
+Immutable Fedora variants and many minimal images ship without `cronie`, and a
+crontab there is instructions that silently never fire. `meute doctor` detects
+which scheduler you actually have. For systemd:
+
+```sh
+./bin/meute install-timers        # writes and enables meute-daily/weekly .timer units
+loginctl enable-linger "$USER"    # REQUIRED, or timers only fire while you are logged in
+systemctl --user list-timers 'meute-*'
+```
+
+The units set `Persistent=true`, so a slot missed while the machine was off runs
+at next boot rather than being skipped — which plain cron does not do. Output
+goes to the journal (`journalctl --user -u meute-daily`) as well as `state/log`.
+
 **Set `PATH` in your crontab.** `claude` and `codex` are usually installed
 outside cron's default `PATH` (`/usr/bin:/bin`), so a crontab without it fails
 every run with `the 'claude' CLI is not on PATH`. `doctor` prints a block you can

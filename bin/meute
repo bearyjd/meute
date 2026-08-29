@@ -5,7 +5,8 @@
 #   bin/meute <command> [args]
 #
 # Commands:
-#   doctor                        is this fleet deployable? checks cron's real environment
+#   doctor                        is this fleet deployable? checks the real scheduling environment
+#   install-timers                write and enable systemd user timers for both slots
 #   status                        quota, what runs next, this week's activity
 #   reports [--new|--all]         list reports with their triage state
 #   show <id>                     print a report to stdout and mark it read
@@ -51,7 +52,7 @@ ENGINE_ENV=()
 
 note() { printf 'meute: %s\n' "$*" >&2; }
 die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
 
 # --------------------------------------------------------------------------
 # Reports on disk are the source of truth. state/reports only annotates them:
@@ -249,6 +250,54 @@ d_ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
 d_warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; DOCTOR_WARNINGS=$(( DOCTOR_WARNINGS + 1 )); }
 d_err()  { printf '    \033[31mFAIL\033[0m %s\n' "$*"; DOCTOR_ERRORS=$(( DOCTOR_ERRORS + 1 )); }
 
+# Writes and enables systemd user timers. Chosen over cron where cron is absent,
+# and better regardless: Persistent=true means a slot missed while the machine
+# was off runs at next boot, which plain cron does not do.
+cmd_install_timers() {
+  command -v systemctl >/dev/null || die "systemd is not available on this machine"
+  local unit_dir="${HOME}/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  local path_line="${HOME}/.local/bin:${HOME}/.npm-global/bin:/usr/bin:/bin"
+  local slot
+  for slot in daily weekly; do
+    local cal="*-*-* 03:17:00"
+    [[ "$slot" == weekly ]] && cal="Sat *-*-* 04:41:00"
+    cat > "${unit_dir}/meute-${slot}.service" <<UNIT
+[Unit]
+Description=meute fleet runner (${slot} slot)
+Documentation=https://github.com/bearyjd/meute
+
+[Service]
+Type=oneshot
+WorkingDirectory=${MEUTE_ROOT}
+Environment=PATH=${path_line}
+ExecStart=${MEUTE_ROOT}/bin/run.sh ${slot}
+# stdout and stderr go to the journal; the runner also appends to state/log.
+UNIT
+    cat > "${unit_dir}/meute-${slot}.timer" <<UNIT
+[Unit]
+Description=meute ${slot} slot
+Documentation=https://github.com/bearyjd/meute
+
+[Timer]
+OnCalendar=${cal}
+# Run a slot missed while the machine was off, rather than skipping the week.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+UNIT
+    note "wrote ${unit_dir}/meute-${slot}.{service,timer}"
+  done
+  systemctl --user daemon-reload
+  systemctl --user enable --now meute-daily.timer meute-weekly.timer
+  note "enabled. next firings:"
+  systemctl --user list-timers 'meute-*' --no-pager 2>/dev/null | head -4 >&2
+  local linger; linger="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || echo unknown)"
+  [[ "$linger" == "yes" ]] || note "WARNING: lingering is off - run 'loginctl enable-linger $USER' or timers only fire while you are logged in"
+}
+
 cmd_doctor() {
   local missing_from_cron=()
 
@@ -338,21 +387,53 @@ cmd_doctor() {
     [[ -w "${MEUTE_ROOT}/${dir}" ]] && d_ok "${dir}/ writable" || d_err "${dir}/ not writable"
   done
   if git -C "$MEUTE_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    d_ok "meute is a git repo (state and reports are auto-committed)"
+    local tracked
+    tracked="$(git -C "$MEUTE_ROOT" ls-files state reports | grep -cv '\.gitkeep' || true)"
+    if (( tracked > 0 )); then
+      d_ok "meute is a git repo; state and reports are auto-committed after each run"
+    else
+      d_ok "meute is a git repo; state and reports are gitignored, so nothing is committed"
+    fi
   else
     d_warn "meute is not a git repo — state and reports will not be committed"
   fi
 
-  printf '\n  cron\n'
+  # Not every machine has cron. Immutable Fedora variants ship without cronie,
+  # and a crontab block there is instructions that silently never fire.
+  printf '\n  scheduling\n'
   local extra
   extra="$(printf '%s\n' "${missing_from_cron[@]:-}" | sort -u | grep -v '^$' | paste -sd: -)"
-  if [[ -n "$extra" ]]; then
-    printf '    PATH must be set — %s is not on cron'"'"'s default PATH.\n' "$extra"
+  local cron_path="${extra:+${extra}:}${CRON_PATH_DEFAULT}"
+
+  if command -v crontab >/dev/null 2>&1; then
+    d_ok "cron is available"
+    [[ -n "$extra" ]] && printf '    PATH must be set - %s is not on cron'"'"'s default PATH.\n' "$extra"
+    printf '\n    # paste into `crontab -e`\n'
+    printf '    PATH=%s\n' "$cron_path"
+    printf '    17 3 * * *  cd %s && ./bin/run.sh daily  >> state/cron.log 2>&1\n' "$MEUTE_ROOT"
+    printf '    41 4 * * 6  cd %s && ./bin/run.sh weekly >> state/cron.log 2>&1\n' "$MEUTE_ROOT"
+  elif systemctl --user --version >/dev/null 2>&1; then
+    d_warn "no cron on this machine - use systemd user timers"
+    local linger; linger="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || echo unknown)"
+    if [[ "$linger" == "yes" ]]; then
+      d_ok "lingering enabled - timers fire while you are logged out"
+    else
+      d_warn "lingering is OFF: user timers will NOT fire unless you are logged in"
+      d_warn "enable with:  loginctl enable-linger $USER"
+    fi
+    local unit_dir="${HOME}/.config/systemd/user"
+    if [[ -f "${unit_dir}/meute-daily.timer" ]]; then
+      d_ok "units installed in ${unit_dir}"
+      systemctl --user is-enabled meute-daily.timer >/dev/null 2>&1 \
+        && d_ok "meute-daily.timer enabled" || d_warn "meute-daily.timer not enabled"
+      systemctl --user is-enabled meute-weekly.timer >/dev/null 2>&1 \
+        && d_ok "meute-weekly.timer enabled" || d_warn "meute-weekly.timer not enabled"
+    else
+      d_warn "units not installed - run:  ./bin/meute install-timers"
+    fi
+  else
+    d_err "neither cron nor systemd --user is available; nothing can schedule this"
   fi
-  printf '\n    # paste into `crontab -e`\n'
-  printf '    PATH=%s%s\n' "${extra:+${extra}:}" "$CRON_PATH_DEFAULT"
-  printf '    17 3 * * *  cd %s && ./bin/run.sh daily  >> state/cron.log 2>&1\n' "$MEUTE_ROOT"
-  printf '    41 4 * * 6  cd %s && ./bin/run.sh weekly >> state/cron.log 2>&1\n' "$MEUTE_ROOT"
 
   printf '\n  %s error(s), %s warning(s)\n\n' "$DOCTOR_ERRORS" "$DOCTOR_WARNINGS"
   (( DOCTOR_ERRORS == 0 ))
@@ -364,6 +445,7 @@ main() {
   case "$command" in
     status)   cmd_status "$@" ;;
     doctor)   cmd_doctor "$@" ;;
+    install-timers) cmd_install_timers "$@" ;;
     reports)  cmd_reports "$@" ;;
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;

@@ -296,6 +296,13 @@ whether the quota gate is real or still a stub, and prints a crontab block with
 
 Two findings from building it, both measured rather than assumed:
 
+- **Not every machine has cron.** This one does not: `cronie` is absent on the
+  immutable Fedora variant it runs on, so every crontab instruction in this
+  document and in `meute doctor` was guidance that would silently never fire.
+  `doctor` now detects the scheduler and `meute install-timers` writes systemd
+  user units. Those want `Persistent=true` and lingering enabled — without
+  lingering, user timers do not run while you are logged out, which for an
+  overnight fleet means they do not run at all.
 - **`claude` and `codex` are not on cron's default `PATH`** (they install to
   `~/.local/bin` and `~/.npm-global/bin`). The cron snippet this document's own
   README shipped set no `PATH`, so following it would have failed on every run
