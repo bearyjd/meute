@@ -61,13 +61,30 @@ There is no API-key mode.
 runner exits 0 without doing anything. Scheduled chores must never eat the window
 you wanted for interactive work.
 
-There is no machine-readable balance on the CLI today, so the probe ships as a
-stub. Point it at whatever source you trust:
+There is no machine-readable balance on the Claude CLI today (`/usage` is
+interactive only; `claude auth status --json` reports the plan tier but not the
+balance), so the probe ships as a **stub returning 100** — meaning **the gate
+never fires until you wire a real source**. Every log line records which it is:
+
+```
+quota=77:stub          ← the gate is not real yet
+quota=41:MEUTE_QUOTA_CMD   ← the gate is real
+```
+
+Wire it up:
 
 ```sh
-MEUTE_QUOTA_CMD='my-quota-probe --percent' ./bin/run.sh daily
+# llm-usage-tracker (https://github.com/bearyjd/llm-usage-tracker) — adapter included
+MEUTE_QUOTA_CMD='contrib/quota-llm-usage-tracker.sh' ./bin/run.sh daily
+
+# or any command that prints one integer 0-100
+MEUTE_QUOTA_CMD='my-probe --percent' ./bin/run.sh daily
 echo 45 > state/quota-override      # or just pin it by hand
 ```
+
+**A configured probe that fails makes the runner decline the slot.** It does not
+fall back to the stub — falling back would silently disable the gate at exactly
+the moment you asked for it. Fail closed, always.
 
 ## How work is chosen
 

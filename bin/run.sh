@@ -47,6 +47,8 @@ readonly THIS_WEEK="$(date +%G-%V)"
 readonly START_EPOCH=0
 
 SLOT=""
+QUOTA_SOURCE="?"
+remaining_at_start="?"
 SCRUBBED=""
 AUTH_MODE=""
 ENGINE_OVERRIDE=""
@@ -189,8 +191,10 @@ main() {
 
   fleet_load_policy || die "could not read policy from ${MANIFEST}"
 
-  local remaining
-  remaining="$("${MEUTE_ROOT}/bin/quota.sh")" || skip "quota probe failed"
+  local remaining probe
+  probe="$("${MEUTE_ROOT}/bin/quota.sh" --with-source)" || skip "quota probe failed"
+  remaining="${probe%% *}"
+  QUOTA_SOURCE="${probe#* }"
   (( remaining < QUOTA_FLOOR )) \
     && skip "quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}"
 
@@ -199,6 +203,7 @@ main() {
   trap 'rm -f "$queue_file"' RETURN
   python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
   fleet_load_scope || die "queue build failed"
+  remaining_at_start="$remaining"
 
   FORCED=0
   if [[ -n "$FORCE_REPO" || -n "$FORCE_TASK" ]]; then
@@ -320,7 +325,7 @@ run_entry() {
     || state_set "lens.${repo}.${task}" "$(( lens_index + 1 ))"
 
   log_run "$ENGINE_STATUS" "kind=${kind}" "repo=${repo}" "task=${task}" "tier=${tier}" \
-          "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" \
+          "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" \
           ${SCRUBBED:+"scrubbed=${SCRUBBED// /,}"} "commit=${committed}" "report=${report_rel}" "cost=${COST}" "turns=${TURNS}" \
           ${ENGINE_DETAIL:+"detail=${ENGINE_DETAIL}"}
 

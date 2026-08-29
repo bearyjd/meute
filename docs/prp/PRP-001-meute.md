@@ -131,6 +131,21 @@ minimum of the two.
 100). If no source can be consulted it exits non-zero and the runner declines to
 run — starving the human is worse than skipping a chore.
 
+**A configured probe that fails is a broken source, not an absent one, and must
+fail closed.** An earlier version fell through to the stub when `MEUTE_QUOTA_CMD`
+errored, which meant a broken probe let the fleet run at full speed at precisely
+the moment the operator had asked it not to — a safety feature that silently
+disappeared. It now exits non-zero and the runner skips the slot.
+
+Because the shipped default is a stub, the gate does nothing until a real source
+is wired. That is easy to forget, so the quota and its source are recorded on
+every run line — `quota=77:stub` versus `quota=41:MEUTE_QUOTA_CMD` — making an
+unconfigured gate permanently visible rather than silently absent.
+
+`contrib/quota-llm-usage-tracker.sh` adapts llm-usage-tracker, whose Claude
+collector already reduces the 5-hour and 7-day windows to whichever is more
+restrictive and stores it as `messages_used` against `messages_limit == 100`.
+
 There is no built-in probe: as of Claude Code 2.1.x the remaining allowance is
 exposed only interactively via `/usage`; `claude auth status --json` reports the
 plan tier but not the balance. `MEUTE_QUOTA_CMD` is the seam for a real source.
@@ -270,6 +285,7 @@ Built and accepted:
 - `tasks/audit-security.md` (tier 2, rotating lens), `tasks/gen-tests.md` (tier 1),
   `tasks/draft-ticket.md` (tier 3, specced tickets only)
 - `lib/artifacts.gitignore`
+- `contrib/quota-llm-usage-tracker.sh` — a real quota source adapter
 - `bin/meute` — review and triage CLI: report lifecycle (new/read/actioned/
   dismissed) and `promote`, which converts a tier-2 finding into a tier-3
   `specced: true` ticket. Plan: `.claude/PRPs/plans/meute-report-lifecycle-cli.plan.md`
@@ -286,7 +302,6 @@ Phase 2, in rough priority order:
 - Remaining tier-1 templates: lint sweep, doc regen, dependency audit, conventions
 - Remaining tier-2 templates: architecture review, market comparison (needs
   WebSearch in the tier tool set), feature brainstorm
-- A real `MEUTE_QUOTA_CMD` source once a machine-readable balance exists
 
 ## 13. Acceptance
 

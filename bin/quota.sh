@@ -30,14 +30,23 @@
 # status --json` reports the plan tier but not the balance. Point MEUTE_QUOTA_CMD
 # at whatever source you trust and this file does not need to change.
 #
-# Usage: quota.sh [-v]
+# Usage: quota.sh [-v] [--with-source]
+#   --with-source  print "<percent> <source>" instead of just the percent, so the
+#                  runner can record in state/log whether the gate is real or a stub.
 set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly OVERRIDE_FILE="${MEUTE_ROOT}/state/quota-override"
 
 verbose=0
-[[ "${1:-}" == "-v" ]] && verbose=1
+with_source=0
+for arg in "$@"; do
+  case "$arg" in
+    -v) verbose=1 ;;
+    --with-source) with_source=1 ;;
+    *) printf 'quota.sh: unknown argument %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
 note() { (( verbose )) && printf 'quota: %s\n' "$1" >&2; return 0; }
 
@@ -54,16 +63,25 @@ emit() {
     return 1
   fi
   note "${value}% remaining (source: ${source})"
-  printf '%s\n' "$value"
+  if (( with_source )); then
+    printf '%s %s\n' "$value" "$source"
+  else
+    printf '%s\n' "$value"
+  fi
   return 0
 }
 
+# A configured probe that fails is NOT "no source available" — it is a broken
+# source. Falling back to the stub here would silently disable the gate and let
+# the fleet run at full speed exactly when the operator asked it not to.
 if [[ -n "${MEUTE_QUOTA_CMD:-}" ]]; then
   if raw="$(eval "${MEUTE_QUOTA_CMD}" 2>/dev/null)"; then
     emit "${raw//[[:space:]]/}" "MEUTE_QUOTA_CMD"
     exit $?
   fi
-  printf 'quota.sh: MEUTE_QUOTA_CMD failed; falling through to override/stub\n' >&2
+  printf 'quota.sh: MEUTE_QUOTA_CMD failed. Refusing to guess — the runner will\n' >&2
+  printf 'quota.sh: decline this slot rather than run against an unknown quota.\n' >&2
+  exit 1
 fi
 
 if [[ -f "$OVERRIDE_FILE" ]]; then

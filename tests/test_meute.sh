@@ -345,6 +345,39 @@ PY
   has "etiquette content carries the agent axis"      "$rendered" "autonomous_agents"
 }
 
+
+# The quota gate is the promise that scheduled work never starves interactive
+# work. A broken probe must stop the fleet, not silently unlock it.
+test_quota_gate() {
+  local out rc
+  out="$(MEUTE_QUOTA_STUB=55 "$REPO/bin/quota.sh")"
+  is "quota: stub value is reported" "$out" "55"
+
+  out="$(MEUTE_QUOTA_STUB=55 "$REPO/bin/quota.sh" --with-source)"
+  is "quota: --with-source names the source" "$out" "55 stub"
+
+  out="$(MEUTE_QUOTA_CMD='echo 42' "$REPO/bin/quota.sh" --with-source)"
+  is "quota: configured probe wins" "$out" "42 MEUTE_QUOTA_CMD"
+
+  # the safety property: a configured probe that fails must NOT fall back
+  MEUTE_QUOTA_CMD='exit 3' "$REPO/bin/quota.sh" >/dev/null 2>&1; rc=$?
+  is "quota: broken probe fails closed, never falls back to the stub" "$rc" "1"
+
+  out="$(MEUTE_QUOTA_CMD='exit 3' "$REPO/bin/quota.sh" 2>&1 || true)"
+  hasnt "quota: broken probe emits no number at all" "$out" "100"
+
+  # non-numeric output is a broken source too
+  MEUTE_QUOTA_CMD='echo banana' "$REPO/bin/quota.sh" >/dev/null 2>&1; rc=$?
+  is "quota: non-numeric probe output is rejected" "$rc" "1"
+
+  MEUTE_QUOTA_CMD='echo 250' "$REPO/bin/quota.sh" >/dev/null 2>&1; rc=$?
+  is "quota: out-of-range probe output is rejected" "$rc" "1"
+
+  # the adapter must fail cleanly when its backend is absent
+  LUT_URL='http://127.0.0.1:9' "$REPO/contrib/quota-llm-usage-tracker.sh" >/dev/null 2>&1; rc=$?
+  is "quota: llm-usage-tracker adapter fails closed when unreachable" "$rc" "1"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
@@ -356,6 +389,7 @@ test_promote
 test_cap
 test_dismiss_and_edges
 test_community_gates
+test_quota_gate
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))
