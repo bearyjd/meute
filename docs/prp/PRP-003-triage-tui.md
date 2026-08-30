@@ -60,6 +60,13 @@ document's own priority (the inbox is the bottleneck) without inventing a schema
 
 ## 1. Motivation
 
+> **Asserted, not measured (noted 2026-08-29).** The claim below is the premise
+> both this document and PRP-002 turn on, and they turn on it in opposite
+> directions — see PRP-002 §0 for the reading that settles it. The evidence will
+> be in `state/reports` (decisions, timestamped) and `state/log` (runs per week,
+> including gate declines); at the time of writing the fleet has produced four
+> runs, which is not enough to read either way.
+
 The bottleneck is review capacity, not token supply. Every hour of agent output
 converges on one human decision: *is this finding worth acting on?* This layer
 compresses that decision; it does not display metrics.

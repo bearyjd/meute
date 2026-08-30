@@ -1,8 +1,41 @@
 # PRP-002 — Cheap-Tier Execution via OmniRoute
 
-**Status:** Proposed
+**Status:** Proposed — **gated on a measurement, not on effort** (see §0)
 **Depends on:** PRP-001 (Meute fleet runner), phase 1 complete
 **Blocks:** nothing — additive layer
+
+---
+
+## 0. The reading that authorizes this, and the one that kills it
+
+PRP-003 §1 opens: *"The bottleneck is review capacity, not token supply."* This
+document exists to raise token supply. Both cannot be the right next build. If
+review is genuinely the constraint, PRP-002 raises the arrival rate at a queue
+that is already backing up and makes the fleet worse while looking like
+progress — and building it is the expensive way to discover that.
+
+The tension is settled by a reading, not by argument. Two branches:
+
+| Reading | Means | Verdict |
+|---|---|---|
+| Undecided findings rise week over week | review is the constraint | **kill or defer.** Build PRP-003's inbox instead; more output makes the queue worse |
+| Undecided findings stay near zero *and* slots decline on the quota gate | token supply is the constraint | **build.** This is the case PRP-002 was written for |
+| Neither — few findings, few declines | nothing is constrained yet | **wait.** The fleet is not producing enough for either to matter |
+
+**The data is already being captured.** `state/reports` records every decision
+with an ISO timestamp; `state/log` records every run with `week=` and its
+`status=`, including `skipped` and the reason. Nothing is being lost while the
+reader does not exist — so the reader is twenty lines whenever there is enough
+data to read, and writing it earlier only produces a confident-looking line over
+a sample too small to mean anything.
+
+**As of 2026-08-29 the sample is four runs**, three of them on one day, and the
+timers are not yet armed. The reading needs consecutive unattended days first.
+
+**When the reader is built, count the same population on both sides.**
+`cmd_findings` filters to `task == "audit-security"` (bin/meute), so "findings"
+means audit findings only. A ratio whose numerator counts every report and whose
+denominator counts only audit decisions is nonsense.
 
 ---
 
