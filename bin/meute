@@ -397,9 +397,7 @@ cmd_pause() {
   local secs; secs="$(hold_duration_seconds "$spec")" \
     || die "bad duration: ${spec} — use 45m, 6h, 3d or 2w, up to a year"
 
-  local until; until=$(( $(now_epoch) + secs ))
-  reason="${reason//$'\t'/ }"; reason="${reason//$'\n'/ }"
-  kv_set_row "$HOLD_FILE" hold "$until" "$reason"
+  local until; until="$(hold_set "$secs" "$reason")"
   note "fleet paused until $(hold_until_human "$until")${reason:+ — ${reason}}"
   note "every slot declines until then. lift it early with:  meute resume"
   note "this hold is local to this machine — state/ is not committed"

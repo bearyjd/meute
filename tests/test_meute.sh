@@ -629,6 +629,64 @@ test_pause() {
     || bad "pause: the hold is gitignored, as the help text promises" "state/hold is tracked"
 }
 
+# hold_extend is what an automatic hold (a provider rate limit) goes through
+# instead of hold_set directly -- a manual pause the user set on purpose must
+# never be shortened by one.
+test_hold_extend() {
+  local root="$FIXTURE/hold_extend"
+  mkdir -p "$root/state"
+  ln -sfn "$REPO/lib" "$root/lib"
+
+  hx() {  # $1=MEUTE_NOW $2=seconds $3=reason -> resulting epoch, on stdout
+    MEUTE_NOW="$1" bash -c '
+      source "$1/lib/state.sh"; source "$1/lib/fleet.sh"
+      HOLD_FILE="$1/state/hold"
+      hold_extend "$2" "$3"' _ "$root" "$2" "$3"
+  }
+  row() { cat "$root/state/hold" 2>/dev/null; }
+
+  is  "hold_extend: sets a hold when none is active" "$(hx 1000000 3600 'auto: first')" "1003600"
+  has "hold_extend: records the reason"              "$(row)" "auto: first"
+
+  is    "hold_extend: a shorter candidate does not shrink an active hold" \
+        "$(hx 1000001 60 'auto: shorter')" "1003600"
+  hasnt "hold_extend: the reason is untouched" "$(row)" "auto: shorter"
+
+  is  "hold_extend: a longer candidate does extend it" \
+      "$(hx 1000001 86400 'auto: longer')" "1086401"
+  has "hold_extend: the reason updates with it" "$(row)" "auto: longer"
+}
+
+# The claude CLI's own event name (subtype) reads "success" even when
+# is_error is true and the real cause was an HTTP 429 -- the fix was to check
+# api_error_status instead of trusting subtype, discovered from a real
+# unattended run that hit the account's weekly limit.
+test_engines() {
+  local root="$FIXTURE/engines" out
+  mkdir -p "$root"
+  source "$REPO/lib/engines.sh"
+
+  out="$root/ok.json"
+  printf '%s' '{"result":"all clear","total_cost_usd":0.01,"num_turns":3,"is_error":false}' > "$out"
+  extract_claude "$out"
+  is "engines: ok clears ENGINE_DETAIL" "$ENGINE_STATUS:$ENGINE_DETAIL" "ok:"
+  is "engines: ok is not rate-limited"  "$RATE_LIMITED" "0"
+
+  out="$root/other-error.json"
+  printf '%s' '{"result":"","is_error":true,"subtype":"error_max_turns"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a non-429 error keeps its own subtype" "$ENGINE_STATUS:$ENGINE_DETAIL" "error:error_max_turns"
+  is "engines: a non-429 error is not rate-limited"    "$RATE_LIMITED" "0"
+
+  out="$root/rate-limited.json"
+  printf '%s' '{"result":"You have hit your weekly limit - resets 3pm (America/New_York)","is_error":true,"subtype":"success","api_error_status":429}' > "$out"
+  extract_claude "$out" || true
+  is  "engines: a 429 is flagged rate-limited" "$RATE_LIMITED" "1"
+  is  "engines: a 429 status is still error"   "$ENGINE_STATUS" "error"
+  has "engines: detail says what happened, not the misleading subtype" "$ENGINE_DETAIL" "rate-limited:"
+  has "engines: detail carries the provider's own message"             "$ENGINE_DETAIL" "hit your weekly limit"
+}
+
 
 # The self-budget source: a cap on meute's own footprint, computed from its own
 # log. This is the first quota source that actually makes the gate fire.
@@ -799,6 +857,8 @@ test_doctor
 test_timer_arming
 test_install_timers
 test_pause
+test_hold_extend
+test_engines
 test_self_budget
 test_manifest_ceiling
 test_branch_prune

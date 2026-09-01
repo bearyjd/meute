@@ -49,6 +49,12 @@ readonly CURSOR_FILE="${STATE_DIR}/cursor"
 readonly LOG_FILE="${STATE_DIR}/log"
 readonly LOCK_FILE="${STATE_DIR}/.lock"
 readonly HOLD_FILE="${STATE_DIR}/hold"
+# A 429 is not "try again in n seconds" so much as "this pool is spent" -- the
+# provider's own reset text is free-form and not worth parsing. A day-long
+# hold means at most one more wasted (and, per observation, free: a 429
+# attempt costs $0) attempt before it backs off again, self-correcting
+# without ever needing to know the real reset time.
+readonly RATE_LIMIT_HOLD="24h"
 readonly WORKTREE_DIR="${MEUTE_ROOT}/.worktrees"
 readonly DATE="$(date +%F)"
 readonly STARTED_AT="$(date --iso-8601=seconds)"
@@ -324,7 +330,7 @@ run_entry() {
 
   local out err; out="$(mktemp)"; err="$(mktemp)"
   CODEX_LAST="$(mktemp)"
-  REPORT=""; ENGINE_STATUS="error"; ENGINE_DETAIL=""; COST="-"; TURNS="-"
+  REPORT=""; ENGINE_STATUS="error"; ENGINE_DETAIL=""; COST="-"; TURNS="-"; RATE_LIMITED=0
   local rc=0
   case "$engine" in
     claude) invoke_claude "$prompt_file" "$out" "$err" || rc=$?; extract_claude "$out" || true ;;
@@ -335,6 +341,16 @@ run_entry() {
     ENGINE_STATUS="error"; ENGINE_DETAIL="engine exited ${rc}"
   fi
   [[ -n "$REPORT" ]] || { ENGINE_STATUS="error"; ENGINE_DETAIL="${ENGINE_DETAIL:-empty report}"; }
+
+  # The self-budget gate only sees meute's own spend, never the subscription
+  # it draws from -- a 429 here means the real pool is already gone and every
+  # slot until the hold lifts would fail the same way for nothing.
+  if (( RATE_LIMITED )); then
+    local hold_secs paused_until
+    hold_secs="$(hold_duration_seconds "$RATE_LIMIT_HOLD")"
+    paused_until="$(hold_extend "$hold_secs" "auto: provider rate limit — ${ENGINE_DETAIL}")"
+    note "provider rate limit hit; auto-paused until $(hold_until_human "$paused_until")"
+  fi
 
   write_report "$report_rel" "$entry" "$engine" "$lens" "$base_ref" "$err"
 

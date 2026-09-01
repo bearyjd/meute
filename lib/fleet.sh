@@ -59,6 +59,30 @@ hold_clear() {
   [[ -s "$HOLD_FILE" ]] || rm -f "$HOLD_FILE"
 }
 
+# Writes the hold unconditionally. Prints the resulting absolute epoch so the
+# caller can report it without recomputing now_epoch() a second time.
+hold_set() {
+  local secs="$1" reason="$2" until
+  until=$(( $(now_epoch) + secs ))
+  reason="${reason//$'\t'/ }"; reason="${reason//$'\n'/ }"
+  kv_set_row "$HOLD_FILE" hold "$until" "$reason"
+  printf '%s\n' "$until"
+}
+
+# Sets a hold only if none is active or the active one expires sooner than
+# this would -- an automatic hold (e.g. a provider rate limit) must never cut
+# a longer hold the user set on purpose short. Prints the hold's final epoch,
+# whether that came from this call or the one already in force.
+hold_extend() {
+  local secs="$1" reason="$2" candidate
+  candidate=$(( $(now_epoch) + secs ))
+  if hold_active && (( HOLD_UNTIL >= candidate )); then
+    printf '%s\n' "$HOLD_UNTIL"
+  else
+    hold_set "$secs" "$reason"
+  fi
+}
+
 # Sets HOLD_UNTIL / HOLD_REASON and returns 0 when a hold is in force. An
 # expired hold answers no, so it lifts itself without anyone running `resume`.
 hold_active() {

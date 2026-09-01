@@ -420,6 +420,31 @@ timer that is enabled and inert.
 Open: the gate still cannot answer "how much is left?", only "has the fleet had
 enough?". `contrib/quota-llm-usage-tracker.sh` is the path to the real reading.
 
+**The finding above stopped being hypothetical on the first night the timers
+actually fired.** 2026-08-31, 03:21, unattended: `meute status` read
+`quota 100% · ok` and the daily slot ran anyway, straight into the account's
+real weekly limit — an HTTP 429 three seconds in, `$0` spent, one turn. Two
+things about how it surfaced were themselves findings:
+
+- The claude CLI's own JSON reported `is_error: true` with `subtype: "success"`
+  — its event name, not a verdict — so `state/log` recorded `detail=success`
+  next to `status=error`. Reading `subtype` as if it meant something was the
+  same mistake as reading `enabled` as if it meant *armed*: the field that's
+  easiest to print again wasn't the one that was true. Fixed by checking
+  `api_error_status == 429` instead, which is what actually happened.
+- The raw stdout/stderr behind that line only survived because `run.sh`'s
+  `mktemp` files for the engine's output are never cleaned up — an unrelated
+  leak that happened to be the only reason this was diagnosable at all. Still
+  open: worth capping or scoping once it causes an actual problem, not before.
+
+Fixed: a 429 now sets an automatic hold (`hold_extend`, 24h, never shortening
+a hold the operator set on purpose) instead of retrying into the same wall
+every slot until a human notices. It does not know the provider's real reset
+time — that text is free-form and not worth parsing — so it backs off a day at
+a time, which costs nothing per attempt and self-corrects without knowing the
+answer precisely. The manual `meute pause` from the prior finding is still the
+right tool for *foreseeing* a squeeze; this is what happens when nobody did.
+
 ## 12. Phase status
 
 Built and accepted:

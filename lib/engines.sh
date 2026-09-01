@@ -7,6 +7,8 @@
 #   ENGINE_STATUS  ok | error
 #   ENGINE_DETAIL  short reason when status is error
 #   COST, TURNS    accounting for state/log, or "-" when unavailable
+#   RATE_LIMITED   1 when the provider itself declined with HTTP 429 (claude
+#                  only for now -- codex's failure shape is not yet observed)
 #
 # Add an engine by adding a pair here and a case arm in run_entry.
 
@@ -44,8 +46,21 @@ extract_claude() {
   REPORT="$(jq -r '.result // ""' "$out")"
   COST="$(jq -r '.total_cost_usd // "-"' "$out")"
   TURNS="$(jq -r '.num_turns // "-"' "$out")"
+  RATE_LIMITED=0
   if [[ "$(jq -r '.is_error // false' "$out")" == "true" ]]; then
-    ENGINE_STATUS="error"; ENGINE_DETAIL="$(jq -r '.subtype // "unknown"' "$out")"; return 1
+    ENGINE_STATUS="error"
+    # subtype is the CLI's own event name and reads as "success" even when
+    # is_error is true and this was actually an HTTP 429 -- report the thing
+    # that actually happened instead of parroting a misleading field.
+    if [[ "$(jq -r '.api_error_status // empty' "$out")" == "429" ]]; then
+      RATE_LIMITED=1
+      local msg; msg="$(jq -r '.result // "no message"' "$out")"
+      msg="${msg//$'\t'/ }"; msg="${msg//$'\n'/ }"
+      ENGINE_DETAIL="rate-limited: ${msg}"
+    else
+      ENGINE_DETAIL="$(jq -r '.subtype // "unknown"' "$out")"
+    fi
+    return 1
   fi
   ENGINE_STATUS="ok"; ENGINE_DETAIL=""
   return 0
