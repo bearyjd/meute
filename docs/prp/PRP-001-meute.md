@@ -469,6 +469,27 @@ and pinned by a test that calls the real function rather than a copy of it —
 the first version of that test passed against a hand-written duplicate of the
 snippet and would have caught nothing had the actual fix regressed.
 
+**`contrib/quota-llm-usage-tracker.sh`'s own header admitted it had never run
+against a live instance — checking why found the instance doesn't exist on
+this machine at all.** `bearyjd/llm-usage-tracker` is a real, public repo, but
+it isn't cloned, installed, or running here. Verifying the adapter against the
+tracker's actual source (`backend/api/routes.py`, `backend/db/models.py`,
+`backend/recommendations.py`, `backend/collectors/claude.py`) confirmed every
+claim in the adapter's header except one: the default `LUT_URL` was
+`127.0.0.1:8000`, a plausible guess, while the tracker's own `serve` command
+(`backend/cli.py`) binds `48372`. Fixed, and pinned by a test that reads the
+adapter's own error message rather than re-deriving the port, so a future edit
+that changes the literal without checking it against the tracker's real
+default fails the test instead of drifting again.
+
+Still open, and squarely out of scope for an unattended fix: `llm-tracker auth
+claude` requires a *headed* browser and a manual login — Cloudflare's bot
+detection on claude.ai depends on a persistent browser profile and a human at
+the keyboard. That step cannot run from this container, and should not run
+unattended anywhere: it is the operator's own session credential. Deploying
+the tracker is therefore a task with a mandatory human step in the middle, not
+something to automate through.
+
 ## 12. Phase status
 
 Built and accepted:

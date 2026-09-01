@@ -27,7 +27,10 @@
 # decline to run, which is the safe direction to fail.
 set -Eeuo pipefail
 
-readonly URL="${LUT_URL:-http://127.0.0.1:8000}"
+# 48372 is the tracker's own default (backend/cli.py: `serve` binds there unless
+# --port overrides it) -- verified against the source after this repo turned out
+# not to have the tracker installed at all, which is what prompted the check.
+readonly URL="${LUT_URL:-http://127.0.0.1:48372}"
 
 command -v curl >/dev/null || { echo "quota-lut: curl is required" >&2; exit 1; }
 command -v jq   >/dev/null || { echo "quota-lut: jq is required" >&2; exit 1; }

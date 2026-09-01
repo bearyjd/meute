@@ -406,6 +406,15 @@ test_quota_gate() {
   # the adapter must fail cleanly when its backend is absent
   LUT_URL='http://127.0.0.1:9' "$REPO/contrib/quota-llm-usage-tracker.sh" >/dev/null 2>&1; rc=$?
   is "quota: llm-usage-tracker adapter fails closed when unreachable" "$rc" "1"
+
+  # The default used to be :8000 -- plausible, and wrong: the tracker's own
+  # `serve` command (backend/cli.py) binds :48372. Pin it against the error
+  # message rather than the source line, so a future edit that changes the
+  # literal without checking it against the tracker's real default still fails
+  # this test instead of silently drifting again.
+  local out
+  out="$(env -u LUT_URL "$REPO/contrib/quota-llm-usage-tracker.sh" 2>&1 || true)"
+  has "quota: llm-usage-tracker adapter defaults to the tracker's real port" "$out" "127.0.0.1:48372"
 }
 
 
