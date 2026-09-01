@@ -474,11 +474,26 @@ linger_state() {
 # Writes and enables systemd user timers. Chosen over cron where cron is absent,
 # and better regardless: Persistent=true means a slot missed while the machine
 # was off runs at next boot, which plain cron does not do.
+#
+# Derived from where these binaries actually resolve right now, not assumed
+# from a fixed install layout -- a hardcoded ~/.local/bin:~/.npm-global/bin
+# happens to be right on the machine this was written on and wrong on the
+# next one, silently, since a unit missing its PATH still installs and arms.
+unit_path_line() {
+  local dirs=() bin path
+  for bin in git jq python3 claude codex; do
+    path="$(command -v "$bin" 2>/dev/null)" || continue
+    dirs+=( "$(dirname "$path")" )
+  done
+  local uniq; uniq="$(printf '%s\n' "${dirs[@]:-}" | awk 'NF && !seen[$0]++' | paste -sd: -)"
+  printf '%s\n' "${uniq:+${uniq}:}/usr/bin:/bin"
+}
+
 cmd_install_timers() {
   command -v systemctl >/dev/null || die "systemd is not available on this machine"
   local unit_dir="${HOME}/.config/systemd/user"
   mkdir -p "$unit_dir"
-  local path_line="${HOME}/.local/bin:${HOME}/.npm-global/bin:/usr/bin:/bin"
+  local path_line; path_line="$(unit_path_line)"
   local slot
   for slot in daily weekly; do
     local cal="*-*-* 03:17:00"
@@ -538,19 +553,38 @@ UNIT
     die "units written, but ${inert[*]} not armed. Start them where systemd can be reached:  systemctl --user start ${inert[*]}"
 }
 
+# Sorted, de-duplicated, colon-joined, blanks dropped. Always exits 0: `grep -v`
+# exits 1 when it selects zero lines, which is exactly what "nothing missing"
+# looks like -- and a plain (non-`local`) assignment takes on that as its own
+# exit status, which under `set -e` used to kill `doctor` with no message on
+# the one machine state that should be the easiest to report.
+dedup_dirs() {
+  printf '%s\n' "$@" | sort -u | grep -v '^$' | paste -sd: - || true
+}
+
 cmd_doctor() {
   local missing_from_cron=()
+  # Checking every binary against cron's PATH is only honest on a machine that
+  # actually schedules through cron. On a systemd-only box it produced a
+  # warning pointing at "the cron block below" — a block that branch of this
+  # function never prints, since it goes to the systemd path instead. Check
+  # against whatever `install-timers` would actually put in the unit.
+  local has_cron=0; command -v crontab >/dev/null 2>&1 && has_cron=1
+  local check_path="$CRON_PATH_DEFAULT"
+  (( has_cron )) || check_path="$(unit_path_line)"
 
   printf '\n  binaries\n'
   local bin path
   for bin in git jq python3 flock timeout; do
     path="$(command -v "$bin" 2>/dev/null || true)"
     if [[ -z "$path" ]]; then d_err "$bin not found — required"; continue; fi
-    if env -i PATH="$CRON_PATH_DEFAULT" sh -c "command -v $bin" >/dev/null 2>&1; then
+    if env -i PATH="$check_path" sh -c "command -v $bin" >/dev/null 2>&1; then
       d_ok "$(printf '%-8s %s' "$bin" "$path")"
-    else
+    elif (( has_cron )); then
       d_warn "$(printf '%-8s %s  (outside cron PATH)' "$bin" "$path")"
       missing_from_cron+=( "$(dirname "$path")" )
+    else
+      d_warn "$(printf "%-8s %s  (outside the systemd timer's PATH — re-run install-timers)" "$bin" "$path")"
     fi
   done
   for bin in claude codex gh; do
@@ -560,11 +594,13 @@ cmd_doctor() {
                            || d_warn "$bin not found — that engine is unavailable"
       continue
     fi
-    if env -i PATH="$CRON_PATH_DEFAULT" sh -c "command -v $bin" >/dev/null 2>&1; then
+    if env -i PATH="$check_path" sh -c "command -v $bin" >/dev/null 2>&1; then
       d_ok "$(printf '%-8s %s' "$bin" "$path")"
-    else
+    elif (( has_cron )); then
       d_warn "$(printf '%-8s %s  ← NOT on cron PATH; the cron block below fixes this' "$bin" "$path")"
       missing_from_cron+=( "$(dirname "$path")" )
+    else
+      d_warn "$(printf "%-8s %s  ← NOT on the systemd timer's PATH — re-run install-timers" "$bin" "$path")"
     fi
   done
 
@@ -646,8 +682,7 @@ cmd_doctor() {
   # Not every machine has cron. Immutable Fedora variants ship without cronie,
   # and a crontab block there is instructions that silently never fire.
   printf '\n  scheduling\n'
-  local extra
-  extra="$(printf '%s\n' "${missing_from_cron[@]:-}" | sort -u | grep -v '^$' | paste -sd: -)"
+  local extra; extra="$(dedup_dirs "${missing_from_cron[@]:-}")"
   local cron_path="${extra:+${extra}:}${CRON_PATH_DEFAULT}"
 
   if command -v crontab >/dev/null 2>&1; then

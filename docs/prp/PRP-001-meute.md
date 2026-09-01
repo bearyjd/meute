@@ -445,6 +445,30 @@ a time, which costs nothing per attempt and self-corrects without knowing the
 answer precisely. The manual `meute pause` from the prior finding is still the
 right tool for *foreseeing* a squeeze; this is what happens when nobody did.
 
+**`doctor` checked binaries against a PATH nothing on this machine uses.** The
+binaries section always compared `claude`/`codex` against `CRON_PATH_DEFAULT`
+and, when they weren't reachable there, pointed at "the cron block below" — on
+a systemd-only host, that block is never printed; the scheduling section takes
+a different branch entirely. `install-timers` had the matching problem in the
+other direction: it wrote a hardcoded `~/.local/bin:~/.npm-global/bin` into the
+unit's own `Environment=PATH=`, correct on this machine purely by coincidence
+of layout, silently wrong on the next one. Same lesson as the timer-arming
+finding, applied to a different field: check the PATH the thing will actually
+run under, not a fixed guess. Both are now derived from where the binaries
+actually resolve (`unit_path_line`), and `doctor` checks against that when
+cron isn't the active scheduler.
+
+That change retired the last "something is missing from the list" case on a
+fully healthy box, which exposed a second, sharper bug: `grep -v` exits 1 when
+it selects zero lines — exactly what an empty missing-binaries list produces —
+and a bare pipeline (or a plain, non-`local` assignment built from one) takes
+that on as its own exit status. Under `set -e` that killed `doctor` outright,
+with no message, on precisely the machine state — nothing wrong — that should
+have been the easiest of all to report. Factored into `dedup_dirs`, guarded,
+and pinned by a test that calls the real function rather than a copy of it —
+the first version of that test passed against a hand-written duplicate of the
+snippet and would have caught nothing had the actual fix regressed.
+
 ## 12. Phase status
 
 Built and accepted:

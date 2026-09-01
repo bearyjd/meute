@@ -435,6 +435,42 @@ test_doctor() {
   has "doctor: warns an unwired quota gate"   "$out" "does NOT fire"
 }
 
+# install-timers used to hardcode ~/.local/bin:~/.npm-global/bin into the unit's
+# PATH — right on the machine this was written on, silently wrong on the next
+# one. unit_path_line derives it from where the binaries actually resolve.
+# Deterministic regardless of what this test machine happens to have on PATH.
+test_unit_path_line() {
+  local stub="$FIXTURE/unitpath"; mkdir -p "$stub"
+  local b
+  for b in git jq python3 claude codex; do : > "$stub/$b"; chmod +x "$stub/$b"; done
+
+  local out
+  out="$(PATH="$stub:/usr/bin:/bin" bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  has "unit_path_line: includes where a binary actually resolves from" "$out" "$stub"
+  has "unit_path_line: keeps the /usr/bin:/bin fallback tail"          "$out" "/usr/bin:/bin"
+}
+
+# dedup_dirs backs the one line in `doctor` that used to crash it: `grep -v`
+# exits 1 when it selects zero lines, exactly what an empty missing-binaries
+# list produces, and a plain (non-`local`) assignment takes on that as its own
+# exit status -- which under `set -e` killed `doctor` with no message on the
+# one machine state (nothing missing) that should be the easiest to report.
+# Exercises the real function, not a copy, so a regression here is caught
+# regardless of what this test machine happens to have on PATH or in cron.
+test_dedup_dirs() {
+  local out rc
+  out="$(bash -c 'set -Eeuo pipefail; source "$1"; dedup_dirs' _ "$REPO/bin/meute")"; rc=$?
+  is "dedup_dirs: no args does not abort under set -e" "$rc" "0"
+  is "dedup_dirs: no args joins to nothing"             "$out" ""
+
+  out="$(bash -c 'set -Eeuo pipefail; source "$1"; dedup_dirs "" ""' _ "$REPO/bin/meute")"; rc=$?
+  is "dedup_dirs: all-blank args do not abort under set -e" "$rc" "0"
+  is "dedup_dirs: all-blank args join to nothing"            "$out" ""
+
+  out="$(bash -c 'set -Eeuo pipefail; source "$1"; dedup_dirs /b /a /a' _ "$REPO/bin/meute")"
+  is "dedup_dirs: sorts and de-duplicates" "$out" "/a:/b"
+}
+
 
 # A timer can be `enabled` and inert at the same time. The doctor used to assert
 # `is-enabled`, which reads the on-disk symlink, so it printed "ok" over two
@@ -854,6 +890,8 @@ test_dismiss_and_edges
 test_community_gates
 test_quota_gate
 test_doctor
+test_unit_path_line
+test_dedup_dirs
 test_timer_arming
 test_install_timers
 test_pause
