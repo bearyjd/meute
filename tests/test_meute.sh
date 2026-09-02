@@ -534,6 +534,86 @@ YAML
   out="$(MEUTE_MANIFEST="$FIXTURE/unitpath/broken.yaml" bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"; rc=$?
   is  "unit_path_line: an unparseable manifest does not abort" "$rc" "0"
   has "unit_path_line: ...and still yields the fallback tail (broken)" "$out" "/usr/bin:/bin"
+
+  # Real-world trigger: this machine has two real cargos (a distro package in
+  # /usr/bin, rustup's in ~/.cargo/bin) at different versions. Building the
+  # derived PATH in name-iteration order rather than the caller's own PATH
+  # order let the unit silently resolve to a *different* cargo, and therefore
+  # different clippy lints, than both the caller and the repo's own CI use.
+  # Synthetic stand-in for that split, deterministic regardless of what's
+  # really installed on the machine running the suite.
+  local dir_a="$FIXTURE/precedence-a" dir_b="$FIXTURE/precedence-b"
+  mkdir -p "$dir_a" "$dir_b"
+  printf '#!/bin/sh\necho from-a\n' > "$dir_a/toolchain-dup"; chmod +x "$dir_a/toolchain-dup"
+  printf '#!/bin/sh\necho from-b\n' > "$dir_b/toolchain-dup"; chmod +x "$dir_b/toolchain-dup"
+  local precedence_manifest="$FIXTURE/unitpath/precedence-manifest.yaml"
+  cat > "$precedence_manifest" <<'YAML'
+version: 1
+tiers:
+  tier1:
+    allowed_tools: Bash(toolchain-dup:*)
+tasks: {}
+repos: []
+community: []
+YAML
+
+  local derived_a_wins derived_b_wins resolved
+  derived_a_wins="$(PATH="$dir_a:$dir_b:/usr/bin:/bin" MEUTE_MANIFEST="$precedence_manifest" \
+             bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  resolved="$(env -i PATH="$derived_a_wins" sh -c 'toolchain-dup')"
+  is "unit_path_line: preserves which duplicate binary wins, same as the caller's PATH" \
+     "$resolved" "from-a"
+
+  derived_b_wins="$(PATH="$dir_b:$dir_a:/usr/bin:/bin" MEUTE_MANIFEST="$precedence_manifest" \
+             bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  resolved="$(env -i PATH="$derived_b_wins" sh -c 'toolchain-dup')"
+  is "unit_path_line: ...and flips when the caller's own PATH does" \
+     "$resolved" "from-b"
+
+  # dir_a is only ever "needed" when it's the one that actually wins (it's a
+  # fully shadowed loser in the second case above, so it correctly does not
+  # appear there at all) -- check the case where it legitimately belongs,
+  # exactly once, not duplicated.
+  local occurrences; occurrences="$(grep -o "$dir_a" <<< "$derived_a_wins" | wc -l)"
+  is "unit_path_line: no duplicate directory entries" "$occurrences" "1"
+
+  # The real trigger for the dedup guard: this machine's actual interactive
+  # PATH has the same directory listed several times over (shell init files
+  # each prepending their own copy). A needed directory appearing twice in
+  # the caller's own $PATH must not appear twice in the derived one either.
+  derived_a_wins="$(PATH="$dir_a:$dir_a:$dir_b:/usr/bin:/bin" MEUTE_MANIFEST="$precedence_manifest" \
+             bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  occurrences="$(grep -o "$dir_a" <<< "$derived_a_wins" | wc -l)"
+  is "unit_path_line: a directory repeated in \$PATH itself is still deduped" "$occurrences" "1"
+
+  # The actual mechanism of the real bug wasn't one binary name resolving two
+  # ways -- it was TWO DIFFERENT binaries (git -> /usr/bin, cargo ->
+  # ~/.cargo/bin) whose directories get combined, in whatever order they were
+  # looked up rather than the order $PATH itself puts them in. zzz-tool sorts
+  # (and is therefore scanned) after aaa-tool, so old insertion-order code
+  # always placed aaa-tool's directory first regardless of $PATH; putting
+  # zzz-tool's directory ahead of aaa-tool's in $PATH makes that distinction
+  # visible without relying on any specific binary actually existing twice.
+  local dir_early="$FIXTURE/precedence-early" dir_late="$FIXTURE/precedence-late"
+  mkdir -p "$dir_early" "$dir_late"
+  : > "$dir_early/zzz-tool"; chmod +x "$dir_early/zzz-tool"
+  : > "$dir_late/aaa-tool";  chmod +x "$dir_late/aaa-tool"
+  local cross_manifest="$FIXTURE/unitpath/cross-manifest.yaml"
+  cat > "$cross_manifest" <<'YAML'
+version: 1
+tiers:
+  tier1:
+    allowed_tools: Bash(aaa-tool:*) Bash(zzz-tool:*)
+tasks: {}
+repos: []
+community: []
+YAML
+  local cross_derived before_late
+  cross_derived="$(PATH="$dir_early:$dir_late:/usr/bin:/bin" MEUTE_MANIFEST="$cross_manifest" \
+             bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  before_late="${cross_derived%%"$dir_late"*}"
+  has "unit_path_line: two different binaries' directories keep \$PATH's own relative order" \
+      "$before_late" "$dir_early"
 }
 
 # dedup_dirs backs the one line in `doctor` that used to crash it: `grep -v`

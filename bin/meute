@@ -504,23 +504,18 @@ linger_state() {
 # happens to be right on the machine this was written on and wrong on the
 # next one, silently, since a unit missing its PATH still installs and arms.
 unit_path_line() {
-  local dirs=() bin path
-  for bin in git jq python3 claude codex; do
-    path="$(command -v "$bin" 2>/dev/null)" || continue
-    dirs+=( "$(dirname "$path")" )
-  done
-  # The fixed list above is meute's own hard dependencies -- it has no way to
-  # know a given repo's toolchain. Found live: veille-finance's lint-sweep
-  # blocked under the timer because cargo (~/.cargo/bin, nowhere near
-  # git/jq/python3/claude/codex) was missing from the unit's PATH, even though
-  # the manifest already declares it needs `cargo` via each tier's
-  # allowed_tools (Bash(cargo test:*), ...). Derive from that instead of
-  # guessing a second fixed list that would just be wrong on a different repo.
+  local names=(git jq python3 claude codex)
+  # The fixed five above are meute's own hard dependencies -- they have no way
+  # to know a given repo's toolchain. Found live: veille-finance's lint-sweep
+  # blocked under the timer because cargo (~/.cargo/bin, nowhere near any of
+  # them) was missing from the unit's PATH, even though the manifest already
+  # declares it needs `cargo` via each tier's allowed_tools (Bash(cargo
+  # test:*), ...). Derive from that instead of guessing a second fixed list
+  # that would just be wrong on a different repo.
   local word
   while IFS= read -r word; do
     [[ -n "$word" ]] || continue
-    path="$(command -v "$word" 2>/dev/null)" || continue
-    dirs+=( "$(dirname "$path")" )
+    names+=( "$word" )
   done < <(python3 -c "
 import re, sys, yaml
 d = yaml.safe_load(open(sys.argv[1])) or {}
@@ -532,7 +527,38 @@ for tier in (d.get('tiers') or {}).values():
             seen.add(w)
 print('\n'.join(sorted(seen)))
 " "$MANIFEST" 2>/dev/null)
-  local uniq; uniq="$(printf '%s\n' "${dirs[@]:-}" | awk 'NF && !seen[$0]++' | paste -sd: -)"
+
+  local needed=() bin path
+  for bin in "${names[@]}"; do
+    path="$(command -v "$bin" 2>/dev/null)" || continue
+    needed+=( "$(dirname "$path")" )
+  done
+
+  # Order the result the way $PATH itself already does, not by which binary
+  # happened to be resolved first. Two cargos can both be real: a distro
+  # package in /usr/bin and a rustup one in ~/.cargo/bin, at different
+  # versions. Building dirs in name-iteration order put /usr/bin ahead of
+  # ~/.cargo/bin regardless of the caller's own PATH, so the unit could
+  # silently run a different cargo (and get different clippy lints) than the
+  # one both the caller and this repo's own CI (dtolnay/rust-toolchain) use.
+  # `"${ordered[*]}"` joins on the *current* IFS, not the ':' from the read
+  # below (that assignment scopes only to the read command) -- a colon-based
+  # substring dedup against that join silently never matches, which is how
+  # this leaked duplicate after duplicate into the PATH the first time this
+  # was written. An associative array can't have that ambiguity.
+  local -A seen=()
+  local ordered=() dir nd want
+  IFS=':' read -ra path_dirs <<< "$PATH"
+  for dir in "${path_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    want=0
+    for nd in "${needed[@]:-}"; do [[ "$nd" == "$dir" ]] && { want=1; break; }; done
+    (( want )) || continue
+    [[ -n "${seen[$dir]:-}" ]] && continue
+    seen[$dir]=1
+    ordered+=( "$dir" )
+  done
+  local uniq; uniq="$(IFS=:; printf '%s' "${ordered[*]:-}")"
   printf '%s\n' "${uniq:+${uniq}:}/usr/bin:/bin"
 }
 
