@@ -497,6 +497,31 @@ test_unit_path_line() {
   out="$(PATH="$stub:/usr/bin:/bin" bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
   has "unit_path_line: includes where a binary actually resolves from" "$out" "$stub"
   has "unit_path_line: keeps the /usr/bin:/bin fallback tail"          "$out" "/usr/bin:/bin"
+
+  # cargo lives in ~/.cargo/bin, nowhere near git/jq/python3/claude/codex --
+  # the only way its directory gets in is by reading what a tier's
+  # allowed_tools actually declares (Bash(cargo test:*), ...), same as
+  # veille-finance's real manifest does. A second stub dir stands in for
+  # ~/.cargo/bin so this is deterministic regardless of what's really
+  # installed on the machine running the suite.
+  local toolchain_dir="$FIXTURE/unitpath-toolchain"; mkdir -p "$toolchain_dir"
+  : > "$toolchain_dir/toolchain-probe"; chmod +x "$toolchain_dir/toolchain-probe"
+  local tiny_manifest="$FIXTURE/unitpath/tiny-manifest.yaml"
+  cat > "$tiny_manifest" <<'YAML'
+version: 1
+tiers:
+  tier1:
+    allowed_tools: Bash(toolchain-probe:*) Bash(git:*)
+tasks: {}
+repos: []
+community: []
+YAML
+  # Real python3 must resolve here (not the empty stub above) to actually
+  # parse the YAML, so $stub is deliberately left out of this PATH.
+  out="$(PATH="$toolchain_dir:/usr/bin:/bin" MEUTE_MANIFEST="$tiny_manifest" \
+         bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  has "unit_path_line: also includes a directory a tier's allowed_tools names" \
+      "$out" "$toolchain_dir"
 }
 
 # dedup_dirs backs the one line in `doctor` that used to crash it: `grep -v`
