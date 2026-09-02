@@ -509,6 +509,29 @@ unit_path_line() {
     path="$(command -v "$bin" 2>/dev/null)" || continue
     dirs+=( "$(dirname "$path")" )
   done
+  # The fixed list above is meute's own hard dependencies -- it has no way to
+  # know a given repo's toolchain. Found live: veille-finance's lint-sweep
+  # blocked under the timer because cargo (~/.cargo/bin, nowhere near
+  # git/jq/python3/claude/codex) was missing from the unit's PATH, even though
+  # the manifest already declares it needs `cargo` via each tier's
+  # allowed_tools (Bash(cargo test:*), ...). Derive from that instead of
+  # guessing a second fixed list that would just be wrong on a different repo.
+  local word
+  while IFS= read -r word; do
+    [[ -n "$word" ]] || continue
+    path="$(command -v "$word" 2>/dev/null)" || continue
+    dirs+=( "$(dirname "$path")" )
+  done < <(python3 -c "
+import re, sys, yaml
+d = yaml.safe_load(open(sys.argv[1])) or {}
+seen = set()
+for tier in (d.get('tiers') or {}).values():
+    for m in re.finditer(r'Bash\(([^:)]+)', tier.get('allowed_tools') or ''):
+        w = m.group(1).split()[0]
+        if not w.startswith('.') and not w.startswith('/'):
+            seen.add(w)
+print('\n'.join(sorted(seen)))
+" "$MANIFEST" 2>/dev/null)
   local uniq; uniq="$(printf '%s\n' "${dirs[@]:-}" | awk 'NF && !seen[$0]++' | paste -sd: -)"
   printf '%s\n' "${uniq:+${uniq}:}/usr/bin:/bin"
 }

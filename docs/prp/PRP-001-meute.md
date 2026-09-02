@@ -490,6 +490,27 @@ unattended anywhere: it is the operator's own session credential. Deploying
 the tracker is therefore a task with a mandatory human step in the middle, not
 something to automate through.
 
+**`unit_path_line`'s fixed list was still a fixed list, one level down.**
+Deriving the timer's PATH from `git jq python3 claude codex` fixed the
+specific hardcoded-layout bug, but it is exactly as fixed a guess as the
+string it replaced — just a better one, and only for meute's own five hard
+dependencies. It has no way to know what an individual *repo* needs. Found
+live: veille-finance's daily `lint-sweep` blocked under the timer because
+`cargo` (`~/.cargo/bin`, nowhere near any of those five) was missing from the
+unit's PATH — the run correctly reported itself blocked rather than silently
+skipping, cost nothing, and named the exact cause, but it's still a repo the
+fleet could not actually work on.
+
+The fix does not add `cargo` to the guess list — that repeats the mistake one
+binary later, for the next repo's toolchain. It reads what the manifest
+already declares: every tier's `allowed_tools` names its own commands
+(`Bash(cargo test:*)`, `Bash(pytest:*)`, ...) precisely because those are the
+commands a run is allowed to execute. `unit_path_line` now extracts the first
+word of each `Bash(...)` entry across all tiers and resolves it the same way
+as the fixed five, so the unit's PATH always covers whatever every configured
+tier is actually permitted to run — no separate list to fall out of sync with
+the manifest again.
+
 ## 12. Phase status
 
 Built and accepted:
