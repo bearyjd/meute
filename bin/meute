@@ -311,7 +311,25 @@ cmd_promote() {
   mark_finding "$id" "$number" "actioned" "promoted -> ${ticket_id}"
   close_report_if_settled "$id"
   note "ticket ${ticket_id} written to state/tickets.yaml (specced: true)"
-  note "tier-3 will pick it up next weekly slot ($(( TIER3_CAP - in_flight - 1 )) of ${TIER3_CAP} slots left)"
+
+  # Writing the ticket is not the same as it ever being drafted -- that needs
+  # some task in this repo's own list to actually consume specced tickets.
+  # Found the hard way: BB-1 sat promoted for a repo with no draft-ticket task
+  # wired up at all, and this command said nothing about it.
+  local slot picked=0
+  for slot in daily weekly; do
+    if python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null \
+         | jq -e --arg r "$repo" --arg t "$ticket_id" \
+             'select(.repo == $r and .ticket_id == $t)' >/dev/null; then
+      picked=1; break
+    fi
+  done
+  if (( picked )); then
+    note "tier-3 will pick it up next weekly slot ($(( TIER3_CAP - in_flight - 1 )) of ${TIER3_CAP} slots left)"
+  else
+    note "WARNING: ${repo} has no task wired to draft specced tickets -- ${ticket_id} will sit unpicked"
+    note "  add a ticket-consuming task (e.g. draft-ticket) to ${repo}'s task list in ${MANIFEST}"
+  fi
 }
 
 # Is every change on this branch already present in the base?

@@ -98,6 +98,27 @@ Findings present.
 - **Location:** `src/web.py:14`
 MD
 
+  # beta has no draft-ticket task wired (tasks: [gen-tests] only) -- promoting
+  # a finding here must warn, not silently write a ticket nothing will draft.
+  cat > "$FIXTURE/reports/beta/audit-security-2026-08-28.md" <<'MD'
+---
+repo: beta
+task: audit-security
+tier: tier2
+lens: injection
+started: 2026-08-28T03:00:00-04:00
+status: ok
+---
+
+## Summary
+Findings present.
+
+## Findings
+
+### [HIGH] Unvalidated redirect
+- **Location:** `src/web.py:40`
+MD
+
   cat > "$FIXTURE/reports/beta/gen-tests-2026-08-27.md" <<'MD'
 ---
 repo: beta
@@ -172,7 +193,7 @@ test_listing() {
   local out; out="$(meute reports --new 2>&1)"
   has "reports: lists new audit"  "$out" "alpha"
   has "reports: lists new tests"  "$out" "beta"
-  is  "reports: 4 unread"         "$(meute reports --new 2>/dev/null | grep -c '^NEW')" "4"
+  is  "reports: 5 unread"         "$(meute reports --new 2>/dev/null | grep -c '^NEW')" "5"
 }
 
 test_show_marks_read() {
@@ -210,6 +231,18 @@ t = d['tickets']['alpha'][0]; print(t['id'], t['specced'], t['source'])")"
 
   is "promote: bad finding number fails" \
      "$(meute promote alpha/audit-security-2026-08-28 -f 99 >/dev/null 2>&1; echo $?)" "1"
+
+  # beta has no task wired to consume specced tickets (tasks: [gen-tests] only).
+  # Writing BT-1 there is a real ticket that will sit unpicked forever -- this
+  # is the exact shape of gap that let BB-1 (bascule-bluetooth) silently stall.
+  local out
+  out="$(meute promote beta/audit-security-2026-08-28 -f 1 2>&1)"
+  has "promote: warns when the repo has no drafting task" "$out" "no task wired to draft"
+  has "promote: still writes the ticket"                  "$out" "written to state/tickets.yaml"
+  local be1_queued
+  be1_queued="$(MEUTE_ROOT="$FIXTURE" python3 "$REPO/lib/manifest.py" queue "$FIXTURE/repos.yaml" weekly \
+                | jq -r 'select(.ticket_id=="BE-1") | .key')"
+  is "promote: and indeed it never reaches any queue" "$be1_queued" ""
 }
 
 test_cap() {
