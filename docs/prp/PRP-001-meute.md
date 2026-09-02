@@ -511,6 +511,35 @@ as the fixed five, so the unit's PATH always covers whatever every configured
 tier is actually permitted to run — no separate list to fall out of sync with
 the manifest again.
 
+**Fixing that exposed a subtler bug in the fix itself, on the same machine.**
+This box has *two* real `cargo`s at different versions: a distro package in
+`/usr/bin` (1.97.1) and rustup's in `~/.cargo/bin` (1.95.0) — the same one the
+repo's own CI (`dtolnay/rust-toolchain@stable`) and the operator's own
+interactive shell both prefer, since `~/.cargo/bin` sits ahead of `/usr/bin`
+there. `unit_path_line` built its directory list in *name-iteration order* —
+git first, then the manifest scan alphabetically — not in the order the
+caller's own `$PATH` actually ranks them. `git` resolving to `/usr/bin` first
+put `/usr/bin` ahead of `~/.cargo/bin` regardless of what the operator's shell
+would have picked, so the unit could have run `cargo fmt`/`clippy` against a
+different toolchain than the one that's actually being developed against —
+silently, since both cargos exist and both work, just possibly disagreeing on
+which lints are warnings.
+
+Fixed by ranking the derived directories in the same order `$PATH` itself
+already does, filtered down to only the directories something actually needs.
+Trying to verify that fix then surfaced a second, purely mechanical bug in the
+same edit: `"${ordered[*]}"` joins on whatever `IFS` happens to be *at that
+point*, not the `:` a nearby `read` had set moments earlier and which had
+already gone out of scope — so a colon-substring dedup check against that join
+silently never matched, and the same directory could pile into the PATH many
+times over (this box's real interactive `$PATH` has some directories repeated
+six or more times, from stacked shell-init files, which is exactly the input
+that exposed it). An associative array closes that ambiguity by construction.
+Both properties — order-preservation and dedup surviving a directory that is
+itself repeated in the caller's `$PATH` — are now pinned by tests that failed
+against each specific mutation before the fix, not just "some test somewhere
+still passes."
+
 ## 12. Phase status
 
 Built and accepted:
