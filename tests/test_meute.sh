@@ -522,6 +522,18 @@ YAML
          bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
   has "unit_path_line: also includes a directory a tier's allowed_tools names" \
       "$out" "$toolchain_dir"
+
+  # install-timers must not fail closed just because the manifest scan can't
+  # run -- a broken or absent manifest still leaves the fixed five working.
+  local rc
+  out="$(MEUTE_MANIFEST="$FIXTURE/unitpath/nope.yaml" bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"; rc=$?
+  is  "unit_path_line: a missing manifest does not abort" "$rc" "0"
+  has "unit_path_line: ...and still yields the fallback tail" "$out" "/usr/bin:/bin"
+
+  printf 'not: valid: yaml: [[[\n' > "$FIXTURE/unitpath/broken.yaml"
+  out="$(MEUTE_MANIFEST="$FIXTURE/unitpath/broken.yaml" bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"; rc=$?
+  is  "unit_path_line: an unparseable manifest does not abort" "$rc" "0"
+  has "unit_path_line: ...and still yields the fallback tail (broken)" "$out" "/usr/bin:/bin"
 }
 
 # dedup_dirs backs the one line in `doctor` that used to crash it: `grep -v`
