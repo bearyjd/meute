@@ -316,11 +316,17 @@ cmd_promote() {
   # some task in this repo's own list to actually consume specced tickets.
   # Found the hard way: BB-1 sat promoted for a repo with no draft-ticket task
   # wired up at all, and this command said nothing about it.
-  local slot picked=0
+  local slot picked=0 queue_out
   for slot in daily weekly; do
-    if python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null \
-         | jq -e --arg r "$repo" --arg t "$ticket_id" \
-             'select(.repo == $r and .ticket_id == $t)' >/dev/null; then
+    # Merging stderr in (rather than the 2>/dev/null used elsewhere) is
+    # deliberate: cmd_queue in lib/manifest.py never writes anything but JSON
+    # lines to stdout on success, so a real failure here must not read the
+    # same as "no task consumes this ticket" -- that would be the same
+    # mistake as detail=success for an is_error:true run, just in this file.
+    queue_out="$(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>&1)" \
+      || die "promote: could not verify the ${slot} queue: ${queue_out}"
+    if jq -e --arg r "$repo" --arg t "$ticket_id" \
+         'select(.repo == $r and .ticket_id == $t)' <<< "$queue_out" >/dev/null 2>&1; then
       picked=1; break
     fi
   done

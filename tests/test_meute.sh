@@ -207,9 +207,16 @@ test_show_marks_read() {
 test_promote() {
   local before after ticket
   before="$(md5sum "$FIXTURE/repos.yaml" | cut -d' ' -f1)"
-  meute promote alpha/audit-security-2026-08-28 -f 1 >/dev/null 2>&1
+  local promote_out
+  promote_out="$(meute promote alpha/audit-security-2026-08-28 -f 1 2>&1)"
   after="$(md5sum "$FIXTURE/repos.yaml" | cut -d' ' -f1)"
   is "promote: repos.yaml never written" "$after" "$before"
+  # alpha DOES have draft-ticket wired -- pins the other side of the branch the
+  # beta case below exercises. Without this, inverting the condition only
+  # trips the beta assertion; alpha would silently get the wrong message too.
+  has "promote: a repo with a drafting task gets the real message, not the warning" \
+      "$promote_out" "tier-3 will pick it up next weekly slot"
+  hasnt "promote: ...and not the warning" "$promote_out" "no task wired to draft"
 
   ticket="$(python3 -c "
 import yaml; d = yaml.safe_load(open('$FIXTURE/state/tickets.yaml'))
