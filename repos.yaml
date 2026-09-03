@@ -119,6 +119,16 @@ tiers:
     tools: "Read,Grep,Glob"
     permission_mode: dontAsk
     writes_code: false
+  tier2-web:
+    description: >-
+      Autonomous reports for async reading. Same as tier2, plus the public
+      web via WebSearch/WebFetch. No Bash: WebSearch/WebFetch results are
+      untrusted third-party content, and this tier cannot act on them beyond
+      writing them into a report a human reads later -- it cannot shell out
+      on the strength of something a fetched page said.
+    tools: "Read,Grep,Glob,WebSearch,WebFetch"
+    permission_mode: dontAsk
+    writes_code: false
   tier2-scout:
     description: Reads GitHub through gh. Never modifies a repo, never writes to a project.
     tools: "Read,Grep,Glob,Bash"
@@ -157,6 +167,13 @@ tasks:
     slots: [weekly]        # structural drift moves slowly; daily would be noise
     model: opus            # same reasoning as audit-security: narrow, high stakes
     lenses: [coupling, layering, duplication, boundaries]
+
+  market-comparison:
+    tier: tier2-web         # the only task that needs the public web
+    template: tasks/market-comparison.md
+    slots: [weekly]        # the market doesn't move daily either
+    model: opus            # same reasoning as the other tier-2 reports
+    lenses: [direct-alternatives, feature-gap, approach-divergence]
 
   # Tier 3. Only touches tickets marked `specced: true` — either hand-written
   # below, or promoted from a report by `meute promote`. Capped in flight by
@@ -217,10 +234,12 @@ tasks:
     model: opus
     allowed_tools: *verify_and_gh
 
-  # ---- phase 2: uncomment as the templates land ---------------------------
-  # review-arch:       { tier: tier2, template: tasks/review-arch.md,       slots: [weekly] }
-  # market-compare:    { tier: tier2, template: tasks/market-compare.md,    slots: [weekly] }
-  # feature-brainstorm:{ tier: tier2, template: tasks/feature-brainstorm.md,slots: [weekly] }
+  # ---- phase 2 ------------------------------------------------------------
+  # architecture-review and market-comparison are built above. "feature
+  # brainstorm" is deliberately not: unlike every other task here, free-form
+  # brainstorming has no falsifiability anchor (nothing to point at that
+  # confirms or refutes an idea), which conflicts with this fleet's own rule
+  # that inventing a finding is worse than finding none. See docs/prp/PRP-001-meute.md §11.
 
 # ---------------------------------------------------------------------------
 # My repos. First claim on every slot.
