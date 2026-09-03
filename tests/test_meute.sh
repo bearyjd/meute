@@ -349,6 +349,67 @@ PY
   has "architecture-review: the lens rotation is wired" "$(jq -c '.lenses' <<< "$entry")" "coupling"
 }
 
+# market-comparison is the one task that needs the public web, so it gets its
+# own tier (tier2-web) rather than adding WebSearch/WebFetch to plain tier2 --
+# the assertion that matters here is that audit-security and
+# architecture-review, sharing this same fixture manifest, do NOT pick up
+# network tools just because a sibling task's tier gained them.
+test_market_comparison_queued() {
+  local root="$FIXTURE/market-comparison"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/market-comparison.md" "$REPO/tasks/architecture-review.md" "$root/tasks/"
+  mkdir -p "$root/git-delta"
+  git -C "$root/git-delta" init -q -b main
+  echo x > "$root/git-delta/f.txt"
+  git -C "$root/git-delta" add -A
+  git -C "$root/git-delta" -c user.email=t@t -c user.name=t commit -qm init
+
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {
+        "tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False},
+        "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk", "writes_code": False},
+    },
+    "tasks": {
+        "architecture-review": {
+            "tier": "tier2", "template": "tasks/architecture-review.md",
+            "slots": ["weekly"], "lenses": ["coupling"],
+        },
+        "market-comparison": {
+            "tier": "tier2-web", "template": "tasks/market-comparison.md",
+            "slots": ["weekly"], "model": "opus",
+            "lenses": ["direct-alternatives", "feature-gap", "approach-divergence"],
+        },
+    },
+    "repos": [{"name": "delta", "path": str(root / "git-delta"), "spec": "fixture delta",
+               "tasks": ["architecture-review", "market-comparison"]}],
+    "community": [],
+}, open(root / "repos.yaml", "w"), sort_keys=False)
+PY
+
+  local mc_entry ar_entry
+  mc_entry="$(python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.task=="market-comparison")')"
+  ar_entry="$(python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.task=="architecture-review")')"
+
+  is  "market-comparison: runs at tier2-web"          "$(jq -r '.tier' <<< "$mc_entry")" "tier2-web"
+  is  "market-comparison: writes_code is false"       "$(jq -r '.writes_code' <<< "$mc_entry")" "false"
+  is  "market-comparison: uses the model set for it"  "$(jq -r '.model' <<< "$mc_entry")" "opus"
+  has "market-comparison: gets WebSearch"              "$(jq -r '.tools' <<< "$mc_entry")" "WebSearch"
+  has "market-comparison: gets WebFetch"                "$(jq -r '.tools' <<< "$mc_entry")" "WebFetch"
+  has "market-comparison: the lens rotation is wired"  "$(jq -c '.lenses' <<< "$mc_entry")" "direct-alternatives"
+  hasnt "market-comparison: no Bash, can't act on fetched content" "$(jq -r '.tools' <<< "$mc_entry")" "Bash"
+
+  hasnt "architecture-review: does NOT inherit WebSearch from a sibling task" \
+        "$(jq -r '.tools' <<< "$ar_entry")" "WebSearch"
+}
+
 
 # The community track's gates: no etiquette file means no contribution, and the
 # reproduce/draft stages sit on opposite sides of the human specced: true gate.
@@ -1125,6 +1186,7 @@ test_branch_prune
 test_finding_level_triage
 test_public_manifest_valid
 test_architecture_review_queued
+test_market_comparison_queued
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

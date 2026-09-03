@@ -540,6 +540,45 @@ itself repeated in the caller's `$PATH` — are now pinned by tests that failed
 against each specific mutation before the fix, not just "some test somewhere
 still passes."
 
+**Wiring WebSearch for market comparison meant answering two questions
+first, not adding a tool name.** The line item in §12 named the tool
+dependency but not the two things that actually gated it:
+
+1. *Does WebSearch reintroduce metered billing?* `lib/preflight.sh` exists
+   specifically to guarantee meute never runs on anything but a subscription
+   — it strips API keys from the child env and refuses to start otherwise.
+   The Anthropic API prices the web-search server tool at $10/1,000 searches,
+   but that rate applies to API-key billing; Claude Code's own docs describe
+   Pro/Max usage as included in the subscription with no separate per-tool
+   line item, and preflight already guarantees every meute invocation
+   authenticates via subscription, not a key. So WebSearch draws from the
+   same subscription-usage pool `bin/quota.sh` already gates on — more tokens
+   per run, not a new billing surface. Confirmed against Claude Code's
+   `docs/en/costs` page, not inferred.
+2. *Should a `dontAsk` tier reach the network unsupervised at all?* Yes, with
+   a scoped blast radius, not a blanket yes for tier2. Reaching the web means
+   an unattended agent reads content it doesn't control, which could contain
+   injected instructions — but tier2/tier2-web have no Bash, Edit, or Write,
+   so the worst a hostile page can do is shape the text of a report a human
+   reads later, not execute anything or touch a repo. That's the same
+   blast-radius argument `tier2-scout` already relies on for read-only `gh`
+   access. Consistent with that precedent, WebSearch/WebFetch went into a new
+   `tier2-web` tier rather than onto `tier2` itself — `tools` is resolved
+   per-tier, not per-task (`lib/manifest.py:build_entry`), so adding it to
+   `tier2` directly would have silently handed network access to
+   audit-security and architecture-review too. Pinned by
+   `test_market_comparison_queued`, which asserts the sibling
+   architecture-review entry in the same fixture manifest does NOT pick up
+   WebSearch.
+
+**"Feature brainstorm" turned out not to have a spec to build against.** The
+one line naming it in §12 was the only place it appeared anywhere in the
+repo — no fuller description in this doc's history, no mention in PRP-002,
+nothing in `.claude/PRPs/`. Building a template for it without one would have
+meant inventing the very falsifiability bar the other three tier-2 tasks
+exist to enforce. See the Phase 2 status note below for the actual reasoning
+and what replaces it if it's ever wanted.
+
 ## 12. Phase status
 
 Built and accepted:
@@ -570,10 +609,33 @@ Built and accepted:
   `tasks/conventions.md` — the tier-1 maintenance set. Each carries an explicit
   decline path (see below).
 
-Phase 2, in rough priority order:
+- `tasks/architecture-review.md` (tier 2, rotating lens: coupling, layering,
+  duplication, boundaries) — same falsifiability discipline as audit-security,
+  adapted from "trace input to sink" to "name evidence a skeptical reader can
+  count or reproduce"
 
-- Remaining tier-2 templates: architecture review, market comparison (needs
-  WebSearch in the tier tool set), feature brainstorm
+- `tasks/market-comparison.md` (tier `tier2-web`, rotating lens:
+  direct-alternatives, feature-gap, approach-divergence) — the one task that
+  reaches the public web. Given its own tier rather than added to plain tier2
+  so audit-security and architecture-review don't inherit network tools as a
+  side effect; see the finding below on why it's `tier2-web` and not a
+  `tools` addition to `tier2` itself, and why the billing question is settled.
+
+Phase 2 status: architecture review and market comparison are built. What's
+left:
+
+- **Feature brainstorm — not building it, on purpose.** Every other tier-2
+  task has a falsifiability anchor: audit-security traces input to sink,
+  architecture-review requires a countable artifact (grep, import graph,
+  co-change log), market-comparison requires a live, citable URL. Free-form
+  "brainstorm new features" has no such anchor — there's nothing external a
+  skeptical reader can check an idea against, which conflicts directly with
+  this fleet's own rule (§11) that inventing a finding is worse than finding
+  none. The rigorous version of "feature brainstorm" is really a fifth
+  *finder* — "find unfinished work": TODOs, stubbed endpoints, config parsed
+  but never used. That's a legitimate task, just not this one; build it under
+  its own honest name if it's ever wanted, don't build "brainstorm" as a
+  wrapper around it.
 
 ## 13. Acceptance
 
