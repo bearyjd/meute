@@ -151,6 +151,13 @@ tasks:
     # lens narrow is what makes the finding density worth reading.
     lenses: [auth, input-parsing, injection, dependency-risk]
 
+  architecture-review:
+    tier: tier2
+    template: tasks/architecture-review.md
+    slots: [weekly]        # structural drift moves slowly; daily would be noise
+    model: opus            # same reasoning as audit-security: narrow, high stakes
+    lenses: [coupling, layering, duplication, boundaries]
+
   # Tier 3. Only touches tickets marked `specced: true` — either hand-written
   # below, or promoted from a report by `meute promote`. Capped in flight by
   # policy.tier3_max_in_flight.

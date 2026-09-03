@@ -293,6 +293,62 @@ test_real_repo_untouched() {
   is "the real state/ and reports/ were never touched" "$now" "$REAL_STATE_BEFORE"
 }
 
+# repos.yaml is the tracked schema documentation (repos: [] / community: [] --
+# no live projects), which is exactly why nothing else in this suite exercises
+# it: every other test builds its own throwaway manifest. Nothing previously
+# caught a broken edit to the real file itself.
+test_public_manifest_valid() {
+  local out; out="$(python3 "$REPO/lib/manifest.py" validate "$REPO/repos.yaml" 2>&1)"
+  is  "repos.yaml: the tracked schema doc stays valid" "$?" "0"
+  has "repos.yaml: confirms which file"                "$out" "repos.yaml"
+}
+
+# architecture-review is wired the same way audit-security already is (tier2,
+# lens rotation via the generic queue mechanism) -- this pins that the new
+# task definition itself is shaped correctly, not the rotation mechanism,
+# which audit-security's own fixtures already exercise.
+test_architecture_review_queued() {
+  local root="$FIXTURE/arch-review"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/architecture-review.md" "$root/tasks/"
+  mkdir -p "$root/git-gamma"
+  git -C "$root/git-gamma" init -q -b main
+  echo x > "$root/git-gamma/f.txt"
+  git -C "$root/git-gamma" add -A
+  git -C "$root/git-gamma" -c user.email=t@t -c user.name=t commit -qm init
+
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {
+        "architecture-review": {
+            "tier": "tier2", "template": "tasks/architecture-review.md",
+            "slots": ["weekly"], "model": "opus",
+            "lenses": ["coupling", "layering", "duplication", "boundaries"],
+        },
+    },
+    "repos": [{"name": "gamma", "path": str(root / "git-gamma"), "spec": "fixture gamma",
+               "tasks": ["architecture-review"]}],
+    "community": [],
+}, open(root / "repos.yaml", "w"), sort_keys=False)
+PY
+
+  local entry
+  entry="$(python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.repo=="gamma")')"
+  is  "architecture-review: reaches the weekly queue" "$(jq -r '.task' <<< "$entry")" "architecture-review"
+  is  "architecture-review: runs at tier2, read-only" "$(jq -r '.tier' <<< "$entry")" "tier2"
+  is  "architecture-review: writes_code is false"     "$(jq -r '.writes_code' <<< "$entry")" "false"
+  is  "architecture-review: uses the model set for it" "$(jq -r '.model' <<< "$entry")" "opus"
+  has "architecture-review: the lens rotation is wired" "$(jq -c '.lenses' <<< "$entry")" "coupling"
+}
+
 
 # The community track's gates: no etiquette file means no contribution, and the
 # reproduce/draft stages sit on opposite sides of the human specced: true gate.
@@ -1067,6 +1123,8 @@ test_self_budget
 test_manifest_ceiling
 test_branch_prune
 test_finding_level_triage
+test_public_manifest_valid
+test_architecture_review_queued
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))
