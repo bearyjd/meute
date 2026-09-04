@@ -170,6 +170,30 @@ status: error
 
 **Status:** error — engine exited 124
 MD
+
+  # Dedicated to test_resolve -- its own report/finding, untouched by anything
+  # else, so marking it doesn't disturb test_finding_level_triage's assumption
+  # that alpha/audit-security-2026-08-28's own findings stay untouched by
+  # other tests until it runs.
+  cat > "$FIXTURE/reports/alpha/audit-security-2026-08-30.md" <<'MD'
+---
+repo: alpha
+task: audit-security
+tier: tier2
+lens: input-parsing
+started: 2026-08-30T03:00:00-04:00
+status: ok
+---
+
+## Summary
+Findings present.
+
+## Findings
+
+### [HIGH] Unescaped notes field corrupts the section parser
+- **Location:** `src/journal.py:130`
+MD
+
   : > "$FIXTURE/state/log"
 }
 
@@ -193,7 +217,7 @@ test_listing() {
   local out; out="$(meute reports --new 2>&1)"
   has "reports: lists new audit"  "$out" "alpha"
   has "reports: lists new tests"  "$out" "beta"
-  is  "reports: 5 unread"         "$(meute reports --new 2>/dev/null | grep -c '^NEW')" "5"
+  is  "reports: 6 unread"         "$(meute reports --new 2>/dev/null | grep -c '^NEW')" "6"
 }
 
 test_show_marks_read() {
@@ -283,6 +307,24 @@ test_dismiss_and_edges() {
 
   has "status: runs without error" "$(meute status 2>&1)" "tier-3 in flight"
   is  "unknown command exits 1"    "$(meute frobnicate >/dev/null 2>&1; echo $?)" "1"
+}
+
+# resolve is for a finding fixed directly (a PR against the target repo), not
+# routed through promote's tier-3 ticket flow. The outcome must be "actioned",
+# distinct from dismiss's "dismissed" -- dismissing something that was
+# actually fixed would record the opposite of what happened.
+test_resolve() {
+  local rc
+  meute resolve alpha/audit-security-2026-08-30 -f 1 >/dev/null 2>&1; rc=$?
+  is "resolve: refuses without -m" "$rc" "1"
+
+  meute resolve alpha/audit-security-2026-08-30 -f 1 -m "fixed in owner/repo#2" >/dev/null 2>&1
+  local row; row="$(grep 'alpha/audit-security-2026-08-30#1' "$FIXTURE/state/reports")"
+  is  "resolve: recorded as actioned, not dismissed" "$(awk -F'\t' '{print $2}' <<< "$row")" "actioned"
+  has "resolve: the message is kept"                  "$row" "fixed in owner/repo#2"
+
+  has "resolve: report closes (single finding, now settled)" \
+      "$(meute reports --all 2>/dev/null | grep '2026-08-30')" "actioned"
 }
 
 # Compares against a snapshot taken before the suite ran, rather than demanding a
@@ -1339,6 +1381,7 @@ test_show_marks_read
 test_promote
 test_cap
 test_dismiss_and_edges
+test_resolve
 test_community_gates
 test_quota_gate
 test_doctor

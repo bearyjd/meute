@@ -12,6 +12,9 @@
 #   findings [--new|--all]        one row per finding — the actual unit of decision
 #   show <id>                     print a report to stdout and mark it read
 #   promote <id> -f <n> [-t T]    turn finding <n> into a tier-3 specced ticket
+#   resolve <id> [-f <n>] -m <text>
+#                                 record that a finding was already fixed directly
+#                                 (no ticket) -- -m is required, e.g. a PR link
 #   dismiss <id> [-f <n>] -r <reason> [-m <text>]
 #                                 record a decision; -r is required and is one of
 #                                 false-positive wont-fix out-of-scope duplicate too-large other
@@ -63,7 +66,7 @@ ENGINE_ENV=()
 
 note() { printf 'meute: %s\n' "$*" >&2; }
 die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+usage() { sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
 
 # --------------------------------------------------------------------------
 # Reports on disk are the source of truth. state/reports only annotates them:
@@ -229,6 +232,36 @@ cmd_show() {
   cat "$(report_path "$id")"
   [[ "$(report_state "$id")" == "new" ]] && mark "$id" "read"
   return 0
+}
+
+# For when a finding got fixed directly (a PR against the target repo,
+# outside meute's own tier-3 draft flow) rather than promoted into a ticket
+# for the fleet to draft later. Same shape as cmd_dismiss, but the outcome is
+# "actioned", not "dismissed" -- dismissing a finding that was actually fixed
+# would record the opposite of what happened.
+cmd_resolve() {
+  local id="${1:-}"; shift || true
+  local number="" note_text=""
+  while (( $# )); do
+    case "$1" in
+      -f|--finding) number="${2:?-f needs a finding number}"; shift ;;
+      -m|--message) note_text="${2:?-m needs text}"; shift ;;
+      *) die "resolve: unknown argument $1" ;;
+    esac
+    shift
+  done
+  require_report "$id"
+  [[ -n "$note_text" ]] || die "resolve: -m <text> is required (what was done, e.g. a PR link)"
+
+  if [[ -n "$number" ]]; then
+    [[ "$number" =~ ^[0-9]+$ ]] || die "resolve: -f takes a finding number"
+    mark_finding "$id" "$number" "actioned" "resolved: ${note_text}"
+    close_report_if_settled "$id"
+    note "resolved finding ${number} of ${id}"
+  else
+    mark "$id" "actioned" "resolved: ${note_text}"
+    note "resolved ${id}"
+  fi
 }
 
 cmd_dismiss() {
@@ -943,6 +976,7 @@ main() {
     findings) cmd_findings "$@" ;;
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;
+    resolve)  cmd_resolve "$@" ;;
     dismiss)  cmd_dismiss "$@" ;;
     branches) cmd_branches "$@" ;;
     pause)    cmd_pause "$@" ;;
