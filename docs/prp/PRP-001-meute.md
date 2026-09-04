@@ -594,6 +594,18 @@ Built and accepted:
   `tasks/draft-ticket.md` (tier 3, specced tickets only)
 - `lib/artifacts.gitignore`
 - `contrib/quota-llm-usage-tracker.sh` — a real quota source adapter
+- `meute discover [dir]` — scans a directory (default `~/Documents/vibe-code`)
+  for git repos not yet in the manifest and adds the ones you pick,
+  interactively. `lib/manifest.py add-repo` is the mechanism underneath:
+  validates the *merged* document the same way `validate` does before ever
+  touching disk, backs up the manifest first, and hard-refuses to write
+  `repos.yaml` itself (only `repos.local.yaml` is a legal target — checked by
+  filename, not by convention). Excludes meute-ai-trader's own checkout from
+  the candidate list, which matters in practice: it typically lives inside
+  the same directory it's asked to scan. Newly discovered repos default to
+  only the read-only tier-2 tasks (`audit-security`, `architecture-review`,
+  `market-comparison`) — a fresh repo's toolchain is unknown, and a tier-1
+  task like `lint-sweep` against the wrong linter burns a slot for nothing.
 - `bin/meute` — review and triage CLI: report lifecycle (new/read/actioned/
   dismissed) and `promote`, which converts a tier-2 finding into a tier-3
   `specced: true` ticket. Plan: `.claude/PRPs/plans/meute-report-lifecycle-cli.plan.md`

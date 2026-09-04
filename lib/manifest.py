@@ -10,6 +10,9 @@ Subcommands
     policy   <manifest>              -- policy block as a single JSON object
     queue    <manifest> <slot>       -- candidate work items, one JSON object per line
     render   <template> KEY=VAL ...  -- substitute {{KEY}} placeholders, print to stdout
+    list-repos <manifest>            -- name+path for every repo, one JSON object per line
+    list-tasks <manifest>            -- name+tier+writes_code for every task, one JSON object per line
+    add-repo <manifest> <json>       -- append a repo; refuses to write repos.yaml
 
 The queue is *candidates only*. Gating that depends on live repo state (weekly
 community share, tier-3 in-flight cap, cursor position) belongs to run.sh.
@@ -459,6 +462,116 @@ def cmd_add_ticket(args: list) -> int:
     return 0
 
 
+def cmd_list_repos(args: list) -> int:
+    """Raw name+path for every configured repo, personal and community.
+
+    Deliberately does not validate or expand tasks/tickets -- `meute discover`
+    only needs this to dedup against paths already configured, and a manifest
+    with one broken entry elsewhere must not block that.
+    """
+    data = load(args[0])
+    for key in ("repos", "community"):
+        for project in data.get(key) or []:
+            if not isinstance(project, dict) or not project.get("path"):
+                continue
+            print(json.dumps({
+                "kind": key,
+                "name": project.get("name", ""),
+                "path": expand(str(project["path"])),
+            }))
+    return 0
+
+
+def cmd_list_tasks(args: list) -> int:
+    """name + tier + writes_code for every declared task, for `meute discover`'s picker."""
+    data = load(args[0])
+    tiers = checked_tiers(data)
+    tasks = data.get("tasks")
+    if not isinstance(tasks, dict):
+        raise ManifestError("tasks: must be a mapping")
+    for name, task in tasks.items():
+        tier = tiers.get(task.get("tier")) if isinstance(task, dict) else None
+        print(json.dumps({
+            "name": name,
+            "tier": task.get("tier") if isinstance(task, dict) else None,
+            "writes_code": bool(tier["writes_code"]) if tier else None,
+        }))
+    return 0
+
+
+def cmd_add_repo(args: list) -> int:
+    """Append one repo to a personal manifest. Refuses to touch repos.yaml.
+
+    repos.yaml is the tracked schema doc, hand-written and commented; PyYAML
+    cannot round-trip it without destroying those comments (see
+    load_machine_tickets's docstring for the same reasoning applied to
+    tickets). repos.local.yaml is gitignored and already machine-editable --
+    that split is exactly why this command exists as a separate path instead
+    of extending add-ticket.
+    """
+    manifest, payload = args[0], args[1]
+    if os.path.basename(manifest) == "repos.yaml":
+        raise ManifestError(
+            "add-repo: refusing to write repos.yaml (tracked schema doc, hand-commented). "
+            "Create repos.local.yaml first -- e.g. `cp repos.yaml repos.local.yaml` -- "
+            "it's gitignored, so no PR is needed for what you add to it.")
+    root = repo_root(manifest)
+
+    try:
+        fields = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ManifestError(f"add-repo: payload is not valid JSON: {error}") from error
+    if not isinstance(fields, dict):
+        raise ManifestError("add-repo: payload must be a JSON object")
+    name = fields.get("name")
+    if not name or not SAFE_NAME.match(str(name)):
+        raise ManifestError(f"add-repo: name {name!r} must match {SAFE_NAME.pattern}")
+    if not fields.get("path"):
+        raise ManifestError("add-repo: path is required")
+    if not fields.get("spec"):
+        raise ManifestError("add-repo: spec is required (one line, injected into every prompt)")
+
+    data = load(manifest)
+    new_path = expand(str(fields["path"]))
+    for key in ("repos", "community"):
+        for project in data.get(key) or []:
+            if not isinstance(project, dict):
+                continue
+            if project.get("name") == name:
+                raise ManifestError(f"add-repo: name {name!r} is already configured under {key}")
+            if project.get("path") and expand(str(project["path"])) == new_path:
+                raise ManifestError(
+                    f"add-repo: path {new_path!r} is already configured as "
+                    f"{project.get('name')!r} under {key}")
+
+    new_project = {"name": name, "path": fields["path"], "spec": fields["spec"]}
+    if fields.get("default_branch"):
+        new_project["default_branch"] = fields["default_branch"]
+    new_project["tasks"] = list(fields.get("tasks") or [])
+
+    new_data = {**data, "repos": list(data.get("repos") or []) + [new_project]}
+
+    # Validate the *merged* document, the same way `validate` does, before
+    # touching disk -- a bad payload must never leave the real file corrupt
+    # or half-written.
+    tiers = checked_tiers(new_data)
+    tasks = checked_tasks(new_data, tiers, root)
+    checked_projects(new_data, "repos", tasks, root)
+    merged_policy(new_data)
+    for slot in VALID_SLOTS:
+        build_queue(new_data, slot, root)
+
+    backup = f"{manifest}.bak"
+    with open(manifest, "r", encoding="utf-8") as handle:
+        original = handle.read()
+    with open(backup, "w", encoding="utf-8") as handle:
+        handle.write(original)
+    with open(manifest, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(new_data, handle, sort_keys=False, default_flow_style=False)
+    print(name)
+    return 0
+
+
 def cmd_mark_delivered(args: list) -> int:
     """Retire a machine-written ticket once tier 3 has produced a branch for it.
 
@@ -502,6 +615,9 @@ COMMANDS = {
     "render": (cmd_render, 1),
     "add-ticket": (cmd_add_ticket, 3),
     "mark-delivered": (cmd_mark_delivered, 4),
+    "list-repos": (cmd_list_repos, 1),
+    "list-tasks": (cmd_list_tasks, 1),
+    "add-repo": (cmd_add_repo, 2),
 }
 
 
