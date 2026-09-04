@@ -410,6 +410,175 @@ PY
         "$(jq -r '.tools' <<< "$ar_entry")" "WebSearch"
 }
 
+# lib/manifest.py add-repo is the mechanism `meute discover` writes through.
+# Tested directly (no stdin plumbing) so the invariants that matter -- refuses
+# repos.yaml, dedups, validates before ever touching disk -- are pinned at the
+# unit that actually enforces them.
+test_add_repo() {
+  local root="$FIXTURE/add-repo"
+  mkdir -p "$root"/tasks
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  local g
+  for g in git-existing git-newcomer; do
+    mkdir -p "$root/$g"
+    git -C "$root/$g" init -q -b main
+    echo x > "$root/$g/f.txt"
+    git -C "$root/$g" add -A
+    git -C "$root/$g" -c user.email=t@t -c user.name=t commit -qm init
+  done
+
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
+    "repos": [{"name": "existing", "path": str(root / "git-existing"), "spec": "already here",
+               "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+  local manifest="$root/repos.local.yaml"
+  export MEUTE_ROOT="$root"
+
+  local before after out
+  before="$(cat "$manifest")"
+
+  out="$(python3 "$REPO/lib/manifest.py" add-repo "$REPO/repos.yaml" '{"name":"x","path":"/tmp","spec":"s"}' 2>&1)"
+  has  "add-repo: refuses to write the tracked repos.yaml" "$out" "refusing to write repos.yaml"
+
+  out="$(python3 "$REPO/lib/manifest.py" add-repo "$manifest" '{"name":"existing","path":"/tmp/y","spec":"s"}' 2>&1)"
+  has  "add-repo: rejects a duplicate name"                "$out" "already configured"
+  after="$(cat "$manifest")"
+  is   "add-repo: duplicate-name rejection touches nothing" "$after" "$before"
+
+  out="$(python3 "$REPO/lib/manifest.py" add-repo "$manifest" \
+        "$(printf '{"name":"other","path":"%s","spec":"s"}' "$root/git-existing")" 2>&1)"
+  has  "add-repo: rejects a duplicate path under a new name" "$out" "already configured"
+
+  out="$(python3 "$REPO/lib/manifest.py" add-repo "$manifest" '{"name":"Not Valid","path":"/tmp/z","spec":"s"}' 2>&1)"
+  has  "add-repo: rejects an invalid name"                 "$out" "must match"
+
+  before="$(cat "$manifest")"
+  out="$(python3 "$REPO/lib/manifest.py" add-repo "$manifest" \
+        '{"name":"bad-task","path":"/tmp/z","spec":"s","tasks":["nonexistent-task"]}' 2>&1)"
+  has  "add-repo: an unknown task fails validation"        "$out" "undeclared task"
+  after="$(cat "$manifest")"
+  is   "add-repo: validation runs before any write, not after" "$after" "$before"
+
+  local added
+  added="$(python3 "$REPO/lib/manifest.py" add-repo "$manifest" \
+        "$(printf '{"name":"newcomer","path":"%s","spec":"a new one","tasks":["audit-security"]}' "$root/git-newcomer")")"
+  is   "add-repo: happy path returns the new name"          "$added" "newcomer"
+  [[ -f "${manifest}.bak" ]] && ok "add-repo: backs up the manifest before writing" \
+    || bad "add-repo: backs up the manifest before writing" "no .bak file found"
+
+  local entry
+  entry="$(python3 "$REPO/lib/manifest.py" queue "$manifest" daily | jq -c 'select(.repo=="newcomer")')"
+  is   "add-repo: the new repo actually reaches the queue" "$(jq -r '.repo' <<< "$entry")" "newcomer"
+
+  unset MEUTE_ROOT
+}
+
+# The interactive picker itself: excludes the manifest's own checkout and
+# already-configured paths, cancels cleanly, and honors both the default task
+# preselection and an explicit override.
+#
+# `universe` is the directory `discover` scans; `root` (one of its own
+# children) stands in for meute-ai-trader's own checkout -- exactly the real
+# layout, where meute-ai-trader lives inside the same ~/Documents/vibe-code
+# it's asked to scan. repo-alpha/repo-beta/already-configured are its siblings.
+test_discover() {
+  local universe="$FIXTURE/discover-universe"
+  local root="$universe/meute-stand-in"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$REPO/tasks/architecture-review.md" "$root/tasks/"
+  git -C "$root" init -q -b main
+  echo x > "$root/f.txt"; git -C "$root" add -A
+  git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+
+  local r
+  for r in repo-alpha repo-beta already-configured; do
+    mkdir -p "$universe/$r"
+    git -C "$universe/$r" init -q -b main
+    echo x > "$universe/$r/f.txt"
+    git -C "$universe/$r" add -A
+    git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
+  done
+
+  python3 - "$root" "$universe" <<'PY'
+import sys, pathlib, yaml
+root, universe = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {
+        "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]},
+        "architecture-review": {"tier": "tier2", "template": "tasks/architecture-review.md", "slots": ["weekly"]},
+    },
+    "repos": [{"name": "already-configured", "path": str(universe / "already-configured"),
+               "spec": "already here", "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+
+  local out before after
+  out="$(printf '\n' | "$root/bin/meute" discover "$universe" 2>&1)"
+  has   "discover: lists an undiscovered repo"          "$out" "repo-alpha"
+  has   "discover: lists the other undiscovered repo"   "$out" "repo-beta"
+  hasnt "discover: excludes the meute checkout itself"  "$out" "meute-stand-in"
+  hasnt "discover: excludes an already-configured path" "$out" "already-configured"
+
+  before="$(cat "$root/repos.local.yaml")"
+  printf '\n' | "$root/bin/meute" discover "$universe" >/dev/null 2>&1
+  after="$(cat "$root/repos.local.yaml")"
+  is    "discover: blank input cancels, manifest untouched" "$after" "$before"
+
+  # repo-alpha and repo-beta are the only two real candidates; select the
+  # first (alphabetically first in scan order), accept the default task
+  # preselection, then supply the required spec.
+  printf '1\n\nfixture alpha spec\n' | "$root/bin/meute" discover "$universe" >/dev/null 2>&1
+  has "discover: default selection picks up both read-only tasks" \
+      "$(python3 -c "
+import yaml
+data = yaml.safe_load(open('$root/repos.local.yaml'))
+for p in data['repos']:
+    if p['spec'] == 'fixture alpha spec':
+        print(sorted(p.get('tasks') or []))
+")" "audit-security"
+
+  # With repo-alpha now configured, only repo-beta remains -- pick it
+  # (now index 1), override tasks to just one, and confirm the pre-existing
+  # entry and manifest scaffolding survive untouched.
+  printf '1\n2\nfixture beta spec\n' | "$root/bin/meute" discover "$universe" >/dev/null 2>&1
+  local check
+  check="$(python3 - "$root/repos.local.yaml" <<'PY'
+import sys, yaml
+data = yaml.safe_load(open(sys.argv[1]))
+print("names", sorted(p["name"] for p in data["repos"]))
+print("version", data["version"])
+print("tiers", sorted(data["tiers"]))
+for p in data["repos"]:
+    if p["name"] == "already-configured":
+        print("preserved-spec", p["spec"])
+    if p["spec"] == "fixture beta spec":
+        print("beta-tasks", sorted(p.get("tasks") or []))
+PY
+)"
+  has "discover: custom task selection overrides the default" "$check" "beta-tasks ['architecture-review']"
+  has "discover: leaves the pre-existing entry intact"         "$check" "preserved-spec already here"
+  has "discover: leaves manifest scaffolding intact"           "$check" "tiers ['tier2']"
+}
+
 
 # The community track's gates: no etiquette file means no contribution, and the
 # reproduce/draft stages sit on opposite sides of the human specced: true gate.
@@ -1187,6 +1356,8 @@ test_finding_level_triage
 test_public_manifest_valid
 test_architecture_review_queued
 test_market_comparison_queued
+test_add_repo
+test_discover
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))
