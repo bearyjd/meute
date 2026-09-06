@@ -7,6 +7,9 @@ state/.cursor.*
 # Your real fleet config: names your projects and describes what they do.
 # The harness is public; that list is yours.
 repos.local.yaml
+# `manifest.py add-repo` writes this before every edit, so `meute discover`
+# is recoverable. It is a copy of the gitignored manifest; it stays out too.
+repos.local.yaml.bak
 
 # Everything about YOUR fleet stays local. The harness is public; what it
 # found in your private code, and which repos it even looks at, is not.

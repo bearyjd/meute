@@ -11,6 +11,14 @@
 #
 set -uo pipefail
 
+# Hermetic against an ambient MEUTE_ROOT. bin/meute is documented as sourceable
+# (that is how the timer helpers are tested) and sourcing it exports MEUTE_ROOT;
+# contrib/quota-self-budget.sh then deliberately prefers the inherited value
+# over deriving its own. So a shell that has sourced bin/meute makes the budget
+# tests read the REAL state/log instead of the fixture's, and five of them fail
+# with nothing to indicate why. Found exactly that way.
+unset MEUTE_ROOT
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0; FAILED=0
 FIXTURE="$(mktemp -d)"
