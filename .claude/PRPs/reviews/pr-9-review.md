@@ -69,6 +69,15 @@ None outstanding. One was found during the change and fixed in it:
   is uniform — every allowlist backing a Bash-bearing tier can hit a missing
   binary — which is easier to reason about later than a per-list carve-out.
 
+  One of the four is not symmetric with the others and the uniform rule should
+  not hide it: `gh_read_commands` backs `tier2-scout`, the only tier here at
+  `permission_mode: dontAsk` rather than `acceptEdits`. Checked rather than
+  waved through — that tier's `tools` string is `Read,Grep,Glob,Bash`, with no
+  Edit or Write, and `command -v gh` executes nothing, so the blast-radius
+  argument in that anchor's own comment ("nothing it does reaches the
+  project") is untouched. A probe that resolves a name is if anything a better
+  fit for a read-only tier than for a writing one.
+
 ### LOW
 
 - The comment deliberately does **not** claim what the original bug report
