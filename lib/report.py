@@ -80,6 +80,10 @@ def parse_findings(body: str) -> list:
     return out
 
 
+def has_findings_section(body: str) -> bool:
+    return re.search(r"^## Findings\s*$", body, re.M) is not None
+
+
 def summarise(meta: dict, body: str) -> str:
     """One line for a list view. Never raises -- an odd report still gets a row."""
     if FAILED_MARKER in body or meta.get("status") not in (None, "ok"):
@@ -87,7 +91,11 @@ def summarise(meta: dict, body: str) -> str:
         return f"run failed ({detail})"
 
     task = meta.get("task", "")
-    if task == "audit-security":
+    # Any report written to the findings contract gets counted, not just the
+    # security audit: architecture-review, market-comparison and
+    # suggest-features share the `### [SEVERITY] title` shape and were showing
+    # up as a truncated first line instead.
+    if has_findings_section(body):
         findings = parse_findings(body)
         if not findings:
             return "no findings"
@@ -123,8 +131,8 @@ def cmd_summary(args: list) -> int:
 
 def cmd_findings(args: list) -> int:
     meta, body = read(args[0])
-    if meta.get("task") == "gen-tests":
-        raise ReportError("findings: only audit-style reports carry findings")
+    if not has_findings_section(body):
+        raise ReportError("findings: this report has no Findings section")
     print(json.dumps(parse_findings(body)))
     return 0
 
