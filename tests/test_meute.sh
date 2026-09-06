@@ -1756,6 +1756,35 @@ PY2
   is  "suggest-features: registered in the public schema doc" "$pub" "tier2"
 }
 
+# discover recorded whatever branch happened to be checked out as the repo's
+# default -- five of the first twenty-one repos added were mid-feature, so
+# their audits and drafts would have been cut from unfinished work.
+test_repo_default_branch() {
+  local base="$FIXTURE/defbranch"; mkdir -p "$base"
+  mk() { # name initial-branch
+    git -C "$base" init -q -b "$2" "$1"; echo x > "$base/$1/f"
+    git -C "$base/$1" add -A; git -C "$base/$1" -c user.email=t@t -c user.name=t commit -qm init
+  }
+  local pick; pick() { bash -c "source '$REPO/bin/meute' >/dev/null 2>&1; repo_default_branch '$1'"; }
+
+  mk on-feature main; git -C "$base/on-feature" checkout -q -b feat/wip
+  is "default_branch: main wins over the checked-out feature branch" "$(pick "$base/on-feature")" "main"
+
+  mk on-master master; git -C "$base/on-master" checkout -q -b fix/x
+  is "default_branch: master when there is no main"                  "$(pick "$base/on-master")" "master"
+
+  # origin's declared default outranks a local main -- this is the case the
+  # set -e bug hid: with NO origin/HEAD the symbolic-ref fails and, unguarded,
+  # aborted the function before the main/master fallback could run.
+  mk with-origin main; git -C "$base/with-origin" checkout -q -b trunk
+  git -C "$base/with-origin" update-ref refs/remotes/origin/trunk HEAD
+  git -C "$base/with-origin" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk
+  is "default_branch: origin/HEAD outranks a local main"            "$(pick "$base/with-origin")" "trunk"
+
+  mk neither devel
+  is "default_branch: falls back to the checked-out branch"          "$(pick "$base/neither")" "devel"
+}
+
 # Pruning deletes branches. The property that matters is not "does it prune"
 # but "does it ever delete work that exists nowhere else".
 test_branch_prune() {
@@ -1863,6 +1892,7 @@ test_findings_are_content_driven
 test_suggest_features_queued
 test_add_repo
 test_discover
+test_repo_default_branch
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))
