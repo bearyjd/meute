@@ -152,18 +152,24 @@ tier3_in_flight() {
   printf '%s\n' "$count"
 }
 
-# Wire the manifest-declared ceiling, if there is one and the operator has not
-# pointed us at a real subscription probe. Returns 0 if a self-budget is now in
-# force, 1 if none applies.
+# Wire the manifest-declared ceiling, if there is one. Returns 0 if a
+# self-budget is in force (and exports the number for quota-self-budget.sh to
+# read), 1 if none applies.
 #
-# quota_floor_percent reserves headroom for the human against a real pool
-# reading. A self-budget is already meute's own allocation, so the floor would
-# double-count and make the declared number lie — budget 10 with a 30% floor
-# would stop at 7. Against a self-budget the declared ceiling IS the stop point;
-# floor 1 rather than 0, so an exhausted budget (remaining 0) still trips the
-# `remaining < floor` comparison.
+# Two gates, not one. The subscription gate (bin/quota.sh against
+# quota_floor_percent) answers "is there room in the pool the human shares?"
+# The self-budget answers "has meute taken its own agreed share this week?"
+# They measure different things and a run must clear both. This used to make
+# the self-budget *replace* the subscription probe when no MEUTE_QUOTA_CMD was
+# set, which read as "gate: ok" while knowing nothing about the pool — the
+# original goal's one hard constraint, silently unmeasured. Now the ceiling is
+# checked on its own (fleet_self_budget_remaining) and quota.sh is left to
+# find the best subscription source it can.
+#
+# The floor does not apply to the self-budget: the declared ceiling is already
+# meute's allocation, so reserving 30% headroom inside it would make budget 10
+# stop at 7. Exhausted means 0 remaining, and 0 is what stops it.
 fleet_wire_self_budget() {
-  [[ -z "${MEUTE_QUOTA_CMD:-}" ]] || return 1
   if [[ "${POLICY_WEEKLY_RUNS:-null}" != "null" && -n "${POLICY_WEEKLY_RUNS:-}" ]]; then
     export MEUTE_WEEKLY_RUNS="$POLICY_WEEKLY_RUNS"
   elif [[ "${POLICY_WEEKLY_COST:-null}" != "null" && -n "${POLICY_WEEKLY_COST:-}" ]]; then
@@ -171,7 +177,12 @@ fleet_wire_self_budget() {
   else
     return 1
   fi
-  export MEUTE_QUOTA_CMD="${MEUTE_ROOT}/contrib/quota-self-budget.sh"
-  QUOTA_FLOOR=1
   return 0
+}
+
+# Percent of meute's own declared ceiling still unspent this week. Only
+# meaningful after fleet_wire_self_budget returned 0. Fails (non-zero) if the
+# adapter cannot answer, which the caller must treat as "decline", not "fine".
+fleet_self_budget_remaining() {
+  "${MEUTE_ROOT}/contrib/quota-self-budget.sh"
 }

@@ -21,14 +21,19 @@
 # human is worse than skipping a chore.
 #
 # Sources, in precedence order:
-#   1. $MEUTE_QUOTA_CMD      external command; its stdout must be an integer 0-100
-#   2. state/quota-override  a file containing an integer; wins over the stub
-#   3. $MEUTE_QUOTA_STUB     the stub value (default 100)
+#   1. $MEUTE_QUOTA_CMD        external command; its stdout must be an integer 0-100
+#   2. state/rate-limits.json  the subscription's own 5-hour/7-day windows, as
+#                              snapshotted by the status line; read through
+#                              contrib/quota-subscription.sh. Installed by
+#                              `meute install-statusline`.
+#   3. state/quota-override    a file containing an integer; wins over the stub
+#   4. $MEUTE_QUOTA_STUB       the stub value (default 100)
 #
-# There is deliberately no built-in probe. As of Claude Code 2.1.x the remaining
-# 5-hour/weekly allowance is only exposed interactively (/usage); `claude auth
-# status --json` reports the plan tier but not the balance. Point MEUTE_QUOTA_CMD
-# at whatever source you trust and this file does not need to change.
+# No CLI subcommand exposes the balance — `claude auth status --json` reports
+# the plan tier, not the pools — but the status line's stdin JSON does, for
+# Pro/Max seats: `rate_limits.five_hour` and `rate_limits.seven_day`, each with
+# `used_percentage` and `resets_at`. Source 2 is that, captured. It is the only
+# built-in source that measures what this gate is for; the stub measures nothing.
 #
 # Usage: quota.sh [-v] [--with-source]
 #   --with-source  print "<percent> <source>" instead of just the percent, so the
@@ -81,6 +86,19 @@ if [[ -n "${MEUTE_QUOTA_CMD:-}" ]]; then
   fi
   printf 'quota.sh: MEUTE_QUOTA_CMD failed. Refusing to guess — the runner will\n' >&2
   printf 'quota.sh: decline this slot rather than run against an unknown quota.\n' >&2
+  exit 1
+fi
+
+# A snapshot that exists but cannot be read is a broken source, same as a
+# failing MEUTE_QUOTA_CMD: fail closed rather than fall through to the stub.
+readonly SNAPSHOT_FILE="${MEUTE_ROOT}/state/rate-limits.json"
+if [[ -f "$SNAPSHOT_FILE" ]]; then
+  if raw="$("${MEUTE_ROOT}/contrib/quota-subscription.sh" 2>/dev/null)"; then
+    emit "${raw//[[:space:]]/}" "quota-subscription.sh"
+    exit $?
+  fi
+  printf 'quota.sh: state/rate-limits.json is present but unreadable. Refusing to\n' >&2
+  printf 'quota.sh: guess — delete it to fall back, or let the status line rewrite it.\n' >&2
   exit 1
 fi
 

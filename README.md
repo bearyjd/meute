@@ -136,29 +136,72 @@ meute: preflight: claude is not logged in. Run:  claude auth login
 
 There is no API-key mode.
 
-## Quota gate
+## Quota gates
 
 "Quota" is your plan's rolling 5-hour and weekly allowance, not a dollar budget.
-`bin/quota.sh` prints one integer 0–100; below `policy.quota_floor_percent` the
-runner exits 0 without doing anything. Scheduled chores must never eat the window
-you wanted for interactive work.
+Scheduled chores must never eat the window you wanted for interactive work —
+that is the one constraint the whole design is shaped around. A run has to
+clear **two** gates, and they answer different questions:
 
-There is no machine-readable balance on the Claude CLI today (`/usage` is
-interactive only; `claude auth status --json` reports the plan tier but not the
-balance), so the probe ships as a **stub returning 100** — meaning **the gate
-never fires until you wire a real source**. Every log line records which it is:
-
-```
-quota=77:stub          ← the gate is not real yet
-quota=41:MEUTE_QUOTA_CMD   ← the gate is real
-```
-
-Wire it up. Two sources ship, and they answer different questions:
-
-| Source | Answers | Needs |
+| Gate | Answers | Reads |
 |---|---|---|
-| `contrib/quota-self-budget.sh` | *has the fleet had enough this week?* | nothing — reads meute's own log |
-| `contrib/quota-llm-usage-tracker.sh` | *how much of my subscription pool is left?* | llm-usage-tracker with a claude.ai browser login |
+| subscription | *is there room in the pool I share with the fleet?* | the plan's own 5h/7d windows, snapshotted by the status line |
+| self-budget | *has the fleet taken its agreed share this week?* | meute's own `state/log` against `policy.weekly_cost_usd` |
+
+### The subscription gate
+
+Nothing on the CLI reports the balance (`claude auth status --json` gives the
+plan tier, not the pools) — but the JSON Claude Code feeds its **status line**
+does, for Pro/Max seats: `rate_limits.five_hour` and `rate_limits.seven_day`,
+each with `used_percentage` and `resets_at`. So the source is a wrapper that
+snapshots those fields every time you work interactively, which is exactly
+when they change:
+
+```sh
+./bin/meute install-statusline
+```
+
+That puts `contrib/statusline-capture.sh` in front of whatever status line you
+already have (kept verbatim as its argument; backup in
+`settings.json.meute-bak`), and from the next turn on `state/rate-limits.json`
+holds the real windows. `bin/quota.sh` reads it through
+`contrib/quota-subscription.sh`, reporting the **scarcer** of the two pools.
+Below `policy.quota_floor_percent` the runner declines. A window whose
+`resets_at` has passed counts as fresh — the fleet runs at 03:17, long after
+your last session, and refusing until you next open one would idle it exactly
+when the capacity is going spare; the 429 auto-pause is the backstop.
+
+Until you install it the probe answers from a **stub returning 100**, and both
+`meute status` and `meute doctor` say so in as many words. Every log line
+records which source answered:
+
+```
+quota=100:stub                     ← the gate measures nothing yet
+quota=61:quota-subscription.sh     ← the gate is real
+```
+
+Other sources, in precedence order — an explicit `MEUTE_QUOTA_CMD` wins over
+the snapshot, which wins over `state/quota-override`, which wins over the stub:
+
+```sh
+MEUTE_QUOTA_CMD='my-probe --percent' ./bin/run.sh daily   # any command printing 0-100
+echo 45 > state/quota-override                            # or pin it by hand
+MEUTE_QUOTA_CMD='contrib/quota-llm-usage-tracker.sh' ./bin/run.sh daily  # llm-usage-tracker, if you run it
+```
+
+**A configured source that fails makes the runner decline the slot.** It does
+not fall back to the stub — falling back would silently disable the gate at
+exactly the moment you asked for it. Fail closed, always. That includes a
+`state/rate-limits.json` that exists but cannot be read.
+
+### The self-budget gate
+
+Declare a ceiling in the manifest and it applies with no environment at all:
+
+```yaml
+policy:
+  weekly_cost_usd: 15.0     # or weekly_runs: 20 — one or the other
+```
 
 Observed cost per run, so you can calibrate rather than guess — it scales with
 repo size far more than with task type:
@@ -172,47 +215,15 @@ repo size far more than with task type:
 
 Seven daily audits across mid-sized repos is comfortably $6–9, so a ceiling
 calibrated on your smallest repo will trip mid-week. `meute status` shows the
-week's burn against the ceiling.
-
-The self-budget source cannot see your interactive usage, so it is a cap on
-meute's footprint rather than a reading of your pool. That is most of what the
-gate is for, and a cap you actually have beats a true reading you do not:
-
-```sh
-MEUTE_WEEKLY_RUNS=20 MEUTE_QUOTA_CMD='contrib/quota-self-budget.sh' ./bin/run.sh daily
-# or budget by list-price-equivalent effort instead of run count:
-MEUTE_WEEKLY_COST_USD=5.00 MEUTE_QUOTA_CMD='contrib/quota-self-budget.sh' ./bin/run.sh daily
-```
-
-The real pool needs a claude.ai session cookie, which means an interactive
-browser login (`llm-tracker auth claude`); `~/.claude/.credentials.json` alone
-yields the plan tier and no message counts.
-
-Other options:
-
-```sh
-# llm-usage-tracker (https://github.com/bearyjd/llm-usage-tracker) — adapter included
-MEUTE_QUOTA_CMD='contrib/quota-llm-usage-tracker.sh' ./bin/run.sh daily
-
-# or any command that prints one integer 0-100
-MEUTE_QUOTA_CMD='my-probe --percent' ./bin/run.sh daily
-echo 45 > state/quota-override      # or just pin it by hand
-```
-
-**A configured probe that fails makes the runner decline the slot.** It does not
-fall back to the stub — falling back would silently disable the gate at exactly
-the moment you asked for it. Fail closed, always.
+week's burn against the ceiling. The floor does not apply here: the ceiling is
+already meute's allocation, so exhausted means 0 and 0 is what stops it.
 
 ### `meute pause` — the gate cannot protect you from yourself
 
-`quota-self-budget.sh` caps meute against *meute's* spend. It cannot see your
-interactive usage, so `meute status` can read `quota 100% · ok` on a week you
-have nearly exhausted yourself — and then the 03:17 slot spends the window you
-wanted for real work, which is the one thing this project exists not to do.
-
-There is no fix for that inside the gate short of reading your real pool, which
-needs a browser session cookie (`contrib/quota-llm-usage-tracker.sh`). So there
-is a manual override:
+The gates read what they can measure. The snapshot is only as fresh as your
+last interactive turn, a window that rolled over since then counts as fresh
+whatever you have used in it, and no reading knows that you are *about* to
+need the pool for something that matters. So there is a manual override:
 
 ```sh
 ./bin/meute pause --for 3d -r "saving the week for my own work"

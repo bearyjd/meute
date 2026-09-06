@@ -21,4 +21,6 @@ state/cursor
 state/reports
 state/tickets.yaml
 state/quota-override
+# The subscription windows, snapshotted by contrib/statusline-capture.sh.
+state/rate-limits.json
 state/hold
