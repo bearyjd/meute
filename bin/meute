@@ -697,6 +697,16 @@ print('\n'.join(sorted(seen)))
   local needed=() bin path
   for bin in "${names[@]}"; do
     path="$(command -v "$bin" 2>/dev/null)" || continue
+    # `command -v` answers for shell builtins too, and answers with the bare
+    # word rather than a path: `command -v command` prints "command", which
+    # dirname turns into ".". Every name derived above used to be a real
+    # binary, so this could not arise; the allowlist now carries
+    # `Bash(command -v:*)`, whose first word is the builtin, so it can. A
+    # relative entry in the unit's PATH resolves against the unit's working
+    # directory -- a worktree of the repo being worked on, which on the
+    # community track is a third party's code, where a planted ./git would
+    # then win. Take only absolute answers.
+    [[ "$path" == /* ]] || continue
     needed+=( "$(dirname "$path")" )
   done
 
