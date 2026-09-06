@@ -43,6 +43,16 @@ policy:
   # weekly_runs: 20
   branch_prefix: meute      # scratch branches are <prefix>/<task>-<date>
 
+  # When the two slots fire, as systemd OnCalendar specs (`meute install-timers`
+  # writes them into the timers). One queue item runs per fire, so this is
+  # what decides how often any given repo is looked at: four repos at one
+  # fire a day is weekly-ish coverage; thirty repos needs "*-*-* 03/4:17:00"
+  # (every four hours) to stay in the same ballpark. The quota gates decide
+  # whether a fire actually runs, so a tighter cadence costs nothing when the
+  # pool is scarce -- the slot just declines.
+  # daily_calendar: "*-*-* 03:17:00"
+  # weekly_calendar: "Sat *-*-* 04:41:00"
+
 # ---------------------------------------------------------------------------
 # Commands a write tier may run without an approver present.
 #

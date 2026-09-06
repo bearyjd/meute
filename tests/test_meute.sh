@@ -1211,8 +1211,11 @@ SH
   printf '#!/usr/bin/env bash\nprintf "yes\\n"\n' > "$stub/loginctl"
   chmod +x "$stub/systemctl" "$stub/loginctl"
 
+  # XDG_CONFIG_HOME rather than HOME: systemd's own rule for where user units
+  # live, and overriding HOME hides the user-site PyYAML from python3, which
+  # install-timers now needs to read the cadence from the manifest.
   install_with() {
-    HOME="$home" PATH="$stub:$PATH" STUB_SHOW="$1" \
+    XDG_CONFIG_HOME="$home/.config" PATH="$stub:$PATH" STUB_SHOW="$1" \
       "$FIXTURE/bin/meute" install-timers 2>&1
   }
 
@@ -1226,6 +1229,33 @@ NextElapseUSecRealtime=Sun 2026-08-30 03:17:00 EDT')"; rc=$?
   [[ -f "$home/.config/systemd/user/meute-daily.timer" ]] \
     && ok "install-timers: writes the unit files" \
     || bad "install-timers: writes the unit files" "no meute-daily.timer under $home"
+  # The fixture manifest declares no cadence, so the timers carry the defaults.
+  has "install-timers: default daily cadence reaches the timer"  \
+      "$(grep OnCalendar "$home/.config/systemd/user/meute-daily.timer")"  "*-*-* 03:17:00"
+  has "install-timers: default weekly cadence reaches the timer" \
+      "$(grep OnCalendar "$home/.config/systemd/user/meute-weekly.timer")" "Sat *-*-* 04:41:00"
+
+  # A cadence declared in the manifest is what gets written, and a bad one
+  # is refused before any unit is touched.
+  python3 - "$FIXTURE" <<'PY2'
+import sys, pathlib, yaml
+fx = pathlib.Path(sys.argv[1]); d = yaml.safe_load((fx/"repos.yaml").read_text())
+d["policy"]["daily_calendar"] = "*-*-* 03/4:17:00"
+yaml.safe_dump(d, open(fx/"cadence.yaml", "w"), sort_keys=False)
+d["policy"]["daily_calendar"] = "every other tuesday"
+yaml.safe_dump(d, open(fx/"badcadence.yaml", "w"), sort_keys=False)
+PY2
+  MEUTE_MANIFEST="$FIXTURE/cadence.yaml" install_with 'LoadState=loaded
+UnitFileState=enabled
+ActiveState=active
+NextElapseUSecRealtime=Sun 2026-08-30 03:17:00 EDT' >/dev/null
+  has "install-timers: a declared cadence reaches the timer" \
+      "$(grep OnCalendar "$home/.config/systemd/user/meute-daily.timer")" "*-*-* 03/4:17:00"
+  local before; before="$(cat "$home/.config/systemd/user/meute-daily.timer")"
+  out="$(MEUTE_MANIFEST="$FIXTURE/badcadence.yaml" install_with '' )"; rc=$?
+  is  "install-timers: refuses an invalid OnCalendar spec" "$rc" "1"
+  has "install-timers: ...and names the policy key"        "$out" "policy.daily_calendar"
+  is  "install-timers: ...without touching the units"      "$(cat "$home/.config/systemd/user/meute-daily.timer")" "$before"
 
   # The regression: enabled, and nothing scheduled.
   out="$(install_with 'LoadState=loaded
