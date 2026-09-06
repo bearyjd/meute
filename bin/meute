@@ -483,6 +483,24 @@ cmd_resume() {
   fi
 }
 
+# The branch a repo's audits and drafts should be cut from: what origin calls
+# its default, else main, else master, else whatever is checked out. NOT
+# simply the current branch -- a repo mid-feature would otherwise be audited
+# on, and have fixes drafted against, unfinished work. Found live: five of
+# the first twenty-one repos added were sitting on a feature branch.
+repo_default_branch() {
+  local repo="$1" ref
+  # `|| true` on the substitution itself: under set -e a failing $(...) in an
+  # assignment aborts the whole function before any fallback runs.
+  ref="$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -n "$ref" ]]; then printf '%s\n' "${ref#origin/}"; return 0; fi
+  local b
+  for b in main master; do
+    git -C "$repo" show-ref --verify -q "refs/heads/$b" && { printf '%s\n' "$b"; return 0; }
+  done
+  git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || printf ''
+}
+
 # Scan a directory for git repos not already in the manifest, and interactively
 # add the ones you pick. Only ever writes repos.local.yaml -- lib/manifest.py's
 # add-repo refuses repos.yaml itself, so there's no PR-required-file edited here.
@@ -588,7 +606,7 @@ cmd_discover() {
       [[ -n "$i" ]] && chosen_tasks+=( "${task_names[$(( i - 1 ))]}" )
     done
 
-    default_branch="$(git -C "$repo_path" symbolic-ref --short HEAD 2>/dev/null || printf '')"
+    default_branch="$(repo_default_branch "$repo_path")"
 
     printf 'One-line spec for %s (what it is -- goes into every prompt, no default): ' "$repo_name" >&2
     spec=""

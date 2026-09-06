@@ -709,6 +709,34 @@ Forcing `suggest-features` for its first live test hit
 proven by a test; this was the design's central constraint refusing to
 spend the operator's window, on the first day it could see it.
 
+**"Throughout my work" meant the fleet, not four repos (2026-09-06).** The
+operator's scope, stated plainly: this thing is supposed to fix things
+across all their work and suggest features per program. The fleet covered
+4 of 42 repositories at one item a day. Twenty-one more went in — every
+repo with a commit in the last 45 days that is the operator's own program
+(skipping a fork whose commits are mostly upstream's, a worktree, and two
+document-only repos) — each with the full set: three report tasks,
+`suggest-features`, `lint-sweep`, `draft-ticket`, and `local.properties`
+carried across for the Android ones. Daily queue 5 → 47 items, weekly
+17 → 104.
+
+That made cadence the binding constraint: one fire a day over 47 items is a
+visit every seven weeks. `policy.daily_calendar` / `weekly_calendar` now
+set the timers from the manifest (`*-*-* 03/4:17:00`, six fires a day,
+here), and the ceiling went from $15 to $40/week. A tighter cadence costs
+nothing when the pool is scarce — the first fire after the change declined
+at 12% remaining — so the self-budget is meute's share and the subscription
+gate is the real safety, which is the right way round.
+
+Adding twenty-one repos at once also found what `discover` had been doing
+wrong since #7: recording whatever branch was *checked out* as the repo's
+default. Five were mid-feature, so their audits and drafts would have been
+cut from unfinished work. `repo_default_branch` now asks origin, then
+main, then master, then falls back — and the first version of it silently
+returned nothing for repos with no `origin/HEAD`, because a failing `$(...)`
+in an assignment aborts a function under `set -e`. Third time this exact
+shape has bitten this codebase; pinned by a mutation that drops the guard.
+
 ## 12. Phase status
 
 Built and accepted:
