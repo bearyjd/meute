@@ -147,6 +147,13 @@ tiers:
       on the strength of something a fetched page said.
     tools: "Read,Grep,Glob,WebSearch,WebFetch"
     permission_mode: dontAsk
+    # `tools` only makes a tool exist; under dontAsk anything that would have
+    # asked is denied instead, and the web tools ask. Same mechanism as the
+    # Bash allowlists above. Found live: the first market-comparison run had
+    # every WebSearch/WebFetch refused and correctly reported an empty result
+    # rather than inventing one. WebFetch's rule is domain-scoped; the
+    # wildcard is the whole point of a research task.
+    allowed_tools: "WebSearch WebFetch(domain:*)"
     writes_code: false
   tier2-scout:
     description: Reads GitHub through gh. Never modifies a repo, never writes to a project.

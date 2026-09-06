@@ -514,6 +514,20 @@ PY
 
   hasnt "architecture-review: does NOT inherit WebSearch from a sibling task" \
         "$(jq -r '.tools' <<< "$ar_entry")" "WebSearch"
+
+  # `tools` makes a tool exist; dontAsk denies anything that would have asked,
+  # and the web tools ask. The first real run had all three lookups refused.
+  # The public manifest is the schema doc, so pin the fix there, at the point
+  # the runner reads it -- the resolved queue entry, not the YAML text.
+  local pub_entry
+  pub_entry="$(python3 - "$REPO/repos.yaml" <<'PY2'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+print(d["tiers"]["tier2-web"].get("allowed_tools", ""))
+PY2
+)"
+  has "tier2-web: allows WebSearch, not merely offers it"  "$pub_entry" "WebSearch"
+  has "tier2-web: allows WebFetch on every domain"          "$pub_entry" "WebFetch(domain:*)"
 }
 
 # lib/manifest.py add-repo is the mechanism `meute discover` writes through.
@@ -1561,6 +1575,14 @@ PY2
   printf '{"captured_at":1,"seven_day":{"used_percentage":10,"resets_at":9999999999}}' > "$snap"
   out="$("$root/bin/run.sh" daily --dry-run 2>&1)"
   has "gates: both clear and the run goes ahead" "$out" "would run: key=r/audit-security"
+
+  # The agent's cwd is the worktree and dontAsk refuses reads outside it, so
+  # the prompt must say the checkout is the worktree -- not the repo it was
+  # cut from, which is what the first market-comparison run was told and
+  # could not read.
+  local prompt; prompt="$(grep -oE 'prompt=\S+' <<< "$out" | cut -d= -f2)"
+  has   "prompt: names the worktree as the checkout"  "$(grep -m1 'checked out at' "$prompt")" ".worktrees/r-audit-security-"
+  hasnt "prompt: ...not the repo it was cut from"     "$(grep -m1 'checked out at' "$prompt")" "git-r\`"
 }
 
 # Pruning deletes branches. The property that matters is not "does it prune"

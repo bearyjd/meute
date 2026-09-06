@@ -312,9 +312,15 @@ run_entry() {
   fi
   BASE_SHA="$(git -C "$REPO_PATH" rev-parse "$base_ref")"
 
+  # The agent runs with the worktree as its cwd, and under dontAsk a read
+  # outside cwd is refused. So the path the prompt calls "checked out at" has
+  # to be the worktree, not the repo it was cut from -- the first
+  # market-comparison run had every Read/Glob of the original path denied.
+  # Fixed here rather than at the call site because it is deterministic.
+  WORKTREE="${WORKTREE_DIR}/${repo}-${task}-${DATE}.$$"
   local prompt_file; prompt_file="$(mktemp)"
   python3 "$MANIFEST_PY" render "$template" \
-    "REPO_NAME=${repo}" "REPO_SPEC=${spec}" "REPO_PATH=${REPO_PATH}" \
+    "REPO_NAME=${repo}" "REPO_SPEC=${spec}" "REPO_PATH=${WORKTREE}" \
     "TASK=${task}" "TIER=${tier}" "DATE=${DATE}" "BRANCH=${BRANCH}" \
     "FILE_BUDGET=${file_budget}" "LENS=${lens}" "REPORT_PATH=${report_rel}" \
     "ALLOWED_COMMANDS=${ALLOWED_TOOLS:-<none: no shell command is pre-approved>}" \
@@ -335,7 +341,6 @@ run_entry() {
   fi
 
   trap cleanup EXIT
-  WORKTREE="${WORKTREE_DIR}/${repo}-${task}-${DATE}.$$"
   git -C "$REPO_PATH" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
     || { log_run "error" "kind=${kind}" "repo=${repo}" "task=${task}" "detail=worktree-add-failed"; exit 1; }
 
