@@ -127,8 +127,9 @@ there is no spend to cap. Where both pools are visible the binding figure is the
 minimum of the two.
 
 `bin/quota.sh` prints one integer 0-100 and exits 0. Sources in order:
-`$MEUTE_QUOTA_CMD`, `state/quota-override`, then `$MEUTE_QUOTA_STUB` (default
-100). If no source can be consulted it exits non-zero and the runner declines to
+`$MEUTE_QUOTA_CMD`, `state/rate-limits.json` (the subscription's own windows,
+snapshotted by the status line — see the 2026-09-06 finding in §11),
+`state/quota-override`, then `$MEUTE_QUOTA_STUB` (default 100). If no source can be consulted it exits non-zero and the runner declines to
 run — starving the human is worse than skipping a chore.
 
 **A configured probe that fails is a broken source, not an absent one, and must
@@ -158,9 +159,10 @@ the true pool reading cannot be wired unattended, by anyone, today.
 collector already reduces the 5-hour and 7-day windows to whichever is more
 restrictive and stores it as `messages_used` against `messages_limit == 100`.
 
-There is no built-in probe: as of Claude Code 2.1.x the remaining allowance is
-exposed only interactively via `/usage`; `claude auth status --json` reports the
-plan tier but not the balance. `MEUTE_QUOTA_CMD` is the seam for a real source.
+`claude auth status --json` reports the plan tier but not the balance, and no
+subcommand exposes it — but the status line's stdin JSON does, for Pro/Max
+seats. That is now the built-in source (§11, 2026-09-06). `MEUTE_QUOTA_CMD`
+remains the seam for anything else.
 
 The `cost_usd` recorded per run is the list-price equivalent of work already paid
 for by the seat. It is useful for ranking which tasks are expensive. It is not
@@ -578,6 +580,56 @@ nothing in `.claude/PRPs/`. Building a template for it without one would have
 meant inventing the very falsifiability bar the other three tier-2 tasks
 exist to enforce. See the Phase 2 status note below for the actual reasoning
 and what replaces it if it's ever wanted.
+
+**The gate the whole design hangs on was not measuring the thing it is for
+(2026-09-06).** §1 names one constraint that shapes everything: scheduled work
+must never compete with interactive work. §3 step 4 implements it: decline if
+the remaining *subscription* quota is under the floor. But the shipped
+`quota.sh` had no source for that number — the stub says 100 — and
+`fleet_wire_self_budget` then made the self-budget *replace* the probe
+whenever no `MEUTE_QUOTA_CMD` was set. So `meute status` read `quota 100% ·
+ok`, every log line read `quota=94:quota-self-budget.sh`, and both meant only
+"meute has not yet spent its own $15" — nothing about the pool the human
+shares. A week where the human had burned 80% interactively looked identical
+to an idle one. The only real protection was reactive: the 429 auto-pause,
+after the damage.
+
+The data was there all along, one layer over. Claude Code feeds its status
+line a JSON document that, for Pro/Max seats, carries
+`rate_limits.five_hour` and `rate_limits.seven_day` — `used_percentage` and
+`resets_at` each. The comment in `quota.sh` saying the balance was "only
+exposed interactively via /usage" was true of the CLI's subcommands and false
+of the CLI. Confirmed against the docs, then against this machine: installing
+the capture wrapper and running one more command produced a snapshot reading
+5h 39% used, 7d 30% used, and the gate answered 61 from
+`quota-subscription.sh` instead of 100 from the stub. First real reading the
+gate has ever had.
+
+Three things changed shape:
+
+- **Two gates, not one.** The self-budget no longer hijacks the subscription
+  probe. `run.sh` checks meute's own ceiling first (declared → must be
+  unspent), then asks `quota.sh` for the best subscription source it has,
+  against the floor. Each declines with its own reason, and the log line
+  carries both readings (`quota=` and `budget=`). Pinned by `test_two_gates`,
+  which was the mutation that mattered: removing the self-budget check from
+  `run.sh` makes exactly its three assertions fail.
+- **The snapshot is a first-class source**, ranked under an explicit
+  `MEUTE_QUOTA_CMD` and over the override file. Present-but-unreadable fails
+  closed, same rule as a broken probe.
+- **A window past its `resets_at` counts as fresh.** The timer fires at 03:17,
+  hours after the last interactive turn; the 5h window will nearly always
+  have rolled over by then and the 7d window binds. Refusing to run until the
+  human next opens a session would idle the fleet precisely when the capacity
+  is going spare, which is the opposite of §1. This is optimistic on purpose,
+  and the 429 hold is what catches it being wrong.
+
+`meute install-statusline` wraps whatever status line is already configured
+(the original kept verbatim as the wrapper's argument, backup written,
+idempotent) and is the one step that turns the gate on. `status` and `doctor`
+now say "UNMEASURED (stub)" rather than "ok" until it has been run — the
+earlier wording let a gate that measured nothing read as a gate that had
+passed.
 
 ## 12. Phase status
 

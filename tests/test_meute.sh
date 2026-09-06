@@ -810,29 +810,36 @@ PY
 # work. A broken probe must stop the fleet, not silently unlock it.
 test_quota_gate() {
   local out rc
-  out="$(MEUTE_QUOTA_STUB=55 "$REPO/bin/quota.sh")"
+  # A fixture root: quota.sh resolves state/ relative to itself, and the real
+  # checkout's state/rate-limits.json (a live snapshot, once install-statusline
+  # has run) would otherwise answer these instead of the stub.
+  local root="$FIXTURE/quota"; mkdir -p "$root/state"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  local q="$root/bin/quota.sh"
+
+  out="$(MEUTE_QUOTA_STUB=55 "$q")"
   is "quota: stub value is reported" "$out" "55"
 
-  out="$(MEUTE_QUOTA_STUB=55 "$REPO/bin/quota.sh" --with-source)"
+  out="$(MEUTE_QUOTA_STUB=55 "$q" --with-source)"
   is "quota: --with-source names the source" "$out" "55 stub"
 
-  out="$(MEUTE_QUOTA_CMD='echo 42' "$REPO/bin/quota.sh" --with-source)"
+  out="$(MEUTE_QUOTA_CMD='echo 42' "$q" --with-source)"
   # The source is the probe's basename, not the variable name: state/log should
   # say WHICH probe answered (quota-self-budget.sh vs a real pool reader).
   is "quota: configured probe wins, named by its command" "$out" "42 echo"
 
   # the safety property: a configured probe that fails must NOT fall back
-  MEUTE_QUOTA_CMD='exit 3' "$REPO/bin/quota.sh" >/dev/null 2>&1; rc=$?
+  MEUTE_QUOTA_CMD='exit 3' "$q" >/dev/null 2>&1; rc=$?
   is "quota: broken probe fails closed, never falls back to the stub" "$rc" "1"
 
-  out="$(MEUTE_QUOTA_CMD='exit 3' "$REPO/bin/quota.sh" 2>&1 || true)"
+  out="$(MEUTE_QUOTA_CMD='exit 3' "$q" 2>&1 || true)"
   hasnt "quota: broken probe emits no number at all" "$out" "100"
 
   # non-numeric output is a broken source too
-  MEUTE_QUOTA_CMD='echo banana' "$REPO/bin/quota.sh" >/dev/null 2>&1; rc=$?
+  MEUTE_QUOTA_CMD='echo banana' "$q" >/dev/null 2>&1; rc=$?
   is "quota: non-numeric probe output is rejected" "$rc" "1"
 
-  MEUTE_QUOTA_CMD='echo 250' "$REPO/bin/quota.sh" >/dev/null 2>&1; rc=$?
+  MEUTE_QUOTA_CMD='echo 250' "$q" >/dev/null 2>&1; rc=$?
   is "quota: out-of-range probe output is rejected" "$rc" "1"
 
   # the adapter must fail cleanly when its backend is absent
@@ -873,7 +880,8 @@ test_doctor() {
       has "doctor: uninstalled timers point at the installer" "$out" "install-timers"
     fi
   fi
-  has "doctor: warns an unwired quota gate"   "$out" "does NOT fire"
+  has "doctor: warns an unwired quota gate"   "$out" "measures NOTHING yet"
+  has "doctor: says how to wire it"           "$out" "meute install-statusline"
 }
 
 # install-timers used to hardcode ~/.local/bin:~/.npm-global/bin into the unit's
@@ -1430,6 +1438,131 @@ PY
 }
 
 
+# The subscription gate: PRP-001 §3 step 4, finally measuring the thing it is
+# for. Source is the status line's rate_limits snapshot; the adapter reports
+# the scarcer of the 5h/7d pools, and a window past its resets_at counts as
+# fresh.
+test_subscription_gate() {
+  local root="$FIXTURE/subq"; mkdir -p "$root/state"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  ln -sfn "$REPO/lib" "$root/lib"
+  local snap="$root/state/rate-limits.json" cap="$REPO/contrib/statusline-capture.sh"
+  local adapter="$root/contrib/quota-subscription.sh"
+
+  # -- adapter arithmetic --
+  printf '{"captured_at":1,"five_hour":{"used_percentage":23.5,"resets_at":9999999999},"seven_day":{"used_percentage":41.2,"resets_at":9999999999}}' > "$snap"
+  is "subscription: reports the scarcer pool, ceilinged" "$(MEUTE_ROOT="$root" "$adapter")" "58"
+  printf '{"captured_at":1,"five_hour":{"used_percentage":90,"resets_at":500},"seven_day":{"used_percentage":41.2,"resets_at":9999999999}}' > "$snap"
+  is "subscription: a window past resets_at counts as fresh" "$(MEUTE_ROOT="$root" MEUTE_NOW=1000 "$adapter")" "58"
+  printf '{"captured_at":1,"five_hour":{"used_percentage":100,"resets_at":9999999999}}' > "$snap"
+  is "subscription: a single window is enough"            "$(MEUTE_ROOT="$root" "$adapter")" "0"
+  printf '{"captured_at":1}' > "$snap"
+  MEUTE_ROOT="$root" "$adapter" >/dev/null 2>&1
+  is "subscription: a snapshot with no window is not a source" "$?" "1"
+  rm -f "$snap"
+  MEUTE_ROOT="$root" "$adapter" >/dev/null 2>&1
+  is "subscription: no snapshot fails, never guesses"     "$?" "1"
+
+  # -- quota.sh precedence: snapshot beats the override and the stub --
+  printf '{"captured_at":1,"seven_day":{"used_percentage":70,"resets_at":9999999999}}' > "$snap"
+  printf '99\n' > "$root/state/quota-override"
+  is "quota.sh: the snapshot outranks the override file" \
+     "$(MEUTE_QUOTA_STUB=100 "$root/bin/quota.sh" --with-source)" "30 quota-subscription.sh"
+  is "quota.sh: an explicit MEUTE_QUOTA_CMD still outranks the snapshot" \
+     "$(MEUTE_QUOTA_CMD='echo 42' "$root/bin/quota.sh")" "42"
+  printf 'not json' > "$snap"
+  "$root/bin/quota.sh" >/dev/null 2>&1
+  is "quota.sh: an unreadable snapshot fails closed, no fallback" "$?" "1"
+  rm -f "$snap" "$root/state/quota-override"
+
+  # -- the capture wrapper --
+  local out
+  out="$(printf '{"model":{"display_name":"M"},"rate_limits":{"five_hour":{"used_percentage":5,"resets_at":9999999999}}}' \
+         | MEUTE_ROOT="$root" "$cap" -- 'jq -r .model.display_name')"
+  is  "capture: the wrapped status line still gets stdin and speaks" "$out" "M"
+  is  "capture: the snapshot carries the window" "$(jq -r .five_hour.used_percentage "$snap")" "5"
+  has "capture: ...and when it was taken"        "$(jq -r 'has("captured_at")' "$snap")" "true"
+  printf '{"model":{"display_name":"M"}}' | MEUTE_ROOT="$root" "$cap" -- 'true'
+  is  "capture: a document without rate_limits leaves the last snapshot alone" \
+      "$(jq -r .five_hour.used_percentage "$snap")" "5"
+  out="$(printf '{}' | MEUTE_ROOT="$root" "$cap")"; rc=$?
+  is  "capture: with nothing to wrap it prints nothing and exits 0" "${rc}:${out}" "0:"
+
+  # -- install-statusline edits settings.json, carefully --
+  local cfg="$root/claude"; mkdir -p "$cfg"
+  printf '{"model":"opus","statusLine":{"type":"command","command":"echo \\"it'"'"'s $HOME\\""}}' > "$cfg/settings.json"
+  CLAUDE_CONFIG_DIR="$cfg" "$root/bin/meute" install-statusline >/dev/null 2>&1
+  is  "install-statusline: exits 0" "$?" "0"
+  local wrapped; wrapped="$(jq -r .statusLine.command "$cfg/settings.json")"
+  has "install-statusline: the wrapper leads"               "$wrapped" "statusline-capture.sh --"
+  is  "install-statusline: other settings survive"          "$(jq -r .model "$cfg/settings.json")" "opus"
+  [[ -f "$cfg/settings.json.meute-bak" ]] && ok "install-statusline: backs the file up first" \
+    || bad "install-statusline: backs the file up first" "no .meute-bak"
+  # The original, quotes and $HOME and all, must run exactly as before.
+  is  "install-statusline: the original command runs unchanged inside the wrapper" \
+      "$(printf '{}' | MEUTE_ROOT="$root" sh -c "$wrapped")" "it's $HOME"
+  CLAUDE_CONFIG_DIR="$cfg" "$root/bin/meute" install-statusline >/dev/null 2>&1
+  is  "install-statusline: idempotent" \
+      "$(jq -r .statusLine.command "$cfg/settings.json" | grep -o 'statusline-capture' | wc -l)" "1"
+  printf '{broken' > "$cfg/settings.json"
+  CLAUDE_CONFIG_DIR="$cfg" "$root/bin/meute" install-statusline >/dev/null 2>&1
+  is  "install-statusline: refuses to touch invalid JSON" "$?" "1"
+  is  "install-statusline: ...and leaves it as it found it" "$(cat "$cfg/settings.json")" "{broken"
+}
+
+# Two gates, and a run must clear both. Before this the self-budget REPLACED the
+# subscription probe whenever no MEUTE_QUOTA_CMD was set, so "quota 100% · ok"
+# meant "meute has not spent its own allowance" and said nothing about the
+# pool the human shares -- the one constraint the whole design is for.
+test_two_gates() {
+  local root="$FIXTURE/gates"
+  mkdir -p "$root/state" "$root/tasks" "$root/git-r"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/contrib" "$root/contrib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  git -C "$root/git-r" init -q -b main
+  echo x > "$root/git-r/f"; git -C "$root/git-r" add -A
+  git -C "$root/git-r" -c user.email=t@t -c user.name=t commit -qm init
+  python3 - "$root" <<'PY2'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute", "weekly_cost_usd": 10.0},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
+    "repos": [{"name": "r", "path": str(root / "git-r"), "spec": "fixture", "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root / "repos.yaml", "w"), sort_keys=False)
+PY2
+  local wk; wk="$(date +%G-%V)"
+  local snap="$root/state/rate-limits.json" out
+
+  # Pool fine, meute's own ceiling spent -> declines, and says it is the ceiling.
+  printf '{"captured_at":1,"seven_day":{"used_percentage":10,"resets_at":9999999999}}' > "$snap"
+  : > "$root/state/log"
+  printf 'ts\tweek=%s\tstatus=ok\tcost=10.00\n' "$wk" >> "$root/state/log"
+  out="$("$root/bin/run.sh" daily 2>&1)"
+  has "gates: a spent self-budget declines even with pool to spare" "$out" "status=skipped"
+  has "gates: ...naming the ceiling as the reason"                  "$out" "own weekly ceiling"
+  has "gates: ...with the budget reading on the log line"           "$out" "budget=0"
+
+  # Ceiling fine, pool below the floor -> declines, and says it is the pool.
+  : > "$root/state/log"
+  printf '{"captured_at":1,"seven_day":{"used_percentage":80,"resets_at":9999999999}}' > "$snap"
+  out="$("$root/bin/run.sh" daily 2>&1)"
+  has "gates: a scarce pool declines even with self-budget to spare" "$out" "status=skipped"
+  has "gates: ...naming the floor as the reason"                     "$out" "below floor 30%"
+  has "gates: ...and the real source, not the stub"                  "$out" "quota=20:quota-subscription.sh"
+
+  # Both clear -> the run proceeds to selection.
+  printf '{"captured_at":1,"seven_day":{"used_percentage":10,"resets_at":9999999999}}' > "$snap"
+  out="$("$root/bin/run.sh" daily --dry-run 2>&1)"
+  has "gates: both clear and the run goes ahead" "$out" "would run: key=r/audit-security"
+}
+
 # Pruning deletes branches. The property that matters is not "does it prune"
 # but "does it ever delete work that exists nowhere else".
 test_branch_prune() {
@@ -1524,6 +1657,8 @@ test_hold_extend
 test_engines
 test_self_budget
 test_manifest_ceiling
+test_subscription_gate
+test_two_gates
 test_branch_prune
 test_finding_level_triage
 test_public_manifest_valid

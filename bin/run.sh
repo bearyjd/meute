@@ -65,6 +65,7 @@ readonly START_EPOCH=0
 SLOT=""
 QUOTA_SOURCE="?"
 remaining_at_start="?"
+BUDGET_LEFT="-"
 SCRUBBED=""
 AUTH_MODE=""
 ENGINE_OVERRIDE=""
@@ -214,18 +215,28 @@ main() {
 
   fleet_load_policy || die "could not read policy from ${MANIFEST}"
 
+  # Gate 1 of 2: meute's own weekly ceiling, when the manifest declares one.
   # Not `|| true`: if this function goes missing the ceiling lapses silently,
-  # which is the exact failure this change exists to prevent. It returns 1
+  # which is the exact failure this check exists to prevent. It returns 1
   # legitimately when no ceiling is declared, so only a *missing* function
   # (127) is fatal.
-  fleet_wire_self_budget; (( $? == 127 )) && die "lib/fleet.sh is missing fleet_wire_self_budget"
+  local rc=0; fleet_wire_self_budget || rc=$?
+  (( rc == 127 )) && die "lib/fleet.sh is missing fleet_wire_self_budget"
+  if (( rc == 0 )); then
+    BUDGET_LEFT="$(fleet_self_budget_remaining)" || skip "self-budget probe failed"
+    (( BUDGET_LEFT < 1 )) \
+      && skip "meute's own weekly ceiling is spent" "budget=${BUDGET_LEFT}"
+  fi
 
+  # Gate 2 of 2: the subscription pool the human shares. PRP-001 §3 step 4 —
+  # the one constraint that shapes everything: a chore that eats the window
+  # the human wanted is worse than a chore that never ran.
   local remaining probe
   probe="$("${MEUTE_ROOT}/bin/quota.sh" --with-source)" || skip "quota probe failed"
   remaining="${probe%% *}"
   QUOTA_SOURCE="${probe#* }"
   (( remaining < QUOTA_FLOOR )) \
-    && skip "quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}"
+    && skip "quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}"
 
   local queue_file
   queue_file="$(mktemp)"
@@ -372,7 +383,7 @@ run_entry() {
     || state_set "lens.${repo}.${task}" "$(( lens_index + 1 ))"
 
   log_run "$ENGINE_STATUS" "kind=${kind}" "repo=${repo}" "task=${task}" "tier=${tier}" \
-          "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" \
+          "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" "budget=${BUDGET_LEFT}" \
           ${SCRUBBED:+"scrubbed=${SCRUBBED// /,}"} "commit=${committed}" "report=${report_rel}" "cost=${COST}" "turns=${TURNS}" \
           ${ENGINE_DETAIL:+"detail=${ENGINE_DETAIL}"}
 
