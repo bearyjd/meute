@@ -835,13 +835,19 @@ PY
 
 cmd_install_timers() {
   command -v systemctl >/dev/null || die "systemd is not available on this machine"
-  local unit_dir="${HOME}/.config/systemd/user"
+  local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   mkdir -p "$unit_dir"
   local path_line; path_line="$(unit_path_line)"
+  fleet_load_policy || die "install-timers: could not read policy from ${MANIFEST}"
   local slot
   for slot in daily weekly; do
-    local cal="*-*-* 03:17:00"
-    [[ "$slot" == weekly ]] && cal="Sat *-*-* 04:41:00"
+    # Cadence comes from the manifest. "daily" is the slot's name, not a
+    # promise about frequency: a fleet of thirty repos at one item a day
+    # sees each repo monthly, so the operator sets how often the slot fires.
+    local cal="$POLICY_DAILY_CALENDAR"
+    [[ "$slot" == weekly ]] && cal="$POLICY_WEEKLY_CALENDAR"
+    systemd-analyze calendar "$cal" >/dev/null 2>&1 \
+      || die "install-timers: policy.${slot}_calendar ${cal@Q} is not a valid OnCalendar spec (try: systemd-analyze calendar ${cal@Q})"
     cat > "${unit_dir}/meute-${slot}.service" <<UNIT
 [Unit]
 Description=meute fleet runner (${slot} slot)
@@ -1064,7 +1070,7 @@ cmd_doctor() {
       *)   d_warn "lingering: cannot tell - no system bus reachable from here (a container?)"
            d_warn "check on the host with:  loginctl show-user $USER --property=Linger" ;;
     esac
-    local unit_dir="${HOME}/.config/systemd/user"
+    local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     if [[ -f "${unit_dir}/meute-daily.timer" ]]; then
       d_ok "units installed in ${unit_dir}"
       local slot state detail

@@ -42,6 +42,10 @@ POLICY_DEFAULTS = {
     "community_share": 0.20,
     "tier3_max_in_flight": 3,
     "branch_prefix": "meute",
+    # systemd OnCalendar strings. One item runs per fire, so cadence is the
+    # lever that turns "fleet coverage" into "how often each repo is seen".
+    "daily_calendar": "*-*-* 03:17:00",
+    "weekly_calendar": "Sat *-*-* 04:41:00",
 }
 
 ENTRY_DEFAULTS = {
@@ -105,6 +109,12 @@ def merged_policy(data: dict) -> dict:
         raise ManifestError("policy.weekly_cost_usd: must be a positive number")
     if not SAFE_NAME.match(str(policy["branch_prefix"])):
         raise ManifestError("policy.branch_prefix: must be a safe identifier")
+    for key in ("daily_calendar", "weekly_calendar"):
+        value = policy[key]
+        # Validated for shape only; systemd is the authority on the grammar,
+        # and install-timers runs `systemd-analyze calendar` on it.
+        if not isinstance(value, str) or not value.strip() or "\n" in value:
+            raise ManifestError(f"policy.{key}: must be a one-line systemd OnCalendar string")
     return policy
 
 

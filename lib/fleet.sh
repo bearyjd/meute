@@ -105,6 +105,8 @@ fleet_load_policy() {
   BRANCH_PREFIX="$(jq -r '.branch_prefix' <<< "$policy")"
   POLICY_WEEKLY_RUNS="$(jq -r '.weekly_runs' <<< "$policy")"
   POLICY_WEEKLY_COST="$(jq -r '.weekly_cost_usd' <<< "$policy")"
+  POLICY_DAILY_CALENDAR="$(jq -r '.daily_calendar' <<< "$policy")"
+  POLICY_WEEKLY_CALENDAR="$(jq -r '.weekly_calendar' <<< "$policy")"
 }
 
 # Tier-3 accounting spans both slots, so gather the whole fleet, not one slot.
