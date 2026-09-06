@@ -682,15 +682,36 @@ unit_path_line() {
   while IFS= read -r word; do
     [[ -n "$word" ]] || continue
     names+=( "$word" )
+  # Every level the runner resolves an allowlist from, not just tiers.
+  # lib/manifest.py's build_entry picks the FIRST non-empty allowed_tools of
+  # (task, project, tier) -- a task-level list REPLACES the tier's rather than
+  # extending it, so a task can need binaries no tier ever names. dep-audit is
+  # exactly that: its allowed_tools are audit_commands, and osv-scanner,
+  # pip-audit, grype and govulncheck appear nowhere else. Scanning tiers alone
+  # left those invisible to the unit's PATH -- the same dead end as the cargo
+  # bug this function was written for, just one level further in. `go install`
+  # putting govulncheck in ~/go/bin is the concrete way it bites.
   done < <(python3 -c "
 import re, sys, yaml
 d = yaml.safe_load(open(sys.argv[1])) or {}
 seen = set()
-for tier in (d.get('tiers') or {}).values():
-    for m in re.finditer(r'Bash\(([^:)]+)', tier.get('allowed_tools') or ''):
+
+def scan(value):
+    for m in re.finditer(r'Bash\(([^:)]+)', value or ''):
         w = m.group(1).split()[0]
         if not w.startswith('.') and not w.startswith('/'):
             seen.add(w)
+
+for tier in (d.get('tiers') or {}).values():
+    if isinstance(tier, dict):
+        scan(tier.get('allowed_tools'))
+for task in (d.get('tasks') or {}).values():
+    if isinstance(task, dict):
+        scan(task.get('allowed_tools'))
+for key in ('repos', 'community'):
+    for project in (d.get(key) or []):
+        if isinstance(project, dict):
+            scan(project.get('allowed_tools'))
 print('\n'.join(sorted(seen)))
 " "$MANIFEST" 2>/dev/null)
 
