@@ -664,6 +664,36 @@ The lint-sweep that had been blocked on `cargo: command not found` was
 forced the same way and ran fmt, clippy and 175 tests — the cargo-PATH fix
 (#3/#4) confirmed in the environment it was for, not just in my shell.
 
+**The first tier-3 draft on an Android repo shipped a real fix and disclosed
+that it had to hand-build its own environment (2026-09-06).** BB-1: 70
+turns, $4.74, five files, 622 tests and detekt green, and the agent
+mutation-tested its own change before reporting — the branch is mergeable
+as-is. Under *Blocked* it said the worktree had no `local.properties`, so
+the Android plugin could not find the SDK and it created the file itself;
+and that `gradlew` died on `JAVA_HOME`, which it worked around by
+temporarily patching the script and reverting. Both disclosed, both
+reverted or gitignored, neither in the diff.
+
+The SDK gap is structural: a worktree holds only what git tracks, and the
+SDK path lives in a file that is gitignored *by design*. Every write tier on
+every Android repo would hit it. Fixed with a per-repo `worktree_files:`
+list — gitignored build plumbing the runner copies from the main checkout
+into every worktree, validated to relative paths inside the tree, missing
+sources skipped. Both Android repos in the fleet now carry
+`local.properties` across. This landed with the suite's first true
+end-to-end test: a stub `claude` on PATH that passes preflight and reports
+its cwd listing, so the real `run.sh` is now exercised through worktree,
+invoke and report rather than stopping at the gates.
+
+The `JAVA_HOME` failure did not reproduce: under the real unit environment,
+inside the CLI's own sandbox, `command -v java` resolves and `./gradlew
+--version` runs. No fix was built for it.
+
+With that, every path the manifest can schedule has now run for real at
+least once — tier 1 with cargo, tier 2 with and without the web, tier 3
+with gradle — and the fleet has fired unattended on seven consecutive
+timer slots since arming.
+
 ## 12. Phase status
 
 Built and accepted:

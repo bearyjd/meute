@@ -343,6 +343,7 @@ run_entry() {
   trap cleanup EXIT
   git -C "$REPO_PATH" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
     || { log_run "error" "kind=${kind}" "repo=${repo}" "task=${task}" "detail=worktree-add-failed"; exit 1; }
+  copy_worktree_files "$entry"
 
   local out err; out="$(mktemp)"; err="$(mktemp)"
   CODEX_LAST="$(mktemp)"
@@ -395,6 +396,23 @@ run_entry() {
   # Last, so the log line written above is included in the same commit.
   commit_state "$repo" "$task"
   [[ "$ENGINE_STATUS" == "ok" ]]
+}
+
+# A worktree holds only what git tracks. Build plumbing that is gitignored by
+# design -- Android's local.properties with its sdk.dir, a .env -- is absent,
+# and a tier that has to run the build then fails on "SDK location not
+# found" before it has done anything. Found live: the first tier-3 draft on
+# an Android repo had to create local.properties by hand to get gradle to
+# configure, and disclosed it under Blocked. Each repo names what to carry
+# across; missing sources are skipped, never an error.
+copy_worktree_files() {
+  local entry="$1" rel
+  while IFS= read -r rel; do
+    [[ -n "$rel" && -f "${REPO_PATH}/${rel}" ]] || continue
+    mkdir -p "${WORKTREE}/$(dirname "$rel")"
+    cp -p "${REPO_PATH}/${rel}" "${WORKTREE}/${rel}"
+    note "carried ${rel} into the worktree"
+  done < <(jq -r '.worktree_files[]? // empty' <<< "$entry")
 }
 
 # The agent runs inside a worktree of the TARGET repo, so a path under MEUTE_ROOT

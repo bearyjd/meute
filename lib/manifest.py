@@ -193,6 +193,17 @@ def checked_projects(data: dict, key: str, tasks: dict, root: str = "") -> list:
         for ticket in project.get("tickets") or []:
             if not isinstance(ticket, dict) or not ticket.get("id"):
                 raise ManifestError(f"{key}.{name}.tickets: every ticket needs an id")
+        files = project.get("worktree_files") or []
+        if not isinstance(files, list):
+            raise ManifestError(f"{key}.{name}.worktree_files: must be a list of relative paths")
+        for rel in files:
+            # Copied from the main checkout into every worktree. Relative and
+            # inside the tree only: this exists for gitignored build plumbing
+            # like local.properties, not for reaching anywhere else.
+            if not isinstance(rel, str) or not rel or rel.startswith("/") \
+                    or ".." in rel.split("/"):
+                raise ManifestError(
+                    f"{key}.{name}.worktree_files: {rel!r} must be a relative path inside the repo")
     return projects
 
 
@@ -310,6 +321,7 @@ def build_entry(kind: str, project: dict, task_name: str, task: dict,
         "file_budget": setting("file_budget"),
         "timeout_seconds": setting("timeout_seconds"),
         "lenses": task.get("lenses") or [],
+        "worktree_files": list(project.get("worktree_files") or []),
     }
 
 

@@ -280,6 +280,10 @@ repos: []
 #   tasks: [audit-security, gen-tests, lint-sweep, dep-audit, conventions]
 #   file_budget: 20                    # optional per-repo override
 #   model: sonnet                      # optional per-repo override
+#   worktree_files: [local.properties] # gitignored build plumbing to copy into
+#                                      # every worktree (Android: the SDK path lives
+#                                      # here and nowhere git can see). Relative
+#                                      # paths inside the repo only.
 #   tickets:                           # only consumed by tier-3 tasks
 #     - id: NL-14
 #       title: "Capture service leaks a wakelock when Wi-Fi drops mid-capture"
