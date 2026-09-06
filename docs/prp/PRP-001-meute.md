@@ -631,6 +631,39 @@ now say "UNMEASURED (stub)" rather than "ok" until it has been run — the
 earlier wording let a gate that measured nothing read as a gate that had
 passed.
 
+**Forcing the never-run paths through the real unit environment found two
+prompt-level bugs that no test could have (2026-09-06).** The first
+`market-comparison` run returned `status=ok` in 53 seconds with zero
+findings — and the report was the *correct* output: every `WebSearch` and
+`WebFetch` had been refused, so under its own falsifiability rules the agent
+declared the run failed rather than name competitors from memory. The
+template held. The mechanism underneath had two holes:
+
+- `tools:` only makes a tool *exist*. Under `dontAsk`, anything that would
+  have prompted is denied instead, and the web tools prompt. The Bash
+  allowlists already solved this for Bash; `tier2-web` needed the same:
+  `allowed_tools: "WebSearch WebFetch(domain:*)"`. Verified in isolation
+  with a $0.03 headless call each way — `WebSearch` alone: `DENIED`; with the
+  allow rule: a live URL. `WebFetch` is domain-scoped; a bare `WebFetch` rule
+  is *not* honoured, `WebFetch(domain:*)` is.
+- The prompt said the repo was "checked out at `{{REPO_PATH}}`" — the
+  original repo, while the agent's cwd is the worktree, and `dontAsk`
+  refuses reads outside cwd. So the agent's own `Read`/`Glob` of the path it
+  had been given were denied too. Every earlier tier-2 run had only worked
+  because agents mostly use relative paths. `REPO_PATH` in the prompt is now
+  the worktree.
+
+Re-run: 39 turns, 7 searches, 12 fetches, 20 of 25 budget, `$1.62`, and it
+dropped two candidates whose first-party pages 403'd rather than source them
+from mirrors — exactly the discipline the template asks for. The headline
+finding was concrete and cheap: every DNS lookup in netlens-android is
+hardcoded to `8.8.8.8` with no resolver choice, in an app that ships a DNS
+Leak Test.
+
+The lint-sweep that had been blocked on `cargo: command not found` was
+forced the same way and ran fmt, clippy and 175 tests — the cargo-PATH fix
+(#3/#4) confirmed in the environment it was for, not just in my shell.
+
 ## 12. Phase status
 
 Built and accepted:
