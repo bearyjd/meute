@@ -1042,6 +1042,36 @@ YAML
   # real binary named alongside it still has to land.
   has "unit_path_line: ...while a real binary on the same list still resolves" \
       "$derived" "/usr/bin"
+
+  # build_entry resolves allowed_tools as the FIRST non-empty of
+  # (task, project, tier) -- a task-level list REPLACES the tier's, so a task
+  # can need a binary no tier ever names. dep-audit is exactly that in the
+  # real manifest: osv-scanner/pip-audit/grype/govulncheck appear only under
+  # its own allowed_tools. Scanning tiers alone left them off the unit's PATH.
+  local task_dir="$FIXTURE/unitpath-task" proj_dir="$FIXTURE/unitpath-proj"
+  mkdir -p "$task_dir" "$proj_dir"
+  : > "$task_dir/task-only-probe"; chmod +x "$task_dir/task-only-probe"
+  : > "$proj_dir/project-only-probe"; chmod +x "$proj_dir/project-only-probe"
+  local levels_manifest="$FIXTURE/unitpath/levels-manifest.yaml"
+  cat > "$levels_manifest" <<'YAML'
+version: 1
+tiers:
+  tier1:
+    allowed_tools: Bash(git:*)
+tasks:
+  dep-audit-ish:
+    allowed_tools: Bash(task-only-probe:*) Bash(git:*)
+repos:
+- name: alpha
+  allowed_tools: Bash(project-only-probe:*)
+community: []
+YAML
+  out="$(PATH="$task_dir:$proj_dir:/usr/bin:/bin" MEUTE_MANIFEST="$levels_manifest" \
+         bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  has "unit_path_line: includes a dir only a TASK's allowed_tools names" \
+      "$out" "$task_dir"
+  has "unit_path_line: includes a dir only a PROJECT's allowed_tools names" \
+      "$out" "$proj_dir"
 }
 
 # dedup_dirs backs the one line in `doctor` that used to crash it: `grep -v`
