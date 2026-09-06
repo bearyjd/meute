@@ -56,6 +56,21 @@ policy:
 # write outside its worktree. Interpreters (`python3 -c`, `node -e`, `bash -c`)
 # are deliberately absent — pre-approving one is equivalent to full execution.
 # Add them per-repo only if you accept that.
+#
+# Every list below also carries `command -v` and `which`, the two commands that
+# resolve a name against PATH and print a path. They execute nothing, write
+# nothing, and reach no network, which is why they sit outside the reasoning
+# above rather than needing an exception to it. Found live: veille-finance's
+# lint-sweep died on `cargo: command not found` and could say nothing further,
+# because nothing on the list could resolve a binary at all — so the report
+# dead-ended exactly where an operator needed a diagnosis. These turn that into
+# a definite "cargo is not on PATH".
+#
+# They do NOT tell you where it should have been. `ls ~/.cargo/bin` is already
+# allowed here and was still refused, by the sandbox's working-directory limit
+# rather than by this list — an allowlist entry cannot lift that. `echo $PATH`
+# stays off for a different reason: it needs shell expansion, and the whole
+# point of the interpreter exclusion above is that nothing here gets a shell.
 # ---------------------------------------------------------------------------
 verify_commands: &verify_commands >-
   Bash(pytest:*) Bash(python3 -m pytest:*) Bash(python -m pytest:*)
@@ -68,6 +83,7 @@ verify_commands: &verify_commands >-
   Bash(ruff:*) Bash(eslint:*) Bash(prettier:*) Bash(black:*)
   Bash(rustfmt:*) Bash(ktlint:*) Bash(shfmt:*) Bash(pre-commit run:*)
   Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
+  Bash(command -v:*) Bash(which:*)
 
 # Read-only GitHub access for the community track. Deliberately excludes bare
 # `gh` and `gh api` -- `gh api` can POST, and the community track's hardest rule
@@ -78,6 +94,7 @@ gh_read_commands: &gh_read >-
   Bash(gh issue list:*) Bash(gh issue view:*) Bash(gh pr list:*)
   Bash(gh pr view:*) Bash(gh label list:*) Bash(gh search issues:*)
   Bash(gh repo view:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
+  Bash(command -v:*) Bash(which:*)
 
 # Verify commands plus read-only gh, for the stages that both build and read issues.
 verify_and_gh: &verify_and_gh >-
@@ -87,6 +104,7 @@ verify_and_gh: &verify_and_gh >-
   Bash(./gradlew test:*) Bash(pip install:*) Bash(ruff:*) Bash(eslint:*)
   Bash(gh issue view:*) Bash(gh issue list:*) Bash(gh pr list:*)
   Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(cat:*)
+  Bash(command -v:*) Bash(which:*)
 
 # Dependency scanners. Read-only by construction: each of these reports, and
 # none of them writes a lockfile. Deliberately excludes `npm install`,
@@ -100,6 +118,7 @@ audit_commands: &audit_commands >-
   Bash(go list:*) Bash(govulncheck:*)
   Bash(osv-scanner:*) Bash(grype:*)
   Bash(git log:*) Bash(ls:*) Bash(cat:*)
+  Bash(command -v:*) Bash(which:*)
 
 # ---------------------------------------------------------------------------
 # Tiers define the blast radius of a task: which tools exist at all, whether the

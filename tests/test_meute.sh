@@ -345,6 +345,62 @@ test_public_manifest_valid() {
   has "repos.yaml: confirms which file"                "$out" "repos.yaml"
 }
 
+# Found live: veille-finance's lint-sweep hit `cargo: command not found` and
+# could report nothing beyond that, because no command on the list could
+# resolve a binary at all -- so the report dead-ended exactly where an
+# operator needed a diagnosis.
+#
+# Asserted on the resolved queue entry rather than on repos.yaml's text: what
+# protects a run is the allowlist that actually reaches run.sh, and the two
+# lists here arrive by different routes -- lint-sweep inherits its tier's
+# verify_commands, while dep-audit overrides allowed_tools with the separate
+# audit_commands anchor. Fixing one says nothing about the other, so both are
+# pinned. The fixture starts from the real tracked manifest (repos.yaml ships
+# `repos: []`, so it only needs a repo to schedule) to keep this testing the
+# shipped anchors and not a copy that can drift away from them.
+test_binary_probe_allowlisted() {
+  local root="$FIXTURE/binary-probe"; mkdir -p "$root"
+  python3 - "$REPO/repos.yaml" "$root" <<'PY'
+import sys, pathlib, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+root = pathlib.Path(sys.argv[2])
+d["repos"] = [{"name": "probe", "path": str(root), "spec": "fixture probe",
+               "tasks": ["lint-sweep", "dep-audit"]}]
+yaml.safe_dump(d, open(root / "repos.yaml", "w"), sort_keys=False)
+PY
+
+  # MEUTE_ROOT stays the real repo so the task templates resolve; the fixture
+  # supplies only the repo entry that repos.yaml deliberately ships without.
+  local daily weekly lint audit
+  daily="$(MEUTE_ROOT="$REPO" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" daily)"
+  weekly="$(MEUTE_ROOT="$REPO" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly)"
+  lint="$(jq -r 'select(.task=="lint-sweep").allowed_tools' <<< "$daily")"
+  audit="$(jq -r 'select(.task=="dep-audit").allowed_tools' <<< "$weekly")"
+
+  # Anchor the negative assertions below: every `hasnt` here would pass on an
+  # empty string, so a fixture that silently queued nothing would look clean.
+  is "binary probe: the fixture really did queue a tier-1 entry" \
+     "$(jq -r 'select(.task=="lint-sweep").tier' <<< "$daily")" "tier1"
+  is "binary probe: ...and the dep-audit entry too" \
+     "$(jq -r 'select(.task=="dep-audit").task' <<< "$weekly")" "dep-audit"
+
+  has "binary probe: a tier-1 run can resolve a name against PATH" \
+      "$lint"  "Bash(command -v:*)"
+  has "binary probe: ...and through which as well" \
+      "$lint"  "Bash(which:*)"
+  has "binary probe: dep-audit's scanner list can resolve one too" \
+      "$audit" "Bash(command -v:*)"
+  has "binary probe: ...and through which as well (dep-audit)" \
+      "$audit" "Bash(which:*)"
+
+  # Resolving a name is not the same as gaining a shell. The exclusions the
+  # comment block above these anchors promises must survive the addition --
+  # `echo $PATH` in particular would need the expansion an interpreter gives.
+  hasnt "binary probe: still no interpreter on the list" "$lint" "Bash(bash -c"
+  hasnt "binary probe: still no echo on the list"        "$lint" "Bash(echo"
+  hasnt "binary probe: still no source on the list"      "$lint" "Bash(source"
+}
+
 # architecture-review is wired the same way audit-security already is (tier2,
 # lens rotation via the generic queue mechanism) -- this pins that the new
 # task definition itself is shaped correctly, not the rotation mechanism,
@@ -942,6 +998,42 @@ YAML
   before_late="${cross_derived%%"$dir_late"*}"
   has "unit_path_line: two different binaries' directories keep \$PATH's own relative order" \
       "$before_late" "$dir_early"
+
+  # Every name derived from allowed_tools used to be a real binary. The list
+  # now carries Bash(command -v:*), whose first word is the shell builtin
+  # `command`, and `command -v command` answers with the bare word rather than
+  # a path -- dirname turns that into ".", which the caller's own PATH here
+  # then admits. A relative entry in a unit's PATH resolves against the unit's
+  # working directory, a worktree of the repo being worked on, so on the
+  # community track a third party's planted ./git would win.
+  #
+  # Compared field-by-field on purpose: "." is a substring of no directory and
+  # a regex matching every character, so both `has` and a grep here would pass
+  # without proving anything. Same class of silent-no-match bug the colon-join
+  # dedup above was written for.
+  local builtin_manifest="$FIXTURE/unitpath/builtin-manifest.yaml"
+  cat > "$builtin_manifest" <<'YAML'
+version: 1
+tiers:
+  tier1:
+    allowed_tools: Bash(command -v:*) Bash(which:*)
+tasks: {}
+repos: []
+community: []
+YAML
+  local derived field found_dot=0
+  derived="$(PATH=".:/usr/bin:/bin" MEUTE_MANIFEST="$builtin_manifest" \
+             bash -c 'source "$1"; unit_path_line' _ "$REPO/bin/meute")"
+  local -a derived_fields; IFS=':' read -ra derived_fields <<< "$derived"
+  for field in "${derived_fields[@]}"; do
+    [[ "$field" == "." ]] && found_dot=1
+  done
+  is "unit_path_line: a builtin's non-path answer never becomes a PATH entry" \
+     "$found_dot" "0"
+  # The guard must reject only the relative answer, not the whole scan: the
+  # real binary named alongside it still has to land.
+  has "unit_path_line: ...while a real binary on the same list still resolves" \
+      "$derived" "/usr/bin"
 }
 
 # dedup_dirs backs the one line in `doctor` that used to crash it: `grep -v`
@@ -1397,6 +1489,7 @@ test_manifest_ceiling
 test_branch_prune
 test_finding_level_triage
 test_public_manifest_valid
+test_binary_probe_allowlisted
 test_architecture_review_queued
 test_market_comparison_queued
 test_add_repo
