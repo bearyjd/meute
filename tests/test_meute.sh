@@ -1585,6 +1585,75 @@ PY2
   hasnt "prompt: ...not the repo it was cut from"     "$(grep -m1 'checked out at' "$prompt")" "git-r\`"
 }
 
+# End to end through the real runner with a stubbed engine: the first test that
+# reaches past the gates into worktree -> invoke -> report. The stub `claude`
+# answers preflight and emits a minimal envelope; what it "read" is what was
+# in its cwd, so a file carried into the worktree shows up in the report.
+test_worktree_files() {
+  local root="$FIXTURE/wtfiles" repo="$FIXTURE/wtfiles/git-and"
+  mkdir -p "$root/state" "$root/tasks" "$root/stub" "$repo"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  printf 'Task {{REPO_NAME}} {{REPO_PATH}} {{FILE_BUDGET}} {{LENS}} {{REPORT_PATH}} {{DATE}} {{BRANCH}} {{TASK}} {{TIER}} {{REPO_SPEC}} {{ALLOWED_COMMANDS}} {{DEFAULT_BRANCH}} {{UPSTREAM}} {{ETIQUETTE}} {{ETIQUETTE_CONTENT}} {{TICKET_ID}} {{TICKET_TITLE}} {{TICKET_NOTES}}\n' > "$root/tasks/t.md"
+
+  git -C "$repo" init -q -b main
+  printf 'local.properties\n' > "$repo/.gitignore"
+  echo x > "$repo/f.txt"; git -C "$repo" add -A
+  git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init
+  printf 'sdk.dir=/opt/sdk\n' > "$repo/local.properties"        # gitignored: a worktree never has it
+
+  # The stub engine: preflight passes; the "report" is a listing of its cwd.
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+files="$(ls -A | tr '\n' ' ')"
+jq -n --arg r "## Summary
+cwd holds: ${files}" '{is_error:false,result:$r,total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+
+  python3 - "$root" "$repo" <<'PY2'
+import sys, pathlib, yaml
+root, repo = sys.argv[1], sys.argv[2]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"t": {"tier": "tier2", "template": "tasks/t.md", "slots": ["daily"]}},
+    "repos": [{"name": "and", "path": repo, "spec": "android fixture", "tasks": ["t"],
+               "worktree_files": ["local.properties", "does/not/exist.txt"]}],
+    "community": [],
+}, open(pathlib.Path(root) / "repos.yaml", "w"), sort_keys=False)
+PY2
+
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily 2>&1)"
+  has "worktree_files: the run completes through the stub engine" "$out" "status=ok"
+  has "worktree_files: the runner says what it carried across"     "$out" "carried local.properties"
+  local report; report="$(ls "$root"/reports/and/t-*.md | head -1)"
+  has "worktree_files: the gitignored file was there when the engine ran" \
+      "$(cat "$report")" "local.properties"
+  has "worktree_files: ...alongside the tracked one"               "$(cat "$report")" "f.txt"
+  hasnt "worktree_files: a missing source is skipped, not an error" "$out" "does/not/exist"
+  is  "worktree_files: the main checkout was never touched" \
+      "$(git -C "$repo" status --porcelain | wc -l)" "0"
+
+  # The schema refuses anything that could reach outside the repo.
+  local err
+  for bad in '"/etc/passwd"' '"../secrets"' '"a/../../b"'; do
+    python3 - "$root" "$repo" "$bad" <<'PY3'
+import sys, pathlib, yaml, json
+root, repo, bad = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+d = yaml.safe_load(open(pathlib.Path(root) / "repos.yaml"))
+d["repos"][0]["worktree_files"] = [bad]
+yaml.safe_dump(d, open(pathlib.Path(root) / "bad.yaml", "w"), sort_keys=False)
+PY3
+    err="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/bad.yaml" 2>&1 || true)"
+    has "worktree_files: rejects ${bad}" "$err" "relative path inside the repo"
+  done
+}
+
 # Pruning deletes branches. The property that matters is not "does it prune"
 # but "does it ever delete work that exists nowhere else".
 test_branch_prune() {
@@ -1681,6 +1750,7 @@ test_self_budget
 test_manifest_ceiling
 test_subscription_gate
 test_two_gates
+test_worktree_files
 test_branch_prune
 test_finding_level_triage
 test_public_manifest_valid
