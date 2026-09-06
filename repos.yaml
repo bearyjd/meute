@@ -201,6 +201,16 @@ tasks:
     model: opus            # same reasoning as the other tier-2 reports
     lenses: [direct-alternatives, feature-gap, approach-divergence]
 
+  # Feature suggestions, anchored: every one must point at a TODO, a stub, a
+  # doc promise, a manual step, or code that is one step from the feature.
+  # "Projects like this usually have X" belongs to market-comparison.
+  suggest-features:
+    tier: tier2
+    template: tasks/suggest-features.md
+    slots: [weekly]
+    model: opus
+    lenses: [unfinished, promised, friction, adjacent]
+
   # Tier 3. Only touches tickets marked `specced: true` — either hand-written
   # below, or promoted from a report by `meute promote`. Capped in flight by
   # policy.tier3_max_in_flight.
@@ -261,11 +271,11 @@ tasks:
     allowed_tools: *verify_and_gh
 
   # ---- phase 2 ------------------------------------------------------------
-  # architecture-review and market-comparison are built above. "feature
-  # brainstorm" is deliberately not: unlike every other task here, free-form
-  # brainstorming has no falsifiability anchor (nothing to point at that
-  # confirms or refutes an idea), which conflicts with this fleet's own rule
-  # that inventing a finding is worse than finding none. See docs/prp/PRP-001-meute.md §11.
+  # All three tier-2 report templates are built above. "feature brainstorm"
+  # shipped as suggest-features once it had a falsifiability anchor: not
+  # free-form ideas, but suggestions the reader can check against a TODO, a
+  # doc promise, or the code that is one step from them. See
+  # docs/prp/PRP-001-meute.md §11.
 
 # ---------------------------------------------------------------------------
 # My repos. First claim on every slot.

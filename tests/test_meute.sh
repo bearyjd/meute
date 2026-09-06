@@ -1654,6 +1654,78 @@ PY3
   done
 }
 
+# Findings were gated on the task NAME `audit-security` in two places, so the
+# other findings-shaped reports (architecture-review, market-comparison, now
+# suggest-features) listed as a truncated first line and were invisible to
+# `meute findings` and therefore to per-finding promote/dismiss. Any report
+# with a `## Findings` section counts now.
+test_findings_are_content_driven() {
+  local root="$FIXTURE/fcd"; mkdir -p "$root/reports/zeta" "$root/state" "$root/tasks"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  cp "$FIXTURE/repos.yaml" "$root/repos.yaml"
+  cat > "$root/reports/zeta/suggest-features-2026-09-06.md" <<'MD'
+---
+repo: zeta
+task: suggest-features
+tier: tier2
+lens: unfinished
+started: 2026-09-06T04:00:00-04:00
+status: ok
+---
+
+## Summary
+Two anchored suggestions.
+
+## Findings
+
+### [HIGH] Finish the export path the TODO at exporter.py:40 abandons
+- **Anchor:** `src/exporter.py:40`
+
+### [LOW] Wire the parsed-but-unread `retries` config key
+- **Anchor:** `src/config.py:12`
+MD
+  is  "findings: a suggest-features report is summarised by count" \
+      "$(python3 "$REPO/lib/report.py" summary "$root/reports/zeta/suggest-features-2026-09-06.md")" "HIGH×1 LOW×1"
+  is  "findings: report.py parses them"     "$(python3 "$REPO/lib/report.py" findings "$root/reports/zeta/suggest-features-2026-09-06.md" | jq length)" "2"
+  local out; out="$("$root/bin/meute" findings --all 2>&1)"
+  has "findings: meute lists them for triage" "$out" "zeta/suggest-features-2026-09-06#1"
+  has "findings: with their priority"         "$out" "HIGH"
+  # a report with no Findings section still refuses, so gen-tests stays gen-tests
+  python3 "$REPO/lib/report.py" findings "$FIXTURE/reports/beta/gen-tests-2026-08-27.md" >/dev/null 2>&1
+  is  "findings: a report without a Findings section is still refused" "$?" "2"
+}
+
+# suggest-features is wired the same way the other tier-2 reports are.
+test_suggest_features_queued() {
+  local root="$FIXTURE/sugg"; mkdir -p "$root"/{state,tasks,git-s}
+  ln -sfn "$REPO/lib" "$root/lib"; cp "$REPO/tasks/suggest-features.md" "$root/tasks/"
+  git -C "$root/git-s" init -q -b main; echo x > "$root/git-s/f"; git -C "$root/git-s" add -A
+  git -C "$root/git-s" -c user.email=t@t -c user.name=t commit -qm init
+  python3 - "$root" <<'PY2'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2, "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"suggest-features": {"tier": "tier2", "template": "tasks/suggest-features.md",
+                                   "slots": ["weekly"], "model": "opus",
+                                   "lenses": ["unfinished", "promised", "friction", "adjacent"]}},
+    "repos": [{"name": "s", "path": str(root / "git-s"), "spec": "fixture", "tasks": ["suggest-features"]}],
+    "community": [],
+}, open(root / "repos.yaml", "w"), sort_keys=False)
+PY2
+  local e; e="$(python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.task=="suggest-features")')"
+  is  "suggest-features: read-only tier2"        "$(jq -r .tier <<< "$e")" "tier2"
+  is  "suggest-features: never writes code"      "$(jq -r .writes_code <<< "$e")" "false"
+  has "suggest-features: four rotating lenses"   "$(jq -c .lenses <<< "$e")" "adjacent"
+  hasnt "suggest-features: no web, no Bash"      "$(jq -r .tools <<< "$e")" "Web"
+  local pub; pub="$(python3 -c "import yaml;print(yaml.safe_load(open('$REPO/repos.yaml'))['tasks']['suggest-features']['tier'])")"
+  is  "suggest-features: registered in the public schema doc" "$pub" "tier2"
+}
+
 # Pruning deletes branches. The property that matters is not "does it prune"
 # but "does it ever delete work that exists nowhere else".
 test_branch_prune() {
@@ -1757,6 +1829,8 @@ test_public_manifest_valid
 test_binary_probe_allowlisted
 test_architecture_review_queued
 test_market_comparison_queued
+test_findings_are_content_driven
+test_suggest_features_queued
 test_add_repo
 test_discover
 test_real_repo_untouched

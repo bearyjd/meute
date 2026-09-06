@@ -694,6 +694,21 @@ least once — tier 1 with cargo, tier 2 with and without the web, tier 3
 with gradle — and the fleet has fired unattended on seven consecutive
 timer slots since arming.
 
+**Findings were gated on one task's name (2026-09-06).** `meute findings`
+and the report summariser both checked `task == "audit-security"`, so the
+architecture-review and market-comparison reports — eight real findings
+between them by the time this was noticed — listed as a truncated first
+line and could not be promoted or dismissed individually. Both now key on
+the report's content: any `## Findings` section counts. Found while wiring
+`suggest-features`, which would have been invisible on arrival.
+
+**The subscription gate declined its first real run the same afternoon.**
+Forcing `suggest-features` for its first live test hit
+`status=skipped reason=quota 14% below floor 30%` — the 5-hour window at
+86% after a day of interactive work. Nothing built today could have been
+proven by a test; this was the design's central constraint refusing to
+spend the operator's window, on the first day it could see it.
+
 ## 12. Phase status
 
 Built and accepted:
@@ -751,18 +766,16 @@ Built and accepted:
 Phase 2 status: architecture review and market comparison are built. What's
 left:
 
-- **Feature brainstorm — not building it, on purpose.** Every other tier-2
-  task has a falsifiability anchor: audit-security traces input to sink,
-  architecture-review requires a countable artifact (grep, import graph,
-  co-change log), market-comparison requires a live, citable URL. Free-form
-  "brainstorm new features" has no such anchor — there's nothing external a
-  skeptical reader can check an idea against, which conflicts directly with
-  this fleet's own rule (§11) that inventing a finding is worse than finding
-  none. The rigorous version of "feature brainstorm" is really a fifth
-  *finder* — "find unfinished work": TODOs, stubbed endpoints, config parsed
-  but never used. That's a legitimate task, just not this one; build it under
-  its own honest name if it's ever wanted, don't build "brainstorm" as a
-  wrapper around it.
+- **Feature suggestions — built as `suggest-features`, once it had an
+  anchor.** Earlier text here declined it for lacking a falsifiability
+  anchor. The operator's actual ask was "suggest features per the programs
+  set up," and the anchor turned out to be the same one every other task
+  uses: something in the repository the reader can open. Four lenses —
+  `unfinished` (TODOs, stubs, skipped tests, parsed-but-unread config),
+  `promised` (docs claims the code does not deliver), `friction` (manual
+  steps the project's own history shows), `adjacent` (code one step from a
+  feature). "Projects like this usually have X" is explicitly out of scope
+  and routed to `market-comparison`, which sources it. At most five per run.
 
 ## 13. Acceptance
 

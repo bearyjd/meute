@@ -190,8 +190,8 @@ cmd_findings() {
     [[ -n "$id" ]] || continue
     path="$(report_path "$id")"
     meta="$(python3 "$REPORT_PY" meta "$path" 2>/dev/null || echo '{}')"
-    [[ "$(jq -r '.task // ""' <<< "$meta")" == "audit-security" ]] || continue
     repo="$(jq -r '.repo // "?"' <<< "$meta")"
+    # Content-driven: any report with a Findings section, not one task name.
     total="$(python3 "$REPORT_PY" findings "$path" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
     for (( n = 1; n <= total; n++ )); do
       state="$(finding_state "$id" "$n")"
