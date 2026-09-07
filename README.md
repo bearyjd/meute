@@ -136,6 +136,35 @@ meute: preflight: claude is not logged in. Run:  claude auth login
 
 There is no API-key mode.
 
+## Triage
+
+Findings wait for one human decision each. The CLI is the reference interface;
+the inbox is the same thing with a cursor:
+
+```sh
+./bin/meute findings                 # undecided findings, grouped by repo, severity first
+./bin/meute show <report-id>         # the full report (marks it read)
+./bin/meute promote <id> -f <n>      # -> a tier-3 draft on the next weekly slot
+./bin/meute dismiss <id> -f <n> -r <reason> [-m why]
+./bin/meute resolve <id> -f <n> -m "fixed in PR #12"
+
+./bin/meute tui                      # the inbox in the terminal
+./bin/meute web                      # the identical inbox in a browser, loopback only
+```
+
+`tui` and `web` are one Textual app (PRP-003): `j`/`k` move, `Enter` shows the
+finding with its evidence, `p` promotes, `d` dismisses (a reason is required —
+it is the sole promoted-vs-dismissed signal per lens), `r` resolves, `/`
+filters on any column, `g` jumps to the next repo, `a` shows decided findings
+too. Every action goes through the CLI commands above, so the two can never
+disagree. Tabs for the tier-3 drafts awaiting merge and for every report.
+
+The UI lives in its own uv venv under `tui/`, created on first use. **The
+runner has no dependency on it**: `bin/run.sh` succeeds on a machine where
+that venv was never created, and the suite pins that. `web` is textual-serve
+and has no authentication — it binds `127.0.0.1` unless you pass `--host`,
+and the sensible way to use it from a phone is a tailnet address.
+
 ## Quota gates
 
 "Quota" is your plan's rolling 5-hour and weekly allowance, not a dollar budget.

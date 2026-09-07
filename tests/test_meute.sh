@@ -1785,6 +1785,80 @@ test_repo_default_branch() {
   is "default_branch: falls back to the checked-out branch"          "$(pick "$base/neither")" "devel"
 }
 
+# PRP-003 screen 1. lib/inbox.py is the data layer both the terminal and the
+# browser consume; every write goes through bin/meute, so the UI cannot
+# disagree with the CLI. Tested against the shared fixture with the system
+# python3 -- no Textual, no venv -- which is itself the hard invariant.
+test_inbox() {
+  local dump py="$REPO/lib/inbox.py"
+  dump="$(MEUTE_ROOT="$FIXTURE" python3 "$py" dump)"
+  is  "inbox: dump is JSON"          "$(jq -r 'type' <<< "$dump")" "object"
+  # The CLI and the data layer must count the same undecided findings.
+  is  "inbox: undecided count matches meute findings" \
+      "$(jq '[.findings[]|select(.state=="new")]|length' <<< "$dump")" \
+      "$(meute findings 2>/dev/null | grep -c '^    NEW')"
+  is  "inbox: reports are all listed"  "$(jq '.reports|length' <<< "$dump")" "$(meute reports --all 2>/dev/null | wc -l)"
+  has "inbox: dismiss reasons are the CLI's enum" "$(jq -r '.dismiss_reasons|join(" ")' <<< "$dump")" "false-positive wont-fix out-of-scope duplicate too-large other"
+  is  "inbox: findings come grouped by repo, most severe first" \
+      "$(jq -r '[.findings[]|select(.repo=="alpha" and (.report|endswith("08-28")))|.severity]|join(",")' <<< "$dump")" "CRITICAL,HIGH,HIGH"
+  is  "inbox: a finding carries its report id and number" \
+      "$(jq -r '.findings[]|select(.repo=="alpha" and .severity=="CRITICAL")|"\(.report)#\(.n)"' <<< "$dump")" "alpha/audit-security-2026-08-28#1"
+  is  "inbox: status carries the quota source"  "$(jq -r '.status.quota_source' <<< "$dump")" "stub"
+
+  # One finding's markdown, cut at the next finding or the next section.
+  local body
+  body="$(MEUTE_ROOT="$FIXTURE" python3 -c "
+import sys; sys.path.insert(0,'$REPO/lib'); import inbox
+print(inbox.finding_body('alpha/audit-security-2026-08-28', 2))")"
+  has   "inbox: finding_body starts at its own header" "$body" "### [HIGH] Path traversal"
+  hasnt "inbox: ...and stops before the next finding"  "$body" "Unvalidated header"
+
+  # Actions are the CLI's, verbatim: a dismiss through inbox.py is a dismiss.
+  local out
+  out="$(MEUTE_ROOT="$FIXTURE" python3 "$py" dismiss alpha/audit-security-2026-08-28 3 too-large "via inbox")"
+  is  "inbox: dismiss returns ok"        "$(jq -r .ok <<< "$out")" "true"
+  is  "inbox: ...and the CLI sees it"    "$(meute findings --all 2>/dev/null | grep 'audit-security-2026-08-28#3' | awk '{print $1}')" "dismissed"
+  has "inbox: ...with the reason kept"   "$(grep 'audit-security-2026-08-28#3' "$FIXTURE/state/reports")" "too-large: via inbox"
+  out="$(MEUTE_ROOT="$FIXTURE" python3 "$py" dismiss alpha/audit-security-2026-08-28 3 nonsense 2>/dev/null || true)"
+  is  "inbox: a bad reason is refused by the CLI, not papered over" "$(jq -r .ok <<< "$out")" "false"
+
+  # The view logic, without a terminal.
+  local hdr
+  hdr="$(python3 - "$REPO/tui" <<'PY2'
+import sys, json
+sys.path.insert(0, sys.argv[1])
+from model import Model
+m = Model.from_dump({
+    "findings": [   # in the order inbox.py emits: by repo, then severity
+        {"repo": "a", "state": "dismissed", "severity": "HIGH", "task": "t", "lens": "", "title": "gone", "location": ""},
+        {"repo": "a", "state": "new", "severity": "HIGH", "task": "t", "lens": "", "title": "needs fix", "location": "x.py:1"},
+        {"repo": "b", "state": "new", "severity": "LOW", "task": "t", "lens": "", "title": "low b", "location": ""},
+    ],
+    "status": {"quota": 12, "quota_source": "quota-subscription.sh", "floor": 30, "week": "w", "runs": 1, "declined": 2, "cost": 1.5, "ceiling": 40.0},
+})
+print("visible", len(m.visible()))
+m.show_decided = True; print("all", len(m.visible())); m.show_decided = False
+m.query = "x.py"; print("filter", [f["title"] for f in m.visible()]); m.query = ""
+print("repos", m.repos(), "jump", m.first_index_of_repo("b"))
+print("hdr", m.header_line())
+m.status["quota_source"] = "stub"; print("stub", m.header_line())
+PY2
+)"
+  has "model: undecided only by default"        "$hdr" "visible 2"
+  has "model: toggle shows decided too"          "$hdr" "all 3"
+  has "model: filter matches any column"         "$hdr" "filter ['needs fix']"
+  has "model: repo jump targets that repo's first visible row" "$hdr" "repos ['a', 'b'] jump 1"
+  has "model: header says BELOW FLOOR"           "$hdr" "quota 12% BELOW FLOOR 30%"
+  has "model: header carries spend vs ceiling"   "$hdr" "\$1.50 of \$40.0"
+  has "model: header counts undecided"           "$hdr" "2 undecided"
+  has "model: a stub reads UNMEASURED, never ok" "$hdr" "UNMEASURED (stub)"
+
+  # PRP-003's hard invariant: the runner never depends on the UI.
+  is  "invariant: run.sh never references tui/" "$(grep -c 'tui/' "$REPO/bin/run.sh")" "0"
+  is  "invariant: lib/ never imports textual"   "$(grep -rlc 'textual' "$REPO/lib" | wc -l)" "0"
+  is  "invariant: tui/model.py imports no textual" "$(grep -c 'textual' "$REPO/tui/model.py")" "0"
+}
+
 # Pruning deletes branches. The property that matters is not "does it prune"
 # but "does it ever delete work that exists nowhere else".
 test_branch_prune() {
@@ -1893,6 +1967,7 @@ test_suggest_features_queued
 test_add_repo
 test_discover
 test_repo_default_branch
+test_inbox
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

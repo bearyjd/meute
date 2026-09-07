@@ -1,6 +1,6 @@
 # PRP-003 — Triage TUI and Visualization Layer
 
-**Status:** Proposed — **blocked on PRP-002**
+**Status:** Screen 1 built (2026-09-06) — the rest still blocked on PRP-002
 **Depends on:** PRP-001 (fleet runner, complete), PRP-002 (work orders, executor — **not implemented**)
 **Blocks:** nothing — the runner must remain fully functional with this absent
 
@@ -51,6 +51,18 @@ siblings. A report now closes only when every finding in it has a decision.
 What Textual would still add is rendering and keybindings, not capability. That
 is worth having, but it is worth having *after* the work-order schema exists,
 not instead of it.
+
+**Built 2026-09-06, as the Textual app this document specifies:** screen 1 over
+`reports/` and `state/reports`, with `p` (promote — the narrowed `w`), `d` with
+the reason enum, `↵`, `/`, `g`, plus a tab for tier-3 drafts awaiting merge and
+one for every report. `meute tui` in the terminal; `meute web` is the identical
+app through textual-serve, loopback by default. The operator asked for both a
+TUI and a web GUI; §2's stack decision is what made that one build. Data comes
+from `lib/inbox.py`, every write goes through `bin/meute`, and the runner has
+no dependency on any of it — pinned by tests that grep for it. Built ahead of
+the §1 reading because the operator asked, not because the reading came in;
+the reading itself is now cheap to take, since every decision the inbox
+records is the data it needs.
 
 Recommended sequencing: build the inbox against reports and tickets now, and
 treat the work-order screens as PRP-002's second phase. That preserves the
