@@ -737,6 +737,26 @@ returned nothing for repos with no `origin/HEAD`, because a failing `$(...)`
 in an assignment aborts a function under `set -e`. Third time this exact
 shape has bitten this codebase; pinned by a mutation that drops the guard.
 
+**`suggest-features` proved itself on its first live run (2026-09-06,
+18:21).** immich-journal, `unfinished` lens, 28 turns, $1.39. The repo has
+no `TODO`/`FIXME` markers at all and every PRD story is marked passing, so
+a marker-shaped search would have returned nothing; the template's anchor
+rule pushed it to the other kind of unfinished — capabilities fully built in
+the engine and wired to nothing in the UI. Five suggestions, every anchor
+verified by hand: four `Section` fields the mobile app downloads and never
+renders, seven `/api/v1` routes with no caller, a dead `apiPut` helper.
+
+The one it ranked first was not a feature gap but data loss: the narrator
+can rename an event between regenerations, `_restore_notes` matched by
+exact title, and a family member's hand-typed note was logged and
+overwritten. Four copies of that logic, same hole in each. Fixed in
+immich-journal#4 — one implementation that never drops a note (exact, then
+normalised, then token overlap, then carried with a provenance line) — and
+the fix also removed the duplication that morning's architecture-review
+had flagged. The task found a real bug in the operator's program on its
+first run and it got fixed the same day, which is the loop this whole thing
+is for.
+
 ## 12. Phase status
 
 Built and accepted:
