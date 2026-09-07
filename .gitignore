@@ -24,3 +24,7 @@ state/quota-override
 # The subscription windows, snapshotted by contrib/statusline-capture.sh.
 state/rate-limits.json
 state/hold
+
+# The triage UI's own venv (uv-managed). The runner never touches it.
+tui/.venv/
+__pycache__/
