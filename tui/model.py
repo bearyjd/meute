@@ -53,18 +53,20 @@ class Model:
         q = s.get("quota")
         src = s.get("quota_source") or "?"
         floor = s.get("floor")
+        label = "Claude quota" if s.get("quota_engine") == "claude" else "quota"
         if q is None:
-            gate = "quota ?"
+            gate = f"{label} ?"
         elif src == "stub":
-            gate = "quota UNMEASURED (stub) -- run: meute install-statusline"
+            gate = f"{label} UNMEASURED (stub) -- run: meute install-statusline"
         elif floor is not None and q < floor:
-            gate = f"quota {q}% BELOW FLOOR {floor}%"
+            gate = f"{label} {q}% BELOW FLOOR {floor}%"
         else:
-            gate = f"quota {q}% ok"
+            gate = f"{label} {q}% ok"
+        codex = (f"Codex {s['codex_quota']}%" if s.get("codex_quota") is not None
+                 else "Codex unavailable")
         ceiling = s.get("ceiling")
         spend = f"${s.get('cost', 0):.2f}" + (f" of ${ceiling}" if isinstance(ceiling, float) else "")
         new = sum(1 for f in self.findings if f["state"] == "new")
-        return (f"{gate}  ·  week {s.get('week','?')}: {s.get('runs',0)} runs, "
+        return (f"{gate}  ·  {codex}  ·  week {s.get('week','?')}: {s.get('runs',0)} runs, "
                 f"{s.get('declined',0)} declined, {spend}  ·  {new} undecided")
-
 

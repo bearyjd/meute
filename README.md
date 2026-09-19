@@ -126,8 +126,9 @@ reach.
 
 meute never runs on metered API billing. Claude Code silently prefers an API key
 over subscription auth when one is present in the environment, so every
-invocation is scrubbed of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
-`OPENAI_API_KEY` (with a warning if any were set), and a zero-cost preflight
+invocation is scrubbed of API credentials, Anthropic/OpenAI endpoint overrides,
+Claude provider-routing flags, and upper- and lower-case proxy variables (with
+a warning if any were set), and a zero-cost preflight
 refuses to start unless the engine resolves to a real subscription:
 
 ```
@@ -162,8 +163,10 @@ disagree. Tabs for the tier-3 drafts awaiting merge and for every report.
 The UI lives in its own uv venv under `tui/`, created on first use. **The
 runner has no dependency on it**: `bin/run.sh` succeeds on a machine where
 that venv was never created, and the suite pins that. `web` is textual-serve
-and has no authentication — it binds `127.0.0.1` unless you pass `--host`,
-and the sensible way to use it from a phone is a tailnet address.
+and has no authentication — it binds `127.0.0.1` unless you pass both `--host`
+and `--insecure-public`. The latter is an explicit acknowledgement that anyone
+who can reach the listener can triage findings; a tailnet address is the
+sensible way to use it from a phone.
 
 ## Quota gates
 

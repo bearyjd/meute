@@ -9,6 +9,8 @@ Subcommands
     validate <manifest>              -- schema check; exit 2 and explain on failure
     policy   <manifest>              -- policy block as a single JSON object
     queue    <manifest> <slot>       -- candidate work items, one JSON object per line
+    plan-queue <manifest> <file> <slot>
+                                      -- validated, read-only entries staged by `meute plan --enqueue`
     render   <template> KEY=VAL ...  -- substitute {{KEY}} placeholders, print to stdout
     list-repos <manifest>            -- name+path for every repo, one JSON object per line
     list-tasks <manifest>            -- name+tier+writes_code for every task, one JSON object per line
@@ -141,7 +143,22 @@ def checked_tiers(data: dict) -> dict:
             raise ManifestError(f"tiers.{name}: missing {', '.join(missing)}")
         if not isinstance(tier["writes_code"], bool):
             raise ManifestError(f"tiers.{name}.writes_code: must be true or false")
+        # The web gate splits this on commas; a YAML list would read as "no
+        # web tools" and wave a web tier through a plan that never allowed one.
+        if not isinstance(tier["tools"], str):
+            raise ManifestError(f"tiers.{name}.tools: must be a comma-separated string")
     return tiers
+
+
+# The tools that reach the public web. A tier that has them sends what it
+# learned about a repository to third parties; staging such a tier against a
+# never-enrolled repository is an explicit decision, never a default.
+WEB_TOOLS = frozenset({"WebSearch", "WebFetch"})
+
+
+def tier_uses_web(tier: dict) -> bool:
+    """Only for tiers that passed checked_tiers, which guarantees a string."""
+    return any(tool.strip() in WEB_TOOLS for tool in tier["tools"].split(","))
 
 
 def checked_tasks(data: dict, tiers: dict, root: str) -> dict:
@@ -372,6 +389,75 @@ def build_queue(data: dict, slot: str, root: str) -> list:
     return entries
 
 
+def build_plan_queue(data: dict, path: str, slot: str, root: str) -> list:
+    """Expand the explicit, machine-owned portfolio plan into runner entries.
+
+    The plan file deliberately contains only repo paths, safe synthetic names,
+    and task names.  All executable settings still come from the manifest, and
+    this boundary refuses every writing tier even if someone edits state by
+    hand.  It is therefore safe for the normal scheduler to prefer a staged
+    plan without enrolling those repositories in repos.local.yaml.
+    """
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            staged = json.load(handle)
+    except json.JSONDecodeError as error:
+        raise ManifestError(f"{path}: invalid plan queue JSON: {error.msg}") from error
+    if not isinstance(staged, dict) or staged.get("version") != 1:
+        raise ManifestError(f"{path}: expected plan queue version 1")
+    declarations = staged.get("entries")
+    if not isinstance(declarations, list):
+        raise ManifestError(f"{path}: entries must be a list")
+    allow_web = staged.get("allow_web", False)
+    if not isinstance(allow_web, bool):
+        raise ManifestError(f"{path}: allow_web must be true or false")
+
+    defaults = merged_defaults(data)
+    tiers = checked_tiers(data)
+    tasks = checked_tasks(data, tiers, root)
+    # A portfolio plan normally stages several read-only lenses for the same
+    # discovered repository.  The executable identity is (synthetic name,
+    # task), not the repository name alone; reject only duplicate identities
+    # so an accidental repeated work item cannot run twice.
+    entries, keys = [], set()
+    for number, declared in enumerate(declarations, start=1):
+        if not isinstance(declared, dict):
+            raise ManifestError(f"{path}: entries[{number}] must be a mapping")
+        name, repo_path, task_name = declared.get("name"), declared.get("path"), declared.get("task")
+        if not isinstance(name, str) or not SAFE_NAME.match(name):
+            raise ManifestError(f"{path}: entries[{number}].name must be a safe identifier")
+        if not isinstance(repo_path, str) or not os.path.isabs(repo_path):
+            raise ManifestError(f"{path}: entries[{number}].path must be an absolute path")
+        if task_name not in tasks:
+            raise ManifestError(f"{path}: entries[{number}].task is not declared: {task_name!r}")
+        key = f"plan/{name}/{task_name}"
+        if key in keys:
+            raise ManifestError(f"{path}: duplicate staged entry key {key!r}")
+        keys.add(key)
+        task = tasks[task_name]
+        tier_name = task["tier"]
+        if tiers[tier_name]["writes_code"]:
+            raise ManifestError(
+                f"{path}: entries[{number}].task {task_name!r} writes code and cannot be staged")
+        if tier_uses_web(tiers[tier_name]) and not allow_web:
+            raise ManifestError(
+                f"{path}: entries[{number}].task {task_name!r} uses web tools and the plan did not allow them")
+        if slot != "all" and slot not in (task.get("slots") or list(VALID_SLOTS)):
+            continue
+        spec = declared.get("spec") or "Unconfigured repository staged for read-only analysis."
+        if not isinstance(spec, str) or not spec.strip() or "\n" in spec:
+            raise ManifestError(f"{path}: entries[{number}].spec must be a non-empty one-line string")
+        project = {"name": name, "path": repo_path, "spec": spec, "tasks": [task_name]}
+        entry = build_entry("plan", project, task_name, task, tier_name,
+                            tiers[tier_name], defaults, root)
+        entry.update({"key": key, "ticket_id": "",
+                      "ticket_title": "", "ticket_notes": ""})
+        entries.append(entry)
+    return entries
+
+
 def expand_tickets(entry: dict, project: dict, want_specced: bool = True) -> list:
     """One queue entry per ticket on the right side of the human gate.
 
@@ -414,6 +500,16 @@ def cmd_queue(args: list) -> int:
         raise ManifestError(f"unknown slot {slot!r} (expected one of {', '.join(VALID_SLOTS)})")
     root = repo_root(manifest)
     for entry in build_queue(load(manifest), slot, root):
+        print(json.dumps(entry))
+    return 0
+
+
+def cmd_plan_queue(args: list) -> int:
+    manifest, path, slot = args[0], args[1], args[2]
+    if slot not in (*VALID_SLOTS, "all"):
+        raise ManifestError(f"unknown slot {slot!r} (expected daily, weekly, or all)")
+    root = repo_root(manifest)
+    for entry in build_plan_queue(load(manifest), path, slot, root):
         print(json.dumps(entry))
     return 0
 
@@ -505,7 +601,11 @@ def cmd_list_repos(args: list) -> int:
 
 
 def cmd_list_tasks(args: list) -> int:
-    """name + tier + writes_code for every declared task, for `meute discover`'s picker."""
+    """name + tier + writes_code + tools for every declared task.
+
+    `meute discover`'s picker keys on writes_code; `meute plan` also needs the
+    tier's tools to keep web-reaching tiers out of a plan by default.
+    """
     data = load(args[0])
     tiers = checked_tiers(data)
     tasks = data.get("tasks")
@@ -517,6 +617,7 @@ def cmd_list_tasks(args: list) -> int:
             "name": name,
             "tier": task.get("tier") if isinstance(task, dict) else None,
             "writes_code": bool(tier["writes_code"]) if tier else None,
+            "tools": tier.get("tools") if tier else None,
         }))
     return 0
 
@@ -634,6 +735,7 @@ COMMANDS = {
     "validate": (cmd_validate, 1),
     "policy": (cmd_policy, 1),
     "queue": (cmd_queue, 2),
+    "plan-queue": (cmd_plan_queue, 3),
     "render": (cmd_render, 1),
     "add-ticket": (cmd_add_ticket, 3),
     "mark-delivered": (cmd_mark_delivered, 4),

@@ -11,7 +11,8 @@
 #   --engine <claude|codex>  override the manifest engine for this run
 #   --repo <name>            force a repo (bypasses the cursor and the share gates)
 #   --task <name>            force a task (bypasses the cursor and the share gates)
-#   --dry-run                select and render, invoke nothing, touch no state
+#   --dry-run                select and render, invoke nothing; touches no state except plan
+#                            bookkeeping (marks a vanished staged repo missing, may archive a plan)
 #   --validate               validate the manifest and exit
 #   --help
 #
@@ -23,7 +24,9 @@
 #   MEUTE_MANIFEST         manifest path (default: <root>/repos.yaml)
 #   MEUTE_CODEX_MODEL      model passed to `codex exec -m`; unset means codex's default
 #   MEUTE_SETTING_SOURCES  value for claude --setting-sources (default: none)
-#   MEUTE_QUOTA_CMD        see bin/quota.sh
+#   MEUTE_CLAUDE_QUOTA_CMD, MEUTE_CODEX_QUOTA_CMD
+#                          per-engine subscription probes; see bin/quota.sh
+#   MEUTE_QUOTA_CMD        legacy alias for MEUTE_CLAUDE_QUOTA_CMD
 #
 set -Eeuo pipefail
 
@@ -49,6 +52,8 @@ readonly CURSOR_FILE="${STATE_DIR}/cursor"
 readonly LOG_FILE="${STATE_DIR}/log"
 readonly LOCK_FILE="${STATE_DIR}/.lock"
 readonly HOLD_FILE="${STATE_DIR}/hold"
+readonly PLAN_QUEUE_FILE="${STATE_DIR}/plan-queue.json"
+readonly PLAN_DONE_FILE="${STATE_DIR}/plan-complete"
 # A 429 is not "try again in n seconds" so much as "this pool is spent" -- the
 # provider's own reset text is free-form and not worth parsing. A day-long
 # hold means at most one more wasted (and, per observation, free: a 429
@@ -72,6 +77,7 @@ ENGINE_OVERRIDE=""
 FORCE_REPO=""
 FORCE_TASK=""
 DRY_RUN=0
+PLAN_MODE=0
 
 # Populated during a run; the EXIT trap reads them.
 REPO_PATH=""
@@ -106,7 +112,7 @@ log_run() {
 # declining to run as a failure.
 skip() { log_run "skipped" "reason=$1" "${@:2}"; exit 0; }
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+usage() { sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
 
 # --------------------------------------------------------------------------
 # Worktree teardown. Removes the checkout; keeps the branch when it holds
@@ -156,6 +162,15 @@ eligible() {
 
   if [[ ! -d "$path/.git" && ! -f "$path/.git" ]]; then
     note "skipping $(jq -r '.key' <<< "$entry"): not a git repository at $path"
+    # A staged path that is no longer a repository (an agent worktree torn
+    # down after staging) can never be attempted; unmarked, it would hold the
+    # plan open forever. Recorded on dry runs too, like the retirement it
+    # feeds -- a missing repo is a fact, not an effect of running.
+    (( PLAN_MODE )) && kv_set "$PLAN_DONE_FILE" "$(jq -r '.key' <<< "$entry")" missing
+    return 1
+  fi
+  if (( PLAN_MODE )) && [[ -n "$(kv_get "$PLAN_DONE_FILE" "$(jq -r '.key' <<< "$entry")")" ]]; then
+    note "skipping $(jq -r '.key' <<< "$entry"): staged plan item already attempted"
     return 1
   fi
   # A forced selection is an explicit human decision; only the path check stands.
@@ -173,6 +188,46 @@ eligible() {
     fi
   fi
   return 0
+}
+
+# The runner owns LOCK_FILE for its whole lifetime, so this check and the
+# subsequent rename cannot race another runner.  `meute plan --enqueue` writes
+# a complete replacement atomically; if an operator replaces a plan between
+# timer fires, the next invocation validates that new file from scratch.
+retire_completed_plan() {
+  [[ -f "$PLAN_QUEUE_FILE" ]] || return 0
+  local all_file entry key archive complete=1
+  all_file="$(mktemp)"
+  python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" all > "$all_file" \
+    || { rm -f "$all_file"; die "staged plan queue failed validation"; }
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    key="$(jq -r '.key' <<< "$entry")"
+    if [[ -z "$(kv_get "$PLAN_DONE_FILE" "$key")" ]]; then
+      complete=0
+      break
+    fi
+  done < "$all_file"
+  rm -f "$all_file"
+  (( complete )) || return 0
+
+  archive="${STATE_DIR}/plan-queue.completed-$(date +%Y%m%dT%H%M%S).json"
+  [[ ! -e "$archive" ]] || archive="${archive}.$$"
+  mv "$PLAN_QUEUE_FILE" "$archive"
+  rm -f "$PLAN_DONE_FILE"
+  note "all staged plan items were attempted; archived queue at ${archive}"
+}
+
+# A forced --repo/--task names one entry; nothing else is a candidate.
+load_queue() {
+  local queue_file="$1"
+  if (( FORCED )); then
+    jq -c --arg r "$FORCE_REPO" --arg t "$FORCE_TASK" \
+       'select(($r == "" or .repo == $r) and ($t == "" or .task == $t))' \
+       "$queue_file" > "${queue_file}.f"
+    mv "${queue_file}.f" "$queue_file"
+  fi
+  mapfile -t QUEUE < "$queue_file"
 }
 
 # Round-robin: resume at the entry after the last one executed for this slot,
@@ -228,37 +283,60 @@ main() {
       && skip "meute's own weekly ceiling is spent" "budget=${BUDGET_LEFT}"
   fi
 
-  # Gate 2 of 2: the subscription pool the human shares. PRP-001 §3 step 4 —
-  # the one constraint that shapes everything: a chore that eats the window
-  # the human wanted is worse than a chore that never ran.
-  local remaining probe
-  probe="$("${MEUTE_ROOT}/bin/quota.sh" --with-source)" || skip "quota probe failed"
-  remaining="${probe%% *}"
-  QUOTA_SOURCE="${probe#* }"
-  (( remaining < QUOTA_FLOOR )) \
-    && skip "quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}"
-
   local queue_file
   queue_file="$(mktemp)"
   trap 'rm -f "$queue_file"' RETURN
-  python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
+  # A portfolio plan exists only after an explicit `meute plan --enqueue`.
+  # It is independently re-expanded and refuses writing tiers in manifest.py;
+  # then the ordinary timers prioritize it until every staged item is attempted.
+  if [[ -f "$PLAN_QUEUE_FILE" ]]; then
+    retire_completed_plan
+  fi
+  if [[ -f "$PLAN_QUEUE_FILE" ]]; then
+    python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$SLOT" > "$queue_file" \
+      || die "staged plan queue failed validation"
+    if [[ -s "$queue_file" ]]; then
+      PLAN_MODE=1
+    fi
+  fi
+  (( PLAN_MODE )) || python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
   fleet_load_scope || die "queue build failed"
-  remaining_at_start="$remaining"
 
   FORCED=0
-  if [[ -n "$FORCE_REPO" || -n "$FORCE_TASK" ]]; then
-    FORCED=1
-    jq -c --arg r "$FORCE_REPO" --arg t "$FORCE_TASK" \
-       'select(($r == "" or .repo == $r) and ($t == "" or .task == $t))' \
-       "$queue_file" > "${queue_file}.f"
-    mv "${queue_file}.f" "$queue_file"
-  fi
-
-  mapfile -t QUEUE < "$queue_file"
-  (( ${#QUEUE[@]} )) || skip "no queue entries for slot ${SLOT}"
+  [[ -z "$FORCE_REPO" && -z "$FORCE_TASK" ]] || FORCED=1
+  load_queue "$queue_file"
 
   local entry
-  entry="$(select_entry)" || skip "no eligible entry for slot ${SLOT}"
+  entry="$(select_entry)" || entry=""
+  # A plan's daily items drain in days; its weekly items take weeks. A slot
+  # that finds nothing eligible in the plan -- every item attempted, missing,
+  # or filtered out by --repo/--task -- falls through to the manifest rather
+  # than skip every fire until the other slot retires the plan. Retire first:
+  # a plan whose last item just went missing is complete now, not next fire.
+  if [[ -z "$entry" ]] && (( PLAN_MODE )); then
+    note "no eligible staged plan item for slot ${SLOT}; falling back to the manifest queue"
+    retire_completed_plan
+    PLAN_MODE=0
+    python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
+    load_queue "$queue_file"
+    entry="$(select_entry)" || entry=""
+  fi
+  (( ${#QUEUE[@]} )) || skip "no queue entries for slot ${SLOT}"
+  [[ -n "$entry" ]] || skip "no eligible entry for slot ${SLOT}"
+
+  # Gate 2 of 2: the subscription pool the human shares. Select the entry
+  # before probing so a Codex entry is gated by a Codex source, never by the
+  # Claude status-line snapshot. The selected engine is also written alongside
+  # the source in state/log, making each quota reading attributable.
+  local engine remaining probe
+  engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
+  probe="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source)" \
+    || skip "${engine} quota probe failed"
+  remaining="${probe%% *}"
+  QUOTA_SOURCE="${probe#* }"
+  (( remaining < QUOTA_FLOOR )) \
+    && skip "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
+  remaining_at_start="$remaining"
   run_entry "$entry"
 }
 
@@ -385,6 +463,10 @@ run_entry() {
   # The cursor advances on failure too: a poisoned entry must not stall the
   # whole fleet under cron. The log line is where failures surface.
   state_set "cursor.${SLOT}" "$key"
+  if (( PLAN_MODE )); then
+    kv_set "$PLAN_DONE_FILE" "$key" "$STARTED_AT"
+    retire_completed_plan
+  fi
   [[ "$lens" == "none" || "$ENGINE_STATUS" != "ok" ]] \
     || state_set "lens.${repo}.${task}" "$(( lens_index + 1 ))"
 
@@ -406,11 +488,39 @@ run_entry() {
 # configure, and disclosed it under Blocked. Each repo names what to carry
 # across; missing sources are skipped, never an error.
 copy_worktree_files() {
-  local entry="$1" rel
+  local entry="$1" rel source source_real repo_real part rest probe
+  repo_real="$(readlink -f -- "$REPO_PATH")" \
+    || die "worktree files: cannot resolve repository path: ${REPO_PATH}"
   while IFS= read -r rel; do
-    [[ -n "$rel" && -f "${REPO_PATH}/${rel}" ]] || continue
+    [[ -n "$rel" ]] || continue
+    source="${REPO_PATH}/${rel}"
+    [[ -f "$source" ]] || continue
+
+    # `-f` follows symlinks. Refuse both a symlink file and a symlinked
+    # directory component, so a manifest entry cannot smuggle host data into
+    # an agent worktree.
+    rest="$rel"; probe="$REPO_PATH"
+    while [[ -n "$rest" ]]; do
+      part="${rest%%/*}"
+      rest="${rest#*/}"
+      [[ "$part" == "$rest" ]] && rest=""
+      [[ -z "$part" || "$part" == "." ]] && continue
+      probe+="/${part}"
+      if [[ -L "$probe" ]]; then
+        note "WARNING: skipped unsafe worktree file ${rel} (source traverses a symlink)"
+        continue 2
+      fi
+    done
+    source_real="$(readlink -f -- "$source")" || {
+      note "WARNING: skipped unsafe worktree file ${rel} (source cannot be resolved)"
+      continue
+    }
+    if [[ "$source_real" != "$repo_real/"* ]]; then
+      note "WARNING: skipped unsafe worktree file ${rel} (source resolves outside the repository)"
+      continue
+    fi
     mkdir -p "${WORKTREE}/$(dirname "$rel")"
-    cp -p "${REPO_PATH}/${rel}" "${WORKTREE}/${rel}"
+    cp -p -- "$source" "${WORKTREE}/${rel}"
     note "carried ${rel} into the worktree"
   done < <(jq -r '.worktree_files[]? // empty' <<< "$entry")
 }

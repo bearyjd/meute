@@ -1,8 +1,9 @@
 # Scratch checkouts; created and removed within a single run.
 .worktrees/
-# Lock and temp files; state/cursor, state/log and reports/ ARE committed.
+# Lock and temp files. Only state/.gitkeep and reports/.gitkeep are tracked;
+# the fleet's own state/cursor, state/log and reports/ are ignored below.
 state/.lock
-state/.cursor.*
+state/.kv.*
 .omc/
 # Your real fleet config: names your projects and describes what they do.
 # The harness is public; that list is yours.
@@ -21,6 +22,12 @@ state/cursor
 state/reports
 state/tickets.yaml
 state/quota-override
+# A staged portfolio plan lists every unconfigured repo on the machine by
+# absolute path; its archives and mktemp leftovers carry the same list.
+state/plan-queue.json
+state/plan-complete
+state/plan-queue.completed-*
+state/.plan-*
 # The subscription windows, snapshotted by contrib/statusline-capture.sh.
 state/rate-limits.json
 state/hold

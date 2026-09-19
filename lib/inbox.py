@@ -155,12 +155,23 @@ def _week() -> str:
 
 
 def load_status() -> dict:
-    out: dict = {"quota": None, "quota_source": None, "budget": None, "week": _week(),
+    # `quota` remains the Claude value for compatible consumers, but its
+    # engine is explicit.  A Claude snapshot must never suggest that Codex is
+    # available: Codex only reports a value from its dedicated probe.
+    out: dict = {"quota": None, "quota_source": None, "quota_engine": "claude",
+                 "codex_quota": None, "codex_quota_source": None,
+                 "budget": None, "week": _week(),
                  "runs": 0, "cost": 0.0, "last_run": None, "declined": 0}
     try:
-        probe = subprocess.run([os.path.join(ROOT, "bin", "quota.sh"), "--with-source"],
+        probe = subprocess.run([os.path.join(ROOT, "bin", "quota.sh"), "--engine", "claude", "--with-source"],
                                capture_output=True, text=True, check=True).stdout.split()
         out["quota"], out["quota_source"] = int(probe[0]), probe[1]
+    except Exception:
+        pass
+    try:
+        probe = subprocess.run([os.path.join(ROOT, "bin", "quota.sh"), "--engine", "codex", "--with-source"],
+                               capture_output=True, text=True, check=True).stdout.split()
+        out["codex_quota"], out["codex_quota_source"] = int(probe[0]), probe[1]
     except Exception:
         pass
     try:

@@ -29,6 +29,9 @@ bad()  { printf '  FAIL  %s\n        %s\n' "$1" "$2"; FAILED=$(( FAILED + 1 )); 
 is()   { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "expected [$3], got [$2]"; }
 has()  { [[ "$2" == *"$3"* ]] && ok "$1" || bad "$1" "[$2] does not contain [$3]"; }
 hasnt(){ [[ "$2" != *"$3"* ]] && ok "$1" || bad "$1" "[$2] unexpectedly contains [$3]"; }
+# A skip is visible and counts as neither: a test that cannot run here must not
+# read as a pass, and must not fail a suite on a host that lacks the facility.
+skip() { printf '  skip  %s\n        %s\n' "$1" "$2"; }
 
 meute() { "$FIXTURE/bin/meute" "$@"; }
 report() { python3 "$REPO/lib/report.py" "$@"; }
@@ -313,7 +316,10 @@ test_dismiss_and_edges() {
   local out; out="$(meute reports --all 2>&1)"
   hasnt "stale row for a deleted report is skipped" "$out" "2026-08-20"
 
-  has "status: runs without error" "$(meute status 2>&1)" "tier-3 in flight"
+  local status; status="$(meute status 2>&1)"
+  has "status: runs without error" "$status" "tier-3 in flight"
+  has "status: labels the displayed balance Claude-only" "$status" "Claude quota"
+  has "status: says unwired Codex is unavailable" "$status" "Codex quota unavailable"
   is  "unknown command exits 1"    "$(meute frobnicate >/dev/null 2>&1; echo $?)" "1"
 }
 
@@ -338,9 +344,17 @@ test_resolve() {
 # Compares against a snapshot taken before the suite ran, rather than demanding a
 # clean tree: the operator may legitimately have uncommitted state, and this must
 # still catch the suite itself writing outside its fixture.
+# Nearly everything under the real state/ and reports/ is gitignored, so a
+# porcelain listing alone is blind to exactly the files a test must never
+# write there (state/plan-queue.json, a report). List every file as well;
+# --ignored would collapse an already-ignored report directory to one line.
+real_state_snapshot() {
+  { git -C "$REPO" status --porcelain -- state reports
+    find "$REPO/state" "$REPO/reports" -type f; } | sort | tr -d ' \n'
+}
+
 test_real_repo_untouched() {
-  local now; now="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
-  is "the real state/ and reports/ were never touched" "$now" "$REAL_STATE_BEFORE"
+  is "the real state/ and reports/ were never touched" "$(real_state_snapshot)" "$REAL_STATE_BEFORE"
 }
 
 # repos.yaml is the tracked schema documentation (repos: [] / community: [] --
@@ -699,6 +713,355 @@ PY
   has "discover: leaves manifest scaffolding intact"           "$check" "tiers ['tier2']"
 }
 
+# Everything a staged plan writes under state/ names private repositories by
+# absolute path, and commit_state adds state/ wholesale after every real run.
+# The runner appends `.$$` to an archive name on a same-second collision, so
+# the archive pattern is anchored on the prefix only. kv_set's mktemp scratch
+# (lib/state.sh) lands beside plan-complete and carries the same content.
+test_plan_state_ignored() {
+  local f
+  for f in state/plan-queue.json state/plan-complete \
+           state/plan-queue.completed-20260918T000000.json \
+           state/plan-queue.completed-20260918T000000.json.123 \
+           state/.plan-entries.abc state/.plan-queue.abc state/.kv.abc123; do
+    is "gitignore: ${f} never reaches the public harness" \
+      "$(git -C "$REPO" check-ignore -q -- "$f"; echo $?)" "0"
+  done
+}
+
+# The web gate reads a tier's `tools` as a comma-separated string. A YAML
+# list would read as "no web tools" and let a web entry through a plan that
+# never allowed one, so the shape is checked where every command validates.
+test_tier_tools_must_be_string() {
+  local root="$FIXTURE/tier-tools"
+  mkdir -p "$root"/{state,tasks}
+  cp "$REPO/tasks/market-comparison.md" "$root/tasks/"
+  python3 - "$root" <<'PY2'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2-web": {"tools": ["Read", "WebSearch"], "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"market-comparison": {"tier": "tier2-web", "template": "tasks/market-comparison.md", "slots": ["weekly"]}},
+    "repos": [], "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY2
+  printf '{"version":1,"scan":"%s","allow_web":false,"entries":[{"name":"plan-001-x","path":"%s","task":"market-comparison"}]}\n' \
+    "$root" "$root" > "$root/state/plan-queue.json"
+
+  local out
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.local.yaml" 2>&1; echo "rc=$?")"
+  has "tiers: list-form tools fail validation" "$out" "tiers.tier2-web.tools: must be a comma-separated string"
+  has "tiers: list-form tools are an error"    "$out" "rc=2"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" all 2>&1; echo "rc=$?")"
+  has   "tiers: plan-queue rejects the manifest before expanding" "$out" "tiers.tier2-web.tools: must be a comma-separated string"
+  hasnt "tiers: no web entry slips out under list-form tools"     "$out" '"key": "plan/'
+}
+
+# On some hosts /home/<you> and /var/home/<you> are one directory via a bind
+# mount, and neither `pwd -P` nor `readlink -f` unifies them. The manifest
+# stores one spelling, MEUTE_ROOT takes whichever the script was invoked
+# through, and a string-keyed lookup then reports every enrolled repo as
+# unconfigured -- or proposes meute's own checkout. Only device+inode identity
+# survives that, so the fixture builds a real bind mount in a user namespace.
+# A symlinked alias covers the cheaper case the same way: the link spelling
+# goes in the manifest (find will not descend a symlinked start point), and
+# the scan runs on the real directory.
+test_plan_identity() {
+  local universe="$FIXTURE/plan-identity"
+  local root="$universe/meute-stand-in"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  local r
+  for r in meute-stand-in already-configured repo-alpha; do
+    mkdir -p "$universe/$r"
+    git -C "$universe/$r" init -q -b main
+    echo x > "$universe/$r/f.txt"
+    git -C "$universe/$r" add -A
+    git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
+  done
+
+  # The manifest names already-configured under whichever spelling the
+  # variant under test wants; everything else is fixed.
+  identity_manifest() {
+    python3 - "$root" "$1" <<'PY2'
+import sys, pathlib, yaml
+root, configured = pathlib.Path(sys.argv[1]), sys.argv[2]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
+    "repos": [{"name": "already-configured", "path": configured,
+               "spec": "already here", "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY2
+  }
+
+  local out
+  # (b) first, since it needs no facility: manifest and MEUTE_ROOT through the
+  # link, scan through the real path.
+  local link="$FIXTURE/plan-link"
+  ln -sfn "$universe" "$link"
+  identity_manifest "$link/already-configured"
+  out="$("$link/meute-stand-in/bin/meute" plan "$universe" 2>&1)"
+  has   "identity: symlink spelling still matches the manifest"  "$out" "configured    already-configured"
+  hasnt "identity: symlink spelling still excludes own checkout" "$out" "meute-stand-in"
+  has   "identity: symlink spelling counts one configured repo"  "$out" "configured: 1"
+
+  # And the other way round: the scan itself is asked through the link. find
+  # does not descend a symlinked start point unless told to, so this found
+  # nothing at all before -H.
+  identity_manifest "$universe/already-configured"
+  out="$("$root/bin/meute" plan "$link" 2>&1)"
+  has   "identity: a symlinked scan dir is descended"              "$out" "discovered: 2 "
+  has   "identity: a symlinked scan dir still matches the manifest" "$out" "configured: 1"
+  hasnt "identity: a symlinked scan dir still excludes own checkout" "$out" "meute-stand-in"
+
+  # (a) and (c): a genuine bind mount, as on the host that found this.
+  local alias="$FIXTURE/plan-alias"
+  mkdir -p "$alias"
+  if unshare -Urm true 2>/dev/null; then
+    identity_manifest "$alias/already-configured"
+    out="$(unshare -Urm bash -c 'mount --bind "$1" "$2" && exec "$2/meute-stand-in/bin/meute" plan "$1"' \
+             _ "$universe" "$alias" 2>&1)"
+    has   "identity: bind-mount spelling still matches the manifest"  "$out" "configured    already-configured"
+    hasnt "identity: bind-mount spelling still excludes own checkout" "$out" "meute-stand-in"
+    has   "identity: bind-mount spelling counts one configured repo"  "$out" "configured: 1"
+
+    out="$(unshare -Urm bash -c 'mount --bind "$1" "$2" && exec "$2/meute-stand-in/bin/meute" discover "$1"' \
+             _ "$universe" "$alias" 2>&1 </dev/null)"
+    has   "identity: discover under the alias still finds the new repo"   "$out" "repo-alpha"
+    hasnt "identity: discover under the alias does not re-offer a configured repo" "$out" "already-configured"
+    hasnt "identity: discover under the alias does not offer own checkout" "$out" "meute-stand-in"
+  else
+    skip "identity: bind-mount variants" "unshare -Urm is unavailable on this host"
+  fi
+}
+
+# A `.git` *file* marks a linked worktree or a vendored submodule as readily
+# as a checkout. Found live: six ephemeral agent worktrees and five third-party
+# submodules of already-enrolled repos, each proposed for four audits on the
+# operator's quota. git itself tells the three apart.
+test_plan_worktrees() {
+  local universe="$FIXTURE/plan-worktrees"
+  local root="$universe/meute-stand-in"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  local r
+  for r in meute-stand-in repo-alpha repo-beta; do
+    mkdir -p "$universe/$r"
+    git -C "$universe/$r" init -q -b main
+    echo x > "$universe/$r/f.txt"
+    git -C "$universe/$r" add -A
+    git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
+  done
+  git -C "$universe/repo-alpha" worktree add -q "$universe/repo-alpha/.claude/worktrees/agent-x" -b agent-x
+  git -C "$universe/repo-beta" -c protocol.file.allow=always submodule add -q "$universe/repo-alpha" vendor/alpha
+  git -C "$universe/repo-beta" -c user.email=t@t -c user.name=t commit -qm vendored
+  python3 - "$root" <<'PY2'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
+    "repos": [], "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY2
+
+  local out
+  out="$("$root/bin/meute" plan "$universe" 2>&1)"
+  has   "worktrees: the main checkouts are still proposed"      "$out" "unconfigured  repo-alpha"
+  has   "worktrees: the submodule's host is still proposed"     "$out" "unconfigured  repo-beta"
+  hasnt "worktrees: a linked worktree is not a repository"      "$out" "agent-x"
+  hasnt "worktrees: a vendored submodule is not a repository"   "$out" "vendor/alpha"
+  hasnt "worktrees: the submodule is not proposed by basename"  "$out" "unconfigured  alpha "
+  has   "worktrees: discovered counts only true repositories"   "$out" "discovered: 2 "
+}
+
+# `plan` is the non-interactive counterpart to `discover`: it inventories the
+# checkout's parent by default, recursively spots normal nested repositories,
+# compares them to the manifest, and must never enroll or otherwise write one.
+test_plan() {
+  local universe="$FIXTURE/plan-universe"
+  local root="$universe/meute-stand-in"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$REPO/tasks/architecture-review.md" \
+     "$REPO/tasks/market-comparison.md" "$root/tasks/"
+  git -C "$root" init -q -b main
+  echo x > "$root/f.txt"; git -C "$root" add -A
+  git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+
+  local r
+  for r in repo-alpha repo-beta already-configured nested/repo-gamma; do
+    mkdir -p "$universe/$r"
+    git -C "$universe/$r" init -q -b main
+    echo x > "$universe/$r/f.txt"
+    git -C "$universe/$r" add -A
+    git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
+  done
+
+  python3 - "$root" "$universe" <<'PY'
+import sys, pathlib, yaml
+root, universe = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False},
+              "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk",
+                            "writes_code": False}},
+    "tasks": {
+        "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]},
+        "architecture-review": {"tier": "tier2", "template": "tasks/architecture-review.md", "slots": ["weekly"]},
+        "market-comparison": {"tier": "tier2-web", "template": "tasks/market-comparison.md", "slots": ["weekly"]},
+    },
+    "repos": [{"name": "already-configured", "path": str(universe / "already-configured"),
+               "spec": "already here", "tasks": ["audit-security", "architecture-review"]}],
+    "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+
+  local before after out
+  before="$(md5sum "$root/repos.local.yaml" | cut -d' ' -f1)"
+  out="$("$root/bin/meute" plan 2>&1)"
+  after="$(md5sum "$root/repos.local.yaml" | cut -d' ' -f1)"
+  is  "plan: defaults to the meute checkout's parent" "$after" "$before"
+  has "plan: identifies the manifest match" "$out" "configured    already-configured"
+  has "plan: identifies unconfigured direct children" "$out" "unconfigured  repo-alpha"
+  has "plan: recursively identifies nested repositories" "$out" "unconfigured  repo-gamma"
+  hasnt "plan: excludes its own checkout" "$out" "meute-stand-in"
+  has "plan: explains deterministic ranking" "$out" "security, architecture, features, market; path breaks ties"
+  # Canonical path is the tie-breaker, so nested/repo-gamma sorts before the
+  # direct children; task priority remains security then architecture.
+  has "plan: ranks security before architecture for a repo" "$out" $'1. repo-gamma               audit-security'
+  has "plan: follows with architecture" "$out" $'2. repo-gamma               architecture-review'
+  has "plan: keeps planning read-only" "$out" "No manifest, repository, or state files were changed."
+
+  # A read-only tier that reaches the public web would send what it learned
+  # about a private, never-enrolled repository to third parties. That is an
+  # explicit decision, not a default: the ranking omits it and says how to
+  # opt in. The manifest reports each tier's tools so the planner can tell.
+  is  "plan: list-tasks reports the tier's tools" \
+    "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" list-tasks "$root/repos.local.yaml" | jq -r 'select(.name == "market-comparison") | .tools')" \
+    "Read,Grep,Glob,WebSearch,WebFetch"
+  hasnt "plan: a web-research task is not ranked by default" "$(grep -E '^ +[0-9]+\. ' <<< "$out")" "market-comparison"
+  has   "plan: the omission is visible"   "$out" "excluded 1 web-research task(s): market-comparison"
+  has   "plan: the omission says how to opt in" "$out" "pass --allow-web"
+  out="$("$root/bin/meute" plan --allow-web 2>&1)"
+  has   "plan: --allow-web ranks the web-research task" "$(grep -E '^ +[0-9]+\. ' <<< "$out")" "market-comparison"
+  hasnt "plan: --allow-web has nothing to exclude" "$out" "excluded"
+
+  # A plan intentionally gives one discovered repository several distinct
+  # read-only tasks.  The validator must key entries by repository *and* task,
+  # not reject the second task merely because its synthetic repository name is
+  # shared.
+  printf 'stale\tattempted\n' > "$root/state/plan-complete"
+  out="$("$root/bin/meute" plan --enqueue "$universe" 2>&1)"
+  has "plan: stages several tasks for the same repository" "$out" "Staged 6 read-only analysis item(s)"
+  is "plan: all staged entries have distinct executable keys" \
+    "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" all | jq -r .key | sort -u | wc -l)" "6"
+  is "plan: enqueue clears completion marks from a prior plan" \
+    "$(test -e "$root/state/plan-complete"; echo $?)" "1"
+  is "plan: a default plan records that the web was not allowed" \
+    "$(jq -r .allow_web "$root/state/plan-queue.json")" "false"
+
+  # A real queue contains all six entries even though this daily timer sees
+  # only the daily tasks.  A stubbed subscription preflight lets dry-run prove
+  # that the staged entry reaches selection without touching a repository.
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then
+  printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$root/stub/claude"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has "plan: multi-task staged queue is selected by the runner" "$out" "would run: key=plan/"
+
+  # Mark every staged item attempted, as completed real runs would.  The next
+  # fire archives the finite plan and selects the ordinary manifest queue
+  # instead of perpetually finding an ineligible staged item.
+  while IFS= read -r r; do
+    printf '%s\tattempted\n' "$r" >> "$root/state/plan-complete"
+  done < <(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" all | jq -r .key)
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has "plan: completed queue is archived before selection" "$out" "archived queue"
+  has "plan: completed queue falls back to the manifest" "$out" "would run: key=already-configured/audit-security"
+  is "plan: completed queue no longer blocks future slots" "$(test -e "$root/state/plan-queue.json"; echo $?)" "1"
+  is "plan: one archived record is retained" "$(find "$root/state" -name 'plan-queue.completed-*.json' | wc -l)" "1"
+
+  # The opt-in is recorded in the plan itself, and the runner-side validator
+  # holds the same line: a hand-edited plan cannot smuggle a web tier past a
+  # plan that never allowed one.
+  out="$("$root/bin/meute" plan --enqueue --allow-web "$universe" 2>&1)"
+  has "plan: --allow-web stages the web-research task too" "$out" "Staged 9 read-only analysis item(s)"
+  is  "plan: --allow-web is recorded in the staged plan" "$(jq -r .allow_web "$root/state/plan-queue.json")" "true"
+  is  "plan: the runner accepts a web entry the plan allowed" \
+    "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" all >/dev/null 2>&1; echo $?)" "0"
+  jq '.allow_web = false' "$root/state/plan-queue.json" > "$root/state/plan-queue.json.edit"
+  mv "$root/state/plan-queue.json.edit" "$root/state/plan-queue.json"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" all 2>&1 >/dev/null; echo "rc=$?")"
+  has "plan: the runner refuses a web entry the plan did not allow" "$out" "uses web tools"
+  has "plan: the refusal is an error, not a skip" "$out" "rc=2"
+  jq '.allow_web = "yes"' "$root/state/plan-queue.json" > "$root/state/plan-queue.json.edit"
+  mv "$root/state/plan-queue.json.edit" "$root/state/plan-queue.json"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" all 2>&1 >/dev/null; echo "rc=$?")"
+  has "plan: allow_web must be a boolean" "$out" "allow_web"
+  has "plan: a non-boolean allow_web is an error" "$out" "rc=2"
+
+  # A plan's daily items drain in days while its weekly items take weeks.
+  # In between, a daily slot that finds nothing eligible in the plan must
+  # fall through to the manifest rather than skip until the plan retires.
+  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  while IFS= read -r r; do
+    printf '%s\tattempted\n' "$r" >> "$root/state/plan-complete"
+  done < <(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" daily | jq -r .key)
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has "plan: a slot with no eligible staged item falls back to the manifest" "$out" "would run: key=already-configured/audit-security"
+  is  "plan: the fallback keeps the plan staged for its other slot" "$(test -e "$root/state/plan-queue.json"; echo $?)" "0"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly --dry-run 2>&1)"
+  has "plan: the other slot still prefers the staged plan" "$out" "would run: key=plan/"
+
+  # A staged path that stops being a repository (an agent worktree torn down
+  # between staging and its turn) can never be attempted. Left unmarked it
+  # would hold the plan open forever; marked missing, the plan can retire.
+  # Destructive to the universe, so it is the last thing this test does.
+  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  rm -rf "$universe/repo-alpha"
+  while IFS= read -r r; do
+    printf '%s\tattempted\n' "$r" >> "$root/state/plan-complete"
+  done < <(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" all \
+             | jq -r 'select(.path | endswith("/repo-alpha") | not) | .key')
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has "plan: a vanished staged repo does not wedge the daily slot" "$out" "would run: key=already-configured/audit-security"
+  has "plan: a vanished staged repo is marked missing" "$(cat "$root/state/plan-complete")" $'repo-alpha/audit-security\tmissing'
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly --dry-run 2>&1)"
+  has "plan: a vanished staged repo does not wedge the weekly slot" "$out" "would run: key=already-configured/architecture-review"
+  is  "plan: a plan whose last item vanished retires" "$(test -e "$root/state/plan-queue.json"; echo $?)" "1"
+  is  "plan: the retired plan is archived alongside the first" "$(find "$root/state" -name 'plan-queue.completed-*' | wc -l)" "2"
+}
+
 
 # The community track's gates: no etiquette file means no contribution, and the
 # reproduce/draft stages sit on opposite sides of the human specced: true gate.
@@ -856,6 +1219,17 @@ test_quota_gate() {
   MEUTE_QUOTA_CMD='echo 250' "$q" >/dev/null 2>&1; rc=$?
   is "quota: out-of-range probe output is rejected" "$rc" "1"
 
+  out="$(MEUTE_CLAUDE_QUOTA_CMD='echo 63' MEUTE_QUOTA_CMD='echo 42' "$q" --engine claude --with-source)"
+  is "quota: Claude-specific command outranks its legacy alias" "$out" "63 echo"
+
+  env -u MEUTE_CODEX_QUOTA_CMD MEUTE_QUOTA_CMD='echo 42' "$q" --engine codex >/dev/null 2>&1; rc=$?
+  is "quota: Codex never reuses the legacy Claude probe" "$rc" "1"
+  out="$(env -u MEUTE_CODEX_QUOTA_CMD "$q" --engine codex 2>&1 || true)"
+  has "quota: an unwired Codex probe explains the safe refusal" "$out" "no Codex quota probe is configured"
+
+  out="$(MEUTE_CODEX_QUOTA_CMD='echo 73' "$q" --engine codex --with-source)"
+  is "quota: Codex accepts only its dedicated probe" "$out" "73 echo"
+
   # the adapter must fail cleanly when its backend is absent
   LUT_URL='http://127.0.0.1:9' "$REPO/contrib/quota-llm-usage-tracker.sh" >/dev/null 2>&1; rc=$?
   is "quota: llm-usage-tracker adapter fails closed when unreachable" "$rc" "1"
@@ -868,6 +1242,53 @@ test_quota_gate() {
   local out
   out="$(env -u LUT_URL "$REPO/contrib/quota-llm-usage-tracker.sh" 2>&1 || true)"
   has "quota: llm-usage-tracker adapter defaults to the tracker's real port" "$out" "127.0.0.1:48372"
+}
+
+
+# A manifest can mix engines. The runner must select an entry before it probes,
+# so a Codex job cannot accidentally consume a Claude status-line reading.
+test_runner_uses_selected_engine_quota() {
+  local root="$FIXTURE/codex-quota" repo="$FIXTURE/codex-quota/git-r"
+  mkdir -p "$root"/{state,tasks,stub} "$repo"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  git -C "$repo" init -q -b main
+  echo x > "$repo/f"; git -C "$repo" add -A
+  git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init
+  python3 - "$root" "$repo" <<'PY'
+import pathlib, sys, yaml
+root, repo = map(pathlib.Path, sys.argv[1:])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "codex", "model": "unused", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
+    "repos": [{"name": "r", "path": str(repo), "spec": "fixture", "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root / "repos.yaml", "w"), sort_keys=False)
+PY
+  # A tempting Claude reading must not unlock the Codex queue item.
+  printf '{"captured_at":1,"seven_day":{"used_percentage":1,"resets_at":9999999999}}' > "$root/state/rate-limits.json"
+  local out
+  out="$(env -u MEUTE_CODEX_QUOTA_CMD -u MEUTE_CLAUDE_QUOTA_CMD -u MEUTE_QUOTA_CMD \
+    MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has "runner quota: unwired Codex entry declines despite Claude snapshot" "$out" "codex quota probe failed"
+
+  cat > "$root/stub/codex" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "login" && "$2" == "status" ]]; then
+  printf 'Logged in with ChatGPT\n'
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$root/stub/codex"
+  out="$(env -u MEUTE_CLAUDE_QUOTA_CMD -u MEUTE_QUOTA_CMD \
+    PATH="$root/stub:$PATH" MEUTE_CODEX_QUOTA_CMD='echo 88' "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has "runner quota: configured Codex probe permits Codex entry" "$out" "would run: key=r/audit-security"
+  has "runner quota: selected Codex engine reaches the dry run" "$out" "engine=codex"
 }
 
 
@@ -896,6 +1317,7 @@ test_doctor() {
   fi
   has "doctor: warns an unwired quota gate"   "$out" "measures NOTHING yet"
   has "doctor: says how to wire it"           "$out" "meute install-statusline"
+  has "doctor: says unwired Codex is unavailable" "$out" "subscription (Codex): unavailable"
 }
 
 # install-timers used to hardcode ~/.local/bin:~/.npm-global/bin into the unit's
@@ -1634,6 +2056,9 @@ test_worktree_files() {
   # The stub engine: preflight passes; the "report" is a listing of its cwd.
   cat > "$root/stub/claude" <<'STUB'
 #!/usr/bin/env bash
+for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+  [[ -z "${!var+x}" ]] || { printf 'unsafe inherited engine variable: %s\n' "$var" >&2; exit 91; }
+done
 if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
 files="$(ls -A | tr '\n' ' ')"
 jq -n --arg r "## Summary
@@ -1658,8 +2083,15 @@ yaml.safe_dump({
 PY2
 
   local out
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily 2>&1)"
+  local -a blocked_engine_vars=(
+    ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT
+    OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT
+    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+    HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
+  )
+  out="$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "${blocked_engine_vars[@]/%/=sentinel}" "$root/bin/run.sh" daily 2>&1)"
   has "worktree_files: the run completes through the stub engine" "$out" "status=ok"
+  has "engine environment: routing, proxy, and credential variables are scrubbed" "$out" "scrubbed=ANTHROPIC_API_KEY"
   has "worktree_files: the runner says what it carried across"     "$out" "carried local.properties"
   local report; report="$(ls "$root"/reports/and/t-*.md | head -1)"
   has "worktree_files: the gitignored file was there when the engine ran" \
@@ -1668,6 +2100,22 @@ PY2
   hasnt "worktree_files: a missing source is skipped, not an error" "$out" "does/not/exist"
   is  "worktree_files: the main checkout was never touched" \
       "$(git -C "$repo" status --porcelain | wc -l)" "0"
+
+  # A syntactically safe manifest path must still not follow a local symlink.
+  mkdir -p "$root/outside"; printf 'not for agents\n' > "$root/outside/secret.txt"
+  ln -s "$root/outside/secret.txt" "$repo/linked-secret.txt"
+  python3 - "$root" <<'PY4'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+manifest = root / "repos.yaml"
+d = yaml.safe_load(manifest.read_text())
+d["repos"][0]["worktree_files"] = ["linked-secret.txt"]
+yaml.safe_dump(d, manifest.open("w"), sort_keys=False)
+PY4
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily 2>&1)"
+  has "worktree_files: symlink sources are rejected" "$out" "skipped unsafe worktree file linked-secret.txt"
+  local symlink_report; symlink_report="$(ls "$root"/reports/and/t-*.md | sort | tail -1)"
+  hasnt "worktree_files: symlink target never reaches the engine" "$(cat "$symlink_report")" "linked-secret.txt"
 
   # The schema refuses anything that could reach outside the repo.
   local err
@@ -1682,6 +2130,19 @@ PY3
     err="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/bad.yaml" 2>&1 || true)"
     has "worktree_files: rejects ${bad}" "$err" "relative path inside the repo"
   done
+}
+
+# textual-serve deliberately has no authentication. Pin the CLI boundary so an
+# accidental --host does not expose report triage on a shared network.
+test_web_bind_guard() {
+  local out rc
+  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 0.0.0.0' _ "$REPO" 2>&1)"; rc=$?
+  is "web: refuses non-loopback without explicit acknowledgement" "$rc" "1"
+  has "web: names the required public-bind flag" "$out" "--insecure-public"
+  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 127.0.0.1 --port 8123' _ "$REPO" 2>&1)"
+  has "web: loopback remains available without acknowledgement" "$out" "--host 127.0.0.1 --port 8123"
+  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 0.0.0.0 --insecure-public' _ "$REPO" 2>&1)"
+  has "web: explicit insecure opt-in permits non-loopback" "$out" "--host 0.0.0.0"
 }
 
 # Findings were gated on the task NAME `audit-security` in two places, so the
@@ -1804,6 +2265,8 @@ test_inbox() {
   is  "inbox: a finding carries its report id and number" \
       "$(jq -r '.findings[]|select(.repo=="alpha" and .severity=="CRITICAL")|"\(.report)#\(.n)"' <<< "$dump")" "alpha/audit-security-2026-08-28#1"
   is  "inbox: status carries the quota source"  "$(jq -r '.status.quota_source' <<< "$dump")" "stub"
+  is  "inbox: quota is explicitly Claude-only" "$(jq -r '.status.quota_engine' <<< "$dump")" "claude"
+  is  "inbox: unwired Codex quota is unavailable" "$(jq -r '.status.codex_quota' <<< "$dump")" "null"
 
   # One finding's markdown, cut at the next finding or the next section.
   local body
@@ -1834,7 +2297,7 @@ m = Model.from_dump({
         {"repo": "a", "state": "new", "severity": "HIGH", "task": "t", "lens": "", "title": "needs fix", "location": "x.py:1"},
         {"repo": "b", "state": "new", "severity": "LOW", "task": "t", "lens": "", "title": "low b", "location": ""},
     ],
-    "status": {"quota": 12, "quota_source": "quota-subscription.sh", "floor": 30, "week": "w", "runs": 1, "declined": 2, "cost": 1.5, "ceiling": 40.0},
+    "status": {"quota": 12, "quota_source": "quota-subscription.sh", "quota_engine": "claude", "codex_quota": None, "floor": 30, "week": "w", "runs": 1, "declined": 2, "cost": 1.5, "ceiling": 40.0},
 })
 print("visible", len(m.visible()))
 m.show_decided = True; print("all", len(m.visible())); m.show_decided = False
@@ -1848,7 +2311,8 @@ PY2
   has "model: toggle shows decided too"          "$hdr" "all 3"
   has "model: filter matches any column"         "$hdr" "filter ['needs fix']"
   has "model: repo jump targets that repo's first visible row" "$hdr" "repos ['a', 'b'] jump 1"
-  has "model: header says BELOW FLOOR"           "$hdr" "quota 12% BELOW FLOOR 30%"
+  has "model: header says Claude is BELOW FLOOR" "$hdr" "Claude quota 12% BELOW FLOOR 30%"
+  has "model: header says unwired Codex is unavailable" "$hdr" "Codex unavailable"
   has "model: header carries spend vs ceiling"   "$hdr" "\$1.50 of \$40.0"
   has "model: header counts undecided"           "$hdr" "2 undecided"
   has "model: a stub reads UNMEASURED, never ok" "$hdr" "UNMEASURED (stub)"
@@ -1932,7 +2396,7 @@ test_finding_level_triage() {
 
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
-REAL_STATE_BEFORE="$(git -C "$REPO" status --porcelain -- state reports | sort | tr -d ' \n')"
+REAL_STATE_BEFORE="$(real_state_snapshot)"
 setup
 test_summaries
 test_listing
@@ -1943,6 +2407,7 @@ test_dismiss_and_edges
 test_resolve
 test_community_gates
 test_quota_gate
+test_runner_uses_selected_engine_quota
 test_doctor
 test_unit_path_line
 test_dedup_dirs
@@ -1956,6 +2421,7 @@ test_manifest_ceiling
 test_subscription_gate
 test_two_gates
 test_worktree_files
+test_web_bind_guard
 test_branch_prune
 test_finding_level_triage
 test_public_manifest_valid
@@ -1966,6 +2432,11 @@ test_findings_are_content_driven
 test_suggest_features_queued
 test_add_repo
 test_discover
+test_plan_state_ignored
+test_tier_tools_must_be_string
+test_plan_identity
+test_plan_worktrees
+test_plan
 test_repo_default_branch
 test_inbox
 test_real_repo_untouched
