@@ -13,7 +13,8 @@ Subcommands
                                       -- validated, read-only entries staged by `meute plan --enqueue`
     render   <template> KEY=VAL ...  -- substitute {{KEY}} placeholders, print to stdout
     list-repos <manifest>            -- name+path for every repo, one JSON object per line
-    list-tasks <manifest>            -- name+tier+writes_code for every task, one JSON object per line
+    list-tasks <manifest>            -- name+tier+writes_code+tools+plan_class for every task,
+                                        one JSON object per line
     add-repo <manifest> <json>       -- append a repo; refuses to write repos.yaml
 
 The queue is *candidates only*. Gating that depends on live repo state (weekly
@@ -150,15 +151,35 @@ def checked_tiers(data: dict) -> dict:
     return tiers
 
 
-# The tools that reach the public web. A tier that has them sends what it
-# learned about a repository to third parties; staging such a tier against a
-# never-enrolled repository is an explicit decision, never a default.
+# What `meute plan` may stage against a never-enrolled repository, decided by
+# the tier's tool list alone. "local" reads the checkout and nothing else.
+# "web" also reaches the public internet -- it sends what it learned about a
+# repository to third parties, so it is an explicit opt-in (--allow-web), never
+# a default. Anything else is "other": Bash, Edit, an MCP server, a tool this
+# file has never heard of. Those come with allowlists an operator reviewed for
+# an enrolled project, so enrollment is the path and no plan flag opens it.
+LOCAL_TOOLS = frozenset({"Read", "Grep", "Glob"})
 WEB_TOOLS = frozenset({"WebSearch", "WebFetch"})
 
 
-def tier_uses_web(tier: dict) -> bool:
-    """Only for tiers that passed checked_tiers, which guarantees a string."""
-    return any(tool.strip() in WEB_TOOLS for tool in tier["tools"].split(","))
+def tool_names(tools: str) -> frozenset:
+    """Bare tool names from a comma-separated `tools` string.
+
+    Compared by the prefix before "(", the CLI's own allowlist grammar, so
+    `WebFetch(domain:x)` is WebFetch and not an unknown tool.
+    """
+    return frozenset(tool.strip().split("(", 1)[0].strip()
+                     for tool in tools.split(",") if tool.strip())
+
+
+def plan_tier_class(tier: dict) -> str:
+    """local | web | other. Only for tiers that passed checked_tiers."""
+    names = tool_names(tier["tools"])
+    if names <= LOCAL_TOOLS:
+        return "local"
+    if names <= LOCAL_TOOLS | WEB_TOOLS:
+        return "web"
+    return "other"
 
 
 def checked_tasks(data: dict, tiers: dict, root: str) -> dict:
@@ -430,7 +451,7 @@ def build_plan_queue(data: dict, path: str, slot: str, root: str) -> list:
             raise ManifestError(f"{path}: entries[{number}].name must be a safe identifier")
         if not isinstance(repo_path, str) or not os.path.isabs(repo_path):
             raise ManifestError(f"{path}: entries[{number}].path must be an absolute path")
-        if task_name not in tasks:
+        if not isinstance(task_name, str) or task_name not in tasks:
             raise ManifestError(f"{path}: entries[{number}].task is not declared: {task_name!r}")
         key = f"plan/{name}/{task_name}"
         if key in keys:
@@ -441,7 +462,11 @@ def build_plan_queue(data: dict, path: str, slot: str, root: str) -> list:
         if tiers[tier_name]["writes_code"]:
             raise ManifestError(
                 f"{path}: entries[{number}].task {task_name!r} writes code and cannot be staged")
-        if tier_uses_web(tiers[tier_name]) and not allow_web:
+        tier_class = plan_tier_class(tiers[tier_name])
+        if tier_class == "other":
+            raise ManifestError(
+                f"{path}: entries[{number}].task {task_name!r} uses tools plan cannot stage")
+        if tier_class == "web" and not allow_web:
             raise ManifestError(
                 f"{path}: entries[{number}].task {task_name!r} uses web tools and the plan did not allow them")
         if slot != "all" and slot not in (task.get("slots") or list(VALID_SLOTS)):
@@ -601,10 +626,11 @@ def cmd_list_repos(args: list) -> int:
 
 
 def cmd_list_tasks(args: list) -> int:
-    """name + tier + writes_code + tools for every declared task.
+    """name + tier + writes_code + tools + plan_class for every declared task.
 
-    `meute discover`'s picker keys on writes_code; `meute plan` also needs the
-    tier's tools to keep web-reaching tiers out of a plan by default.
+    `meute discover`'s picker keys on writes_code; `meute plan` keys on
+    plan_class, decided here so the planner and the runner-side validator
+    (build_plan_queue) can never disagree about which tiers a plan may stage.
     """
     data = load(args[0])
     tiers = checked_tiers(data)
@@ -618,6 +644,7 @@ def cmd_list_tasks(args: list) -> int:
             "tier": task.get("tier") if isinstance(task, dict) else None,
             "writes_code": bool(tier["writes_code"]) if tier else None,
             "tools": tier.get("tools") if tier else None,
+            "plan_class": plan_tier_class(tier) if tier else None,
         }))
     return 0
 

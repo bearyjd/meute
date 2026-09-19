@@ -27,8 +27,11 @@
 #                                  not yet configured, and interactively add the ones you pick
 #   plan [--enqueue] [--allow-web] [dir]
 #                                  read-only portfolio inventory and proposed audit plan;
-#                                  --enqueue stages only read-only work for the normal runner;
-#                                  tasks that reach the web are left out unless --allow-web
+#                                  --enqueue stages only read-only work for the normal runner
+#                                  (each staged run still cuts a scratch branch and worktree
+#                                  in the repository); tasks that reach the web are left out
+#                                  unless --allow-web, and a tier that can shell out is never
+#                                  staged -- enroll the repository for that instead
 #                                  defaults to this checkout's parent directory
 #   tui                           the triage inbox, in the terminal (PRP-003 screen 1)
 #   web [--host H] [--port P] [--insecure-public]
@@ -64,11 +67,14 @@ readonly CURSOR_FILE="${STATE_DIR}/cursor"
 readonly REPORT_STATE="${STATE_DIR}/reports"
 readonly LOCK_FILE="${STATE_DIR}/.lock"
 readonly HOLD_FILE="${STATE_DIR}/hold"
+readonly PLAN_QUEUE_FILE="${STATE_DIR}/plan-queue.json"
+readonly PLAN_DONE_FILE="${STATE_DIR}/plan-complete"
 readonly THIS_WEEK="$(date +%G-%V)"
 
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
+source "${MEUTE_ROOT}/lib/plan.sh"
 
 SCRUBBED=""
 AUTH_MODE=""
@@ -76,7 +82,9 @@ ENGINE_ENV=()
 
 note() { printf 'meute: %s\n' "$*" >&2; }
 die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+# The header comment above, however long it grows: everything after the
+# shebang up to the first line that is not a comment.
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^#( |$)/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 # Device+inode, the only identity that survives a bind mount: /home/<you> and
 # /var/home/<you> can be one directory, and neither `pwd -P` nor `readlink -f`
@@ -140,6 +148,9 @@ cmd_status() {
     printf 'Codex quota unavailable  ·  configure MEUTE_CODEX_QUOTA_CMD before Codex jobs can run\n'
   fi
 
+  # A staged plan is what the next fires will actually run, ahead of the
+  # manifest, so the "next" lines below are meaningless without saying so.
+  [[ -f "$PLAN_QUEUE_FILE" ]] && printf '  staged plan: %s\n' "$(plan_progress)"
   local slot
   for slot in daily weekly; do
     printf '  next %-7s %s\n' "$slot" "$(next_for_slot "$slot")"
@@ -166,20 +177,72 @@ cmd_status() {
   printf '  reports unread    %s\n' "${new_count:-0}"
 }
 
-# What the round-robin would pick next, without running anything.
+# What the runner would pick next, without running anything: a staged plan
+# first, on its own cursor and minus the items already attempted or whose path
+# is no longer a repository, then the manifest round-robin. Read-only, unlike
+# the runner: it neither retires a finished plan nor marks a vanished repo.
 next_for_slot() {
-  local slot="$1" cursor start=0 index total
+  local slot="$1" key staged
+  if [[ -f "$PLAN_QUEUE_FILE" ]]; then
+    # The runner dies on a plan it cannot validate; nothing runs until the
+    # file is fixed or removed, so no manifest entry is "next" either.
+    staged="$(python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$slot" 2>/dev/null)" \
+      || { printf -- '- (staged plan invalid; the runner refuses to run)\n'; return 0; }
+    key="$(next_in_queue "plan-cursor.${slot}" plan <<< "$staged")"
+    [[ -z "$key" ]] || { printf '%s\n' "$key"; return 0; }
+  fi
+  key="$(next_in_queue "cursor.${slot}" manifest \
+           < <(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null || true))"
+  printf '%s\n' "${key:--}"
+}
+
+# First key after the cursor in the queue on stdin, wrapping, skipping what
+# the runner would (bin/run.sh eligible): attempted or vanished staged items,
+# and any entry whose engine's pool is unmeasured or below the floor. Blank
+# when none.
+next_in_queue() {
+  local cursor_name="$1" mode="$2" cursor start=0 i idx total key path engine
   local -a queue
-  mapfile -t queue < <(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null || true)
+  local -A quota=()
+  mapfile -t queue
   total=${#queue[@]}
-  (( total )) || { printf -- '-\n'; return 0; }
-  cursor="$(kv_get "$CURSOR_FILE" "cursor.${slot}")"
+  (( total )) || return 0
+  cursor="$(kv_get "$CURSOR_FILE" "$cursor_name")"
   if [[ -n "$cursor" ]]; then
-    for (( index = 0; index < total; index++ )); do
-      if [[ "$(jq -r '.key' <<< "${queue[index]}")" == "$cursor" ]]; then start=$(( (index + 1) % total )); break; fi
+    for (( i = 0; i < total; i++ )); do
+      if [[ "$(jq -r '.key' <<< "${queue[i]}")" == "$cursor" ]]; then start=$(( i + 1 )); break; fi
     done
   fi
-  jq -r '.key' <<< "${queue[start]}"
+  for (( i = 0; i < total; i++ )); do
+    idx=$(( (start + i) % total ))
+    { read -r key; read -r path; read -r engine; } < <(jq -r '.key, .path, .engine' <<< "${queue[idx]}")
+    if [[ "$mode" == plan ]]; then
+      [[ -z "$(kv_get "$PLAN_DONE_FILE" "$key")" ]] || continue
+      [[ -d "$path/.git" || -f "$path/.git" ]] || continue
+    fi
+    # Once per engine per walk, as the runner probes once per engine per fire.
+    if [[ -z "${quota[$engine]+set}" ]]; then
+      quota[$engine]="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" 2>/dev/null)" || quota[$engine]="fail"
+    fi
+    [[ "${quota[$engine]}" != "fail" ]] || continue
+    (( ${quota[$engine]} >= ${QUOTA_FLOOR:-0} )) || continue
+    printf '%s\n' "$key"
+    return 0
+  done
+}
+
+# "<attempted> of <total> attempted" for the staged plan, across both slots
+# -- or why the runner will refuse it, which reads nothing like an empty plan.
+plan_progress() {
+  local key total=0 attempted=0 staged
+  staged="$(python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" all 2>&1)" \
+    || { printf 'invalid — %s\n' "$(head -n1 <<< "$staged" | sed 's|^meute/manifest: ||')"; return 0; }
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    total=$(( total + 1 ))
+    [[ -z "$(kv_get "$PLAN_DONE_FILE" "$key")" ]] || attempted=$(( attempted + 1 ))
+  done < <(jq -r '.key' <<< "$staged")
+  printf '%s of %s attempted\n' "$attempted" "$total"
 }
 
 # A report is a row; a decision is made per finding. Promoting one finding used
@@ -661,17 +724,9 @@ cmd_discover() {
   done
 }
 
-# Inventory a directory tree without enrolling anything.  This is deliberately
-# separate from `discover`: a plan is safe to put in cron, paste into a ticket,
-# or run before deciding whether a repository belongs in the fleet.
-#
-# The ranking is intentionally boring and stable: a security baseline first,
-# then an architecture review, then feature/market discovery.  Repositories
-# sort by canonical path, so identical trees and manifests produce identical
-# plans.  Only tasks declared read-only by the manifest are eligible, and of
-# those, a task whose tier reaches the public web (WebSearch/WebFetch) only
-# with --allow-web: it would send what it learned about a private, never-
-# enrolled repository to third parties, which is a decision, not a default.
+# Inventory a directory tree without enrolling anything, and optionally stage
+# the result for the runner. The work lives in lib/plan.sh; this is the
+# command line.
 cmd_plan() {
   local enqueue=0 allow_web=0 requested="" scan_dir
   while (( $# )); do
@@ -686,176 +741,24 @@ cmd_plan() {
   done
   requested="${requested:-$(dirname "$MEUTE_ROOT")}"
   scan_dir="$(cd "$requested" 2>/dev/null && pwd)" || die "plan: no such directory: ${requested}"
+  # A manifest the runner would refuse is not one to plan against.
+  python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "plan: manifest failed validation"
 
   # Four levels finds normal project layouts (portfolio/client/project) while
   # avoiding a surprise full-home scan.  An operator can deliberately raise it
-  # for a deeper tree without making the default unbounded.
+  # for a deeper tree without making the default unbounded; sixteen is past
+  # any layout and into "scan the whole disk" territory.
   local max_depth="${MEUTE_PLAN_MAX_DEPTH:-4}"
-  [[ "$max_depth" =~ ^[1-9][0-9]*$ ]] || die "plan: MEUTE_PLAN_MAX_DEPTH must be a positive integer"
+  [[ "$max_depth" =~ ^[1-9][0-9]*$ ]] && (( max_depth <= 16 )) \
+    || die "plan: MEUTE_PLAN_MAX_DEPTH must be an integer from 1 to 16"
 
-  # Keyed by identity, not spelling: the manifest says /home/<you>/..., the
-  # scan may say /var/home/<you>/..., and both are the same directory.
-  local -A known_name=()
-  local line path real name
-  known_name["$(dir_id "$MEUTE_ROOT")"]="meute"
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    path="$(jq -r '.path' <<< "$line")"
-    name="$(jq -r '.name // ""' <<< "$line")"
-    known_name["$(dir_id "$path")"]="$name"
-  done < <(python3 "$MANIFEST_PY" list-repos "$MANIFEST")
-
-  local -a readonly_tasks=() task_names=() web_tasks=()
-  local tools
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    [[ "$(jq -r '.writes_code' <<< "$line")" == "false" ]] || continue
-    name="$(jq -r '.name' <<< "$line")"
-    # Split on commas, trim: the tier declares "Read,Grep,Glob,WebSearch,WebFetch".
-    tools="$(jq -r '.tools // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | .[]' <<< "$line")"
-    if ! (( allow_web )) && grep -qx -e WebSearch -e WebFetch <<< "$tools"; then
-      web_tasks+=( "$name" )
-      continue
-    fi
-    task_names+=( "$name" )
-  done < <(python3 "$MANIFEST_PY" list-tasks "$MANIFEST")
-
-  # Prefer the analyses that answer risk and structural questions before
-  # opportunity research.  Unknown read-only tasks remain useful, but follow
-  # the named baselines in lexical order.
-  local preferred
-  for preferred in audit-security architecture-review suggest-features market-comparison; do
-    local task
-    for task in "${task_names[@]}"; do
-      [[ "$task" == "$preferred" ]] && readonly_tasks+=( "$task" )
-    done
-  done
-  while IFS= read -r preferred; do
-    [[ -n "$preferred" ]] || continue
-    case " ${readonly_tasks[*]} " in *" $preferred "*) ;; *) readonly_tasks+=( "$preferred" );; esac
-  done < <(printf '%s\n' "${task_names[@]}" | LC_ALL=C sort -u)
-
-  local -a repos=() configured=() unconfigured=()
-  local -A seen=()
-  local -a gitdirs=()
-  local id
-  # A .git *file* marks a linked worktree or a submodule as readily as a
-  # checkout with --separate-git-dir; only git can tell them apart.  A linked
-  # worktree is another checkout of a repository already found (or enrolled),
-  # and a submodule is third-party code: neither is a repository of its own to
-  # audit on the operator's quota.  Prune directory metadata so find does not
-  # descend into repository internals.  -print0 preserves unusual paths.
-  while IFS= read -r -d '' path; do
-    # A directory can vanish between find and cd (an agent worktree being
-    # torn down); under set -e a bare assignment would abort the whole scan.
-    real="$(cd "$(dirname "$path")" 2>/dev/null && pwd)" \
-      || { note "plan: skipping $(dirname "$path"): vanished during the scan"; continue; }
-    # Line 1 is this checkout's git dir, line 2 the repository's; a linked
-    # worktree has its own.  A third line is the superproject, printed only
-    # for a submodule.
-    mapfile -t gitdirs < <(git -C "$real" rev-parse --path-format=absolute \
-      --git-dir --git-common-dir --show-superproject-working-tree 2>/dev/null)
-    (( ${#gitdirs[@]} >= 2 )) \
-      || { note "plan: skipping ${real}: git cannot read it"; continue; }
-    [[ "${gitdirs[0]}" == "${gitdirs[1]}" ]] || continue
-    [[ -z "${gitdirs[2]:-}" ]] || continue
-    # The scan spelling is kept for display and staging; identity decides
-    # whether two spellings are one repository.
-    id="$(dir_id "$real")"
-    [[ -n "${seen[$id]+present}" ]] && continue
-    seen["$id"]=1
-    repos+=( "$real" )
-  # `find` measures the .git marker, one level below the repository root.
-  # The advertised limit is repository depth, so include that final marker.
-  # Meute's own subtree -- this checkout and any in-flight .worktrees/* under
-  # it -- is pruned by inode, so it is skipped under any spelling; the
-  # trailing /. makes -samefile look through a symlinked MEUTE_ROOT.  -H so a
-  # symlinked scan directory is descended (find otherwise stops at the link)
-  # without following symlinks found inside the tree.
-  done < <(find -H "$scan_dir" -mindepth 1 -maxdepth "$(( max_depth + 1 ))" \
-    \( -samefile "${MEUTE_ROOT}/." -prune \) \
-    -o \( -type d -name .git -prune -print0 \) \
-    -o \( -type f -name .git -print0 \) 2>/dev/null)
-
-  while IFS= read -r real; do
-    [[ -n "$real" ]] || continue
-    [[ -n "${known_name[$(dir_id "$real")]+present}" ]] && configured+=( "$real" ) || unconfigured+=( "$real" )
-  done < <(printf '%s\n' "${repos[@]}" | LC_ALL=C sort -u)
-
-  printf 'Portfolio inventory (read-only)\n'
-  printf '  scan: %s (max depth: %s)\n' "$scan_dir" "$max_depth"
-  printf '  discovered: %d  configured: %d  unconfigured: %d\n' \
-    "${#repos[@]}" "${#configured[@]}" "${#unconfigured[@]}"
-  printf '\nComparison\n'
-  for real in "${configured[@]}"; do
-    printf '  configured    %-24s %s\n' "${known_name[$(dir_id "$real")]:-<unnamed>}" "$real"
-  done
-  for real in "${unconfigured[@]}"; do
-    printf '  unconfigured  %-24s %s\n' "$(basename "$real")" "$real"
-  done
-  (( ${#repos[@]} )) || printf '  (no Git repositories found)\n'
-
-  printf '\nProposed read-only analysis plan\n'
-  printf '  Ranking: unconfigured repositories first; then security, architecture, features, market; path breaks ties.\n'
-  if (( ${#unconfigured[@]} == 0 )); then
-    printf '  (nothing to enroll; configured repositories remain on their manifest schedules)\n'
-  elif (( ${#readonly_tasks[@]} == 0 )); then
-    printf '  (manifest declares no read-only tasks)\n'
-  else
-    local rank=1 task reason
-    for real in "${unconfigured[@]}"; do
-      for task in "${readonly_tasks[@]}"; do
-        case "$task" in
-          audit-security) reason="security baseline" ;;
-          architecture-review) reason="structure and maintainability" ;;
-          suggest-features) reason="feature opportunities" ;;
-          market-comparison) reason="market gaps" ;;
-          *) reason="declared read-only analysis" ;;
-        esac
-        printf '  %3d. %-24s %-22s %s\n' "$rank" "$(basename "$real")" "$task" "$reason"
-        rank=$(( rank + 1 ))
-      done
-    done
-  fi
-  (( ${#web_tasks[@]} == 0 )) \
-    || printf '  (excluded %d web-research task(s): %s — pass --allow-web to stage them)\n' \
-         "${#web_tasks[@]}" "$(IFS=,; printf '%s' "${web_tasks[*]}")"
+  plan_collect_tasks "$allow_web"
+  plan_scan_repos "$scan_dir" "$max_depth"
+  plan_print "$scan_dir" "$max_depth"
   if (( enqueue )); then
-    mkdir -p "$STATE_DIR"
-    local entries_file queue_tmp queue_file safe_name stem index=0
-    entries_file="$(mktemp "${STATE_DIR}/.plan-entries.XXXXXX")"
-    queue_tmp="$(mktemp "${STATE_DIR}/.plan-queue.XXXXXX")"
-    queue_file="${STATE_DIR}/plan-queue.json"
-    for real in "${unconfigured[@]}"; do
-      index=$(( index + 1 ))
-      stem="$(basename "$real" | tr -cs 'A-Za-z0-9._-' '-')"
-      stem="${stem#-}"; stem="${stem%-}"
-      [[ -n "$stem" && "$stem" =~ ^[A-Za-z0-9] ]] || stem="repository"
-      safe_name="plan-$(printf '%03d' "$index")-${stem}"
-      for task in "${readonly_tasks[@]}"; do
-        jq -cn --arg name "$safe_name" --arg path "$real" --arg task "$task" \
-          --arg spec "Unconfigured repository discovered by meute plan; read-only analysis only." \
-          '{name:$name, path:$path, task:$task, spec:$spec}' >> "$entries_file"
-      done
-    done
-    # The runner's validator re-checks every staged tier against this flag,
-    # so a hand-edited plan cannot smuggle a web tier past a plan that never
-    # allowed one.
-    local web_json=false; (( allow_web )) && web_json=true
-    jq -s . "$entries_file" | jq -n --arg scan "$scan_dir" --argjson entries "$(cat)" \
-      --argjson web "$web_json" \
-      '{version:1, scan:$scan, allow_web:$web, entries:$entries}' > "$queue_tmp" \
-      || { rm -f "$entries_file" "$queue_tmp"; die "plan: could not stage plan queue"; }
-    mv -f "$queue_tmp" "$queue_file"
-    # Completion markers belong to the previous explicit plan.  The next plan
-    # may reuse synthetic names and task names, so never let stale attempts
-    # silently suppress newly staged work.
-    rm -f "${STATE_DIR}/plan-complete"
-    rm -f "$entries_file"
-    printf '\nStaged %d read-only analysis item(s) in %s. The normal runner will prioritize this explicit queue; it still cannot enroll repositories or run a writing tier.\n' \
-      "$(( ${#unconfigured[@]} * ${#readonly_tasks[@]} ))" "$queue_file"
+    plan_stage "$scan_dir" "$allow_web"
   else
-    printf '\nNo manifest, repository, or state files were changed. Stage this exact plan for autonomous read-only execution with: meute plan --enqueue %s\n' "$scan_dir"
+    printf '\nNo manifest, repository, or state files were changed. Stage this exact plan for the runner with: meute plan --enqueue %s (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).\n' "$scan_dir"
   fi
 }
 
@@ -1259,6 +1162,7 @@ cmd_doctor() {
   printf '\n  manifest\n'
   if python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null 2>&1; then
     d_ok "$(basename "$MANIFEST") is valid"
+    fleet_load_policy >/dev/null 2>&1 || true
     local repos community
     repos="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('repos') or []))" "$MANIFEST")"
     community="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('community') or []))" "$MANIFEST")"
@@ -1335,16 +1239,17 @@ cmd_doctor() {
     mkdir -p "${MEUTE_ROOT}/${dir}" 2>/dev/null || true
     [[ -w "${MEUTE_ROOT}/${dir}" ]] && d_ok "${dir}/ writable" || d_err "${dir}/ not writable"
   done
+  # The runner never commits state/ or reports/: they name private
+  # repositories and carry unfixed findings. A tracked file there means the
+  # ignore rules were loosened, and the next `git push` would publish it.
   if git -C "$MEUTE_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
     local tracked
     tracked="$(git -C "$MEUTE_ROOT" ls-files state reports | grep -cv '\.gitkeep' || true)"
     if (( tracked > 0 )); then
-      d_ok "meute is a git repo; state and reports are auto-committed after each run"
+      d_warn "${tracked} file(s) under state/ or reports/ are tracked by git — they belong to this machine only"
     else
-      d_ok "meute is a git repo; state and reports are gitignored, so nothing is committed"
+      d_ok "state and reports are gitignored; the runner never commits them"
     fi
-  else
-    d_warn "meute is not a git repo — state and reports will not be committed"
   fi
 
   if hold_active; then
