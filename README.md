@@ -126,8 +126,9 @@ reach.
 
 meute never runs on metered API billing. Claude Code silently prefers an API key
 over subscription auth when one is present in the environment, so every
-invocation is scrubbed of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
-`OPENAI_API_KEY` (with a warning if any were set), and a zero-cost preflight
+invocation is scrubbed of API credentials, Anthropic/OpenAI endpoint overrides,
+Claude provider-routing flags, and upper- and lower-case proxy variables (with
+a warning if any were set), and a zero-cost preflight
 refuses to start unless the engine resolves to a real subscription:
 
 ```
@@ -162,8 +163,10 @@ disagree. Tabs for the tier-3 drafts awaiting merge and for every report.
 The UI lives in its own uv venv under `tui/`, created on first use. **The
 runner has no dependency on it**: `bin/run.sh` succeeds on a machine where
 that venv was never created, and the suite pins that. `web` is textual-serve
-and has no authentication — it binds `127.0.0.1` unless you pass `--host`,
-and the sensible way to use it from a phone is a tailnet address.
+and has no authentication — it binds `127.0.0.1` by default. To bind off loopback,
+pass both `--host <addr>` and `--insecure-public`. The latter is an explicit
+acknowledgement that anyone who can reach the listener can triage findings; a
+tailnet address is the sensible way to use it from a phone.
 
 ## Quota gates
 
@@ -174,10 +177,16 @@ clear **two** gates, and they answer different questions:
 
 | Gate | Answers | Reads |
 |---|---|---|
-| subscription | *is there room in the pool I share with the fleet?* | the plan's own 5h/7d windows, snapshotted by the status line |
+| subscription | *is there room in the pool I share with the fleet?* | the plan's own 5h/7d windows, snapshotted by the status line (Claude) or a probe (Codex) |
 | self-budget | *has the fleet taken its agreed share this week?* | meute's own `state/log` against `policy.weekly_cost_usd` |
 
 ### The subscription gate
+
+Quota is per engine: Claude's pool and Codex's pool are measured separately,
+and the runner probes each candidate's engine while selecting, so a fleet that
+mixes engines does not stall on the first entry whose engine cannot be measured.
+
+#### Claude
 
 Nothing on the CLI reports the balance (`claude auth status --json` gives the
 plan tier, not the pools) — but the JSON Claude Code feeds its **status line**
@@ -193,9 +202,9 @@ when they change:
 That puts `contrib/statusline-capture.sh` in front of whatever status line you
 already have (kept verbatim as its argument; backup in
 `settings.json.meute-bak`), and from the next turn on `state/rate-limits.json`
-holds the real windows. `bin/quota.sh` reads it through
-`contrib/quota-subscription.sh`, reporting the **scarcer** of the two pools.
-Below `policy.quota_floor_percent` the runner declines. A window whose
+holds the real windows. `bin/quota.sh --engine claude --with-source` reads it
+through `contrib/quota-subscription.sh`, reporting the **scarcer** of the two
+pools. Below `policy.quota_floor_percent` the runner declines. A window whose
 `resets_at` has passed counts as fresh — the fleet runs at 03:17, long after
 your last session, and refusing until you next open one would idle it exactly
 when the capacity is going spare; the 429 auto-pause is the backstop.
@@ -209,19 +218,39 @@ quota=100:stub                     ← the gate measures nothing yet
 quota=61:quota-subscription.sh     ← the gate is real
 ```
 
-Other sources, in precedence order — an explicit `MEUTE_QUOTA_CMD` wins over
-the snapshot, which wins over `state/quota-override`, which wins over the stub:
+Other Claude sources, in precedence order — an explicit `MEUTE_CLAUDE_QUOTA_CMD`
+(`MEUTE_QUOTA_CMD` is its legacy alias) wins over the snapshot, which wins over
+`state/quota-override`, which wins over the stub:
 
 ```sh
-MEUTE_QUOTA_CMD='my-probe --percent' ./bin/run.sh daily   # any command printing 0-100
-echo 45 > state/quota-override                            # or pin it by hand
-MEUTE_QUOTA_CMD='contrib/quota-llm-usage-tracker.sh' ./bin/run.sh daily  # llm-usage-tracker, if you run it
+MEUTE_CLAUDE_QUOTA_CMD='my-probe --percent' ./bin/run.sh daily   # any command printing 0-100
+echo 45 > state/quota-override                                   # or pin it by hand
+MEUTE_CLAUDE_QUOTA_CMD='contrib/quota-llm-usage-tracker.sh' ./bin/run.sh daily  # llm-usage-tracker, if you run it
 ```
 
 **A configured source that fails makes the runner decline the slot.** It does
 not fall back to the stub — falling back would silently disable the gate at
 exactly the moment you asked for it. Fail closed, always. That includes a
 `state/rate-limits.json` that exists but cannot be read.
+
+#### Codex
+
+Codex has no built-in balance source, and none of the Claude sources — the
+snapshot, the override, the stub — is ever presented as a Codex balance. Codex
+jobs run only when `MEUTE_CODEX_QUOTA_CMD` names a probe; otherwise they decline:
+
+```sh
+MEUTE_CODEX_QUOTA_CMD='my-probe --percent' ./bin/run.sh daily
+./bin/quota.sh --engine codex --with-source     # what the runner will see
+```
+
+The probe must be a trusted local command that prints one integer 0-100 — the
+real remaining ChatGPT/Codex percentage. Do not point it at a constant
+`echo 100` merely to enable Codex jobs: that defeats the human-quota protection
+the gate exists for. The timers read the user session's environment, so
+persist the variable there rather than in the repository —
+`~/.config/environment.d/meute.conf` with one `MEUTE_CODEX_QUOTA_CMD=...` line
+is read by `systemd --user` at login. `install-timers` does not do this for you.
 
 ### The self-budget gate
 
@@ -283,6 +312,52 @@ never touched. Read-only tiers leave nothing behind. Write tiers commit to the
 scratch branch and **never push** — the branch is the deliverable, and you decide
 what happens to it.
 
+## Staging a read-only portfolio plan
+
+`meute plan` takes a read-only inventory of every git checkout under a directory
+(default: this checkout's parent), compared to the manifest. Repo identity is
+`device:inode`, so `/home/<you>` and `/var/home/<you>` spellings of the same tree
+agree. Linked worktrees, submodules, repos with no commits yet, and repos whose
+git dir lives outside the scan root are skipped. The depth limit is
+`MEUTE_PLAN_MAX_DEPTH` (default 4, max 16).
+
+```sh
+./bin/meute plan                        # inventory this checkout's parent; writes nothing
+./bin/meute plan /path/to/scan          # inventory a specific directory
+./bin/meute plan --enqueue              # stage exactly that plan for the timers
+./bin/meute plan --enqueue --allow-web  # also stage tasks that use WebSearch / WebFetch
+./bin/run.sh daily --dry-run            # see which staged item the next fire would take
+```
+
+Without `--enqueue`, the command prints what it found and exits. With it, the
+plan is staged in `state/plan-queue.json` — which lists every unconfigured repo
+by absolute path, and is gitignored for that reason, as is the `state/.kv.*`
+scratch its bookkeeping uses — and the runner prefers it until every entry is
+attempted (or found missing), then archives it and returns to the manifest.
+Enrollment in `repos.local.yaml` is never a side effect.
+
+A staged plan only includes tasks whose tier tools are a subset of `Read,Grep,Glob`.
+`--allow-web` adds tasks that also use `WebSearch,WebFetch` — note that this sends
+queries derived from private, un-enrolled code to third parties, which is why it is
+opt-in and recorded in the plan as `allow_web`. Tasks with `Bash` or any other tool
+are never staged by `plan`; enroll those repositories in the manifest instead. The
+runner re-validates every staged entry against the manifest on each fire and refuses
+writing tiers and un-allowed web tiers even if state is hand-edited.
+
+A staged run is read-only analysis, but it still creates a `meute/<task>-<date>`
+branch and a temporary worktree in that repo (removed on exit). A killed run can
+leave them behind.
+
+`--dry-run` selects and renders without invoking an engine. It is not entirely
+free of side effects: it records a vanished staged repo as missing, logs a repo
+whose HEAD cannot be resolved as an error and steps past it (the cursor moves),
+archives a plan whose every item has been attempted, and — as it always has —
+appends a `status=skipped` log line when one of the gates before selection
+declines.
+
+`meute status` shows `staged plan: n of m attempted` when a plan is active, and
+`next <slot>` reflects the plan while one is staged.
+
 ## Tiers
 
 | Tier | What it does | Touches code |
@@ -320,14 +395,9 @@ branch=meute/gen-tests-2026-08-28	commit=64c180d	report=reports/...	cost=0.31	tu
 A failed run still writes a report (with the engine's stderr tail) and still
 advances the cursor — a poisoned entry must not stall the whole fleet.
 
-**The runner commits its own `state/` and `reports/` at the end of each run**,
-scoped to those paths, so a cron-driven fleet doesn't leave you with a
-permanently dirty checkout. It never pushes. Set `MEUTE_NO_AUTOCOMMIT=1` if you
-would rather commit the audit trail yourself.
-
-Skipped runs (quota floor, empty queue, lock held) append their log line but do
-not commit — otherwise a quota-starved week would produce a commit per cron fire.
-Those lines are folded into the next real run's commit.
+Nothing under `state/` or `reports/` is ever committed. The runner appends to
+`state/log` after every invocation (including skipped runs), which means your
+checkout is never dirty from meute. It never pushes.
 
 ## Task catalogue
 

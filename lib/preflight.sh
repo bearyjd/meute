@@ -6,19 +6,31 @@
 # are stripped from the child environment, and a zero-cost preflight refuses to
 # start unless the engine resolved to a real subscription.
 
-# Claude Code silently prefers an API key over subscription auth when one is
-# present in the environment, which flips billing from the seat to metered
-# per-token without any visible signal. meute is subscription-only, so the keys
-# are stripped from the child environment and their presence is reported loudly.
+# A shell's ambient configuration can silently route a CLI through a proxy or a
+# third-party endpoint as well as switch it from subscription to API-key auth.
+# Keep this explicit rather than using `env -i`: the CLIs still need normal
+# login/config discovery, PATH, locale, and terminal behaviour.
+readonly ENGINE_SCRUB_VARS=(
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT
+  OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT
+  CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+  HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+  http_proxy https_proxy all_proxy no_proxy
+)
+
 scrub_env() {
   local present=() var
-  for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY; do
+  for var in "${ENGINE_SCRUB_VARS[@]}"; do
     if [[ -n "${!var:-}" ]]; then present+=( "$var" ); fi
   done
-  ENGINE_ENV=(env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u OPENAI_API_KEY)
+  ENGINE_ENV=(env)
+  for var in "${ENGINE_SCRUB_VARS[@]}"; do
+    ENGINE_ENV+=( -u "$var" )
+  done
   if (( ${#present[@]} )); then
     note "WARNING: ${present[*]} present in this environment."
-    note "WARNING: unset for the child process — meute never runs on metered API billing."
+    note "WARNING: unset for the child process — meute uses direct subscription authentication only."
     SCRUBBED="${present[*]}"
   fi
 }
@@ -59,4 +71,3 @@ preflight_codex() {
     || die "preflight: codex did not report a ChatGPT subscription (got: ${status}). Run:  codex login"
   AUTH_MODE="codex/chatgpt"
 }
-

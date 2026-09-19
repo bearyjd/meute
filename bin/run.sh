@@ -11,7 +11,13 @@
 #   --engine <claude|codex>  override the manifest engine for this run
 #   --repo <name>            force a repo (bypasses the cursor and the share gates)
 #   --task <name>            force a task (bypasses the cursor and the share gates)
-#   --dry-run                select and render, invoke nothing, touch no state
+#   --dry-run                select and render, invoke nothing. Not a no-op on state/:
+#                            every skip before selection (hold, lock, budget, quota,
+#                            nothing eligible) still appends a status=skipped line to
+#                            state/log, an entry with no commits is logged as an error
+#                            and stepped over, and plan bookkeeping still happens (a
+#                            vanished staged repo is marked missing, a finished plan
+#                            is archived)
 #   --validate               validate the manifest and exit
 #   --help
 #
@@ -23,7 +29,9 @@
 #   MEUTE_MANIFEST         manifest path (default: <root>/repos.yaml)
 #   MEUTE_CODEX_MODEL      model passed to `codex exec -m`; unset means codex's default
 #   MEUTE_SETTING_SOURCES  value for claude --setting-sources (default: none)
-#   MEUTE_QUOTA_CMD        see bin/quota.sh
+#   MEUTE_CLAUDE_QUOTA_CMD, MEUTE_CODEX_QUOTA_CMD
+#                          per-engine subscription probes; see bin/quota.sh
+#   MEUTE_QUOTA_CMD        legacy alias for MEUTE_CLAUDE_QUOTA_CMD
 #
 set -Eeuo pipefail
 
@@ -49,6 +57,8 @@ readonly CURSOR_FILE="${STATE_DIR}/cursor"
 readonly LOG_FILE="${STATE_DIR}/log"
 readonly LOCK_FILE="${STATE_DIR}/.lock"
 readonly HOLD_FILE="${STATE_DIR}/hold"
+readonly PLAN_QUEUE_FILE="${STATE_DIR}/plan-queue.json"
+readonly PLAN_DONE_FILE="${STATE_DIR}/plan-complete"
 # A 429 is not "try again in n seconds" so much as "this pool is spent" -- the
 # provider's own reset text is free-form and not worth parsing. A day-long
 # hold means at most one more wasted (and, per observation, free: a 429
@@ -72,6 +82,7 @@ ENGINE_OVERRIDE=""
 FORCE_REPO=""
 FORCE_TASK=""
 DRY_RUN=0
+PLAN_MODE=0
 
 # Populated during a run; the EXIT trap reads them.
 REPO_PATH=""
@@ -83,8 +94,11 @@ note() { printf 'meute: %s\n' "$*" >&2; }
 die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
 
 # --------------------------------------------------------------------------
-# state/cursor holds both the round-robin cursor (one key per slot) and the
-# per-(repo,task) lens rotation counters. Storage lives in lib/state.sh.
+# state/cursor holds the round-robin cursors (one key per slot, a separate one
+# per slot for a staged plan) and the per-(repo,task) lens rotation counters.
+# Storage lives in lib/state.sh. Everything under state/ and reports/ is
+# gitignored and stays on this machine: it names private repositories and
+# carries unfixed findings, so the runner never commits it.
 # --------------------------------------------------------------------------
 state_get() { kv_get "$CURSOR_FILE" "$1"; }
 state_set() { kv_set "$CURSOR_FILE" "$1" "$2"; }
@@ -106,7 +120,9 @@ log_run() {
 # declining to run as a failure.
 skip() { log_run "skipped" "reason=$1" "${@:2}"; exit 0; }
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^#\( \|$\)//'; }
+# The header comment above, however long it grows: everything after the
+# shebang up to the first line that is not a comment.
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^#( |$)/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 # --------------------------------------------------------------------------
 # Worktree teardown. Removes the checkout; keeps the branch when it holds
@@ -148,39 +164,150 @@ parse_args() {
 }
 
 
+# A staged plan rotates on its own cursor. Sharing one would leave the
+# manifest cursor pointing at a plan key once the plan retires -- a key no
+# manifest entry has -- and restart the manifest rotation at 0.
+cursor_key() {
+  if (( PLAN_MODE )); then printf 'plan-cursor.%s\n' "$SLOT"; else printf 'cursor.%s\n' "$SLOT"; fi
+}
+
 eligible() {
-  local entry="$1" kind path tier
-  kind="$(jq -r '.kind' <<< "$entry")"
-  path="$(jq -r '.path' <<< "$entry")"
-  tier="$(jq -r '.tier' <<< "$entry")"
+  local entry="$1" key kind path tier engine
+  { read -r key; read -r kind; read -r path; read -r tier; read -r engine; } \
+    < <(jq -r '.key, .kind, .path, .tier, .engine' <<< "$entry")
 
   if [[ ! -d "$path/.git" && ! -f "$path/.git" ]]; then
-    note "skipping $(jq -r '.key' <<< "$entry"): not a git repository at $path"
+    note "skipping ${key}: not a git repository at $path"
+    # A staged path that is no longer a repository (an agent worktree torn
+    # down after staging) can never be attempted; unmarked, it would hold the
+    # plan open forever. Recorded on dry runs too, like the retirement it
+    # feeds -- a missing repo is a fact, not an effect of running.
+    (( PLAN_MODE )) && kv_set "$PLAN_DONE_FILE" "$key" missing
     return 1
   fi
-  # A forced selection is an explicit human decision; only the path check stands.
+  # A forced selection is an explicit human decision; only the path check
+  # stands. That includes re-running a staged item already attempted.
   (( FORCED )) && return 0
 
+  if (( PLAN_MODE )) && [[ -n "$(kv_get "$PLAN_DONE_FILE" "$key")" ]]; then
+    note "skipping ${key}: staged plan item already attempted"
+    return 1
+  fi
   if [[ "$kind" == "community" ]] && ! community_allowed; then
-    note "skipping $(jq -r '.key' <<< "$entry"): community share exhausted this week"
+    note "skipping ${key}: community share exhausted this week"
     return 1
   fi
   if [[ "$tier" == "tier3" ]]; then
     local in_flight; in_flight="$(tier3_in_flight)"
     if (( in_flight >= TIER3_CAP )); then
-      note "skipping $(jq -r '.key' <<< "$entry"): ${in_flight} tier-3 drafts already in flight (cap ${TIER3_CAP})"
+      note "skipping ${key}: ${in_flight} tier-3 drafts already in flight (cap ${TIER3_CAP})"
       return 1
     fi
+  fi
+  # Gate 2 of 2: the subscription pool the human shares -- per engine, so a
+  # Codex entry is gated by a Codex source and never by the Claude status-line
+  # snapshot. Checked per candidate rather than after selection: a fleet that
+  # mixes engines must step over the one whose pool is spent or unmeasured,
+  # not pin the rotation on it.
+  engine="${ENGINE_OVERRIDE:-$engine}"
+  quota_for_engine "$engine"
+  if [[ "$QUOTA_PROBE" == "fail" ]]; then
+    note "skipping ${key}: ${engine} quota unavailable"
+    return 1
+  fi
+  if (( ${QUOTA_PROBE%% *} < QUOTA_FLOOR )); then
+    note "skipping ${key}: ${engine} quota ${QUOTA_PROBE%% *}% below floor ${QUOTA_FLOOR}%"
+    return 1
   fi
   return 0
 }
 
+# One quota.sh subprocess per engine per fire, however long the queue: the
+# reading is cached so every candidate can be asked about. Sets QUOTA_PROBE
+# to "<percent> <source>", or "fail" when no source for that engine answered.
+declare -A QUOTA_BY_ENGINE=()
+quota_for_engine() {
+  local engine="$1"
+  if [[ -z "${QUOTA_BY_ENGINE[$engine]+set}" ]]; then
+    QUOTA_BY_ENGINE[$engine]="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source)" \
+      || QUOTA_BY_ENGINE[$engine]="fail"
+  fi
+  QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"
+}
+
+# Nothing was eligible. When a pool was the reason for any candidate, the
+# reason names each such engine with its verdict, and quota=/engine= carry
+# the readings in the same order -- so a wedged fleet reads as "codex quota
+# probe failed", not as an inexplicable empty round.
+skip_nothing_eligible() {
+  local engine probe verdicts=() engines=() quotas=()
+  for engine in $(printf '%s\n' "${!QUOTA_BY_ENGINE[@]}" | LC_ALL=C sort); do
+    probe="${QUOTA_BY_ENGINE[$engine]}"
+    if [[ "$probe" == "fail" ]]; then
+      verdicts+=( "${engine} quota probe failed" ); quotas+=( "fail" )
+    elif (( ${probe%% *} < QUOTA_FLOOR )); then
+      verdicts+=( "${engine} quota ${probe%% *}% below floor ${QUOTA_FLOOR}%" )
+      quotas+=( "${probe%% *}:${probe#* }" )
+    else
+      continue
+    fi
+    engines+=( "$engine" )
+  done
+  (( ${#verdicts[@]} )) || skip "no eligible entry for slot ${SLOT}"
+  local why; why="$(printf '%s; ' "${verdicts[@]}")"
+  skip "no eligible entry for slot ${SLOT} (${why%; })" \
+    "quota=$(IFS=,; printf '%s' "${quotas[*]}")" "engine=$(IFS=,; printf '%s' "${engines[*]}")"
+}
+
+# The runner owns LOCK_FILE for its whole lifetime, so this check and the
+# subsequent rename cannot race another runner.  `meute plan --enqueue` writes
+# a complete replacement atomically; if an operator replaces a plan between
+# timer fires, the next invocation validates that new file from scratch.
+retire_completed_plan() {
+  [[ -f "$PLAN_QUEUE_FILE" ]] || return 0
+  local all_file entry key archive complete=1
+  all_file="$(mktemp)"
+  python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" all > "$all_file" \
+    || { rm -f "$all_file"; die "staged plan queue failed validation"; }
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    key="$(jq -r '.key' <<< "$entry")"
+    if [[ -z "$(kv_get "$PLAN_DONE_FILE" "$key")" ]]; then
+      complete=0
+      break
+    fi
+  done < "$all_file"
+  rm -f "$all_file"
+  (( complete )) || return 0
+
+  archive="${STATE_DIR}/plan-queue.completed-$(date +%Y%m%dT%H%M%S).json"
+  [[ ! -e "$archive" ]] || archive="${archive}.$$"
+  mv "$PLAN_QUEUE_FILE" "$archive"
+  rm -f "$PLAN_DONE_FILE"
+  note "all staged plan items were attempted; archived queue at ${archive}"
+}
+
+# A forced --repo/--task names one entry; nothing else is a candidate.
+load_queue() {
+  local queue_file="$1"
+  if (( FORCED )); then
+    jq -c --arg r "$FORCE_REPO" --arg t "$FORCE_TASK" \
+       'select(($r == "" or .repo == $r) and ($t == "" or .task == $t))' \
+       "$queue_file" > "${queue_file}.f"
+    mv "${queue_file}.f" "$queue_file"
+  fi
+  mapfile -t QUEUE < "$queue_file"
+}
+
 # Round-robin: resume at the entry after the last one executed for this slot,
-# wrap around, and take the first eligible candidate.
+# wrap around, and take the first eligible candidate into SELECTED. A global
+# rather than stdout so the eligibility checks run in this shell, not a
+# subshell whose caches would be thrown away.
 select_entry() {
   local cursor start=0 i idx
-  cursor="$(state_get "cursor.${SLOT}")"
+  cursor="$(state_get "$(cursor_key)")"
   local total=${#QUEUE[@]}
+  SELECTED=""
   if [[ -n "$cursor" ]]; then
     for (( i = 0; i < total; i++ )); do
       if [[ "$(jq -r '.key' <<< "${QUEUE[i]}")" == "$cursor" ]]; then start=$(( i + 1 )); break; fi
@@ -188,7 +315,7 @@ select_entry() {
   fi
   for (( i = 0; i < total; i++ )); do
     idx=$(( (start + i) % total ))
-    if eligible "${QUEUE[idx]}"; then printf '%s\n' "${QUEUE[idx]}"; return 0; fi
+    if eligible "${QUEUE[idx]}"; then SELECTED="${QUEUE[idx]}"; return 0; fi
   done
   return 1
 }
@@ -228,37 +355,63 @@ main() {
       && skip "meute's own weekly ceiling is spent" "budget=${BUDGET_LEFT}"
   fi
 
-  # Gate 2 of 2: the subscription pool the human shares. PRP-001 §3 step 4 —
-  # the one constraint that shapes everything: a chore that eats the window
-  # the human wanted is worse than a chore that never ran.
-  local remaining probe
-  probe="$("${MEUTE_ROOT}/bin/quota.sh" --with-source)" || skip "quota probe failed"
-  remaining="${probe%% *}"
-  QUOTA_SOURCE="${probe#* }"
-  (( remaining < QUOTA_FLOOR )) \
-    && skip "quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}"
-
   local queue_file
   queue_file="$(mktemp)"
   trap 'rm -f "$queue_file"' RETURN
-  python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
+  # A portfolio plan exists only after an explicit `meute plan --enqueue`.
+  # It is independently re-expanded and refuses writing tiers in manifest.py;
+  # then the ordinary timers prioritize it until every staged item is attempted.
+  if [[ -f "$PLAN_QUEUE_FILE" ]]; then
+    retire_completed_plan
+  fi
+  if [[ -f "$PLAN_QUEUE_FILE" ]]; then
+    python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$SLOT" > "$queue_file" \
+      || die "staged plan queue failed validation"
+    if [[ -s "$queue_file" ]]; then
+      PLAN_MODE=1
+    fi
+  fi
+  (( PLAN_MODE )) || python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
   fleet_load_scope || die "queue build failed"
-  remaining_at_start="$remaining"
 
   FORCED=0
-  if [[ -n "$FORCE_REPO" || -n "$FORCE_TASK" ]]; then
-    FORCED=1
-    jq -c --arg r "$FORCE_REPO" --arg t "$FORCE_TASK" \
-       'select(($r == "" or .repo == $r) and ($t == "" or .task == $t))' \
-       "$queue_file" > "${queue_file}.f"
-    mv "${queue_file}.f" "$queue_file"
-  fi
-
-  mapfile -t QUEUE < "$queue_file"
-  (( ${#QUEUE[@]} )) || skip "no queue entries for slot ${SLOT}"
+  [[ -z "$FORCE_REPO" && -z "$FORCE_TASK" ]] || FORCED=1
+  load_queue "$queue_file"
 
   local entry
-  entry="$(select_entry)" || skip "no eligible entry for slot ${SLOT}"
+  select_entry || true
+  entry="$SELECTED"
+  # A plan's daily items drain in days; its weekly items take weeks. A slot
+  # that finds nothing eligible in the plan -- every item attempted, missing,
+  # or filtered out by --repo/--task -- falls through to the manifest rather
+  # than skip every fire until the other slot retires the plan. Retire first:
+  # a plan whose last item just went missing is complete now, not next fire.
+  if [[ -z "$entry" ]] && (( PLAN_MODE )); then
+    note "no eligible staged plan item for slot ${SLOT}; falling back to the manifest queue"
+    retire_completed_plan
+    PLAN_MODE=0
+    python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
+    load_queue "$queue_file"
+    select_entry || true
+    entry="$SELECTED"
+  fi
+  (( ${#QUEUE[@]} )) || skip "no queue entries for slot ${SLOT}"
+  [[ -n "$entry" ]] || skip_nothing_eligible
+
+  # The selected entry's pool, from the reading eligible() cached -- or, for
+  # a forced --repo/--task, which bypasses eligible()'s gates, probed here:
+  # a human's choice of entry is not a licence to spend a pool that is gone.
+  # The engine is written alongside the source in state/log, making each
+  # quota reading attributable.
+  local engine remaining
+  engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
+  quota_for_engine "$engine"
+  [[ "$QUOTA_PROBE" != "fail" ]] || skip "${engine} quota probe failed"
+  remaining="${QUOTA_PROBE%% *}"
+  QUOTA_SOURCE="${QUOTA_PROBE#* }"
+  (( remaining < QUOTA_FLOOR )) \
+    && skip "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
+  remaining_at_start="$remaining"
   run_entry "$entry"
 }
 
@@ -310,7 +463,14 @@ run_entry() {
   if [[ -n "$default_branch" ]] && git -C "$REPO_PATH" rev-parse --verify -q "$default_branch" >/dev/null 2>&1; then
     base_ref="$default_branch"
   fi
-  BASE_SHA="$(git -C "$REPO_PATH" rev-parse "$base_ref")"
+  # A repository with no commits yet (`git init` and nothing else) has no
+  # tree to audit and nothing to cut a worktree from. Stepped over like a
+  # failed worktree add -- logged, marked, cursor advanced -- because dying
+  # here under set -e would pin the slot on it every fire, visible only in
+  # the journal. Recorded on dry runs too: an unborn HEAD is a fact about the
+  # repository, not an effect of running.
+  BASE_SHA="$(git -C "$REPO_PATH" rev-parse --verify -q "${base_ref}^{commit}")" \
+    || abort_entry "$entry" "no-head"
 
   # The agent runs with the worktree as its cwd, and under dontAsk a read
   # outside cwd is refused. So the path the prompt calls "checked out at" has
@@ -342,7 +502,7 @@ run_entry() {
 
   trap cleanup EXIT
   git -C "$REPO_PATH" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
-    || { log_run "error" "kind=${kind}" "repo=${repo}" "task=${task}" "detail=worktree-add-failed"; exit 1; }
+    || abort_entry "$entry" "worktree-add-failed"
   copy_worktree_files "$entry"
 
   local out err; out="$(mktemp)"; err="$(mktemp)"
@@ -384,7 +544,7 @@ run_entry() {
 
   # The cursor advances on failure too: a poisoned entry must not stall the
   # whole fleet under cron. The log line is where failures surface.
-  state_set "cursor.${SLOT}" "$key"
+  advance_past "$key"
   [[ "$lens" == "none" || "$ENGINE_STATUS" != "ok" ]] \
     || state_set "lens.${repo}.${task}" "$(( lens_index + 1 ))"
 
@@ -392,10 +552,30 @@ run_entry() {
           "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" "budget=${BUDGET_LEFT}" \
           ${SCRUBBED:+"scrubbed=${SCRUBBED// /,}"} "commit=${committed}" "report=${report_rel}" "cost=${COST}" "turns=${TURNS}" \
           ${ENGINE_DETAIL:+"detail=${ENGINE_DETAIL}"}
-
-  # Last, so the log line written above is included in the same commit.
-  commit_state "$repo" "$task"
   [[ "$ENGINE_STATUS" == "ok" ]]
+}
+
+# Move the rotation past an entry, attempted or not. In plan mode the item is
+# also marked so the plan can retire once every item has had its turn.
+advance_past() {
+  local key="$1"
+  state_set "$(cursor_key)" "$key"
+  if (( PLAN_MODE )); then
+    kv_set "$PLAN_DONE_FILE" "$key" "$STARTED_AT"
+    retire_completed_plan
+  fi
+}
+
+# An entry the runner cannot even start on. Logged as an error with the cause
+# in detail=, then stepped over: the log line is the only place an unattended
+# failure surfaces, and an entry that dies before the cursor moves would be
+# re-selected every fire, wedging the slot on it.
+abort_entry() {
+  local entry="$1" detail="$2"
+  log_run "error" "kind=$(jq -r '.kind' <<< "$entry")" "repo=$(jq -r '.repo' <<< "$entry")" \
+          "task=$(jq -r '.task' <<< "$entry")" "detail=${detail}"
+  advance_past "$(jq -r '.key' <<< "$entry")"
+  exit 1
 }
 
 # A worktree holds only what git tracks. Build plumbing that is gitignored by
@@ -406,11 +586,38 @@ run_entry() {
 # configure, and disclosed it under Blocked. Each repo names what to carry
 # across; missing sources are skipped, never an error.
 copy_worktree_files() {
-  local entry="$1" rel
+  local entry="$1" rel source source_real repo_real part probe
+  local -a parts
+  repo_real="$(readlink -f -- "$REPO_PATH")" \
+    || die "worktree files: cannot resolve repository path: ${REPO_PATH}"
   while IFS= read -r rel; do
-    [[ -n "$rel" && -f "${REPO_PATH}/${rel}" ]] || continue
+    [[ -n "$rel" ]] || continue
+    source="${REPO_PATH}/${rel}"
+    [[ -f "$source" ]] || continue
+
+    # `-f` follows symlinks. Refuse both a symlink file and a symlinked
+    # directory component, so a manifest entry cannot smuggle host data into
+    # an agent worktree. Every component is probed, the last one included.
+    IFS=/ read -ra parts <<< "$rel"
+    probe="$REPO_PATH"
+    for part in "${parts[@]}"; do
+      [[ -z "$part" || "$part" == "." ]] && continue
+      probe+="/${part}"
+      if [[ -L "$probe" ]]; then
+        note "WARNING: skipped unsafe worktree file ${rel} (source traverses a symlink)"
+        continue 2
+      fi
+    done
+    source_real="$(readlink -f -- "$source")" || {
+      note "WARNING: skipped unsafe worktree file ${rel} (source cannot be resolved)"
+      continue
+    }
+    if [[ "$source_real" != "$repo_real/"* ]]; then
+      note "WARNING: skipped unsafe worktree file ${rel} (source resolves outside the repository)"
+      continue
+    fi
     mkdir -p "${WORKTREE}/$(dirname "$rel")"
-    cp -p "${REPO_PATH}/${rel}" "${WORKTREE}/${rel}"
+    cp -p -- "$source" "${WORKTREE}/${rel}"
     note "carried ${rel} into the worktree"
   done < <(jq -r '.worktree_files[]? // empty' <<< "$entry")
 }
@@ -458,23 +665,6 @@ write_report() {
       printf 'Last 40 lines of engine stderr:\n\n```\n%s\n```\n' "$(tail -n 40 "$err")"
     fi
   } > "$dest"
-}
-
-# state/cursor, state/log and reports/ are meute's own committed history. A
-# cron-driven runner that only wrote them would leave the operator staring at a
-# permanently dirty checkout with nobody responsible for it. Pathspec-scoped so
-# unrelated edits in the meute tree are never swept in. Never pushes.
-commit_state() {
-  [[ -z "${MEUTE_NO_AUTOCOMMIT:-}" ]] || return 0
-  git -C "$MEUTE_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 0
-  [[ -n "$(git -C "$MEUTE_ROOT" status --porcelain -- state reports)" ]] || return 0
-  local ident=()
-  if [[ -z "$(git -C "$MEUTE_ROOT" config user.email || true)" ]]; then
-    ident=( -c "user.name=${MEUTE_GIT_NAME:-meute}" -c "user.email=${MEUTE_GIT_EMAIL:-meute@localhost}" )
-  fi
-  git -C "$MEUTE_ROOT" add -- state reports
-  git -C "$MEUTE_ROOT" "${ident[@]}" commit -q \
-    -m "run: ${1}/${2} ${DATE} (${ENGINE_STATUS})" -- state reports || true
 }
 
 # Commits whatever the write tier left in the worktree, onto the scratch branch
