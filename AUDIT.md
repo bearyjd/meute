@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-20
 **Input:** the pasted PRP "Meute — Cross-Provider Agent Dispatch Fleet"
-(not yet on disk; see Section 8 for where to file it)
+(2026-09-20; its surviving content is filed as `docs/prp/PRP-004-container-review-publish.md`)
 **Audited against:** this repo at `819b515`, the live fleet on Tower, and
 the sibling `atelier-harness` audit of the same date
 **Method:** Read the PRP, then measured the repo, the host, `state/log`,
@@ -92,9 +92,14 @@ them.
   humans only.
 - **Auth:** three named volumes `atelier-auth-{claude,codex,gh}` populated
   by `just auth`; ephemeral containers mount them (§4.1).
-- **Network:** `--network=none` is Meute's default; `proxied` (internal
-  network + CONNECT proxy `atelier-egress`) for anything that needs the
-  web (§4.2).
+- **Network:** Atelier §4.2 proposes `none` as Meute's default and
+  `proxied` (internal network + CONNECT proxy `atelier-egress`) for
+  anything that needs the web. **The first half does not hold**: it assumes
+  a model-free build/test run, and every Meute run is a `claude -p` or
+  `codex exec` call that needs the provider's API hosts. Every engine run
+  is `proxied`; `none` is usable only for an in-container auth preflight.
+  Goes back to Atelier (caught by the PRP-004 review, not by this audit's
+  first pass).
 - **Flags:** `--userns=keep-id:uid=1000,gid=1000`, `:Z` bind of the
   project dir, `--cap-drop=ALL`, `--security-opt=no-new-privileges`,
   `--init`, `--pids-limit` (§4.3, verified on Tower).
@@ -218,10 +223,11 @@ task's completion depends on a provider whose error envelope the runner
 has never parsed under real conditions. That is a week of observation
 runs, not a config change (Section 5.2).
 
-### 4.5 The container path is not "pull and run" — six things the worktree runner learned must survive the move (Phase 1 input, no decision)
+### 4.5 The container path is not "pull and run" — eight things that must survive the move (Phase 1 input, no decision)
 
-Each of these was a measured finding in PRP-001 §11 and will recur inside
-a container unless carried over deliberately:
+Items 1–5 were measured findings in PRP-001 §11; 6–8 only appear once the
+filesystem and network boundary moves, and were added after the PRP-004
+review (§12 there) found them missing here:
 
 1. **`worktree_files`** — gitignored build plumbing (`local.properties`
    for Android) copied into every worktree. The container bind-mounts the
@@ -248,10 +254,24 @@ a container unless carried over deliberately:
    result goes back to Atelier's §4.1 as a finding. The safe interim is
    what 4.1 rejected — a bind mount of the whole `~/.claude` — because at
    least it is one file with one refresher.
-6. **`--network=none` breaks `tier2-web` and the community `scout` tier.**
-   Those need the `proxied` profile with `api.anthropic.com`, the search
-   endpoints, and `github.com` allow-listed. Map tier → network profile in
-   the manifest (`network: none|proxied`), default `none`.
+6. **There is no model-free run, so there is no `none` run.** Every
+   container that runs an engine needs `proxied` with the provider hosts
+   allow-listed; `tier2-scout` adds `github.com`; `tier2-web` needs
+   `WebFetch(domain:*)`, a wildcard a CONNECT allow-list cannot express,
+   so it stays `runtime: host`. Map tier → network profile in the manifest
+   as a tier-only key.
+7. **A linked worktree has no git inside the container.** Its `.git` is a
+   file pointing at `$REPO_PATH/.git/worktrees/<name>` — a host path the
+   container cannot see — so `git status`/`git diff`, which every
+   template's output contract and the `verify_commands` allowlist rely
+   on, fail. The scratch tree for container runs must be a self-contained
+   clone (PRP-004 §4.2), or the owner's `.git` gets mounted into the
+   agent's namespace.
+8. **Preflight runs on the host, before the log line.** `preflight_codex`
+   calls `codex login status` on the host, where `node` is absent, and
+   `die`s without writing to `state/log`. For container runs the preflight
+   must run inside the container against the volume the run will use, and
+   fail through `abort_entry` so the cursor advances.
 
 Also carry over: the `timeout --kill-after` wrapper becomes
 `podman run --timeout` or `--stop-timeout`; `--rm` plus the digest assert
@@ -424,8 +444,9 @@ anchor in the empirical record:
    blast-radius reducer, not a sandbox — `pytest` executes test code the
    agent wrote seconds earlier." A tier-1 run today has the host's
    network, `$HOME`, SSH keys and every other repo one `../` away. The
-   container with `--network=none`, `--cap-drop=ALL` and only the worktree
-   mounted closes that. This is the strongest argument in the PRP and it
+   container with egress allow-listed to the provider and GitHub hosts,
+   `--cap-drop=ALL`, and only the scratch clone plus one credential
+   mounted narrows that to what the allow-list permits. This is the strongest argument in the PRP and it
    is under-sold there.
 2. **Codex at all.** Only the container path makes the second provider
    usable unattended on this host (4.4).
@@ -450,13 +471,17 @@ Keep the PRP's build/review assignments per phase. Reorder and rescope:
 
 | # | Phase | Replaces PRP phase | Build / Review | Gate to pass |
 |---|---|---|---|---|
-| 1 | **Container execution path** — `lib/container.sh`; manifest `runtime: host\|container` (default `host`), `image:` pin, `network:` profile; digest assert in preflight and `doctor`; the six carry-overs in 4.5 | 4 (the container part) | Sonnet / Codex adversarial | The same `lint-sweep` and `audit-security` run green under both runtimes on one repo; a deliberately wrong pinned digest produces `status=skipped reason=image drift`, not a run on an unreviewed image; `tests/smoke.sh` from Atelier passes; OAuth-race test (4.5 #5) has a recorded result |
+| 1 | **Container execution path** — `lib/container.sh`; manifest `runtime: host\|container` (default `host`), `image:` pin, `network:` profile; digest assert in preflight and `doctor`; the eight carry-overs in 4.5 | 4 (the container part) | Sonnet / Codex adversarial | The same `lint-sweep` and `audit-security` run green under both runtimes on one repo; a deliberately wrong pinned digest produces `status=skipped reason=image drift`, not a run on an unreviewed image; `tests/smoke.sh` from Atelier passes; OAuth-race test (4.5 #5) has a recorded result |
 | 2 | **Manifest and log additions** — `stage=`, `pr=`, `engine` per stage, `auto_merge`, demotion counter | 2 (`plan.md` schema) | Sonnet / — | `test_meute.sh` covers each new field |
 | 3 | **Codex observed** — one week of tier-1/2 slots with `engine: codex` in the container; `lib/engines.sh` failure-shape comment replaced by measured cases | new | Sonnet / — | `state/log` has ≥ 10 `engine=codex` runs; every non-ok has a legible `detail=` (4.7) |
 | 4 | **Review stage** — `tasks/review.md`; runner enforces `review.engine != build.engine`; tier 3 only | 3 + 4 (profiles + loop) | Opus design → Sonnet / Codex adversarial | One tier-3 ticket goes build → review → report with the reviewer's verdict in the inbox |
 | 5 | **Publish, don't merge** — push branch, draft PR, `gh pr checks` in-container, zero-checks = fail, result in report; `auto_merge` opt-in stays off | 5 | Sonnet / Codex adversarial | A draft PR appears on a repo with CI and one without; the second reports *no checks — not mergeable* |
 | 6 | **GitHub MCP** in `review.md` only, PAT scoped per Phase 6 | 6 | Sonnet / Codex adversarial | as PRP |
 | 7 | **Spec/critique on Fable** — `tasks/spec.md` → `specced: true` ticket; tier 3 only | 3 (spec/critique profiles) | Sonnet / — | Ten tickets; count owner edits before flip (4.3) |
+
+*Superseded in one respect by PRP-004 §6 after its review: Phases 1 and 2
+are swapped there (schema and plumbing before the container path, because
+the container path dispatches on manifest fields the schema phase adds).*
 
 Dropped: tmux `fleet` + `fleet-ensure` (exists as `lib/timers.sh`);
 pi-flow in the core loop (4.6); `plan.md` (5.5); root `ATELIER_VERSION`
