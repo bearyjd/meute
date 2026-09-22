@@ -3024,6 +3024,14 @@ STUB
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran either" "the stub was invoked" || ok "runtime: ...and no engine ran either"
   is    "runtime: ...no worktree was cut"                         "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
   is    "runtime: ...and the cursor moved past it"                "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  # --runtime host is accepted only where it changes nothing. The one case a
+  # fixture cannot reach -- an entry with no runtime at all -- is pinned by
+  # reading the guard, since manifest.py always emits one.
+  yaml_edit "$root/repos.yaml" "$root/hostrepo.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_MANIFEST="$root/hostrepo.yaml" "$root/bin/run.sh" daily --repo netlens --runtime host 2>&1)"
+  has   "runtime: --runtime host on a host repo runs as before" "$out" "status=ok"
+  is    "runtime: the guard accepts host only against a manifest runtime of exactly host" \
+        "$(grep -c '\[\[ "$RUNTIME_OVERRIDE" != "host" || "$manifest_runtime" == "host" \]\]' "$REPO/bin/run.sh")" "1"
   # A dry run records the same refusal: the entry is unrunnable whether or
   # not this fire would have invoked anything.
   : > "$root/state/cursor"
@@ -3061,6 +3069,18 @@ PYT
   has "rule 6: ...and review_engine is refused there too" "$(validate "$root/repos.yaml" "$root")" \
       "state/tickets.yaml[netlens][NL-90].review_engine: not a field"
   rm -f "$root/state/tickets.yaml"
+  # The writer refuses what the reader would: a promoted ticket must never
+  # leave state/tickets.yaml failing validation on every slot until a human
+  # edits it by hand.
+  local rc
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" add-ticket "$root/repos.yaml" netlens '{"title":"bad engine","engine":"gpt"}' 2>&1)"; rc=$?
+  is  "rule 6: add-ticket refuses an unknown engine"   "$rc" "2"
+  has "rule 6: ...naming the field"                    "$out" "add-ticket[netlens][NE-16].engine: must be 'claude' or 'codex'"
+  [[ -e "$root/state/tickets.yaml" ]] && bad "rule 6: ...and writes nothing" "state/tickets.yaml was created" || ok "rule 6: ...and writes nothing"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" add-ticket "$root/repos.yaml" netlens '{"title":"x","review_engine":"claude"}' 2>&1)"; rc=$?
+  is  "rule 6: add-ticket refuses review_engine"       "$rc" "2"
+  has "rule 6: ...naming that field too"               "$out" "add-ticket[netlens][NE-16].review_engine: not a field"
+  [[ -e "$root/state/tickets.yaml" ]] && bad "rule 6: ...and still writes nothing" "state/tickets.yaml was created" || ok "rule 6: ...and still writes nothing"
 }
 
 # Rule 7: a state/stages row turns the ticket's build entry into its next
@@ -3107,6 +3127,11 @@ test_p4_rule7_stage_entries() {
   is "rule 7: publish keeps the task's tier" "$(jq -r '.tier' <<< "$q")"  "tier3"
   is "rule 7: publish has no tools"         "$(jq -r '.tools' <<< "$q")"  ""
   is "rule 7: publish never writes code"    "$(jq -r '.writes_code' <<< "$q")" "false"
+  # PRP-004 s4.4 pins publish to proxied: git push and gh need the egress
+  # proxy whatever the build tier was allowed.
+  yaml_edit "$root/repos.yaml" "$root/nonet.yaml" 'd["tiers"]["tier3"]["network"] = "none"'
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/nonet.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
+  is "rule 7: publish is proxied even under a network: none build tier" "$(jq -r '.network' <<< "$q")" "proxied"
 
   printf 'netlens/NL-14\tdone\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
   q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
@@ -3133,12 +3158,26 @@ test_p4_rule7_stage_entries() {
   yaml_edit "$root/repos.yaml" "$root/notier.yaml" 'del d["tiers"]["tier3-review"]'
   has "rule 7: a review row without tier3-review is refused" "$(validate "$root/notier.yaml" "$root")" \
       "tiers.tier3-review: required -- state/stages has a review row for netlens/NL-14"
-  # A row for a ticket that no longer exists is a warning, not a wedge: the
-  # queue still builds, on stdout, and says so once on stderr.
+  # A row nothing will run -- its ticket gone, or present but not specced, or
+  # in a repo with no ticket-consuming task -- is a warning, not a wedge: the
+  # queue still builds, and validate says so. queue itself stays silent: it
+  # runs three times a fire and promote parses its output with stderr merged.
   printf 'netlens/NL-99\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  has "rule 7: a row for a vanished ticket is reported by validate" "$(validate "$root/repos.yaml" "$root")" \
+      "state/stages: 1 row(s) that no task consumes: netlens/NL-99"
   local err; err="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly 2>&1 >/dev/null)"
-  has "rule 7: an orphan row is reported on stderr" "$err" "state/stages: 1 row(s) name no ticket: netlens/NL-99"
+  is  "rule 7: ...queue says nothing about it"      "$err" ""
   is  "rule 7: ...and the queue still builds"       "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly 2>/dev/null | jq -r 'select(.ticket_id=="NL-14") | .stage_entry')" "false"
+  yaml_edit "$root/repos.yaml" "$root/unspecced.yaml" 'd["repos"][0]["tickets"][0]["specced"] = False'
+  printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  has "rule 7: a row for an unspecced ticket is reported too" "$(validate "$root/unspecced.yaml" "$root")" \
+      "state/stages: 1 row(s) that no task consumes: netlens/NL-14"
+  has "rule 7: ...while the consumed one is not"    "$(validate "$root/repos.yaml" "$root")" "ok:"
+  printf 'netlens/NL-14\tdone\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  has "rule 7: a done row is finished, not unconsumed" "$(validate "$root/unspecced.yaml" "$root")" "ok:"
+  is  "rule 7: list-stages flags the same rows"      "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" list-stages "$root/unspecced.yaml" | jq -r '.unconsumed')" "false"
+  printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  is  "rule 7: ...and the unspecced one as unconsumed" "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" list-stages "$root/unspecced.yaml" | jq -r '.unconsumed')" "true"
   rm -f "$root/state/stages"
 }
 
@@ -3202,6 +3241,12 @@ STUB
   out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly --dry-run 2>&1 || true)"
   has   "stage: --dry-run still logs the abort"      "$out" "status=error"
   is    "stage: ...and still advances the cursor"    "$(kv_get_test "$root/state/cursor" cursor.weekly)" "netlens/draft-ticket/NL-15/resolve"
+  # One fire, one line: the runner validates once but builds the queue three
+  # times (the slot's, then both slots for the tier-3 scope).
+  printf 'netlens/NL-99\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' >> "$root/state/stages"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly --dry-run 2>&1 || true)"
+  is    "stage: an unconsumed row is reported exactly once per fire" "$(grep -c 'that no task consumes' <<< "$out")" "1"
+  printf 'netlens/NL-15\tresolve\tmeute/draft-ticket-2026-09-01\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
   # publish has no engine, so no pool to probe: it must reach the abort, not
   # stall the slot on a quota reading for an engine called "".
   printf 'netlens/NL-15\tpublish\tmeute/draft-ticket-2026-09-01\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
@@ -3337,7 +3382,7 @@ STUB
   # owner looks; the runner only mutters it on stderr under the timer.
   printf 'netlens/NL-99\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
   out="$(doc)"
-  has "doctor: orphan stage rows are a warning"   "$out" "warn state/stages: 1 row(s) name no ticket: netlens/NL-99"
+  has "doctor: unconsumed stage rows are a warning" "$out" "warn state/stages: 1 row(s) that no task consumes: netlens/NL-99"
   rm -f "$root/state/stages"
   # No podman is a different failure from no image, and says which knob to turn.
   out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/no-such-podman" "$root/bin/meute" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')"

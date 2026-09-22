@@ -504,7 +504,6 @@ def build_queue(data: dict, slot: str, root: str) -> list:
     entries = []
     machine = load_machine_tickets(root)
     stages = load_stages(root)
-    warn_orphan_rows(stages, ticket_keys(data, tasks, root))
     for kind, key in (("personal", "repos"), ("community", "community")):
         for project in checked_projects(data, key, tasks, root):
             project = with_machine_tickets(project, machine)
@@ -543,8 +542,11 @@ def cmd_validate(args: list) -> int:
     root = repo_root(manifest)
     data = load(manifest)
     merged_policy(data)
-    for slot in VALID_SLOTS:
-        build_queue(data, slot, root)
+    entries = [entry for slot in VALID_SLOTS for entry in build_queue(data, slot, root)]
+    # A stranded state/stages row is not a reason to refuse the manifest, but
+    # validate is the one step that runs exactly once per fire, so this is
+    # where the journal hears about it.
+    warn_unconsumed_rows(load_stages(root), consumed_keys(entries))
     print(f"ok: {manifest}")
     return 0
 
@@ -660,10 +662,10 @@ def cmd_list_images(args: list) -> int:
 from plan_queue import cmd_plan_queue, plan_tier_class  # noqa: E402
 from stages import (  # noqa: E402
     cmd_list_stages,
+    consumed_keys,
     expand_tickets,
     load_stages,
-    ticket_keys,
-    warn_orphan_rows,
+    warn_unconsumed_rows,
 )
 from manifest_write import (  # noqa: E402
     cmd_add_repo,

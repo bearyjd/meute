@@ -103,14 +103,15 @@ cmd_doctor() {
         d_ok "$(printf '%-7s queue: %s item(s), next: %s' "$slot" \
           "$(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null | wc -l)" "$(next_for_slot "$slot")")"
       done
-      # PRP-004: a state/stages row whose ticket is gone from both sources
-      # is skipped by the queue with a line on stderr nobody reads under the
-      # timer. Here it reaches the owner, who can delete the row.
-      local orphans
-      orphans="$(python3 "$MANIFEST_PY" list-stages "$MANIFEST" 2>/dev/null \
-                   | jq -r 'select(.orphan) | .key' 2>/dev/null | paste -sd, - || true)"
-      [[ -z "$orphans" ]] \
-        || d_warn "state/stages: $(tr ',' '\n' <<< "$orphans" | wc -l) row(s) name no ticket: ${orphans//,/, }"
+      # PRP-004: a state/stages row no slot will run -- its ticket gone, or
+      # unspecced, or in a repo with no ticket-consuming task -- is a branch
+      # waiting for nobody, reported by validate on stderr nobody reads under
+      # the timer. Here it reaches the owner, who can delete the row.
+      local stranded
+      stranded="$(python3 "$MANIFEST_PY" list-stages "$MANIFEST" 2>/dev/null \
+                    | jq -r 'select(.unconsumed) | .key' 2>/dev/null | paste -sd, - || true)"
+      [[ -z "$stranded" ]] \
+        || d_warn "state/stages: $(tr ',' '\n' <<< "$stranded" | wc -l) row(s) that no task consumes: ${stranded//,/, }"
     fi
   else
     d_err "$(basename "$MANIFEST") failed validation — run: ./bin/run.sh --validate"

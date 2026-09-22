@@ -28,6 +28,7 @@ from manifest import (
     ManifestError,
     build_queue,
     checked_projects,
+    checked_ticket,
     checked_tasks,
     checked_tiers,
     expand,
@@ -207,6 +208,9 @@ def cmd_add_ticket(args: list) -> int:
     if str(ticket["id"]) in {str(t.get("id")) for t in known}:
         raise ManifestError(f"ticket id {ticket['id']!r} already exists for {repo_name}")
     ticket.setdefault("specced", True)
+    # The same gate the reader applies (with_machine_tickets), so a ticket
+    # this writes can never be one every following slot refuses to load.
+    checked_ticket(f"add-ticket[{repo_name}][{ticket['id']}]", ticket)
 
     updated = {**stored, "tickets": {**tickets, repo_name: existing + [ticket]}}
     os.makedirs(os.path.dirname(path), exist_ok=True)

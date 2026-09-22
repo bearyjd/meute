@@ -22,15 +22,12 @@ import os
 import sys
 
 from manifest import (
-    ManifestError,
     VALID_ENGINES,
-    checked_projects,
-    checked_tasks,
-    checked_tiers,
+    VALID_SLOTS,
+    ManifestError,
+    build_queue,
     load,
-    load_machine_tickets,
     repo_root,
-    with_machine_tickets,
 )
 
 # state/stages rows (PRP-004 s4.3): a tier-3 ticket advances one stage per
@@ -43,6 +40,9 @@ OTHER_ENGINE = {"claude": "codex", "codex": "claude"}
 # The tier a review stage runs on (PRP-004 s4.4). Not a task's tier: no task
 # names it, the queue builder puts a ticket there itself.
 REVIEW_TIER = "tier3-review"
+# Publish runs no engine and gets no tier, but git push and gh need the egress
+# proxy: s4.4 pins it, whatever network the build tier was allowed.
+PUBLISH_NETWORK = "proxied"
 
 
 def stages_path(root: str) -> str:
@@ -91,35 +91,36 @@ def checked_row(key: str, row: dict) -> dict:
     return row
 
 
-def ticket_keys(data: dict, tasks: dict, root: str) -> set:
-    """Every `<repo>/<ticket>` the merged manifest knows, both sections, both sources."""
-    machine = load_machine_tickets(root)
-    known = set()
-    for key in ("repos", "community"):
-        for project in checked_projects(data, key, tasks, root):
-            project = with_machine_tickets(project, machine)
-            known.update(f"{project['name']}/{ticket['id']}"
-                         for ticket in project.get("tickets") or [])
-    return known
+def consumed_keys(entries: list) -> set:
+    """The `<repo>/<ticket>` keys whose rows became stage entries, across the queues given."""
+    return {f"{entry['repo']}/{entry['ticket_id']}" for entry in entries if entry["stage_entry"]}
 
 
-_WARNED_ORPHANS = set()
+def unconsumed_rows(stages: dict, consumed: set) -> tuple:
+    """Rows nothing will run, in key order.
 
-
-def warn_orphan_rows(stages: dict, known: set) -> None:
-    """A row whose ticket is gone is a warning, not a wedge.
-
-    The queue must still build, so this goes to stderr (stdout is JSON lines)
-    and once per process, since build_queue runs once per slot. `meute doctor`
-    shows the same rows to the owner; this line is for the journal.
+    A ticket gone from both sources, present but `specced: false`, or in a repo
+    with no ticket-consuming task: each leaves a row that yields no stage
+    entry in any slot, and the branch it names waits for nobody. A `done` row
+    is finished, not stranded, and is not reported.
     """
-    orphans = tuple(sorted(set(stages) - known))
-    if not orphans or orphans in _WARNED_ORPHANS:
-        return
-    _WARNED_ORPHANS.add(orphans)
-    sys.stderr.write(
-        f"meute/manifest: state/stages: {len(orphans)} row(s) name no ticket: "
-        f"{', '.join(orphans)}\n")
+    return tuple(sorted(key for key, row in stages.items()
+                        if row["stage"] != "done" and key not in consumed))
+
+
+def warn_unconsumed_rows(stages: dict, consumed: set) -> None:
+    """A stranded row is a warning, not a wedge: the queue still builds.
+
+    stderr, because stdout is JSON lines. Called from validate and nowhere
+    else: the runner validates once a fire but builds the queue three times,
+    and `meute promote` reads queue's output with stderr merged in.
+    `meute doctor` shows the same rows to the owner through list-stages.
+    """
+    stranded = unconsumed_rows(stages, consumed)
+    if stranded:
+        sys.stderr.write(
+            f"meute/manifest: state/stages: {len(stranded)} row(s) that no task consumes: "
+            f"{', '.join(stranded)}\n")
 
 
 def expand_tickets(entry: dict, project: dict, stages: dict, tiers: dict,
@@ -187,7 +188,8 @@ def stage_entry(item: dict, row: dict, tiers: dict) -> dict:
         profile = tier_profile(tiers[item["tier"]])
         engine, tier_name = row["engine"], item["tier"]
     else:
-        profile = {"tools": "", "permission_mode": "", "writes_code": False, "allowed_tools": ""}
+        profile = {"tools": "", "permission_mode": "", "writes_code": False,
+                   "allowed_tools": "", "network": PUBLISH_NETWORK}
         engine, tier_name = "", item["tier"]
     return {**item,
             **profile,
@@ -210,7 +212,7 @@ def tier_profile(tier: dict) -> dict:
 
 
 def cmd_list_stages(args: list) -> int:
-    """Every state/stages row as JSON, with whether its key still names a ticket.
+    """Every state/stages row as JSON, flagged `unconsumed` when no slot's queue runs it.
 
     `meute doctor` reads this to show the owner rows the runner can only
     mutter about on stderr.
@@ -218,8 +220,10 @@ def cmd_list_stages(args: list) -> int:
     manifest = args[0]
     root = repo_root(manifest)
     data = load(manifest)
-    tasks = checked_tasks(data, checked_tiers(data), root)
-    known = ticket_keys(data, tasks, root)
-    for key, row in load_stages(root).items():
-        print(json.dumps({"key": key, **row, "orphan": key not in known}))
+    stages = load_stages(root)
+    consumed = consumed_keys([entry for slot in VALID_SLOTS
+                              for entry in build_queue(data, slot, root)])
+    stranded = unconsumed_rows(stages, consumed)
+    for key, row in stages.items():
+        print(json.dumps({"key": key, **row, "unconsumed": key in stranded}))
     return 0

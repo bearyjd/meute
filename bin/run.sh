@@ -468,13 +468,15 @@ run_entry() {
   # without one the answer is the validator's, not a fallback to the host.
   # And with one, Phase 2 has yet to build the path -- a repo that opted into
   # isolation must not be quietly run without it, and the CLI may not talk
-  # it down either: --runtime host on a container repo is the same silent
+  # it down either: --runtime host is accepted only where the manifest
+  # already says host, so it changes nothing; against anything else -- a
+  # container repo, a missing or unreadable runtime -- it is the same silent
   # loss of isolation, asked for by hand. Anything that is not plainly
-  # `host` -- a missing or unreadable runtime included -- takes this path.
+  # `host` takes the container path below.
   local manifest_runtime runtime
   manifest_runtime="$(jq -r '.runtime // ""' <<< "$entry")"
   runtime="${RUNTIME_OVERRIDE:-$manifest_runtime}"
-  [[ "$manifest_runtime" != "container" || "$RUNTIME_OVERRIDE" != "host" ]] \
+  [[ "$RUNTIME_OVERRIDE" != "host" || "$manifest_runtime" == "host" ]] \
     || abort_entry "$entry" "repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
   if [[ "$runtime" != "host" ]]; then
     [[ -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]] \
