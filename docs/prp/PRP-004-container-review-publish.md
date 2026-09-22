@@ -799,6 +799,24 @@ What running it disclosed, in the order it changed the design:
   looked straight at that line and read the basename compare as the check
   it was named for.
 
+- **A tier rule is a migration, and a manifest error stops the fire, not
+  the entry.** Requiring `network` per tier made the running fleet's
+  `repos.local.yaml` invalid: its four tiers predate the key, and §3 step 3
+  validates before anything else, so every slot would have aborted with
+  `tiers.tier1.network: required` — a silent halt of the kind §10b is
+  about, arriving the moment the code merged rather than when a repo opted
+  into anything. Caught by validating the live manifest against the new
+  code before merging, not by the suite, which builds its own fixtures. The
+  private manifest was migrated in place (`network: proxied` on tier1,
+  tier2, tier3; `runtime: host` on tier2-web, matching what `repos.yaml`
+  now declares) and validates under both the old and the new code, so the
+  fleet is correct whichever commit the checkout sits on. The general rule,
+  for every later phase: **a new required key in `repos.yaml` is a change
+  to a file the harness does not track, and the migration is part of the
+  phase.** `tier3-review` is deliberately not added there yet — nothing
+  emits a review row before Phase 4, and the validation error names the
+  tier if one ever appears first.
+
 Carried, not fixed here: `write_with_backup` is `open(…, "w")` then dump,
 not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
 `repos:` when a name appears in both sections (validation allows it). Two
