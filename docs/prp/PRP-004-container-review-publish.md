@@ -757,6 +757,12 @@ What running it disclosed, in the order it changed the design:
   container repo *with* a valid image would have run on the host silently.
   Both abort through `abort_entry` with the phase named in `detail=`, and
   anything whose runtime is not plainly `host` takes the same path.
+- **Rule 1 is strict against the repo's declared runtime.** A repo that
+  declares `container` must carry an image pin even if every task it runs
+  today sits on a host-pinned tier (`tier2-web`). The Codex pass read the
+  mismatch with `resolved_runtime` as a defect; it is deliberate — a pin is
+  cheap, and a task added later would otherwise silently need one. Noted in
+  the code where the runtime resolves.
 - **`network` is required on every tier unless the tier is `runtime:
   host`.** The plan said "add `network` to `REQUIRED_TIER_KEYS`"; §4.1's own
   `tier2-web` block (`runtime: host`, no `network`) contradicted that. A
@@ -774,6 +780,24 @@ What running it disclosed, in the order it changed the design:
   `MEUTE_PODMAN` → `distrobox-host-exec podman` (when `/run/.containerenv`)
   → `podman`, in `bin/meute`; `lib/container.sh` inherits the three helpers
   in Phase 2.
+
+- **The tracked manifest was refused by basename, so a symlink walked past
+  it.** Found by the Codex pass, which ran only on the second attempt — the
+  first returned `You've hit your usage limit`, the quota-binding condition
+  §1 describes, met on the day it was first asked for. `refuse_tracked_
+  manifest` compared `os.path.basename(manifest) == "repos.yaml"`; an alias
+  with any other name (`MEUTE_MANIFEST=…/alias.yaml` → `repos.yaml`) passed,
+  and `open(manifest, "w")` followed the link: reproduced against the
+  pre-fix commit, the tracked file's hash changed and the `.bak` landed
+  beside the alias, not beside what was overwritten. The refusal is now an
+  identity test (`realpath`, plus `samefile` against `<root>/repos.yaml`),
+  the write resolves before backing up so the backup sits next to the real
+  file, and `bin/meute`'s and `lib/discover.sh`'s front doors share one
+  helper — while the Python writers keep their own test, because a front
+  door is not a boundary. The bug predates this phase: it came from
+  `add-repo`, and `image bump` inherited it. Three Claude review passes
+  looked straight at that line and read the basename compare as the check
+  it was named for.
 
 Carried, not fixed here: `write_with_backup` is `open(…, "w")` then dump,
 not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
