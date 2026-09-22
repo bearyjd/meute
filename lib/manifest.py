@@ -23,11 +23,15 @@ Subcommands
 
 The queue is *candidates only*. Gating that depends on live repo state (weekly
 community share, tier-3 in-flight cap, cursor position) belongs to run.sh.
+
+This file is the schema, the reader and the CLI. Two features live beside it
+and are dispatched from here: lib/stages.py turns state/stages rows into
+stage entries for the queue, and lib/manifest_write.py holds every command
+that writes repos.local.yaml or state/tickets.yaml.
 """
 
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import re
@@ -37,6 +41,13 @@ try:
     import yaml
 except ImportError:  # pragma: no cover - environment problem, not a data problem
     sys.exit("meute: PyYAML is required (pip install --user PyYAML)")
+
+# Run as `python3 lib/manifest.py` this module is `__main__`, yet lib/stages.py
+# and lib/manifest_write.py import it as `manifest`. Without this alias Python
+# would load a second copy under that name, with a second ManifestError that
+# main()'s except clause below would never catch.
+if __name__ == "__main__":
+    sys.modules["manifest"] = sys.modules[__name__]
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 VALID_SLOTS = ("daily", "weekly")
@@ -56,14 +67,6 @@ IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 # The owner's GitHub repository, `owner/name`. It is the only source of the
 # push URL and the `-R` for gh; nothing derives it from `git remote`.
 OWNER_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
-
-# state/stages rows (PRP-004 s4.3): a tier-3 ticket advances one stage per
-# fire. `preflight` and `build` appear in state/log's stage= column only; a
-# row exists once a build has committed, so its stage is one of these.
-ROW_STAGES = ("review", "resolve", "review-2", "publish", "done")
-STAGES_COLUMNS = ("stage", "branch", "base", "build_report", "engine")
-# A branch is reviewed by the engine that did not write it.
-OTHER_ENGINE = {"claude": "codex", "codex": "claude"}
 
 POLICY_DEFAULTS = {
     "quota_floor_percent": 30,
@@ -402,41 +405,6 @@ def load_machine_tickets(root: str) -> dict:
     return tickets
 
 
-def stages_path(root: str) -> str:
-    return os.path.join(root, "state", "stages")
-
-
-def load_stages(root: str) -> dict:
-    """Where every in-flight tier-3 ticket stands, keyed `<repo>/<ticket>`.
-
-    lib/state.sh kv_set_row format: the key, then STAGES_COLUMNS, tab-separated.
-    Hand-written and machine-written tickets alike are looked up here; neither
-    ticket source is touched to record progress. A row the builder cannot read
-    stops the queue -- the alternative is guessing which stage to run.
-    """
-    path = stages_path(root)
-    if not os.path.isfile(path):
-        return {}
-    rows = {}
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            fields = line.split("\t")
-            key = fields[0]
-            if len(fields) != 1 + len(STAGES_COLUMNS):
-                raise ManifestError(
-                    f"state/stages: {key}: expected {', '.join(STAGES_COLUMNS)}")
-            row = dict(zip(STAGES_COLUMNS, fields[1:]))
-            if row["stage"] not in ROW_STAGES:
-                raise ManifestError(f"state/stages: {key}: unknown stage {row['stage']!r}")
-            if row["engine"] not in VALID_ENGINES:
-                raise ManifestError(f"state/stages: {key}: engine must be claude or codex")
-            rows[key] = row
-    return rows
-
-
 def with_machine_tickets(project: dict, machine: dict) -> dict:
     """Copy of `project` whose ticket list also carries the machine-written ones."""
     extra = machine.get(project["name"]) or []
@@ -452,18 +420,6 @@ def with_machine_tickets(project: dict, machine: dict) -> dict:
                 "repos.yaml and state/tickets.yaml - resolve the clash by hand")
         seen.add(identifier)
     return {**project, "tickets": own + list(extra)}
-
-
-def derive_ticket_id(repo: str, existing: list) -> str:
-    """<INITIALS>-<n>, continuing from the highest n already used for this repo."""
-    parts = [p for p in re.split(r"[^A-Za-z0-9]+", repo) if p]
-    initials = "".join(p[0] for p in parts[:2]).upper() if len(parts) > 1 else repo[:2].upper()
-    highest = 0
-    for ticket in existing:
-        match = re.search(r"(\d+)$", str(ticket.get("id", "")))
-        if match:
-            highest = max(highest, int(match.group(1)))
-    return f"{initials}-{highest + 1}"
 
 
 def load_etiquette(root: str, project: dict) -> dict:
@@ -663,62 +619,6 @@ def build_plan_queue(data: dict, path: str, slot: str, root: str) -> list:
     return entries
 
 
-def expand_tickets(entry: dict, project: dict, stages: dict, want_specced: bool = True) -> list:
-    """One queue entry per ticket on the right side of the human gate.
-
-    want_specced=True  -- tier 3: only tickets a human marked specced: true.
-                          A ticket with a live state/stages row yields its next
-                          stage entry instead of a build.
-    want_specced=False -- the reproduce stage: candidates awaiting that decision.
-                          Stages are tier 3's pipeline; candidates never have one.
-
-    The build engine is settled here and not in build_entry's setting(): that
-    runs with no ticket in scope, and the ticket outranks task, repo and defaults.
-    """
-    out = []
-    for ticket in project.get("tickets") or []:
-        if bool(ticket.get("specced")) is not want_specced:
-            continue
-        ticket_id = str(ticket["id"])
-        item = {**entry,
-                "ticket_id": ticket_id,
-                "ticket_title": ticket.get("title", ""),
-                "ticket_notes": ticket.get("notes", ""),
-                "key": f"{entry['repo']}/{entry['task']}/{ticket_id}",
-                "engine": ticket.get("engine") or entry["engine"]}
-        row = stages.get(f"{entry['repo']}/{ticket_id}") if want_specced else None
-        if row and row["stage"] != "done":
-            item = stage_entry(item, row)
-        out.append(item)
-    return out
-
-
-def stage_entry(item: dict, row: dict) -> dict:
-    """The ticket's next stage as a queue item (PRP-004 s4.3).
-
-    The engine is written into the entry because eligible() and main gate
-    quota on it: a review is charged to the reviewing engine's pool, not the
-    builder's. Publish runs no engine at all. The cap exemption is the
-    `stage_entry` flag itself -- run.sh reads it in eligible().
-    """
-    stage = row["stage"]
-    if stage in ("review", "review-2"):
-        engine, tier = OTHER_ENGINE[row["engine"]], "tier3-review"
-    elif stage == "resolve":
-        engine, tier = row["engine"], "tier3"
-    else:
-        engine, tier = "", item["tier"]
-    return {**item,
-            "stage_entry": True,
-            "stage": stage,
-            "branch": row["branch"],
-            "base": row["base"],
-            "build_report": row["build_report"],
-            "engine": engine,
-            "tier": tier,
-            "key": f"{item['key']}/{stage}"}
-
-
 def cmd_validate(args: list) -> int:
     manifest = args[0]
     root = repo_root(manifest)
@@ -775,53 +675,6 @@ def cmd_render(args: list) -> int:
     return 0
 
 
-def cmd_add_ticket(args: list) -> int:
-    """Append one machine-written ticket. Never touches repos.yaml."""
-    manifest, repo_name, payload = args[0], args[1], args[2]
-    root = repo_root(manifest)
-    data = load(manifest)
-    tasks = checked_tasks(data, checked_tiers(data), root)
-
-    project = None
-    for key in ("repos", "community"):
-        for candidate in checked_projects(data, key, tasks, root):
-            if candidate["name"] == repo_name:
-                project = candidate
-    if project is None:
-        raise ManifestError(f"unknown repo {repo_name!r} - not in repos.yaml")
-
-    try:
-        ticket = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise ManifestError(f"add-ticket: payload is not valid JSON: {error}") from error
-    if not isinstance(ticket, dict) or not ticket.get("title"):
-        raise ManifestError("add-ticket: ticket needs at least a title")
-
-    path = tickets_path(root)
-    stored = {}
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as handle:
-            stored = yaml.safe_load(handle) or {}
-    tickets = stored.get("tickets") or {}
-    existing = list(tickets.get(repo_name) or [])
-
-    known = existing + list(project.get("tickets") or [])
-    if not ticket.get("id"):
-        ticket["id"] = derive_ticket_id(repo_name, known)
-    if str(ticket["id"]) in {str(t.get("id")) for t in known}:
-        raise ManifestError(f"ticket id {ticket['id']!r} already exists for {repo_name}")
-    ticket.setdefault("specced", True)
-
-    updated = {**stored, "tickets": {**tickets, repo_name: existing + [ticket]}}
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("# Tickets written by `meute promote`. Machine-owned - edit repos.yaml\n"
-                     "# for hand-authored tickets instead; this file is rewritten wholesale.\n")
-        yaml.safe_dump(updated, handle, sort_keys=False, default_flow_style=False)
-    print(ticket["id"])
-    return 0
-
-
 def cmd_list_repos(args: list) -> int:
     """Raw name+path for every configured repo, personal and community.
 
@@ -866,127 +719,6 @@ def cmd_list_tasks(args: list) -> int:
     return 0
 
 
-def cmd_add_repo(args: list) -> int:
-    """Append one repo to a personal manifest. Refuses to touch repos.yaml.
-
-    repos.yaml is the tracked schema doc, hand-written and commented; PyYAML
-    cannot round-trip it without destroying those comments (see
-    load_machine_tickets's docstring for the same reasoning applied to
-    tickets). repos.local.yaml is gitignored and already machine-editable --
-    that split is exactly why this command exists as a separate path instead
-    of extending add-ticket.
-    """
-    manifest, payload = args[0], args[1]
-    refuse_tracked_manifest("add-repo", manifest)
-    root = repo_root(manifest)
-
-    try:
-        fields = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise ManifestError(f"add-repo: payload is not valid JSON: {error}") from error
-    if not isinstance(fields, dict):
-        raise ManifestError("add-repo: payload must be a JSON object")
-    name = fields.get("name")
-    if not name or not SAFE_NAME.match(str(name)):
-        raise ManifestError(f"add-repo: name {name!r} must match {SAFE_NAME.pattern}")
-    if not fields.get("path"):
-        raise ManifestError("add-repo: path is required")
-    if not fields.get("spec"):
-        raise ManifestError("add-repo: spec is required (one line, injected into every prompt)")
-
-    data = load(manifest)
-    new_path = expand(str(fields["path"]))
-    for key in ("repos", "community"):
-        for project in data.get(key) or []:
-            if not isinstance(project, dict):
-                continue
-            if project.get("name") == name:
-                raise ManifestError(f"add-repo: name {name!r} is already configured under {key}")
-            if project.get("path") and expand(str(project["path"])) == new_path:
-                raise ManifestError(
-                    f"add-repo: path {new_path!r} is already configured as "
-                    f"{project.get('name')!r} under {key}")
-
-    new_project = {"name": name, "path": fields["path"], "spec": fields["spec"]}
-    if fields.get("default_branch"):
-        new_project["default_branch"] = fields["default_branch"]
-    new_project["tasks"] = list(fields.get("tasks") or [])
-
-    new_data = {**data, "repos": list(data.get("repos") or []) + [new_project]}
-    validate_merged(new_data, root)
-    write_with_backup(manifest, new_data)
-    print(name)
-    return 0
-
-
-def refuse_tracked_manifest(command: str, manifest: str) -> None:
-    """Every machine writer of a manifest shares one refusal, so none can forget it."""
-    if os.path.basename(manifest) == "repos.yaml":
-        raise ManifestError(
-            f"{command}: refusing to write repos.yaml (tracked schema doc, hand-commented). "
-            "Create repos.local.yaml first -- e.g. `cp repos.yaml repos.local.yaml` -- "
-            "it's gitignored, so no PR is needed for what you add to it.")
-
-
-def validate_merged(new_data: dict, root: str) -> None:
-    """The *merged* document, the same way `validate` does, before touching disk.
-
-    A bad payload must never leave the real file corrupt or half-written.
-    """
-    tiers = checked_tiers(new_data)
-    tasks = checked_tasks(new_data, tiers, root)
-    checked_projects(new_data, "repos", tasks, root)
-    merged_policy(new_data)
-    for slot in VALID_SLOTS:
-        build_queue(new_data, slot, root)
-
-
-def write_with_backup(manifest: str, new_data: dict) -> None:
-    backup = f"{manifest}.bak"
-    with open(manifest, "r", encoding="utf-8") as handle:
-        original = handle.read()
-    with open(backup, "w", encoding="utf-8") as handle:
-        handle.write(original)
-    with open(manifest, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(new_data, handle, sort_keys=False, default_flow_style=False)
-
-
-def find_project(data: dict, repo_name: str) -> tuple:
-    """(section, entry) for a name, from the raw document. Unknown is an error."""
-    for key in ("repos", "community"):
-        for project in data.get(key) or []:
-            if isinstance(project, dict) and project.get("name") == repo_name:
-                return key, project
-    raise ManifestError(f"unknown repo {repo_name!r} - not in the manifest")
-
-
-def cmd_set_image_digest(args: list) -> int:
-    """Pin one repo's image.digest. The only writer of that field.
-
-    Reads the document raw rather than validated: the manifest that needs
-    this is, by rule 1, exactly one that does not validate yet -- the tag is
-    set and the digest is not. What must validate is the result.
-    """
-    manifest, repo_name, digest = args[0], args[1], args[2]
-    refuse_tracked_manifest("set-image-digest", manifest)
-    if not IMAGE_DIGEST.match(digest):
-        raise ManifestError(f"set-image-digest: {digest!r} is not a sha256 digest")
-    root = repo_root(manifest)
-    data = load(manifest)
-    section, project = find_project(data, repo_name)
-    image = project.get("image") if isinstance(project.get("image"), dict) else {}
-    if not image.get("tag"):
-        raise ManifestError(
-            f"set-image-digest: {repo_name} has no image.tag - the digest pins a tag; "
-            f"set image.tag (Atelier's agent-{repo_name}:g<sha>) first")
-    updated = {**project, "image": {**image, "digest": digest}}
-    new_data = {**data, section: [updated if p is project else p for p in data[section]]}
-    validate_merged(new_data, root)
-    write_with_backup(manifest, new_data)
-    print(digest)
-    return 0
-
-
 def cmd_list_images(args: list) -> int:
     """Raw runtime + image pin for every configured repo, personal and community.
 
@@ -1011,40 +743,17 @@ def cmd_list_images(args: list) -> int:
     return 0
 
 
-def cmd_mark_delivered(args: list) -> int:
-    """Retire a machine-written ticket once tier 3 has produced a branch for it.
-
-    Without this a ticket stays `specced: true` forever and every weekly slot
-    re-drafts work that is already sitting on a branch awaiting review.
-    Hand-written tickets in repos.yaml are left alone -- that file is yours.
-    """
-    manifest, repo_name, ticket_id, branch = args[0], args[1], args[2], args[3]
-    root = repo_root(manifest)
-    path = tickets_path(root)
-    if not os.path.isfile(path):
-        return 0
-    with open(path, "r", encoding="utf-8") as handle:
-        stored = yaml.safe_load(handle) or {}
-    tickets = stored.get("tickets") or {}
-    entries = tickets.get(repo_name) or []
-    found = False
-    updated = []
-    for ticket in entries:
-        if str(ticket.get("id")) == str(ticket_id) and ticket.get("specced"):
-            ticket = {**ticket, "specced": False,
-                      "delivered_branch": branch,
-                      "delivered": datetime.date.today().isoformat()}
-            found = True
-        updated.append(ticket)
-    if not found:
-        return 0
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("# Tickets written by `meute promote`. Machine-owned - edit repos.yaml\n"
-                     "# for hand-authored tickets instead; this file is rewritten wholesale.\n")
-        yaml.safe_dump({**stored, "tickets": {**tickets, repo_name: updated}},
-                       handle, sort_keys=False, default_flow_style=False)
-    print(ticket_id)
-    return 0
+# The stage machine and the machine-write path import this module's schema
+# by name, so they are imported here, below every definition they need: at
+# this point `from manifest import ...` inside them resolves, and the queue
+# builder and COMMANDS above and below see their functions as plain names.
+from stages import expand_tickets, load_stages  # noqa: E402
+from manifest_write import (  # noqa: E402
+    cmd_add_repo,
+    cmd_add_ticket,
+    cmd_mark_delivered,
+    cmd_set_image_digest,
+)
 
 
 COMMANDS = {
