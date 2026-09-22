@@ -358,7 +358,9 @@ Fixed by Atelier's audit; Meute does not re-decide them:
 | Digest assert | `podman image inspect --format '{{.Digest}}'` must equal the manifest's `digest` | 3.2 |
 | Run flags | `--userns=keep-id:uid=1000,gid=1000 --volume "$SCRATCH:/work:Z" --cap-drop=ALL --security-opt=no-new-privileges --init --pids-limit=2048 --rm` | 4.3 |
 | Podman wrapper | `distrobox-host-exec podman` when `/run/.containerenv` exists; `MEUTE_PODMAN` override | 4.4 |
-| Egress proxy | `atelier-egress` on the internal network; `HTTPS_PROXY=http://atelier-egress:3128` injected at `podman run` | 4.2 |
+| Egress proxy | `atelier-egress` on the internal network; `HTTPS_PROXY` **and** `https_proxy` (curl ignores the uppercase form) injected at `podman run`; the internal subnet is pinned in Atelier's Justfile and the proxy's `Allow` is narrowed to it | 4.2, response below |
+| Tag availability | `g<sha>` is emitted only from a clean committed tree; until Atelier's first commit there is no pinnable tag, and the digest assertion is the thing Meute relies on | response below |
+| Credential import | `scripts/auth-import.sh <volume> <file>` (generic); the owner mints the two PATs. Volumes populated before 2026-09-21 are invalid (files landed as uid 999 under `keep-id`; fixed that day) | response below |
 | Smoke test | Atelier's `tests/smoke.sh` is Phase 2's precondition | 5 |
 
 Four things go **back** to Atelier, raised by this PRP's review (§12).
@@ -393,6 +395,21 @@ volumes itself. The third is a test result. Of the fourth, only the
 4. **Read-only root.** Whether `claude` and `codex` tolerate `--read-only`
    with Atelier §4.3's tmpfs mounts, and whether the review stage can take
    `/work:ro`. Phase 2 reports; Atelier's smoke test adopts what holds.
+
+**Atelier's response, 2026-09-21** (cross-session, recorded here as the
+agreed contract): all four accepted. (1) `none` is documented as
+auth-preflight only; every engine run is `proxied`. The OAuth-refresh
+hostnames stay *unverified* until real credentials go into a volume, which
+is a `just auth` run Atelier will not do unilaterally because of item 3 —
+**it is the owner's call, and it blocks Meute's Phase 2 gate, not
+Atelier's Phase 1.** (2) `atelier-auth-gh-publish` and
+`atelier-auth-gh-review` reserved with the scopes above; `atelier-auth-gh`
+is owner-interactive only and never mounted by an unattended run. (3)
+Open; Atelier's preferred design if rotation-on-use is real is **no copy
+at all** — each volume gets its own token from the CLI's headless login
+run once inside a container (`just auth-login`, planned as their Phase 2
+follow-up if Meute's test shows invalidation). (4) Carried on both sides;
+whichever result lands first, the smoke test adopts it.
 
 ## 6. Phases
 
@@ -645,7 +662,8 @@ phase cannot quietly change them.
 | Item | Resolved by |
 |---|---|
 | A Codex quota probe, or an explicit stubbed reading for the observation week | owner, before Phase 3 |
-| Atelier: `proxied` as Meute's only engine profile; two gh volumes (§5 items 1–2) | Atelier, before Phase 2 |
+| `just auth` — putting real credentials into the Atelier volumes, which is what verifies the OAuth-refresh hostnames and unblocks Phase 2's gate; held by Atelier because of the rotation risk (§5 item 3) | **owner** |
+| Atelier's first commit — no `g<sha>` tag exists before it | Atelier |
 | OAuth refresh-token rotation across the host copy and the auth volume | Phase 2 test; finding to Atelier §4.1 |
 | `gh pr checks` exit status on a PR with zero checks | Phase 5 test |
 | `claude -p --model fable` alias vs. full id | Phase 7 first run |
