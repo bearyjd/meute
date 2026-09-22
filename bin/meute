@@ -100,6 +100,17 @@ usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^#( |$)/, ""); print }' "$
 # abort the caller nor collide with anything real.
 dir_id() { stat -L -c '%d:%i' -- "$1" 2>/dev/null || printf '%s' "$1"; }
 
+# Is the manifest this tool would write the tracked repos.yaml? By identity,
+# not by name, for the same reason as dir_id: a symlink with any other
+# basename resolves to it, and every writer follows the link. Prints where
+# the manifest resolves to, so a refusal can say which file it protected;
+# lib/manifest.py's writers make the same test again on their own.
+manifest_resolves_to() { readlink -f -- "$MANIFEST" 2>/dev/null || printf '%s\n' "$MANIFEST"; }
+manifest_is_tracked() {
+  local real; real="$(manifest_resolves_to)"
+  [[ "$(basename -- "$real")" == "repos.yaml" || "$real" -ef "${MEUTE_ROOT}/repos.yaml" ]]
+}
+
 # --------------------------------------------------------------------------
 # Reports on disk are the source of truth. state/reports only annotates them:
 # a report with no row is `new`, and a row whose file is gone is ignored.
@@ -473,8 +484,8 @@ egress_running() {
 cmd_image_bump() {
   local repo="${1:-}"
   [[ -n "$repo" ]] || die "image bump: which repo? (try: meute image bump <name>)"
-  [[ "$(basename "$MANIFEST")" != "repos.yaml" ]] \
-    || die "image bump: refusing to write repos.yaml (tracked schema doc, hand-commented) -- create repos.local.yaml first: cp repos.yaml repos.local.yaml"
+  ! manifest_is_tracked \
+    || die "image bump: refusing to write repos.yaml$([[ "$(manifest_resolves_to)" == "$MANIFEST" ]] || printf ' (%s resolves to %s)' "$MANIFEST" "$(manifest_resolves_to)") (tracked schema doc, hand-commented) -- create repos.local.yaml first: cp repos.yaml repos.local.yaml"
   local row tag
   row="$(python3 "$MANIFEST_PY" list-images "$MANIFEST" | jq -c --arg r "$repo" 'select(.name == $r)')" \
     || die "image bump: could not read ${MANIFEST}"
@@ -492,7 +503,7 @@ cmd_image_bump() {
   python3 "$MANIFEST_PY" set-image-digest "$MANIFEST" "$repo" "$digest" >/dev/null \
     || die "image bump: the digest was not written"
   note "${repo}: image.digest -> ${digest:0:19}… for ${tag}"
-  note "backup of the previous manifest: $(basename "$MANIFEST").bak"
+  note "backup of the previous manifest: $(basename -- "$(manifest_resolves_to)").bak"
 }
 
 cmd_image() {

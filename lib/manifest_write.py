@@ -40,10 +40,22 @@ from manifest import (
 
 
 def refuse_tracked_manifest(command: str, manifest: str) -> None:
-    """Every machine writer of a manifest shares one refusal, so none can forget it."""
-    if os.path.basename(manifest) == "repos.yaml":
+    """Every machine writer of a manifest shares one refusal, so none can forget it.
+
+    By identity, not by name: open() follows a symlink, so a link with any
+    other basename pointing at repos.yaml would have passed a name check,
+    written the tracked file through it, and left the backup beside the
+    alias. Two tests, either refuses: the resolved path is called repos.yaml,
+    or it is the same inode as this checkout's repos.yaml.
+    """
+    real = os.path.realpath(manifest)
+    tracked = os.path.join(repo_root(manifest), "repos.yaml")
+    same_inode = (os.path.exists(real) and os.path.exists(tracked)
+                  and os.path.samefile(real, tracked))
+    if os.path.basename(real) == "repos.yaml" or same_inode:
+        alias = f" ({manifest} resolves to {real})" if real != os.path.abspath(manifest) else ""
         raise ManifestError(
-            f"{command}: refusing to write repos.yaml (tracked schema doc, hand-commented). "
+            f"{command}: refusing to write repos.yaml{alias} (tracked schema doc, hand-commented). "
             "Create repos.local.yaml first -- e.g. `cp repos.yaml repos.local.yaml` -- "
             "it's gitignored, so no PR is needed for what you add to it.")
 
@@ -62,12 +74,14 @@ def validate_merged(new_data: dict, root: str) -> None:
 
 
 def write_with_backup(manifest: str, new_data: dict) -> None:
-    backup = f"{manifest}.bak"
-    with open(manifest, "r", encoding="utf-8") as handle:
+    """The resolved file is what changes, so the backup sits beside it, not beside a link."""
+    target = os.path.realpath(manifest)
+    backup = f"{target}.bak"
+    with open(target, "r", encoding="utf-8") as handle:
         original = handle.read()
     with open(backup, "w", encoding="utf-8") as handle:
         handle.write(original)
-    with open(manifest, "w", encoding="utf-8") as handle:
+    with open(target, "w", encoding="utf-8") as handle:
         yaml.safe_dump(new_data, handle, sort_keys=False, default_flow_style=False)
 
 

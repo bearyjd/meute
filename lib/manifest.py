@@ -324,7 +324,11 @@ def checked_container_fields(key: str, name: str, project: dict, defaults: dict)
     if "network" in project:
         raise ManifestError(f"{where}.network: network is a tier key only")
     # Missing is an error, not a default: an image that was not pinned is a
-    # run in whatever `podman` resolves the tag to today.
+    # run in whatever `podman` resolves the tag to today. Checked against the
+    # repo's DECLARED runtime, not each task's resolved one: a repo that says
+    # container pins an image even while every task it has sits on a host-
+    # pinned tier -- a pin is cheap, and the next task added would otherwise
+    # need one nobody was told about.
     runtime = project.get("runtime") or defaults["runtime"]
     image = project.get("image")
     if runtime == "container" and not isinstance(image, dict):

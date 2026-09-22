@@ -3342,6 +3342,43 @@ STUB
   has   "image bump: the manifest is invalid before the bump" "$(validate "$root/repos.local.yaml" "$root")" "image.digest: required"
   out="$(bump netlens)"
   has   "image bump: ...and valid after it"    "$(validate "$root/repos.local.yaml" "$root")" "ok:"
+
+  # The refusal is by identity, not by name: open() follows a symlink, so a
+  # link with any other basename would have written the tracked file and
+  # left the backup beside the alias. Found by the Codex pass.
+  ln -s "$root/repos.yaml" "$root/alias.yaml"
+  before="$(cat "$root/repos.yaml")"
+  out="$(MEUTE_MANIFEST="$root/alias.yaml" MEUTE_PODMAN="$root/stub/podman" "$root/bin/meute" image bump netlens 2>&1)"; rc=$?
+  is    "symlink: image bump refuses an alias of repos.yaml"     "$rc" "1"
+  has   "symlink: ...by its identity"                            "$out" "refusing to write repos.yaml"
+  has   "symlink: ...and says what the alias resolves to"        "$out" "resolves to $root/repos.yaml"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" set-image-digest "$root/alias.yaml" netlens "$new" 2>&1)"; rc=$?
+  is    "symlink: set-image-digest refuses the alias too"        "$rc" "2"
+  has   "symlink: ...naming the real file"                       "$out" "resolves to $root/repos.yaml"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" add-repo "$root/alias.yaml" \
+        "$(printf '{"name":"via-alias","path":"%s","spec":"s"}' "$root/git-upstream")" 2>&1)"; rc=$?
+  is    "symlink: add-repo refuses the alias too"                "$rc" "2"
+  has   "symlink: ...with the same refusal"                      "$out" "refusing to write repos.yaml"
+  out="$(MEUTE_MANIFEST="$root/alias.yaml" "$root/bin/meute" discover "$root" 2>&1)"; rc=$?
+  is    "symlink: discover's front door refuses the alias too"   "$rc" "1"
+  has   "symlink: ...pointing at repos.local.yaml"               "$out" "no repos.local.yaml found"
+  is    "symlink: repos.yaml is untouched"                       "$(cat "$root/repos.yaml")" "$before"
+  [[ -e "$root/alias.yaml.bak" ]] && bad "symlink: no backup beside the alias" "alias.yaml.bak exists" || ok "symlink: no backup beside the alias"
+  [[ -e "$root/repos.yaml.bak" ]] && bad "symlink: no backup beside repos.yaml either" "repos.yaml.bak exists" || ok "symlink: no backup beside repos.yaml either"
+  # A link to repos.local.yaml is fine, and the write lands on the real file,
+  # backup beside it -- not beside a link that may be gone tomorrow.
+  local new2="sha256:$(printf 'd%.0s' {1..64})"
+  sed -i "s/$new/$new2/" "$root/stub/podman"
+  ln -s "$root/repos.local.yaml" "$root/local-alias.yaml"
+  rm -f "$root/repos.local.yaml.bak"
+  out="$(MEUTE_MANIFEST="$root/local-alias.yaml" MEUTE_PODMAN="$root/stub/podman" "$root/bin/meute" image bump netlens 2>&1)"; rc=$?
+  is    "symlink: an alias of repos.local.yaml is written through" "$rc" "0"
+  has   "symlink: ...and the note names the backup that exists"    "$out" "backup of the previous manifest: repos.local.yaml.bak"
+  is    "symlink: ...the real file changed"                        "$(python3 -c "import yaml; print(yaml.safe_load(open('$root/repos.local.yaml'))['repos'][0]['image']['digest'])")" "$new2"
+  is    "symlink: ...the backup sits beside the real file"         "$(python3 -c "import yaml; print(yaml.safe_load(open('$root/repos.local.yaml.bak'))['repos'][0]['image']['digest'])")" "$new"
+  [[ -e "$root/local-alias.yaml.bak" ]] && bad "symlink: ...not beside the link" "local-alias.yaml.bak exists" || ok "symlink: ...not beside the link"
+  [[ -L "$root/local-alias.yaml" ]] && ok "symlink: ...and the link is still a link" || bad "symlink: ...and the link is still a link" "the link was replaced by a file"
+
   printf '#!/usr/bin/env bash\necho not-a-digest\n' > "$root/stub/podman"
   out="$(bump netlens)"
   has   "image bump: a malformed inspect answer is refused" "$out" "not a sha256 digest"
