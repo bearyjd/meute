@@ -17,6 +17,8 @@ Subcommands
                                         one JSON object per line
     list-images <manifest>           -- runtime+image tag+digest for every repo, one JSON
                                         object per line; unvalidated on purpose
+    list-stages <manifest>           -- every state/stages row, one JSON object per line,
+                                        flagged when its key names no ticket
     add-repo <manifest> <json>       -- append a repo; refuses to write repos.yaml
     set-image-digest <manifest> <repo> <digest>
                                      -- pin a repo's image.digest; refuses to write repos.yaml
@@ -162,6 +164,14 @@ def merged_defaults(data: dict) -> dict:
         raise ManifestError("defaults.engine: must be 'claude' or 'codex'")
     if defaults["runtime"] not in VALID_RUNTIMES:
         raise ManifestError("defaults.runtime: must be 'host' or 'container'")
+    # Nothing under PRP-004 s4.1 has a fleet-wide value: egress is a tier's to
+    # declare and the pin and the push are a repo's. A defaults key here would
+    # be read by nothing and look like it was honoured.
+    if "network" in supplied:
+        raise ManifestError("defaults.network: set per tier, not in defaults")
+    for key in ("image", "push", "auto_merge"):
+        if key in supplied:
+            raise ManifestError(f"defaults.{key}: set per repo, not in defaults")
     return defaults
 
 
@@ -357,7 +367,10 @@ def checked_container_fields(key: str, name: str, project: dict, defaults: dict)
         raise ManifestError(f"{where}.push: must be true or false")
     if push and key != "repos":
         raise ManifestError(f"{where}.push: only repos: entries may push")
-    if project.get("auto_merge", False) is not False:
+    auto_merge = project.get("auto_merge", False)
+    if not isinstance(auto_merge, bool):
+        raise ManifestError(f"{where}.auto_merge: must be true or false")
+    if auto_merge:
         raise ManifestError(
             f"{where}.auto_merge: true is not supported - a draft PR is where meute stops")
     if key == "repos" and "repo" in project and not OWNER_REPO.match(str(project["repo"])):
@@ -406,14 +419,22 @@ def load_machine_tickets(root: str) -> dict:
 
 
 def with_machine_tickets(project: dict, machine: dict) -> dict:
-    """Copy of `project` whose ticket list also carries the machine-written ones."""
+    """Copy of `project` whose ticket list also carries the machine-written ones.
+
+    The machine-written source passes the same ticket gate as repos.yaml
+    (PRP-001 s10): expand_tickets honours a ticket's `engine`, and a field
+    the validator never saw is a field nobody chose.
+    """
     extra = machine.get(project["name"]) or []
     if not extra:
         return project
     own = list(project.get("tickets") or [])
     seen = {str(ticket.get("id")) for ticket in own}
     for ticket in extra:
+        if not isinstance(ticket, dict) or not ticket.get("id"):
+            raise ManifestError(f"state/tickets.yaml[{project['name']}]: every ticket needs an id")
         identifier = str(ticket.get("id"))
+        checked_ticket(f"state/tickets.yaml[{project['name']}][{identifier}]", ticket)
         if identifier in seen:
             raise ManifestError(
                 f"ticket id {identifier!r} for {project['name']} exists in both "
@@ -513,6 +534,7 @@ def build_queue(data: dict, slot: str, root: str) -> list:
     entries = []
     machine = load_machine_tickets(root)
     stages = load_stages(root)
+    warn_orphan_rows(stages, ticket_keys(data, tasks, root))
     for kind, key in (("personal", "repos"), ("community", "community")):
         for project in checked_projects(data, key, tasks, root):
             project = with_machine_tickets(project, machine)
@@ -535,10 +557,10 @@ def build_queue(data: dict, slot: str, root: str) -> list:
                 entry = build_entry(kind, project, task_name, task, tier_name,
                                     tiers[tier_name], defaults, root)
                 if task.get("requires_specced_ticket"):
-                    for item in expand_tickets(entry, project, stages, want_specced=True):
+                    for item in expand_tickets(entry, project, stages, tiers, want_specced=True):
                         (in_flight if item["stage_entry"] else fresh).append(item)
                 elif task.get("requires_candidate_ticket"):
-                    fresh.extend(expand_tickets(entry, project, stages, want_specced=False))
+                    fresh.extend(expand_tickets(entry, project, stages, tiers, want_specced=False))
                 else:
                     fresh.append({**entry, "key": f"{entry['repo']}/{task_name}",
                                   "ticket_id": "", "ticket_title": "", "ticket_notes": ""})
@@ -747,7 +769,13 @@ def cmd_list_images(args: list) -> int:
 # by name, so they are imported here, below every definition they need: at
 # this point `from manifest import ...` inside them resolves, and the queue
 # builder and COMMANDS above and below see their functions as plain names.
-from stages import expand_tickets, load_stages  # noqa: E402
+from stages import (  # noqa: E402
+    cmd_list_stages,
+    expand_tickets,
+    load_stages,
+    ticket_keys,
+    warn_orphan_rows,
+)
 from manifest_write import (  # noqa: E402
     cmd_add_repo,
     cmd_add_ticket,
@@ -767,6 +795,7 @@ COMMANDS = {
     "list-repos": (cmd_list_repos, 1),
     "list-tasks": (cmd_list_tasks, 1),
     "list-images": (cmd_list_images, 1),
+    "list-stages": (cmd_list_stages, 1),
     "add-repo": (cmd_add_repo, 2),
     "set-image-digest": (cmd_set_image_digest, 3),
 }

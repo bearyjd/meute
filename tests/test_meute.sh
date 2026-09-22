@@ -2872,6 +2872,7 @@ yaml.safe_dump({
         "runtime": "container",
         "image": {"tag": "agent-netlens:g3f9a1c2", "digest": digest},
         "push": True, "repo": "owner/netlens", "auto_merge": False,
+        "allowed_tools": "Bash(./gradlew test:*)",
         "tasks": ["audit-security", "market-comparison", "draft-ticket"],
         "tickets": [{"id": "NL-14", "title": "wakelock", "specced": True, "engine": "codex"},
                     {"id": "NL-15", "title": "default engine", "specced": True}],
@@ -2931,6 +2932,8 @@ test_p4_rule1_image_required() {
   p4_reject "rule 1: the default runtime reaches a repo with no image" "$root" \
     'd["defaults"]["runtime"] = "container"; d["community"][0]["etiquette"] = "etiquette/upstream.yaml"' \
     "community.upstream.image: tag and digest are required when runtime is container"
+  p4_reject "rule 1: image is not a defaults key" "$root" 'd["defaults"]["image"] = {"tag": "agent-base:g1"}' \
+    "defaults.image: set per repo, not in defaults"
   # Not a default: a host repo needs no image, and one it does not need is not an error.
   yaml_edit "$root/repos.yaml" "$root/host.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
   has "rule 1: a host repo needs no image"     "$(validate "$root/host.yaml" "$root")" "ok:"
@@ -2951,6 +2954,8 @@ test_p4_rule2_network_tier_only() {
     "tiers.tier2.network: required (none or proxied) unless the tier is runtime: host"
   p4_reject "rule 2: a host tier has the host's network" "$root" 'd["tiers"]["tier2-web"]["network"] = "proxied"' \
     "tiers.tier2-web.network: meaningless on a runtime: host tier"
+  p4_reject "rule 2: network on defaults"  "$root" 'd["defaults"]["network"] = "none"' \
+    "defaults.network: set per tier, not in defaults"
   p4_reject "rule 2: a tier can only force host"  "$root" 'd["tiers"]["tier2"]["runtime"] = "container"' \
     "tiers.tier2.runtime: only 'host' may be set on a tier"
   local web
@@ -2966,6 +2971,8 @@ test_p4_rule3_push_repos_only() {
     "community.upstream.push: only repos: entries may push"
   p4_reject "rule 3: push is a boolean"           "$root" 'd["repos"][0]["push"] = "yes"' \
     "repos.netlens.push: must be true or false"
+  p4_reject "rule 3: push is not a defaults key"  "$root" 'd["defaults"]["push"] = True' \
+    "defaults.push: set per repo, not in defaults"
   yaml_edit "$root/repos.yaml" "$root/off.yaml" 'd["community"][0]["push"] = False'
   has "rule 3: push: false on community is harmless" "$(validate "$root/off.yaml" "$root")" "ok:"
 }
@@ -2975,6 +2982,8 @@ test_p4_rule4_auto_merge() {
   local root="$FIXTURE/p4-rule4"; p4_fixture "$root"
   p4_reject "rule 4: auto_merge: true" "$root" 'd["repos"][0]["auto_merge"] = True' \
     "repos.netlens.auto_merge: true is not supported"
+  p4_reject "rule 4: auto_merge is a boolean" "$root" 'd["repos"][0]["auto_merge"] = "never"' \
+    "repos.netlens.auto_merge: must be true or false"
   yaml_edit "$root/repos.yaml" "$root/absent.yaml" 'del d["repos"][0]["auto_merge"]'
   has "rule 4: absent is fine" "$(validate "$root/absent.yaml" "$root")" "ok:"
 }
@@ -3006,6 +3015,21 @@ STUB
   out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
   has   "runtime: a container repo is refused before Phase 2" "$out" "detail=container runtime is not available before Phase 2"
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran" "the stub was invoked" || ok "runtime: ...and no engine ran"
+  # Nor may the CLI talk it down: a repo that opted into isolation runs
+  # isolated or not at all. --runtime never changes what runs in Phase 1.
+  : > "$root/state/cursor"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --runtime host 2>&1)"
+  has   "runtime: --runtime host on a container repo is refused" "$out" "detail=repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
+  has   "runtime: ...as an error line"                            "$out" "status=error"
+  [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran either" "the stub was invoked" || ok "runtime: ...and no engine ran either"
+  is    "runtime: ...no worktree was cut"                         "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
+  is    "runtime: ...and the cursor moved past it"                "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  # A dry run records the same refusal: the entry is unrunnable whether or
+  # not this fire would have invoked anything.
+  : > "$root/state/cursor"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --dry-run 2>&1)"
+  has   "runtime: --dry-run on a container entry still logs the error" "$out" "status=error"
+  is    "runtime: ...and still advances the cursor"                     "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
 }
 
 # Rule 6: the build engine is per ticket; the review engine is derived.
@@ -3019,6 +3043,24 @@ test_p4_rule6_ticket_engine() {
     "repos.netlens.tickets[NL-14].review_engine: not a field - the review engine is derived from engine"
   p4_reject "rule 6: a ticket engine is claude or codex" "$root" 'd["repos"][0]["tickets"][0]["engine"] = "gpt"' \
     "repos.netlens.tickets[NL-14].engine: must be 'claude' or 'codex'"
+  # PRP-001 s10: the machine-written source is not a way around the schema.
+  python3 - "$root" <<'PYT'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({"tickets": {"netlens": [{"id": "NL-90", "title": "m", "specced": True, "engine": "gpt"}]}},
+               open(root / "state" / "tickets.yaml", "w"))
+PYT
+  has "rule 6: a machine ticket's engine is gated too" "$(validate "$root/repos.yaml" "$root")" \
+      "state/tickets.yaml[netlens][NL-90].engine: must be 'claude' or 'codex'"
+  python3 - "$root" <<'PYT'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({"tickets": {"netlens": [{"id": "NL-90", "title": "m", "specced": True, "review_engine": "claude"}]}},
+               open(root / "state" / "tickets.yaml", "w"))
+PYT
+  has "rule 6: ...and review_engine is refused there too" "$(validate "$root/repos.yaml" "$root")" \
+      "state/tickets.yaml[netlens][NL-90].review_engine: not a field"
+  rm -f "$root/state/tickets.yaml"
 }
 
 # Rule 7: a state/stages row turns the ticket's build entry into its next
@@ -3038,6 +3080,14 @@ test_p4_rule7_stage_entries() {
   is "rule 7: key carries the stage"      "$(jq -r '.key' <<< "$stage")"           "netlens/draft-ticket/NL-14/review"
   is "rule 7: review runs on tier3-review" "$(jq -r '.tier' <<< "$stage")"         "tier3-review"
   is "rule 7: review engine is the other one" "$(jq -r '.engine' <<< "$stage")"    "claude"
+  # run.sh dispatches on these fields, not on the tier's name: a review that
+  # kept the build tier's profile could edit and run gradle.
+  is "rule 7: review tools are tier3-review's"      "$(jq -r '.tools' <<< "$stage")"           "Read,Grep,Glob,Bash"
+  is "rule 7: review permission mode too"           "$(jq -r '.permission_mode' <<< "$stage")" "dontAsk"
+  is "rule 7: a review never writes code"           "$(jq -r '.writes_code' <<< "$stage")"     "false"
+  is "rule 7: review network is the tier's"         "$(jq -r '.network' <<< "$stage")"         "proxied"
+  is "rule 7: review allowlist is the tier's alone" "$(jq -r '.allowed_tools' <<< "$stage")"   "Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
+  hasnt "rule 7: the build allowlist does not leak into the review" "$(jq -r '.allowed_tools' <<< "$stage")" "gradlew"
   is "rule 7: the stage entry leads its repo" "$(jq -r '.key' <<< "$q" | head -1)" "netlens/draft-ticket/NL-14/review"
   is "rule 7: the other ticket still builds" "$(jq -r 'select(.ticket_id=="NL-15") | .stage_entry' <<< "$q")" "false"
 
@@ -3045,6 +3095,9 @@ test_p4_rule7_stage_entries() {
   q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
   is "rule 7: resolve runs on tier3"        "$(jq -r '.tier' <<< "$q")"   "tier3"
   is "rule 7: resolve uses the build engine" "$(jq -r '.engine' <<< "$q")" "codex"
+  is "rule 7: resolve has tier3's tools"    "$(jq -r '.tools' <<< "$q")"  "Read,Edit,Bash"
+  is "rule 7: resolve writes code"          "$(jq -r '.writes_code' <<< "$q")" "true"
+  has "rule 7: resolve keeps the build allowlist" "$(jq -r '.allowed_tools' <<< "$q")" "gradlew"
   printf 'netlens/NL-14\treview-2\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
   q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
   is "rule 7: review-2 flips the engine too" "$(jq -r '.engine' <<< "$q")" "codex"
@@ -3052,6 +3105,8 @@ test_p4_rule7_stage_entries() {
   q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
   is "rule 7: publish has no engine"        "$(jq -r '.engine' <<< "$q")" ""
   is "rule 7: publish keeps the task's tier" "$(jq -r '.tier' <<< "$q")"  "tier3"
+  is "rule 7: publish has no tools"         "$(jq -r '.tools' <<< "$q")"  ""
+  is "rule 7: publish never writes code"    "$(jq -r '.writes_code' <<< "$q")" "false"
 
   printf 'netlens/NL-14\tdone\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
   q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
@@ -3068,6 +3123,22 @@ test_p4_rule7_stage_entries() {
   has "rule 7: a short row is refused"      "$(validate "$root/repos.yaml" "$root")" "state/stages: netlens/NL-14: expected stage, branch, base, build_report, engine"
   printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tgpt\n' > "$root/state/stages"
   has "rule 7: an unknown build engine is refused" "$(validate "$root/repos.yaml" "$root")" "state/stages: netlens/NL-14: engine must be claude or codex"
+  printf 'netlens/NL-14\treview\tmeute/x\t\treports/x.md\tclaude\n' > "$root/state/stages"
+  has "rule 7: an empty column is refused"         "$(validate "$root/repos.yaml" "$root")" "state/stages: netlens/NL-14: base is empty"
+  printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tclaude\nnetlens/NL-14\tresolve\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  has "rule 7: a duplicate key is refused"         "$(validate "$root/repos.yaml" "$root")" "state/stages: netlens/NL-14: duplicate row"
+  # A review row needs the tier it runs on; without one the entry would have
+  # no profile at all, which is not a safer profile.
+  printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  yaml_edit "$root/repos.yaml" "$root/notier.yaml" 'del d["tiers"]["tier3-review"]'
+  has "rule 7: a review row without tier3-review is refused" "$(validate "$root/notier.yaml" "$root")" \
+      "tiers.tier3-review: required -- state/stages has a review row for netlens/NL-14"
+  # A row for a ticket that no longer exists is a warning, not a wedge: the
+  # queue still builds, on stdout, and says so once on stderr.
+  printf 'netlens/NL-99\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  local err; err="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly 2>&1 >/dev/null)"
+  has "rule 7: an orphan row is reported on stderr" "$err" "state/stages: 1 row(s) name no ticket: netlens/NL-99"
+  is  "rule 7: ...and the queue still builds"       "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly 2>/dev/null | jq -r 'select(.ticket_id=="NL-14") | .stage_entry')" "false"
   rm -f "$root/state/stages"
 }
 
@@ -3126,6 +3197,11 @@ STUB
   [[ -f "$root/stub/invocations" ]] && bad "stage: no engine ran" "the stub was invoked" || ok "stage: no engine ran"
   is    "stage: the cursor moved past it"            "$(kv_get_test "$root/state/cursor" cursor.weekly)" "netlens/draft-ticket/NL-15/resolve"
   is    "stage: no worktree was cut"                 "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
+  # A dry run records the same abort and moves on.
+  : > "$root/state/cursor"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly --dry-run 2>&1 || true)"
+  has   "stage: --dry-run still logs the abort"      "$out" "status=error"
+  is    "stage: ...and still advances the cursor"    "$(kv_get_test "$root/state/cursor" cursor.weekly)" "netlens/draft-ticket/NL-15/resolve"
   # publish has no engine, so no pool to probe: it must reach the abort, not
   # stall the slot on a quota reading for an engine called "".
   printf 'netlens/NL-15\tpublish\tmeute/draft-ticket-2026-09-01\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
@@ -3204,7 +3280,7 @@ STUB
   out="$(bump netlens)"
   has   "image bump: writes repos.local.yaml"  "$out" "netlens: image.digest -> ${new:0:19}"
   is    "image bump: the digest landed"        "$(python3 -c "import yaml; print(yaml.safe_load(open('$root/repos.local.yaml'))['repos'][0]['image']['digest'])")" "$new"
-  is    "image bump: ...for the manifest's tag" "$(cat "$root/stub/podman-calls")" "image inspect --format {{.Digest}} agent-netlens:g3f9a1c2"
+  is    "image bump: ...for the manifest's tag" "$(cat "$root/stub/podman-calls")" "image inspect --format {{.Digest}} -- agent-netlens:g3f9a1c2"
   [[ -f "$root/repos.local.yaml.bak" ]] && ok "image bump: backs the manifest up first" || bad "image bump: backs the manifest up first" "no .bak"
   is    "image bump: the backup is the old manifest" "$(cat "$root/repos.local.yaml.bak")" "$before"
   has   "image bump: the result validates"     "$(validate "$root/repos.local.yaml" "$root")" "ok:"
@@ -3237,8 +3313,8 @@ test_p4_doctor_containers() {
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
-  "image inspect --format {{.Digest}} agent-netlens:g3f9a1c2") printf '%s\n' "\${STUB_DIGEST:-$P4_DIGEST}" ;;
-  "container inspect --format {{.State.Running}} atelier-egress") printf '%s\n' "\${STUB_EGRESS:-true}" ;;
+  "image inspect --format {{.Digest}} -- agent-netlens:g3f9a1c2") printf '%s\n' "\${STUB_DIGEST:-$P4_DIGEST}" ;;
+  "container inspect --format {{.State.Running}} -- atelier-egress") printf '%s\n' "\${STUB_EGRESS:-true}" ;;
   *) echo "Error: no such object" >&2; exit 125 ;;
 esac
 STUB
@@ -3257,6 +3333,20 @@ STUB
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["image"]["tag"] = "agent-netlens:gdeadbeef"'
   out="$(doc)"
   has "doctor: an absent image is a FAIL"         "$out" "FAIL image agent-netlens:gdeadbeef not present"
+  # A row for a ticket the manifest no longer has is reported here, where the
+  # owner looks; the runner only mutters it on stderr under the timer.
+  printf 'netlens/NL-99\treview\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  out="$(doc)"
+  has "doctor: orphan stage rows are a warning"   "$out" "warn state/stages: 1 row(s) name no ticket: netlens/NL-99"
+  rm -f "$root/state/stages"
+  # No podman is a different failure from no image, and says which knob to turn.
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/no-such-podman" "$root/bin/meute" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')"
+  has "doctor: a missing podman is named as such" "$out" "FAIL podman not found (MEUTE_PODMAN=$root/stub/no-such-podman)"
+  hasnt "doctor: ...not mistaken for a missing image" "$out" "not present"
+  # A tag with no digest yet is the bump the owner has not run.
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["image"] = {"tag": "agent-netlens:g3f9a1c2"}'
+  out="$(doc)"
+  has "doctor: an unpinned digest says so"        "$out" "FAIL image agent-netlens:g3f9a1c2: no digest pinned yet -- meute image bump netlens"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
   out="$(doc)"
   hasnt "doctor: no container repo, no image check" "$out" "pinned digest"

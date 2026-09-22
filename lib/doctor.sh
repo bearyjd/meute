@@ -7,7 +7,8 @@
 # the scheduler will really provide, not the one you are typing in.
 #
 # Expects from the caller: MEUTE_ROOT, MANIFEST_PY, MANIFEST, SCRUBBED,
-# AUTH_MODE, die, image_digest_on_host, egress_running, plus lib/fleet.sh,
+# AUTH_MODE, die, podman_cmd, podman_available, image_digest_on_host,
+# egress_running, plus lib/fleet.sh,
 # lib/preflight.sh, lib/status.sh (next_for_slot) and lib/timers.sh
 # (unit_path_line, timer_state, linger_state).
 
@@ -102,6 +103,14 @@ cmd_doctor() {
         d_ok "$(printf '%-7s queue: %s item(s), next: %s' "$slot" \
           "$(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null | wc -l)" "$(next_for_slot "$slot")")"
       done
+      # PRP-004: a state/stages row whose ticket is gone from both sources
+      # is skipped by the queue with a line on stderr nobody reads under the
+      # timer. Here it reaches the owner, who can delete the row.
+      local orphans
+      orphans="$(python3 "$MANIFEST_PY" list-stages "$MANIFEST" 2>/dev/null \
+                   | jq -r 'select(.orphan) | .key' 2>/dev/null | paste -sd, - || true)"
+      [[ -z "$orphans" ]] \
+        || d_warn "state/stages: $(tr ',' '\n' <<< "$orphans" | wc -l) row(s) name no ticket: ${orphans//,/, }"
     fi
   else
     d_err "$(basename "$MANIFEST") failed validation — run: ./bin/run.sh --validate"
@@ -245,12 +254,18 @@ doctor_containers() {
   [[ -n "$images" ]] || return 0
 
   printf '\n  containers\n'
+  if ! podman_available; then
+    d_err "podman not found (MEUTE_PODMAN=${MEUTE_PODMAN:-unset}) — resolved to '$(podman_cmd)'; the image and egress checks need the host's podman"
+    return 0
+  fi
   local row name tag digest actual
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     { read -r name; read -r tag; read -r digest; } < <(jq -r '.name, .tag, .digest' <<< "$row")
     if [[ -z "$tag" ]]; then
       d_err "image for ${name}: no image.tag in the manifest (rule 1 refuses this repo)"
+    elif [[ -z "$digest" ]]; then
+      d_err "image ${tag}: no digest pinned yet -- meute image bump ${name}"
     elif ! actual="$(image_digest_on_host "$tag")"; then
       d_err "image ${tag} not present on the host — build it with Atelier, then: meute image bump ${name}"
     elif [[ "$actual" == "$digest" ]]; then

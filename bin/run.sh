@@ -10,10 +10,11 @@
 # Options:
 #   --engine <claude|codex>  override the manifest engine for this run
 #   --runtime <host|container>
-#                            override the manifest runtime for this run. `container`
-#                            needs the repo's pinned image (PRP-004 rule 1) and, until
-#                            Phase 2 lands the container path, is refused with the
-#                            entry logged as an error rather than run on the host
+#                            PRP-004. In Phase 1 this never changes what runs; it only
+#                            fails closed, in both directions, with the entry logged as
+#                            an error: `container` needs the repo's pinned image (rule 1)
+#                            and has no path to run in until Phase 2; `host` on a repo
+#                            that opted into isolation is not a downgrade path
 #   --repo <name>            force a repo (bypasses the cursor and the share gates)
 #   --task <name>            force a task (bypasses the cursor and the share gates)
 #   --dry-run                select and render, invoke nothing. Not a no-op on state/:
@@ -466,10 +467,16 @@ run_entry() {
   # Rule 5, fail closed. A container run needs a pinned image to run in;
   # without one the answer is the validator's, not a fallback to the host.
   # And with one, Phase 2 has yet to build the path -- a repo that opted into
-  # isolation must not be quietly run without it.
-  local runtime
-  runtime="${RUNTIME_OVERRIDE:-$(jq -r '.runtime' <<< "$entry")}"
-  if [[ "$runtime" == "container" ]]; then
+  # isolation must not be quietly run without it, and the CLI may not talk
+  # it down either: --runtime host on a container repo is the same silent
+  # loss of isolation, asked for by hand. Anything that is not plainly
+  # `host` -- a missing or unreadable runtime included -- takes this path.
+  local manifest_runtime runtime
+  manifest_runtime="$(jq -r '.runtime // ""' <<< "$entry")"
+  runtime="${RUNTIME_OVERRIDE:-$manifest_runtime}"
+  [[ "$manifest_runtime" != "container" || "$RUNTIME_OVERRIDE" != "host" ]] \
+    || abort_entry "$entry" "repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
+  if [[ "$runtime" != "host" ]]; then
     [[ -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]] \
       || abort_entry "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
     abort_entry "$entry" "container runtime is not available before Phase 2"

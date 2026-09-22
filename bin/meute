@@ -444,15 +444,27 @@ podman_cmd() {
   else printf 'podman\n'; fi
 }
 
+# Is the resolved podman even on PATH? A wrapper that is not is a different
+# failure from an image that is not, and doctor must say which.
+podman_available() {
+  local -a podman; read -ra podman <<< "$(podman_cmd)"
+  command -v "${podman[0]}" >/dev/null 2>&1
+}
+
+# Every podman call is bounded: doctor and image bump run interactively, and a
+# podman waiting on a stuck socket (or distrobox-host-exec on a host that is
+# not answering) would otherwise hang them with no message at all.
+readonly PODMAN_TIMEOUT=15
+
 # The digest podman holds for a tag, or non-zero when it has no such image.
 image_digest_on_host() {
   local -a podman; read -ra podman <<< "$(podman_cmd)"
-  "${podman[@]}" image inspect --format '{{.Digest}}' "$1" 2>/dev/null
+  timeout "$PODMAN_TIMEOUT" "${podman[@]}" image inspect --format '{{.Digest}}' -- "$1" 2>/dev/null
 }
 
 egress_running() {
   local -a podman; read -ra podman <<< "$(podman_cmd)"
-  [[ "$("${podman[@]}" container inspect --format '{{.State.Running}}' atelier-egress 2>/dev/null)" == "true" ]]
+  [[ "$(timeout "$PODMAN_TIMEOUT" "${podman[@]}" container inspect --format '{{.State.Running}}' -- atelier-egress 2>/dev/null)" == "true" ]]
 }
 
 # The only writer of image.digest. Reads the tag from the manifest as it is --
@@ -470,6 +482,8 @@ cmd_image_bump() {
   tag="$(jq -r '.tag' <<< "$row")"
   [[ -n "$tag" ]] \
     || die "image bump: ${repo} has no image.tag - set it first (Atelier's agent-${repo}:g<sha>); the digest pins that tag"
+  podman_available \
+    || die "image bump: podman not found (MEUTE_PODMAN=${MEUTE_PODMAN:-unset}) - resolved to '$(podman_cmd)'; point MEUTE_PODMAN at the host's podman"
   local digest
   digest="$(image_digest_on_host "$tag")" \
     || die "image bump: podman has no image ${tag} - build it with Atelier first ($(podman_cmd) image ls)"
