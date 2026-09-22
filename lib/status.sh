@@ -105,6 +105,9 @@ next_in_queue() {
       [[ -z "$(kv_get "$PLAN_DONE_FILE" "$key")" ]] || continue
       [[ -d "$path/.git" || -f "$path/.git" ]] || continue
     fi
+    # A publish stage (PRP-004) runs no engine: nothing to probe, so it is
+    # next -- and "" is not a key an associative array will take.
+    if [[ -z "$engine" ]]; then printf '%s\n' "$key"; return 0; fi
     # Once per engine per walk, as the runner probes once per engine per fire.
     if [[ -z "${quota[$engine]+set}" ]]; then
       quota[$engine]="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" 2>/dev/null)" || quota[$engine]="fail"

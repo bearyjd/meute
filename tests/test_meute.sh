@@ -36,6 +36,20 @@ skip() { printf '  skip  %s\n        %s\n' "$1" "$2"; }
 meute() { "$FIXTURE/bin/meute" "$@"; }
 report() { python3 "$REPO/lib/report.py" "$@"; }
 
+# One manifest, many single-field mutations: the PRP-004 schema tests each
+# break exactly one rule of a manifest that otherwise validates, so the message
+# they see is that rule's and not a bystander's. `d` is the loaded document.
+yaml_edit() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys, yaml
+src, dst, code = sys.argv[1:4]
+d = yaml.safe_load(open(src))
+exec(code)
+yaml.safe_dump(d, open(dst, "w"), sort_keys=False)
+PY
+}
+validate() { MEUTE_ROOT="${2:-$(dirname "$1")}" python3 "$REPO/lib/manifest.py" validate "$1" 2>&1 || true; }
+
 # ---------------------------------------------------------------- fixture ---
 setup() {
   mkdir -p "$FIXTURE"/{state,tasks,reports/alpha,reports/beta}
@@ -63,9 +77,9 @@ yaml.safe_dump({
     "policy": {"quota_floor_percent": 30, "community_share": 0.20,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
     "tiers": {
-        "tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
-        "tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False},
-        "tier3": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
+        "tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"},
+        "tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"},
+        "tier3": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"},
     },
     "tasks": {
         "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
@@ -446,7 +460,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {
         "architecture-review": {
             "tier": "tier2", "template": "tasks/architecture-review.md",
@@ -494,8 +508,8 @@ yaml.safe_dump({
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
     "tiers": {
-        "tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False},
-        "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk", "writes_code": False},
+        "tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"},
+        "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"},
     },
     "tasks": {
         "architecture-review": {
@@ -569,7 +583,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
     "repos": [{"name": "existing", "path": str(root / "git-existing"), "spec": "already here",
                "tasks": ["audit-security"]}],
@@ -654,7 +668,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {
         "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]},
         "architecture-review": {"tier": "tier2", "template": "tasks/architecture-review.md", "slots": ["weekly"]},
@@ -745,7 +759,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2-web": {"tools": ["Read", "WebSearch"], "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2-web": {"tools": ["Read", "WebSearch"], "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"market-comparison": {"tier": "tier2-web", "template": "tasks/market-comparison.md", "slots": ["weekly"]}},
     "repos": [], "community": [],
 }, open(root / "repos.local.yaml", "w"), sort_keys=False)
@@ -786,7 +800,7 @@ tiers = {
 }
 yaml.safe_dump({
     "version": 1,
-    "tiers": {name: {"tools": tools, "permission_mode": "dontAsk", "writes_code": False}
+    "tiers": {name: {"tools": tools, "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}
               for name, tools in tiers.items()},
     "tasks": {f"t-{name}": {"tier": name, "template": "tasks/x.md"} for name in tiers},
     "repos": [], "community": [],
@@ -841,7 +855,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
     "repos": [{"name": "already-configured", "path": configured,
                "spec": "already here", "tasks": ["audit-security"]}],
@@ -934,7 +948,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
     "repos": [], "community": [],
 }, open(root / "repos.local.yaml", "w"), sort_keys=False)
@@ -995,11 +1009,11 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"},
               "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk",
-                            "writes_code": False},
+                            "writes_code": False, "network": "proxied"},
               "tier2-scout": {"tools": "Read,Grep,Glob,Bash", "permission_mode": "dontAsk",
-                              "allowed_tools": "Bash(gh issue list:*)", "writes_code": False}},
+                              "allowed_tools": "Bash(gh issue list:*)", "writes_code": False, "network": "proxied"}},
     "tasks": {
         "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]},
         "architecture-review": {"tier": "tier2", "template": "tasks/architecture-review.md", "slots": ["weekly"]},
@@ -1227,7 +1241,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
     "repos": [{"name": "alpha-cfg", "path": str(universe / "alpha-cfg"), "spec": "enrolled", "tasks": ["audit-security"]},
               {"name": "beta-cfg", "path": str(universe / "beta-cfg"), "spec": "enrolled", "tasks": ["audit-security"]},
@@ -1372,9 +1386,9 @@ doc = {
     "policy": {"quota_floor_percent": 30, "community_share": 0.20,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
     "tiers": {
-        "tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
-        "tier2-scout": {"tools": "Read,Bash", "permission_mode": "dontAsk", "writes_code": False},
-        "tier3": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True},
+        "tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"},
+        "tier2-scout": {"tools": "Read,Bash", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"},
+        "tier3": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"},
     },
     "tasks": {
         "scout": {"tier": "tier2-scout", "template": "tasks/scout.md", "slots": ["weekly"]},
@@ -1549,7 +1563,7 @@ yaml.safe_dump({
     "defaults": {"engine": "codex", "model": "unused", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
     "repos": [{"name": "r", "path": str(repo), "spec": "fixture", "tasks": ["audit-security"]}],
     "community": [],
@@ -1603,7 +1617,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
     "repos": [
         {"name": "alpha", "path": str(root / "git-alpha"), "spec": "claude repo", "tasks": ["audit-security"]},
@@ -1672,7 +1686,7 @@ test_help() {
   local out
   out="$(meute help)"
   is    "help: starts with the tool's own name"   "$(grep -m1 . <<< "$out")" "meute — review and triage what the fleet produced."
-  is    "help: ends on the last header line"      "$(tail -n1 <<< "$out")" "to touch it."
+  is    "help: ends on the last header line"      "$(tail -n1 <<< "$out")" "add-repo and set-image-digest both refuse to touch it."
   hasnt "help: prints no code"                    "$out" "set -"
   out="$("$FIXTURE/bin/run.sh" --help)"
   is    "help: run.sh starts with its own name"   "$(grep -m1 . <<< "$out")" "meute — autonomous fleet runner."
@@ -2260,7 +2274,7 @@ yaml.safe_dump({
     "policy": {"quota_floor_percent": 30, "community_share": 0.20,
                "tier3_max_in_flight": 3, "branch_prefix": "meute",
                "weekly_cost_usd": 10.0},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
                                  "slots": ["daily"]}},
     "repos": [], "community": [],
@@ -2385,7 +2399,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.20,
                "tier3_max_in_flight": 3, "branch_prefix": "meute", "weekly_cost_usd": 10.0},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
     "repos": [{"name": "r", "path": str(root / "git-r"), "spec": "fixture", "tasks": ["audit-security"]}],
     "community": [],
@@ -2462,7 +2476,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.20,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"t": {"tier": "tier2", "template": "tasks/t.md", "slots": ["daily"]}},
     "repos": [{"name": "and", "path": repo, "spec": "android fixture", "tasks": ["t"],
                "worktree_files": ["local.properties", "does/not/exist.txt"]}],
@@ -2604,7 +2618,7 @@ yaml.safe_dump({
     "version": 1,
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.2, "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"suggest-features": {"tier": "tier2", "template": "tasks/suggest-features.md",
                                    "slots": ["weekly"], "model": "opus",
                                    "lenses": ["unfinished", "promised", "friction", "adjacent"]}},
@@ -2754,7 +2768,7 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.20,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False}},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
                                  "slots": ["daily"]}},
     "repos": [{"name": "prunefix", "path": repo, "spec": "fixture",
@@ -2796,6 +2810,457 @@ test_finding_level_triage() {
   hasnt "findings: a dismissed finding leaves the list" "$out" "audit-security-2026-08-28#2"
   has   "findings: its siblings remain"                 "$out" "audit-security-2026-08-28#3"
   has   "reports: the report is not closed early"       "$(meute reports --all 2>/dev/null | grep '2026-08-28')" "read"
+}
+
+# ---------------------------------------------------- PRP-004 phase 1 -------
+# The container schema (PRP-004 §4.1), one test per rule. Every rule test
+# starts from the §4.1 example merged into tier blocks shaped like
+# repos.yaml's, breaks one field, and reads the message; the example itself
+# has to validate first or the rejections prove nothing.
+readonly P4_DIGEST="sha256:$(printf 'a%.0s' {1..64})"
+
+# Writes $root/repos.yaml and a git repo at $root/git-netlens. Templates are
+# the real ones, so MEUTE_ROOT=$REPO for validation and MEUTE_ROOT=$root when
+# state/ (stages, tickets) must be the fixture's.
+p4_fixture() {
+  local root="$1"
+  mkdir -p "$root"/{state,tasks,etiquette,git-netlens,git-upstream}
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  cp "$REPO/etiquette/example-project.yaml" "$root/etiquette/upstream.yaml"
+  local g
+  for g in git-netlens git-upstream; do
+    git -C "$root/$g" init -q -b main
+    echo x > "$root/$g/f.txt"; git -C "$root/$g" add -A
+    git -C "$root/$g" -c user.email=t@t -c user.name=t commit -qm init
+  done
+  python3 - "$root" "$P4_DIGEST" <<'PY'
+import sys, pathlib, yaml
+root, digest = pathlib.Path(sys.argv[1]), sys.argv[2]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5,
+                 "timeout_seconds": 60, "runtime": "host"},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {
+        "tier1": {"tools": "Read,Edit,Bash", "permission_mode": "acceptEdits",
+                  "writes_code": True, "network": "proxied"},
+        "tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk",
+                  "writes_code": False, "network": "proxied"},
+        "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk",
+                      "writes_code": False, "runtime": "host"},
+        "tier2-scout": {"tools": "Read,Grep,Glob,Bash", "permission_mode": "dontAsk",
+                        "writes_code": False, "network": "proxied"},
+        "tier3": {"tools": "Read,Edit,Bash", "permission_mode": "acceptEdits",
+                  "writes_code": True, "network": "proxied"},
+        "tier3-review": {"tools": "Read,Grep,Glob,Bash", "permission_mode": "dontAsk",
+                         "allowed_tools": "Bash(git diff:*) Bash(git log:*) Bash(git show:*)",
+                         "writes_code": False, "network": "proxied"},
+    },
+    "tasks": {
+        "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]},
+        "market-comparison": {"tier": "tier2-web", "template": "tasks/market-comparison.md",
+                              "slots": ["weekly"]},
+        "draft-ticket": {"tier": "tier3", "template": "tasks/draft-ticket.md",
+                         "slots": ["weekly"], "requires_specced_ticket": True},
+        "scout": {"tier": "tier2-scout", "template": "tasks/scout.md", "slots": ["weekly"]},
+        "draft": {"tier": "tier3", "template": "tasks/draft.md",
+                  "slots": ["weekly"], "requires_specced_ticket": True},
+    },
+    "repos": [{
+        "name": "netlens", "path": str(root / "git-netlens"), "spec": "fixture netlens",
+        "runtime": "container",
+        "image": {"tag": "agent-netlens:g3f9a1c2", "digest": digest},
+        "push": True, "repo": "owner/netlens", "auto_merge": False,
+        "tasks": ["audit-security", "market-comparison", "draft-ticket"],
+        "tickets": [{"id": "NL-14", "title": "wakelock", "specced": True, "engine": "codex"},
+                    {"id": "NL-15", "title": "default engine", "specced": True}],
+    }],
+    "community": [{
+        "name": "upstream", "repo": "owner/upstream", "path": str(root / "git-upstream"),
+        "spec": "fixture upstream", "etiquette": "etiquette/upstream.yaml",
+        "tasks": ["scout", "draft"],
+        "tickets": [{"id": "77", "title": "cleared", "specced": True}],
+    }],
+}, open(root / "repos.yaml", "w"), sort_keys=False)
+PY
+}
+
+# A manifest edit that must be rejected: apply it, validate, read the message.
+p4_reject() { # label root code expected-message
+  local root="$2"
+  yaml_edit "$root/repos.yaml" "$root/bad.yaml" "$3"
+  has "$1" "$(validate "$root/bad.yaml" "$root")" "$4"
+}
+
+test_p4_example_validates() {
+  local root="$FIXTURE/p4-example"; p4_fixture "$root"
+  is  "prp-004: the §4.1 example validates"          "$(validate "$root/repos.yaml" "$root")" "ok: $root/repos.yaml"
+  has "prp-004: repos.yaml ships tier3-review"       "$(python3 -c "import yaml; print(yaml.safe_load(open('$REPO/repos.yaml'))['tiers']['tier3-review'])")" "'network': 'proxied'"
+  has "prp-004: ...that never edits"                 "$(python3 -c "import yaml; print(yaml.safe_load(open('$REPO/repos.yaml'))['tiers']['tier3-review'])")" "'writes_code': False"
+  is  "prp-004: repos.yaml defaults to the host"     "$(python3 -c "import yaml; print(yaml.safe_load(open('$REPO/repos.yaml'))['defaults']['runtime'])")" "host"
+  is  "prp-004: repos.yaml's web tier is host-only"  "$(python3 -c "import yaml; print(yaml.safe_load(open('$REPO/repos.yaml'))['tiers']['tier2-web']['runtime'])")" "host"
+  p4_reject "prp-004: defaults.runtime is host or container" "$root" \
+    'd["defaults"]["runtime"] = "vm"' "defaults.runtime: must be 'host' or 'container'"
+  p4_reject "prp-004: a repo runtime is host or container"   "$root" \
+    'd["repos"][0]["runtime"] = "vm"' "repos.netlens.runtime: must be 'host' or 'container'"
+
+  # The entry carries what run.sh will need, resolved, and is not a stage.
+  local entry
+  entry="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" daily | jq -c 'select(.repo=="netlens")')"
+  is "entry: runtime resolved"        "$(jq -r '.runtime' <<< "$entry")"      "container"
+  is "entry: image tag carried"       "$(jq -r '.image.tag' <<< "$entry")"    "agent-netlens:g3f9a1c2"
+  is "entry: image digest carried"    "$(jq -r '.image.digest' <<< "$entry")" "$P4_DIGEST"
+  is "entry: network from the tier"   "$(jq -r '.network' <<< "$entry")"      "proxied"
+  is "entry: push carried"            "$(jq -r '.push' <<< "$entry")"         "true"
+  is "entry: repo reaches upstream"   "$(jq -r '.upstream' <<< "$entry")"     "owner/netlens"
+  is "entry: a build is not a stage"  "$(jq -r '.stage_entry' <<< "$entry")"  "false"
+}
+
+# Rule 1: image.tag + image.digest when the resolved runtime is container.
+test_p4_rule1_image_required() {
+  local root="$FIXTURE/p4-rule1"; p4_fixture "$root"
+  p4_reject "rule 1: no image: block at all"     "$root" 'del d["repos"][0]["image"]' \
+    "repos.netlens.image: tag and digest are required when runtime is container"
+  p4_reject "rule 1: digest missing"             "$root" 'del d["repos"][0]["image"]["digest"]' \
+    "repos.netlens.image.digest: required when runtime is container"
+  p4_reject "rule 1: tag missing"                "$root" 'del d["repos"][0]["image"]["tag"]' \
+    "repos.netlens.image.tag: required when runtime is container"
+  p4_reject "rule 1: digest must be sha256:<64 hex>" "$root" 'd["repos"][0]["image"]["digest"] = "sha256:abc"' \
+    "repos.netlens.image.digest: must match ^sha256:[0-9a-f]{64}$"
+  p4_reject "rule 1: the default runtime reaches a repo with no image" "$root" \
+    'd["defaults"]["runtime"] = "container"; d["community"][0]["etiquette"] = "etiquette/upstream.yaml"' \
+    "community.upstream.image: tag and digest are required when runtime is container"
+  # Not a default: a host repo needs no image, and one it does not need is not an error.
+  yaml_edit "$root/repos.yaml" "$root/host.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  has "rule 1: a host repo needs no image"     "$(validate "$root/host.yaml" "$root")" "ok:"
+}
+
+# Rule 2: network is a tier key only; a host tier beats a container repo.
+test_p4_rule2_network_tier_only() {
+  local root="$FIXTURE/p4-rule2"; p4_fixture "$root"
+  p4_reject "rule 2: network on a repo"    "$root" 'd["repos"][0]["network"] = "none"' \
+    "repos.netlens.network: network is a tier key only"
+  p4_reject "rule 2: network on a task"    "$root" 'd["tasks"]["audit-security"]["network"] = "none"' \
+    "tasks.audit-security.network: network is a tier key only"
+  p4_reject "rule 2: network on a ticket"  "$root" 'd["repos"][0]["tickets"][0]["network"] = "none"' \
+    "repos.netlens.tickets[NL-14].network: network is a tier key only"
+  p4_reject "rule 2: a tier must say none or proxied" "$root" 'd["tiers"]["tier2"]["network"] = "open"' \
+    "tiers.tier2.network: must be 'none' or 'proxied'"
+  p4_reject "rule 2: a tier cannot omit it" "$root" 'del d["tiers"]["tier2"]["network"]' \
+    "tiers.tier2.network: required (none or proxied) unless the tier is runtime: host"
+  p4_reject "rule 2: a host tier has the host's network" "$root" 'd["tiers"]["tier2-web"]["network"] = "proxied"' \
+    "tiers.tier2-web.network: meaningless on a runtime: host tier"
+  p4_reject "rule 2: a tier can only force host"  "$root" 'd["tiers"]["tier2"]["runtime"] = "container"' \
+    "tiers.tier2.runtime: only 'host' may be set on a tier"
+  local web
+  web="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.task=="market-comparison")')"
+  is "rule 2: tier runtime: host beats the repo's container" "$(jq -r '.runtime' <<< "$web")" "host"
+  is "rule 2: ...and carries no network"                     "$(jq -r '.network' <<< "$web")" ""
+}
+
+# Rule 3: push only under repos:.
+test_p4_rule3_push_repos_only() {
+  local root="$FIXTURE/p4-rule3"; p4_fixture "$root"
+  p4_reject "rule 3: push on a community project" "$root" 'd["community"][0]["push"] = True' \
+    "community.upstream.push: only repos: entries may push"
+  p4_reject "rule 3: push is a boolean"           "$root" 'd["repos"][0]["push"] = "yes"' \
+    "repos.netlens.push: must be true or false"
+  yaml_edit "$root/repos.yaml" "$root/off.yaml" 'd["community"][0]["push"] = False'
+  has "rule 3: push: false on community is harmless" "$(validate "$root/off.yaml" "$root")" "ok:"
+}
+
+# Rule 4: auto_merge: true is refused.
+test_p4_rule4_auto_merge() {
+  local root="$FIXTURE/p4-rule4"; p4_fixture "$root"
+  p4_reject "rule 4: auto_merge: true" "$root" 'd["repos"][0]["auto_merge"] = True' \
+    "repos.netlens.auto_merge: true is not supported"
+  yaml_edit "$root/repos.yaml" "$root/absent.yaml" 'del d["repos"][0]["auto_merge"]'
+  has "rule 4: absent is fine" "$(validate "$root/absent.yaml" "$root")" "ok:"
+}
+
+# Rule 5: --runtime container on a repo with no image: fails closed at run
+# time, with rule 1's message, before any engine is invoked.
+test_p4_rule5_cli_runtime_fails_closed() {
+  local root="$FIXTURE/p4-rule5"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+echo invoked >> "$(dirname "$0")/invocations"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --runtime container 2>&1)"
+  has   "rule 5: refused with rule 1's message" "$out" "repos.netlens.image: tag and digest are required when runtime is container"
+  has   "rule 5: ...as an error line"           "$out" "status=error"
+  [[ -f "$root/stub/invocations" ]] && bad "rule 5: no engine ran" "the stub was invoked" || ok "rule 5: no engine ran"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --runtime vm 2>&1 || true)"
+  has   "rule 5: --runtime takes host or container" "$out" "unknown runtime"
+  # A repo that opted into containers has nothing to run in before Phase 2;
+  # the host must not quietly stand in for the isolation it asked for.
+  p4_fixture "$root"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has   "runtime: a container repo is refused before Phase 2" "$out" "detail=container runtime is not available before Phase 2"
+  [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran" "the stub was invoked" || ok "runtime: ...and no engine ran"
+}
+
+# Rule 6: the build engine is per ticket; the review engine is derived.
+test_p4_rule6_ticket_engine() {
+  local root="$FIXTURE/p4-rule6"; p4_fixture "$root"
+  local q
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly)"
+  is "rule 6: ticket engine wins"            "$(jq -r 'select(.ticket_id=="NL-14") | .engine' <<< "$q")" "codex"
+  is "rule 6: no ticket engine, repo/defaults" "$(jq -r 'select(.ticket_id=="NL-15") | .engine' <<< "$q")" "claude"
+  p4_reject "rule 6: review_engine is not a field" "$root" 'd["repos"][0]["tickets"][0]["review_engine"] = "claude"' \
+    "repos.netlens.tickets[NL-14].review_engine: not a field - the review engine is derived from engine"
+  p4_reject "rule 6: a ticket engine is claude or codex" "$root" 'd["repos"][0]["tickets"][0]["engine"] = "gpt"' \
+    "repos.netlens.tickets[NL-14].engine: must be 'claude' or 'codex'"
+}
+
+# Rule 7: a state/stages row turns the ticket's build entry into its next
+# stage entry, ahead of the repo's other work; done or absent -> build entry.
+test_p4_rule7_stage_entries() {
+  local root="$FIXTURE/p4-rule7"; p4_fixture "$root"
+  local q
+  printf 'netlens/NL-14\treview\tmeute/draft-ticket-2026-09-01\tabc123\treports/netlens/draft-ticket-2026-09-01.md\tcodex\n' > "$root/state/stages"
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly)"
+  local stage; stage="$(jq -c 'select(.ticket_id=="NL-14")' <<< "$q")"
+  is "rule 7: a review row yields one entry for the ticket" "$(wc -l <<< "$stage")" "1"
+  is "rule 7: it is a stage entry"        "$(jq -r '.stage_entry' <<< "$stage")"   "true"
+  is "rule 7: stage"                      "$(jq -r '.stage' <<< "$stage")"         "review"
+  is "rule 7: branch"                     "$(jq -r '.branch' <<< "$stage")"        "meute/draft-ticket-2026-09-01"
+  is "rule 7: base"                       "$(jq -r '.base' <<< "$stage")"          "abc123"
+  is "rule 7: build_report"               "$(jq -r '.build_report' <<< "$stage")"  "reports/netlens/draft-ticket-2026-09-01.md"
+  is "rule 7: key carries the stage"      "$(jq -r '.key' <<< "$stage")"           "netlens/draft-ticket/NL-14/review"
+  is "rule 7: review runs on tier3-review" "$(jq -r '.tier' <<< "$stage")"         "tier3-review"
+  is "rule 7: review engine is the other one" "$(jq -r '.engine' <<< "$stage")"    "claude"
+  is "rule 7: the stage entry leads its repo" "$(jq -r '.key' <<< "$q" | head -1)" "netlens/draft-ticket/NL-14/review"
+  is "rule 7: the other ticket still builds" "$(jq -r 'select(.ticket_id=="NL-15") | .stage_entry' <<< "$q")" "false"
+
+  printf 'netlens/NL-14\tresolve\tmeute/x\tabc123\treports/x.md\tcodex\n' > "$root/state/stages"
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
+  is "rule 7: resolve runs on tier3"        "$(jq -r '.tier' <<< "$q")"   "tier3"
+  is "rule 7: resolve uses the build engine" "$(jq -r '.engine' <<< "$q")" "codex"
+  printf 'netlens/NL-14\treview-2\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
+  is "rule 7: review-2 flips the engine too" "$(jq -r '.engine' <<< "$q")" "codex"
+  printf 'netlens/NL-14\tpublish\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
+  is "rule 7: publish has no engine"        "$(jq -r '.engine' <<< "$q")" ""
+  is "rule 7: publish keeps the task's tier" "$(jq -r '.tier' <<< "$q")"  "tier3"
+
+  printf 'netlens/NL-14\tdone\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
+  is "rule 7: a done row yields the build entry" "$(jq -r '.stage_entry' <<< "$q")" "false"
+  is "rule 7: ...with the build key"             "$(jq -r '.key' <<< "$q")"         "netlens/draft-ticket/NL-14"
+  rm -f "$root/state/stages"
+  q="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" weekly | jq -c 'select(.ticket_id=="NL-14")')"
+  is "rule 7: no file, build entry"              "$(jq -r '.stage_entry' <<< "$q")" "false"
+
+  # A row the builder cannot read must stop the queue, not invent a stage.
+  printf 'netlens/NL-14\tshipping\tmeute/x\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  has "rule 7: an unknown stage is refused" "$(validate "$root/repos.yaml" "$root")" "state/stages: netlens/NL-14: unknown stage 'shipping'"
+  printf 'netlens/NL-14\treview\tmeute/x\n' > "$root/state/stages"
+  has "rule 7: a short row is refused"      "$(validate "$root/repos.yaml" "$root")" "state/stages: netlens/NL-14: expected stage, branch, base, build_report, engine"
+  printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tgpt\n' > "$root/state/stages"
+  has "rule 7: an unknown build engine is refused" "$(validate "$root/repos.yaml" "$root")" "state/stages: netlens/NL-14: engine must be claude or codex"
+  rm -f "$root/state/stages"
+}
+
+# Rule 8: the tag is Atelier's immutable one for this repo, or the base image.
+test_p4_rule8_tag_format() {
+  local root="$FIXTURE/p4-rule8"; p4_fixture "$root"
+  p4_reject "rule 8: a registry-style tag"      "$root" 'd["repos"][0]["image"]["tag"] = "localhost/agent-netlens:latest"' \
+    "repos.netlens.image.tag: 'localhost/agent-netlens:latest' must be agent-netlens:g<hex> or agent-base:g<hex>"
+  p4_reject "rule 8: another project's overlay" "$root" 'd["repos"][0]["image"]["tag"] = "agent-other:g3f9a1c2"' \
+    "repos.netlens.image.tag: 'agent-other:g3f9a1c2' must be agent-netlens:g<hex> or agent-base:g<hex>"
+  p4_reject "rule 8: a mutable tag"             "$root" 'd["repos"][0]["image"]["tag"] = "agent-netlens:latest"' \
+    "repos.netlens.image.tag: 'agent-netlens:latest' must be agent-netlens:g<hex> or agent-base:g<hex>"
+  yaml_edit "$root/repos.yaml" "$root/base.yaml" 'd["repos"][0]["image"]["tag"] = "agent-base:g0badf00d"'
+  has "rule 8: the base image is accepted" "$(validate "$root/base.yaml" "$root")" "ok:"
+}
+
+# Rule 9: push needs the owner's repo, owner/name, and nothing derives it.
+test_p4_rule9_push_needs_repo() {
+  local root="$FIXTURE/p4-rule9"; p4_fixture "$root"
+  p4_reject "rule 9: push without repo"     "$root" 'del d["repos"][0]["repo"]' \
+    "repos.netlens.repo: required (owner/name) when push is true"
+  p4_reject "rule 9: repo must be owner/name" "$root" 'd["repos"][0]["repo"] = "https://github.com/owner/netlens"' \
+    "repos.netlens.repo: 'https://github.com/owner/netlens' must be owner/name"
+  yaml_edit "$root/repos.yaml" "$root/nopush.yaml" 'd["repos"][0]["push"] = False; del d["repos"][0]["repo"]'
+  has "rule 9: no push, no repo needed" "$(validate "$root/nopush.yaml" "$root")" "ok:"
+}
+
+# Decision 3: a stage entry is exempt from the tier-3 cap -- the cap gates new
+# builds, and at cap a resolve must still run on a branch it counts -- and,
+# until Phase 4 can run one, is aborted before any engine is invoked.
+test_p4_stage_entry_cap_and_abort() {
+  local root="$FIXTURE/p4-stage-run"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+echo invoked >> "$(dirname "$0")/invocations"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+  # Host runtime, no image: this test is about stages, not containers.
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]; d["repos"][0]["tickets"] = [d["repos"][0]["tickets"][1]]; d["repos"][0]["tasks"] = ["draft-ticket"]; d["community"] = []; d["policy"]["tier3_max_in_flight"] = 1'
+  # One draft in flight fills the cap of 1.
+  git -C "$root/git-netlens" branch meute/draft-ticket-2026-09-01 >/dev/null 2>&1
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly --dry-run 2>&1)"
+  has "cap: the build entry is held at the cap" "$out" "tier-3 drafts already in flight"
+
+  printf 'netlens/NL-15\tresolve\tmeute/draft-ticket-2026-09-01\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly 2>&1 || true)"
+  hasnt "cap: the stage entry passes the cap"        "$out" "already in flight"
+  has   "stage: aborted before Phase 4 can run it"   "$out" "detail=stage entries are not runnable before Phase 4"
+  has   "stage: ...logged as an error"               "$out" "status=error"
+  [[ -f "$root/stub/invocations" ]] && bad "stage: no engine ran" "the stub was invoked" || ok "stage: no engine ran"
+  is    "stage: the cursor moved past it"            "$(kv_get_test "$root/state/cursor" cursor.weekly)" "netlens/draft-ticket/NL-15/resolve"
+  is    "stage: no worktree was cut"                 "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
+  # publish has no engine, so no pool to probe: it must reach the abort, not
+  # stall the slot on a quota reading for an engine called "".
+  printf 'netlens/NL-15\tpublish\tmeute/draft-ticket-2026-09-01\tabc123\treports/x.md\tclaude\n' > "$root/state/stages"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly 2>&1 || true)"
+  has   "stage: a publish entry is aborted, not gated on an empty engine" "$out" "detail=stage entries are not runnable before Phase 4"
+  is    "stage: ...and the cursor moved past it too" "$(kv_get_test "$root/state/cursor" cursor.weekly)" "netlens/draft-ticket/NL-15/publish"
+  # status walks the same queue the runner does; an engine-less stage entry
+  # must read as "next", not as a bash error about an empty array key.
+  : > "$root/state/cursor"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)"
+  hasnt "stage: status survives an engine-less stage entry" "$out" "bad array subscript"
+  has   "stage: ...and names it as next"                    "$out" "next weekly  netlens/draft-ticket/NL-15/publish"
+}
+kv_get_test() { awk -F'\t' -v key="$2" '$1 == key { print $2; exit }' "$1"; }
+
+# The four PRP-004 columns, always `-` in this phase, on every line class the
+# runner writes: a line differs from one on main only by this suffix.
+test_p4_log_columns() {
+  local root="$FIXTURE/p4-log"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  local suffix=$'\truntime=-\timage=-\tstage=-\tpr=-'
+  local run; run() { PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB="$1" "$root/bin/run.sh" daily "${@:2}" >/dev/null 2>&1 || true; }
+  run 100 --repo netlens
+  local line; line="$(grep 'status=ok' "$root/state/log" | tail -1)"
+  is  "log: an ok line ends with the four columns"  "${line: -${#suffix}}" "$suffix"
+  has "log: ...after the last existing column"      "${line%"$suffix"}" $'\tdur='
+  hasnt "log: ...and nowhere else"                  "${line%"$suffix"}" "runtime="
+  run 10 --repo netlens
+  line="$(grep 'status=skipped' "$root/state/log" | tail -1)"
+  is  "log: a skipped line carries them too"        "${line: -${#suffix}}" "$suffix"
+  printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tcodex\n' > "$root/state/stages"
+  PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly >/dev/null 2>&1 || true
+  line="$(grep 'status=error' "$root/state/log" | tail -1)"
+  is  "log: an error line carries them too"         "${line: -${#suffix}}" "$suffix"
+  # Everything that reads the log still counts this week.
+  local status_out
+  status_out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)"
+  has "log: status still totals the week"           "$status_out" "2 runs"
+  is  "log: the inbox still reads it"               "$(MEUTE_ROOT="$root" python3 "$REPO/lib/inbox.py" dump | jq -r '.status.runs')" "2"
+}
+
+# meute image bump: the only writer of image.digest, through add-repo's
+# validated, backed-up path, and never into repos.yaml.
+test_p4_image_bump() {
+  local root="$FIXTURE/p4-bump"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  local new="sha256:$(printf 'b%.0s' {1..64})"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+[[ "\$*" == *"agent-netlens:g3f9a1c2"* ]] || { echo "Error: no such image" >&2; exit 125; }
+printf '%s\n' "$new"
+STUB
+  chmod +x "$root/stub/podman"
+  local bump; bump() { MEUTE_PODMAN="$root/stub/podman" "$root/bin/meute" image bump "$@" 2>&1; }
+
+  # repos.yaml is the tracked schema doc: refused before podman is even asked.
+  local out before
+  before="$(cat "$root/repos.yaml")"
+  out="$(bump netlens)"
+  has   "image bump: refuses repos.yaml"       "$out" "refusing to write repos.yaml"
+  is    "image bump: ...untouched"             "$(cat "$root/repos.yaml")" "$before"
+  [[ -e "$root/repos.yaml.bak" ]] && bad "image bump: no .bak of repos.yaml" "repos.yaml.bak exists" || ok "image bump: no .bak of repos.yaml"
+  [[ -e "$root/stub/podman-calls" ]] && bad "image bump: podman not consulted for a refused write" "podman was called" || ok "image bump: podman not consulted for a refused write"
+
+  cp "$root/repos.yaml" "$root/repos.local.yaml"
+  out="$(bump netlens)"
+  has   "image bump: writes repos.local.yaml"  "$out" "netlens: image.digest -> ${new:0:19}"
+  is    "image bump: the digest landed"        "$(python3 -c "import yaml; print(yaml.safe_load(open('$root/repos.local.yaml'))['repos'][0]['image']['digest'])")" "$new"
+  is    "image bump: ...for the manifest's tag" "$(cat "$root/stub/podman-calls")" "image inspect --format {{.Digest}} agent-netlens:g3f9a1c2"
+  [[ -f "$root/repos.local.yaml.bak" ]] && ok "image bump: backs the manifest up first" || bad "image bump: backs the manifest up first" "no .bak"
+  is    "image bump: the backup is the old manifest" "$(cat "$root/repos.local.yaml.bak")" "$before"
+  has   "image bump: the result validates"     "$(validate "$root/repos.local.yaml" "$root")" "ok:"
+
+  out="$(bump unknown)"
+  has   "image bump: unknown repo"             "$out" "unknown repo 'unknown'"
+  yaml_edit "$root/repos.local.yaml" "$root/repos.local.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  out="$(bump netlens)"
+  has   "image bump: refuses a repo with no image.tag" "$out" "netlens has no image.tag"
+  # Digest bumps happen because the manifest fails rule 1 today; the write
+  # must validate the manifest as it will be, not as it is.
+  yaml_edit "$root/repos.local.yaml" "$root/repos.local.yaml" \
+    'd["repos"][0]["runtime"] = "container"; d["repos"][0]["image"] = {"tag": "agent-netlens:g3f9a1c2"}'
+  has   "image bump: the manifest is invalid before the bump" "$(validate "$root/repos.local.yaml" "$root")" "image.digest: required"
+  out="$(bump netlens)"
+  has   "image bump: ...and valid after it"    "$(validate "$root/repos.local.yaml" "$root")" "ok:"
+  printf '#!/usr/bin/env bash\necho not-a-digest\n' > "$root/stub/podman"
+  out="$(bump netlens)"
+  has   "image bump: a malformed inspect answer is refused" "$out" "not a sha256 digest"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" set-image-digest "$root/repos.yaml" netlens "$new" 2>&1 || true)"
+  has   "set-image-digest: refuses repos.yaml on its own too" "$out" "refusing to write repos.yaml"
+}
+
+# doctor: image present at the pinned digest, per container repo, and the
+# egress proxy running, fleet-wide -- only when some repo runs in a container.
+test_p4_doctor_containers() {
+  local root="$FIXTURE/p4-doctor"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  "image inspect --format {{.Digest}} agent-netlens:g3f9a1c2") printf '%s\n' "\${STUB_DIGEST:-$P4_DIGEST}" ;;
+  "container inspect --format {{.State.Running}} atelier-egress") printf '%s\n' "\${STUB_EGRESS:-true}" ;;
+  *) echo "Error: no such object" >&2; exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  # Colour stripped so the label and its message can be matched as one string.
+  local doc; doc() { PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" "$root/bin/meute" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g'; }
+  local out
+  out="$(doc)"
+  has "doctor: image at the pinned digest"        "$out" "ok   image agent-netlens:g3f9a1c2 present at pinned digest"
+  has "doctor: egress proxy running"              "$out" "ok   atelier-egress running"
+  out="$(STUB_DIGEST="sha256:$(printf 'c%.0s' {1..64})" doc)"
+  has "doctor: digest drift is a FAIL"            "$out" "FAIL image agent-netlens:g3f9a1c2 is not at the pinned digest"
+  has "doctor: ...and says how to re-pin"         "$out" "meute image bump netlens"
+  out="$(STUB_EGRESS=false doc)"
+  has "doctor: a stopped proxy is a FAIL"         "$out" "FAIL atelier-egress is not running"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["image"]["tag"] = "agent-netlens:gdeadbeef"'
+  out="$(doc)"
+  has "doctor: an absent image is a FAIL"         "$out" "FAIL image agent-netlens:gdeadbeef not present"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  out="$(doc)"
+  hasnt "doctor: no container repo, no image check" "$out" "pinned digest"
+  hasnt "doctor: ...and no proxy check"             "$out" "atelier-egress"
 }
 
 # ------------------------------------------------------------------- main ---
@@ -2847,6 +3312,20 @@ test_plan
 test_plan_run
 test_repo_default_branch
 test_inbox
+test_p4_example_validates
+test_p4_rule1_image_required
+test_p4_rule2_network_tier_only
+test_p4_rule3_push_repos_only
+test_p4_rule4_auto_merge
+test_p4_rule5_cli_runtime_fails_closed
+test_p4_rule6_ticket_engine
+test_p4_rule7_stage_entries
+test_p4_rule8_tag_format
+test_p4_rule9_push_needs_repo
+test_p4_stage_entry_cap_and_abort
+test_p4_log_columns
+test_p4_image_bump
+test_p4_doctor_containers
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

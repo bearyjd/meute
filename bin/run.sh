@@ -9,6 +9,11 @@
 #
 # Options:
 #   --engine <claude|codex>  override the manifest engine for this run
+#   --runtime <host|container>
+#                            override the manifest runtime for this run. `container`
+#                            needs the repo's pinned image (PRP-004 rule 1) and, until
+#                            Phase 2 lands the container path, is refused with the
+#                            entry logged as an error rather than run on the host
 #   --repo <name>            force a repo (bypasses the cursor and the share gates)
 #   --task <name>            force a task (bypasses the cursor and the share gates)
 #   --dry-run                select and render, invoke nothing. Not a no-op on state/:
@@ -79,6 +84,7 @@ BUDGET_LEFT="-"
 SCRUBBED=""
 AUTH_MODE=""
 ENGINE_OVERRIDE=""
+RUNTIME_OVERRIDE=""
 FORCE_REPO=""
 FORCE_TASK=""
 DRY_RUN=0
@@ -112,6 +118,12 @@ log_run() {
   local field
   for field in "$@"; do line+="$(printf '\t%s' "$field")"; done
   line+="$(printf '\tdur=%ss' "$duration")"
+  # PRP-004's columns, on every line class so a reader can rely on them:
+  # runtime= (host|container), image= (12-hex digest prefix), stage=
+  # (preflight|build|review|resolve|publish), pr= (URL). Written as `-`
+  # until the phase that fills each one; a line differs from a pre-PRP-004
+  # one by this suffix and nothing else.
+  line+="$(printf '\truntime=%s\timage=%s\tstage=%s\tpr=%s' "-" "-" "-" "-")"
   printf '%s\n' "$line" >> "$LOG_FILE"
   printf '%s\n' "$line" >&2
 }
@@ -149,6 +161,7 @@ parse_args() {
     case "$1" in
       daily|weekly) SLOT="$1" ;;
       --engine)   ENGINE_OVERRIDE="${2:?--engine needs a value}"; shift ;;
+      --runtime)  RUNTIME_OVERRIDE="${2:?--runtime needs a value}"; shift ;;
       --repo)     FORCE_REPO="${2:?--repo needs a value}"; shift ;;
       --task)     FORCE_TASK="${2:?--task needs a value}"; shift ;;
       --dry-run)  DRY_RUN=1 ;;
@@ -161,6 +174,8 @@ parse_args() {
   [[ -n "$SLOT" ]] || die "missing slot: expected 'daily' or 'weekly' (try --help)"
   [[ -z "$ENGINE_OVERRIDE" || "$ENGINE_OVERRIDE" =~ ^(claude|codex)$ ]] \
     || die "unknown engine: $ENGINE_OVERRIDE"
+  [[ -z "$RUNTIME_OVERRIDE" || "$RUNTIME_OVERRIDE" =~ ^(host|container)$ ]] \
+    || die "unknown runtime: $RUNTIME_OVERRIDE (expected host or container)"
 }
 
 
@@ -172,9 +187,9 @@ cursor_key() {
 }
 
 eligible() {
-  local entry="$1" key kind path tier engine
-  { read -r key; read -r kind; read -r path; read -r tier; read -r engine; } \
-    < <(jq -r '.key, .kind, .path, .tier, .engine' <<< "$entry")
+  local entry="$1" key kind path tier engine stage_entry
+  { read -r key; read -r kind; read -r path; read -r tier; read -r engine; read -r stage_entry; } \
+    < <(jq -r '.key, .kind, .path, .tier, .engine, .stage_entry' <<< "$entry")
 
   if [[ ! -d "$path/.git" && ! -f "$path/.git" ]]; then
     note "skipping ${key}: not a git repository at $path"
@@ -197,13 +212,18 @@ eligible() {
     note "skipping ${key}: community share exhausted this week"
     return 1
   fi
-  if [[ "$tier" == "tier3" ]]; then
+  # The cap gates NEW builds. A stage entry (PRP-004 §4.3) works a branch that
+  # is itself one of the counted ones; at cap -- the designed steady state --
+  # a resolve must still be able to run, or nothing ever frees a slot.
+  if [[ "$tier" == "tier3" && "$stage_entry" != "true" ]]; then
     local in_flight; in_flight="$(tier3_in_flight)"
     if (( in_flight >= TIER3_CAP )); then
       note "skipping ${key}: ${in_flight} tier-3 drafts already in flight (cap ${TIER3_CAP})"
       return 1
     fi
   fi
+  # A publish stage runs no engine, so there is no pool to ask about.
+  [[ -n "$engine" ]] || return 0
   # Gate 2 of 2: the subscription pool the human shares -- per engine, so a
   # Codex entry is gated by a Codex source and never by the Claude status-line
   # snapshot. Checked per candidate rather than after selection: a fleet that
@@ -405,13 +425,15 @@ main() {
   # quota reading attributable.
   local engine remaining
   engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
-  quota_for_engine "$engine"
-  [[ "$QUOTA_PROBE" != "fail" ]] || skip "${engine} quota probe failed"
-  remaining="${QUOTA_PROBE%% *}"
-  QUOTA_SOURCE="${QUOTA_PROBE#* }"
-  (( remaining < QUOTA_FLOOR )) \
-    && skip "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
-  remaining_at_start="$remaining"
+  if [[ -n "$engine" ]]; then
+    quota_for_engine "$engine"
+    [[ "$QUOTA_PROBE" != "fail" ]] || skip "${engine} quota probe failed"
+    remaining="${QUOTA_PROBE%% *}"
+    QUOTA_SOURCE="${QUOTA_PROBE#* }"
+    (( remaining < QUOTA_FLOOR )) \
+      && skip "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
+    remaining_at_start="$remaining"
+  fi
   run_entry "$entry"
 }
 
@@ -435,6 +457,23 @@ run_entry() {
   WRITES_CODE=0; [[ "$(jq -r '.writes_code' <<< "$entry")" == "true" ]] && WRITES_CODE=1
   engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
   local kind; kind="$(jq -r '.kind' <<< "$entry")"
+
+  # PRP-004 Phase 1 built the stage machine's schema and nothing that runs a
+  # stage -- Phase 4 does. Until then a state/stages row must never reach an
+  # engine: aborted here, cursor advanced, so a stray row cannot wedge the slot.
+  [[ "$(jq -r '.stage_entry' <<< "$entry")" != "true" ]] \
+    || abort_entry "$entry" "stage entries are not runnable before Phase 4"
+  # Rule 5, fail closed. A container run needs a pinned image to run in;
+  # without one the answer is the validator's, not a fallback to the host.
+  # And with one, Phase 2 has yet to build the path -- a repo that opted into
+  # isolation must not be quietly run without it.
+  local runtime
+  runtime="${RUNTIME_OVERRIDE:-$(jq -r '.runtime' <<< "$entry")}"
+  if [[ "$runtime" == "container" ]]; then
+    [[ -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]] \
+      || abort_entry "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
+    abort_entry "$entry" "container runtime is not available before Phase 2"
+  fi
 
   # Rotating lens: one narrow angle per run, advanced only on success.
   local lenses lens="none" lens_index=0
@@ -564,6 +603,16 @@ advance_past() {
     kv_set "$PLAN_DONE_FILE" "$key" "$STARTED_AT"
     retire_completed_plan
   fi
+}
+
+# The manifest section an entry came from, as the validator names it, so a
+# runtime refusal reads the same as the validation error it stands in for.
+manifest_section() {
+  case "$1" in
+    personal)  printf 'repos\n' ;;
+    community) printf 'community\n' ;;
+    *)         printf '%s\n' "$1" ;;
+  esac
 }
 
 # An entry the runner cannot even start on. Logged as an error with the cause

@@ -21,6 +21,8 @@
 #                                 record a decision; -r is required and is one of
 #                                 false-positive wont-fix out-of-scope duplicate too-large other
 #   branches                      tier-3 drafts currently in flight
+#   image bump <repo>             pin the repo's container image: record the digest
+#                                  podman has for its image.tag into repos.local.yaml
 #   pause [--for 3d] [-r why]     stand the fleet down; every slot declines until it expires
 #   resume                        lift the pause early
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
@@ -43,9 +45,9 @@
 # Anything this tool prints as an id can be passed straight back to it.
 #
 # This tool never invokes an engine and never pushes. It reads either manifest
-# but only ever WRITES repos.local.yaml (via `discover`) -- repos.yaml is the
-# tracked, hand-commented schema doc, and `lib/manifest.py add-repo` refuses
-# to touch it.
+# but only ever WRITES repos.local.yaml (via `discover` and `image bump`) --
+# repos.yaml is the tracked, hand-commented schema doc, and `lib/manifest.py`'s
+# add-repo and set-image-digest both refuse to touch it.
 #
 set -Eeuo pipefail
 
@@ -430,6 +432,64 @@ cmd_branches() {
 }
 
 # --------------------------------------------------------------------------
+# Containers (PRP-004). Phase 1 pins images and reports on them; nothing here
+# runs one. The podman these reach is the HOST's: from inside a distrobox
+# (/run/.containerenv exists) that means distrobox-host-exec, and MEUTE_PODMAN
+# names a wrapper outright and wins. Phase 2's lib/container.sh takes these
+# over; the runner will resolve podman the same way.
+# --------------------------------------------------------------------------
+podman_cmd() {
+  if [[ -n "${MEUTE_PODMAN:-}" ]]; then printf '%s\n' "$MEUTE_PODMAN"
+  elif [[ -e /run/.containerenv ]]; then printf 'distrobox-host-exec podman\n'
+  else printf 'podman\n'; fi
+}
+
+# The digest podman holds for a tag, or non-zero when it has no such image.
+image_digest_on_host() {
+  local -a podman; read -ra podman <<< "$(podman_cmd)"
+  "${podman[@]}" image inspect --format '{{.Digest}}' "$1" 2>/dev/null
+}
+
+egress_running() {
+  local -a podman; read -ra podman <<< "$(podman_cmd)"
+  [[ "$("${podman[@]}" container inspect --format '{{.State.Running}}' atelier-egress 2>/dev/null)" == "true" ]]
+}
+
+# The only writer of image.digest. Reads the tag from the manifest as it is --
+# a manifest that needs this is exactly one rule 1 rejects today, tag set and
+# digest not -- and lets set-image-digest validate the manifest as it will be.
+cmd_image_bump() {
+  local repo="${1:-}"
+  [[ -n "$repo" ]] || die "image bump: which repo? (try: meute image bump <name>)"
+  [[ "$(basename "$MANIFEST")" != "repos.yaml" ]] \
+    || die "image bump: refusing to write repos.yaml (tracked schema doc, hand-commented) -- create repos.local.yaml first: cp repos.yaml repos.local.yaml"
+  local row tag
+  row="$(python3 "$MANIFEST_PY" list-images "$MANIFEST" | jq -c --arg r "$repo" 'select(.name == $r)')" \
+    || die "image bump: could not read ${MANIFEST}"
+  [[ -n "$row" ]] || die "image bump: unknown repo '${repo}' - not in $(basename "$MANIFEST")"
+  tag="$(jq -r '.tag' <<< "$row")"
+  [[ -n "$tag" ]] \
+    || die "image bump: ${repo} has no image.tag - set it first (Atelier's agent-${repo}:g<sha>); the digest pins that tag"
+  local digest
+  digest="$(image_digest_on_host "$tag")" \
+    || die "image bump: podman has no image ${tag} - build it with Atelier first ($(podman_cmd) image ls)"
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "image bump: podman answered '${digest}' for ${tag}, not a sha256 digest"
+  python3 "$MANIFEST_PY" set-image-digest "$MANIFEST" "$repo" "$digest" >/dev/null \
+    || die "image bump: the digest was not written"
+  note "${repo}: image.digest -> ${digest:0:19}… for ${tag}"
+  note "backup of the previous manifest: $(basename "$MANIFEST").bak"
+}
+
+cmd_image() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    bump) cmd_image_bump "$@" ;;
+    *)    die "image: unknown subcommand '${sub}' (try: meute image bump <repo>)" ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
 # Stand the fleet down. The quota gate measures meute's own spend, not yours —
 # see lib/fleet.sh — so when you need the week's capacity for your own work this
 # is the only thing that stops the next slot.
@@ -558,6 +618,7 @@ main() {
     resolve)  cmd_resolve "$@" ;;
     dismiss)  cmd_dismiss "$@" ;;
     branches) cmd_branches "$@" ;;
+    image)    cmd_image "$@" ;;
     pause)    cmd_pause "$@" ;;
     resume)   cmd_resume "$@" ;;
     discover) cmd_discover "$@" ;;

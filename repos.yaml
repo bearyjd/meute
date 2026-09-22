@@ -18,6 +18,11 @@ defaults:
   model: sonnet           # alias or full model id; sonnet is the cost/quality default
   file_budget: 25         # max files a task may open; injected into every prompt
   timeout_seconds: 1800   # hard wall-clock kill for a single engine invocation
+  # host | container (CLI --runtime overrides this). A container repo runs in
+  # the Atelier image it pins under `image:` -- see the repo example below --
+  # and a tier may force `runtime: host` for itself, which wins. Not per task:
+  # where a run executes is a property of the repository, not of the chore.
+  runtime: host
 
 # ---------------------------------------------------------------------------
 # Scheduling policy.
@@ -135,6 +140,13 @@ audit_commands: &audit_commands >-
 # engine may accept its own edits, and whether the scratch branch is committed.
 # `tools` is a hard availability filter, not a permission prompt — a tier
 # without Write/Edit/Bash physically cannot modify the worktree.
+#
+# `network` is what the tier's container may reach: `proxied` (the egress
+# proxy's allow-list — the provider's API hosts, the package indexes) or
+# `none`. Every tier states it, so a new tier cannot inherit egress by leaving
+# the line out, and only a tier may: the blast radius is the tier's to declare
+# and a repo or ticket cannot widen it. Meaningless under `runtime: host`, which
+# has the host's network — a tier pinned there says so and states no network.
 # ---------------------------------------------------------------------------
 tiers:
   tier1:
@@ -143,11 +155,13 @@ tiers:
     permission_mode: acceptEdits
     allowed_tools: *verify_commands
     writes_code: true
+    network: proxied
   tier2:
     description: Autonomous reports for async reading. Never touches the repo.
     tools: "Read,Grep,Glob"
     permission_mode: dontAsk
     writes_code: false
+    network: proxied
   tier2-web:
     description: >-
       Autonomous reports for async reading. Same as tier2, plus the public
@@ -165,18 +179,35 @@ tiers:
     # wildcard is the whole point of a research task.
     allowed_tools: "WebSearch WebFetch(domain:*)"
     writes_code: false
+    # Always on the host, whatever the repo says: WebFetch(domain:*) is a
+    # wildcard, and a CONNECT allow-list cannot express one.
+    runtime: host
   tier2-scout:
     description: Reads GitHub through gh. Never modifies a repo, never writes to a project.
     tools: "Read,Grep,Glob,Bash"
     permission_mode: dontAsk
     allowed_tools: *gh_read
     writes_code: false
+    network: proxied
   tier3:
     description: Drafts behind a human gate. Specced tickets only, capped in flight.
     tools: "Read,Grep,Glob,Edit,Write,Bash,TodoWrite"
     permission_mode: acceptEdits
     allowed_tools: *verify_commands
     writes_code: true
+    network: proxied
+  # The review stage's blast radius (PRP-004 §4.3): the engine that did NOT
+  # write a tier-3 branch reads it and renders a verdict. It can diff and
+  # read the log; it cannot edit, so a bad review costs a stage, not a branch.
+  # No task names this tier -- the queue builder puts a ticket here itself
+  # when state/stages says its branch is awaiting review.
+  tier3-review:
+    description: Reads a tier-3 branch and renders a verdict. Never edits.
+    tools: "Read,Grep,Glob,Bash"
+    permission_mode: dontAsk
+    allowed_tools: "Bash(git diff:*) Bash(git log:*) Bash(git show:*)"
+    writes_code: false                            # codex gets -s read-only
+    network: proxied
 
 # ---------------------------------------------------------------------------
 # Task registry. `template` is resolved relative to this file.
@@ -304,10 +335,33 @@ repos: []
 #                                      # every worktree (Android: the SDK path lives
 #                                      # here and nowhere git can see). Relative
 #                                      # paths inside the repo only.
+#   # ---- containers and publishing (PRP-004) --------------------------------
+#   runtime: container                 # run in the Atelier image below instead of
+#                                      # on the host; tiers marked runtime: host
+#                                      # (tier2-web) stay on the host regardless
+#   image:                             # required when runtime is container; both halves
+#     tag: agent-netlens-android:g3f9a1c2   # Atelier's immutable tag: agent-<this name>
+#                                      # or agent-base, and a g<sha>, never :latest
+#     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+#                                      # asserted before every dispatch, so a rebuilt
+#                                      # image is a step-over, not a silent change.
+#                                      # Written by `meute image bump <name>` only,
+#                                      # into repos.local.yaml, never here.
+#   push: true                         # repos: only. A tier-3 branch whose review
+#                                      # verdict is approve becomes a DRAFT PR on
+#                                      # `repo:`; nothing is ever merged
+#   repo: you/netlens-android          # owner/name; required when push is true and
+#                                      # the only source of the push target
+#   auto_merge: false                  # reserved; true is refused
 #   tickets:                           # only consumed by tier-3 tasks
 #     - id: NL-14
 #       title: "Capture service leaks a wakelock when Wi-Fi drops mid-capture"
 #       specced: true                  # tier 3 refuses to touch a ticket without this
+#       engine: claude                 # the build engine for this ticket (beats the
+#                                      # task, the repo and defaults). The review
+#                                      # engine is not a field: it is always the
+#                                      # other one, so a branch is never reviewed by
+#                                      # the engine that wrote it
 #       notes: >
 #         Repro: start a capture, toggle airplane mode. Expected: capture stops
 #         cleanly and the wakelock is released. Fix belongs in CaptureService,
