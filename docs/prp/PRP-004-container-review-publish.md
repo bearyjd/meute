@@ -1,6 +1,6 @@
 # PRP-004 — Container execution, a review stage, and publishing
 
-**Status:** Proposed — hardened from the 2026-09-20 "Cross-Provider Agent
+**Status:** Proposed; **Phase 1 built** (2026-09-22, §11) — hardened from the 2026-09-20 "Cross-Provider Agent
 Dispatch Fleet" PRP by `AUDIT.md`, then rewritten after an adversarial
 review of the first draft (§12). **Phase 2 is blocked on Atelier**
 producing `agent-base` and `tests/smoke.sh` (zero commits there at filing).
@@ -697,8 +697,131 @@ as a build surface. Pushing tier-1 branches.
 
 ## 11. Findings
 
-Empty at filing. Each phase appends what running it disclosed, in the
-form PRP-001 §11 uses.
+Each phase appends what running it disclosed, in the form PRP-001 §11
+uses.
+
+### Phase 1 — schema, plumbing, and log columns (2026-09-22)
+
+Built in an isolated worktree off `docs/prp-004-audit`; the live checkout,
+which the timers execute from, was never on the branch. Plan:
+`.claude/PRPs/plans/prp-004-phase-1.plan.md`. Baseline 487 assertions →
+653, every new one red first. Review: one `code-reviewer` pass (Warning:
+one HIGH, four MEDIUM), a confirmation pass (Approve, two new MEDIUM), a
+final compact pass. The PRP's "Codex, light pass" for this phase **did not
+run**: `codex exec` returned `You've hit your usage limit` — the quota
+condition §1 describes, met on the first day it was asked for. It is owed
+before merge or recorded as skipped in the PR.
+
+What running it disclosed, in the order it changed the design:
+
+- **A stage entry is a profile, not a tier name.** The first build swapped
+  `tier` to `tier3-review` and left `tools`, `permission_mode`,
+  `writes_code`, `allowed_tools`, `network` as the build tier had resolved
+  them — a "never edits" review carrying `Edit`, `acceptEdits` and the
+  repo's gradle allowlist, and `tier3-review`'s absence from a manifest went
+  unnoticed. `run.sh` dispatches on those fields, not the name. `stage_entry`
+  now re-resolves every profile field from the stage's tier (review: all
+  from `tier3-review`, allowlist from that tier only; resolve: from the
+  build tier, keeping the build allowlist it verifies with; publish: no
+  engine profile, `network` pinned `proxied` by constant). A review row with
+  no `tier3-review` declared is a validation error naming the row. §4.3 and
+  §4.4 stand as written; this is what "the tier's" meant.
+- **`--runtime` never changes what runs in Phase 1.** §4.1 says "CLI
+  `--runtime` overrides". Implemented, `--runtime host` on a repo that had
+  opted into `container` ran it on the host and logged `runtime=-`. Refused
+  now, in both directions: `container` on anything → "not available before
+  Phase 2"; `host` accepted only where the manifest already says `host`. A
+  downgrade path, if one is wanted, is Phase 2's to define with an audit
+  trail. Amends §4.1's parenthetical.
+- **Both ticket sources get every gate, on read and on write.**
+  `checked_ticket` ran only over hand-written tickets; a machine ticket
+  with `engine: gpt` validated, and `add-ticket` would write one that the
+  next fire refused — a fleet halt with a wrong diagnosis. Reader and
+  writer now both call `checked_ticket`. PRP-001 §10's rule, extended.
+- **`state/stages` rows carry the build engine.** §4.1 rule 7's field list
+  (`stage`, `branch`, `base`, `build_report`) cannot derive the review
+  engine without it. Column added; row order is `key, stage, branch, base,
+  build_report, engine`. Empty columns and duplicate keys are refused
+  (Python's last-wins and `kv_row`'s first-wins had disagreed on a
+  duplicate). A row that yields a stage entry in no slot — the ticket
+  vanished, or was flipped back to `specced: false` — is reported once per
+  fire from `validate`, and by `doctor` via `list-stages`; `done` rows are
+  finished, not stranded.
+- **`queue` must stay silent on stderr.** `meute promote` reads `queue …
+  2>&1` into `jq`. The stranded-row warning was first emitted from the
+  queue builder; it would have broken `promote` with a false "no task wired"
+  message. Warnings from the manifest layer belong in `validate`, which the
+  runner calls exactly once a fire.
+- **A container repo is fail-closed until Phase 2 exists.** The plan
+  specified aborting stage entries and a container repo with no image; a
+  container repo *with* a valid image would have run on the host silently.
+  Both abort through `abort_entry` with the phase named in `detail=`, and
+  anything whose runtime is not plainly `host` takes the same path.
+- **Rule 1 is strict against the repo's declared runtime.** A repo that
+  declares `container` must carry an image pin even if every task it runs
+  today sits on a host-pinned tier (`tier2-web`). The Codex pass read the
+  mismatch with `resolved_runtime` as a defect; it is deliberate — a pin is
+  cheap, and a task added later would otherwise silently need one. Noted in
+  the code where the runtime resolves.
+- **`network` is required on every tier unless the tier is `runtime:
+  host`.** The plan said "add `network` to `REQUIRED_TIER_KEYS`"; §4.1's own
+  `tier2-web` block (`runtime: host`, no `network`) contradicted that. A
+  host tier that states `network` is refused as meaningless; so is a tier
+  `runtime` other than `host`, and a task-level `runtime`, and
+  `defaults.{network,image,push,auto_merge}` — every level rule 2 did not
+  name is now closed.
+- **`manifest.py` split twice, by feature, as pure moves** (`stages.py`,
+  `manifest_write.py`, `plan_queue.py`), each proven by `ast`: every
+  top-level name byte-identical in exactly one file. The circular import
+  rides a bottom-of-file import block and a `sys.modules["manifest"]` alias
+  for script mode; the three modules say "import manifest first" and
+  nothing in the repo does otherwise. 715 lines.
+- **Podman is called with `timeout 15` and `--`**, resolved through
+  `MEUTE_PODMAN` → `distrobox-host-exec podman` (when `/run/.containerenv`)
+  → `podman`, in `bin/meute`; `lib/container.sh` inherits the three helpers
+  in Phase 2.
+
+- **The tracked manifest was refused by basename, so a symlink walked past
+  it.** Found by the Codex pass, which ran only on the second attempt — the
+  first returned `You've hit your usage limit`, the quota-binding condition
+  §1 describes, met on the day it was first asked for. `refuse_tracked_
+  manifest` compared `os.path.basename(manifest) == "repos.yaml"`; an alias
+  with any other name (`MEUTE_MANIFEST=…/alias.yaml` → `repos.yaml`) passed,
+  and `open(manifest, "w")` followed the link: reproduced against the
+  pre-fix commit, the tracked file's hash changed and the `.bak` landed
+  beside the alias, not beside what was overwritten. The refusal is now an
+  identity test (`realpath`, plus `samefile` against `<root>/repos.yaml`),
+  the write resolves before backing up so the backup sits next to the real
+  file, and `bin/meute`'s and `lib/discover.sh`'s front doors share one
+  helper — while the Python writers keep their own test, because a front
+  door is not a boundary. The bug predates this phase: it came from
+  `add-repo`, and `image bump` inherited it. Three Claude review passes
+  looked straight at that line and read the basename compare as the check
+  it was named for.
+
+- **A tier rule is a migration, and a manifest error stops the fire, not
+  the entry.** Requiring `network` per tier made the running fleet's
+  `repos.local.yaml` invalid: its four tiers predate the key, and §3 step 3
+  validates before anything else, so every slot would have aborted with
+  `tiers.tier1.network: required` — a silent halt of the kind §10b is
+  about, arriving the moment the code merged rather than when a repo opted
+  into anything. Caught by validating the live manifest against the new
+  code before merging, not by the suite, which builds its own fixtures. The
+  private manifest was migrated in place (`network: proxied` on tier1,
+  tier2, tier3; `runtime: host` on tier2-web, matching what `repos.yaml`
+  now declares) and validates under both the old and the new code, so the
+  fleet is correct whichever commit the checkout sits on. The general rule,
+  for every later phase: **a new required key in `repos.yaml` is a change
+  to a file the harness does not track, and the migration is part of the
+  phase.** `tier3-review` is deliberately not added there yet — nothing
+  emits a review row before Phase 4, and the validation error names the
+  tier if one ever appears first.
+
+Carried, not fixed here: `write_with_backup` is `open(…, "w")` then dump,
+not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
+`repos:` when a name appears in both sections (validation allows it). Two
+`requires_specced_ticket` tasks on one repo would each emit a stage entry
+for the same row — Phase 4 dedupes by row, not by task.
 
 ## 12. Review record
 

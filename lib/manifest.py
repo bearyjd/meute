@@ -15,15 +15,26 @@ Subcommands
     list-repos <manifest>            -- name+path for every repo, one JSON object per line
     list-tasks <manifest>            -- name+tier+writes_code+tools+plan_class for every task,
                                         one JSON object per line
+    list-images <manifest>           -- runtime+image tag+digest for every repo, one JSON
+                                        object per line; unvalidated on purpose
+    list-stages <manifest>           -- every state/stages row, one JSON object per line,
+                                        flagged when its key names no ticket
     add-repo <manifest> <json>       -- append a repo; refuses to write repos.yaml
+    set-image-digest <manifest> <repo> <digest>
+                                     -- pin a repo's image.digest; refuses to write repos.yaml
 
 The queue is *candidates only*. Gating that depends on live repo state (weekly
 community share, tier-3 in-flight cap, cursor position) belongs to run.sh.
+
+This file is the schema, the reader and the CLI. Three features live beside
+it and are dispatched from here: lib/stages.py turns state/stages rows into
+stage entries for the queue, lib/plan_queue.py decides what `meute plan` may
+stage and expands the staged plan, and lib/manifest_write.py holds every
+command that writes repos.local.yaml or state/tickets.yaml.
 """
 
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import re
@@ -34,9 +45,31 @@ try:
 except ImportError:  # pragma: no cover - environment problem, not a data problem
     sys.exit("meute: PyYAML is required (pip install --user PyYAML)")
 
+# Run as `python3 lib/manifest.py` this module is `__main__`, yet lib/stages.py
+# and lib/manifest_write.py import it as `manifest`. Without this alias Python
+# would load a second copy under that name, with a second ManifestError that
+# main()'s except clause below would never catch.
+if __name__ == "__main__":
+    sys.modules["manifest"] = sys.modules[__name__]
+
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 VALID_SLOTS = ("daily", "weekly")
 REQUIRED_TIER_KEYS = ("tools", "permission_mode", "writes_code")
+
+# PRP-004 s4.1. Where a run executes, and what a tier's container may reach.
+# `network` is a tier key and nothing else's: the blast radius of a task is
+# the tier's to state, and a repo or ticket must not be able to widen it.
+VALID_RUNTIMES = ("host", "container")
+VALID_NETWORKS = ("none", "proxied")
+VALID_ENGINES = ("claude", "codex")
+# Atelier's immutable tag for this repo's overlay image, or the shared base
+# image when the repo has no overlay. Anything else -- `latest`, a registry
+# prefix, another project's overlay -- is not a pin.
+IMAGE_TAG = re.compile(r"^agent-([A-Za-z0-9._-]+):g[0-9a-f]+$")
+IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+# The owner's GitHub repository, `owner/name`. It is the only source of the
+# push URL and the `-R` for gh; nothing derives it from `git remote`.
+OWNER_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 POLICY_DEFAULTS = {
     "quota_floor_percent": 30,
@@ -56,6 +89,7 @@ ENTRY_DEFAULTS = {
     "model": "sonnet",
     "file_budget": 25,
     "timeout_seconds": 1800,
+    "runtime": "host",
 }
 
 
@@ -127,8 +161,18 @@ def merged_defaults(data: dict) -> dict:
     if not isinstance(supplied, dict):
         raise ManifestError("defaults: must be a mapping")
     defaults.update(supplied)
-    if defaults["engine"] not in ("claude", "codex"):
+    if defaults["engine"] not in VALID_ENGINES:
         raise ManifestError("defaults.engine: must be 'claude' or 'codex'")
+    if defaults["runtime"] not in VALID_RUNTIMES:
+        raise ManifestError("defaults.runtime: must be 'host' or 'container'")
+    # Nothing under PRP-004 s4.1 has a fleet-wide value: egress is a tier's to
+    # declare and the pin and the push are a repo's. A defaults key here would
+    # be read by nothing and look like it was honoured.
+    if "network" in supplied:
+        raise ManifestError("defaults.network: set per tier, not in defaults")
+    for key in ("image", "push", "auto_merge"):
+        if key in supplied:
+            raise ManifestError(f"defaults.{key}: set per repo, not in defaults")
     return defaults
 
 
@@ -148,38 +192,29 @@ def checked_tiers(data: dict) -> dict:
         # web tools" and wave a web tier through a plan that never allowed one.
         if not isinstance(tier["tools"], str):
             raise ManifestError(f"tiers.{name}.tools: must be a comma-separated string")
+        checked_tier_network(name, tier)
     return tiers
 
 
-# What `meute plan` may stage against a never-enrolled repository, decided by
-# the tier's tool list alone. "local" reads the checkout and nothing else.
-# "web" also reaches the public internet -- it sends what it learned about a
-# repository to third parties, so it is an explicit opt-in (--allow-web), never
-# a default. Anything else is "other": Bash, Edit, an MCP server, a tool this
-# file has never heard of. Those come with allowlists an operator reviewed for
-# an enrolled project, so enrollment is the path and no plan flag opens it.
-LOCAL_TOOLS = frozenset({"Read", "Grep", "Glob"})
-WEB_TOOLS = frozenset({"WebSearch", "WebFetch"})
+def checked_tier_network(name: str, tier: dict) -> None:
+    """Every tier states its egress, so a new tier cannot inherit one by omission.
 
-
-def tool_names(tools: str) -> frozenset:
-    """Bare tool names from a comma-separated `tools` string.
-
-    Compared by the prefix before "(", the CLI's own allowlist grammar, so
-    `WebFetch(domain:x)` is WebFetch and not an unknown tool.
+    The one exception is a tier pinned to the host (tier2-web: WebFetch's
+    domain wildcard cannot be expressed as a CONNECT allow-list), and there
+    `network` means nothing -- a host run has the host's network -- so
+    stating one is refused rather than ignored.
     """
-    return frozenset(tool.strip().split("(", 1)[0].strip()
-                     for tool in tools.split(",") if tool.strip())
-
-
-def plan_tier_class(tier: dict) -> str:
-    """local | web | other. Only for tiers that passed checked_tiers."""
-    names = tool_names(tier["tools"])
-    if names <= LOCAL_TOOLS:
-        return "local"
-    if names <= LOCAL_TOOLS | WEB_TOOLS:
-        return "web"
-    return "other"
+    if "runtime" in tier and tier["runtime"] != "host":
+        raise ManifestError(f"tiers.{name}.runtime: only 'host' may be set on a tier")
+    if tier.get("runtime") == "host":
+        if "network" in tier:
+            raise ManifestError(f"tiers.{name}.network: meaningless on a runtime: host tier")
+        return
+    if "network" not in tier:
+        raise ManifestError(
+            f"tiers.{name}.network: required (none or proxied) unless the tier is runtime: host")
+    if tier["network"] not in VALID_NETWORKS:
+        raise ManifestError(f"tiers.{name}.network: must be 'none' or 'proxied'")
 
 
 def checked_tasks(data: dict, tiers: dict, root: str) -> dict:
@@ -201,6 +236,13 @@ def checked_tasks(data: dict, tiers: dict, root: str) -> dict:
         for slot in task.get("slots") or []:
             if slot not in VALID_SLOTS:
                 raise ManifestError(f"tasks.{name}.slots: unknown slot {slot!r}")
+        if "network" in task:
+            raise ManifestError(f"tasks.{name}.network: network is a tier key only")
+        # build_entry's setting() would honour this silently; the runtime is
+        # a property of the repository being worked on, not of the chore.
+        if "runtime" in task:
+            raise ManifestError(
+                f"tasks.{name}.runtime: runtime is set per repo or in defaults, not per task")
     return tasks
 
 
@@ -208,6 +250,7 @@ def checked_projects(data: dict, key: str, tasks: dict, root: str = "") -> list:
     projects = data.get(key) or []
     if not isinstance(projects, list):
         raise ManifestError(f"{key}: must be a list")
+    defaults = merged_defaults(data)
     seen = set()
     for project in projects:
         if not isinstance(project, dict):
@@ -241,6 +284,8 @@ def checked_projects(data: dict, key: str, tasks: dict, root: str = "") -> list:
         for ticket in project.get("tickets") or []:
             if not isinstance(ticket, dict) or not ticket.get("id"):
                 raise ManifestError(f"{key}.{name}.tickets: every ticket needs an id")
+            checked_ticket(f"{key}.{name}.tickets[{ticket['id']}]", ticket)
+        checked_container_fields(key, name, project, defaults)
         files = project.get("worktree_files") or []
         if not isinstance(files, list):
             raise ManifestError(f"{key}.{name}.worktree_files: must be a list of relative paths")
@@ -253,6 +298,76 @@ def checked_projects(data: dict, key: str, tasks: dict, root: str = "") -> list:
                 raise ManifestError(
                     f"{key}.{name}.worktree_files: {rel!r} must be a relative path inside the repo")
     return projects
+
+
+def checked_ticket(where: str, ticket: dict) -> None:
+    """The build engine is the ticket's to choose; the review engine never is.
+
+    It is derived as the other engine when the stage entry is built, because
+    a branch reviewed by the engine that wrote it is not a review. A field
+    for it would be a way to make that happen.
+    """
+    if "network" in ticket:
+        raise ManifestError(f"{where}.network: network is a tier key only")
+    if "review_engine" in ticket:
+        raise ManifestError(
+            f"{where}.review_engine: not a field - the review engine is derived from engine")
+    if "engine" in ticket and ticket["engine"] not in VALID_ENGINES:
+        raise ManifestError(f"{where}.engine: must be 'claude' or 'codex'")
+
+
+def checked_container_fields(key: str, name: str, project: dict, defaults: dict) -> None:
+    """PRP-004 s4.1 rules 1-4, 8, 9 for one repos:/community: entry."""
+    where = f"{key}.{name}"
+    if "runtime" in project and project["runtime"] not in VALID_RUNTIMES:
+        raise ManifestError(f"{where}.runtime: must be 'host' or 'container'")
+    if "network" in project:
+        raise ManifestError(f"{where}.network: network is a tier key only")
+    # Missing is an error, not a default: an image that was not pinned is a
+    # run in whatever `podman` resolves the tag to today. Checked against the
+    # repo's DECLARED runtime, not each task's resolved one: a repo that says
+    # container pins an image even while every task it has sits on a host-
+    # pinned tier -- a pin is cheap, and the next task added would otherwise
+    # need one nobody was told about.
+    runtime = project.get("runtime") or defaults["runtime"]
+    image = project.get("image")
+    if runtime == "container" and not isinstance(image, dict):
+        raise ManifestError(
+            f"{where}.image: tag and digest are required when runtime is container")
+    if image is not None:
+        checked_image(where, name, image, runtime)
+    push = project.get("push", False)
+    if not isinstance(push, bool):
+        raise ManifestError(f"{where}.push: must be true or false")
+    if push and key != "repos":
+        raise ManifestError(f"{where}.push: only repos: entries may push")
+    auto_merge = project.get("auto_merge", False)
+    if not isinstance(auto_merge, bool):
+        raise ManifestError(f"{where}.auto_merge: must be true or false")
+    if auto_merge:
+        raise ManifestError(
+            f"{where}.auto_merge: true is not supported - a draft PR is where meute stops")
+    if key == "repos" and "repo" in project and not OWNER_REPO.match(str(project["repo"])):
+        raise ManifestError(f"{where}.repo: {project['repo']!r} must be owner/name")
+    if push and not project.get("repo"):
+        raise ManifestError(f"{where}.repo: required (owner/name) when push is true")
+
+
+def checked_image(where: str, name: str, image: dict, runtime: str) -> None:
+    """Both halves of the pin when a container needs it; each half's shape whenever present."""
+    if not isinstance(image, dict):
+        raise ManifestError(f"{where}.image: must be a mapping with tag and digest")
+    for field in ("tag", "digest"):
+        if runtime == "container" and not image.get(field):
+            raise ManifestError(f"{where}.image.{field}: required when runtime is container")
+    tag, digest = image.get("tag"), image.get("digest")
+    if tag is not None:
+        match = IMAGE_TAG.match(str(tag))
+        if not match or match.group(1) not in (name, "base"):
+            raise ManifestError(
+                f"{where}.image.tag: {tag!r} must be agent-{name}:g<hex> or agent-base:g<hex>")
+    if digest is not None and not IMAGE_DIGEST.match(str(digest)):
+        raise ManifestError(f"{where}.image.digest: must match {IMAGE_DIGEST.pattern}")
 
 
 def tickets_path(root: str) -> str:
@@ -278,32 +393,28 @@ def load_machine_tickets(root: str) -> dict:
 
 
 def with_machine_tickets(project: dict, machine: dict) -> dict:
-    """Copy of `project` whose ticket list also carries the machine-written ones."""
+    """Copy of `project` whose ticket list also carries the machine-written ones.
+
+    The machine-written source passes the same ticket gate as repos.yaml
+    (PRP-001 s10): expand_tickets honours a ticket's `engine`, and a field
+    the validator never saw is a field nobody chose.
+    """
     extra = machine.get(project["name"]) or []
     if not extra:
         return project
     own = list(project.get("tickets") or [])
     seen = {str(ticket.get("id")) for ticket in own}
     for ticket in extra:
+        if not isinstance(ticket, dict) or not ticket.get("id"):
+            raise ManifestError(f"state/tickets.yaml[{project['name']}]: every ticket needs an id")
         identifier = str(ticket.get("id"))
+        checked_ticket(f"state/tickets.yaml[{project['name']}][{identifier}]", ticket)
         if identifier in seen:
             raise ManifestError(
                 f"ticket id {identifier!r} for {project['name']} exists in both "
                 "repos.yaml and state/tickets.yaml - resolve the clash by hand")
         seen.add(identifier)
     return {**project, "tickets": own + list(extra)}
-
-
-def derive_ticket_id(repo: str, existing: list) -> str:
-    """<INITIALS>-<n>, continuing from the highest n already used for this repo."""
-    parts = [p for p in re.split(r"[^A-Za-z0-9]+", repo) if p]
-    initials = "".join(p[0] for p in parts[:2]).upper() if len(parts) > 1 else repo[:2].upper()
-    highest = 0
-    for ticket in existing:
-        match = re.search(r"(\d+)$", str(ticket.get("id", "")))
-        if match:
-            highest = max(highest, int(match.group(1)))
-    return f"{initials}-{highest + 1}"
 
 
 def load_etiquette(root: str, project: dict) -> dict:
@@ -349,6 +460,7 @@ def build_entry(kind: str, project: dict, task_name: str, task: dict,
                 return source["allowed_tools"]
         return ""
 
+    image = project.get("image") if isinstance(project.get("image"), dict) else None
     return {
         "kind": kind,
         "repo": project["name"],
@@ -370,7 +482,22 @@ def build_entry(kind: str, project: dict, task_name: str, task: dict,
         "timeout_seconds": setting("timeout_seconds"),
         "lenses": task.get("lenses") or [],
         "worktree_files": list(project.get("worktree_files") or []),
+        # PRP-004: where this runs and in what. `network` is the tier's word
+        # on egress and is empty for a host-pinned tier, which has the host's.
+        "runtime": resolved_runtime(project, tier, defaults),
+        "image": {"tag": str(image.get("tag", "")), "digest": str(image.get("digest", ""))}
+                 if image else None,
+        "network": tier.get("network", ""),
+        "push": bool(project.get("push", False)),
+        "stage_entry": False,
     }
+
+
+def resolved_runtime(project: dict, tier: dict, defaults: dict) -> str:
+    """host | container. A tier pinned to the host wins over the repo's choice."""
+    if tier.get("runtime") == "host":
+        return "host"
+    return project.get("runtime") or defaults["runtime"]
 
 
 def build_queue(data: dict, slot: str, root: str) -> list:
@@ -380,10 +507,15 @@ def build_queue(data: dict, slot: str, root: str) -> list:
     tasks = checked_tasks(data, tiers, root)
     entries = []
     machine = load_machine_tickets(root)
+    stages = load_stages(root)
     for kind, key in (("personal", "repos"), ("community", "community")):
         for project in checked_projects(data, key, tasks, root):
             project = with_machine_tickets(project, machine)
             etiquette = load_etiquette(root, project) if kind == "community" else {}
+            # A ticket mid-pipeline goes ahead of the repo's new work: its
+            # branch is already one of the counted ones, and finishing it is
+            # what frees the slot.
+            in_flight, fresh = [], []
             for task_name in project.get("tasks") or []:
                 task = tasks[task_name]
                 slots = task.get("slots") or list(VALID_SLOTS)
@@ -398,108 +530,15 @@ def build_queue(data: dict, slot: str, root: str) -> list:
                 entry = build_entry(kind, project, task_name, task, tier_name,
                                     tiers[tier_name], defaults, root)
                 if task.get("requires_specced_ticket"):
-                    entries.extend(expand_tickets(entry, project, want_specced=True))
+                    for item in expand_tickets(entry, project, stages, tiers, want_specced=True):
+                        (in_flight if item["stage_entry"] else fresh).append(item)
                 elif task.get("requires_candidate_ticket"):
-                    entries.extend(expand_tickets(entry, project, want_specced=False))
+                    fresh.extend(expand_tickets(entry, project, stages, tiers, want_specced=False))
                 else:
-                    entry["key"] = f"{entry['repo']}/{task_name}"
-                    entry["ticket_id"] = ""
-                    entry["ticket_title"] = ""
-                    entry["ticket_notes"] = ""
-                    entries.append(entry)
+                    fresh.append({**entry, "key": f"{entry['repo']}/{task_name}",
+                                  "ticket_id": "", "ticket_title": "", "ticket_notes": ""})
+            entries.extend(in_flight + fresh)
     return entries
-
-
-def build_plan_queue(data: dict, path: str, slot: str, root: str) -> list:
-    """Expand the explicit, machine-owned portfolio plan into runner entries.
-
-    The plan file deliberately contains only repo paths, safe synthetic names,
-    and task names.  All executable settings still come from the manifest, and
-    this boundary refuses every writing tier even if someone edits state by
-    hand.  It is therefore safe for the normal scheduler to prefer a staged
-    plan without enrolling those repositories in repos.local.yaml.
-    """
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            staged = json.load(handle)
-    except json.JSONDecodeError as error:
-        raise ManifestError(f"{path}: invalid plan queue JSON: {error.msg}") from error
-    if not isinstance(staged, dict) or staged.get("version") != 1:
-        raise ManifestError(f"{path}: expected plan queue version 1")
-    declarations = staged.get("entries")
-    if not isinstance(declarations, list):
-        raise ManifestError(f"{path}: entries must be a list")
-    allow_web = staged.get("allow_web", False)
-    if not isinstance(allow_web, bool):
-        raise ManifestError(f"{path}: allow_web must be true or false")
-
-    defaults = merged_defaults(data)
-    tiers = checked_tiers(data)
-    tasks = checked_tasks(data, tiers, root)
-    # A portfolio plan normally stages several read-only lenses for the same
-    # discovered repository.  The executable identity is (synthetic name,
-    # task), not the repository name alone; reject only duplicate identities
-    # so an accidental repeated work item cannot run twice.
-    entries, keys = [], set()
-    for number, declared in enumerate(declarations, start=1):
-        if not isinstance(declared, dict):
-            raise ManifestError(f"{path}: entries[{number}] must be a mapping")
-        name, repo_path, task_name = declared.get("name"), declared.get("path"), declared.get("task")
-        if not isinstance(name, str) or not SAFE_NAME.match(name):
-            raise ManifestError(f"{path}: entries[{number}].name must be a safe identifier")
-        if not isinstance(repo_path, str) or not os.path.isabs(repo_path):
-            raise ManifestError(f"{path}: entries[{number}].path must be an absolute path")
-        if not isinstance(task_name, str) or task_name not in tasks:
-            raise ManifestError(f"{path}: entries[{number}].task is not declared: {task_name!r}")
-        key = f"plan/{name}/{task_name}"
-        if key in keys:
-            raise ManifestError(f"{path}: duplicate staged entry key {key!r}")
-        keys.add(key)
-        task = tasks[task_name]
-        tier_name = task["tier"]
-        if tiers[tier_name]["writes_code"]:
-            raise ManifestError(
-                f"{path}: entries[{number}].task {task_name!r} writes code and cannot be staged")
-        tier_class = plan_tier_class(tiers[tier_name])
-        if tier_class == "other":
-            raise ManifestError(
-                f"{path}: entries[{number}].task {task_name!r} uses tools plan cannot stage")
-        if tier_class == "web" and not allow_web:
-            raise ManifestError(
-                f"{path}: entries[{number}].task {task_name!r} uses web tools and the plan did not allow them")
-        if slot != "all" and slot not in (task.get("slots") or list(VALID_SLOTS)):
-            continue
-        spec = declared.get("spec") or "Unconfigured repository staged for read-only analysis."
-        if not isinstance(spec, str) or not spec.strip() or "\n" in spec:
-            raise ManifestError(f"{path}: entries[{number}].spec must be a non-empty one-line string")
-        project = {"name": name, "path": repo_path, "spec": spec, "tasks": [task_name]}
-        entry = build_entry("plan", project, task_name, task, tier_name,
-                            tiers[tier_name], defaults, root)
-        entry.update({"key": key, "ticket_id": "",
-                      "ticket_title": "", "ticket_notes": ""})
-        entries.append(entry)
-    return entries
-
-
-def expand_tickets(entry: dict, project: dict, want_specced: bool = True) -> list:
-    """One queue entry per ticket on the right side of the human gate.
-
-    want_specced=True  -- tier 3: only tickets a human marked specced: true.
-    want_specced=False -- the reproduce stage: candidates awaiting that decision.
-    """
-    out = []
-    for ticket in project.get("tickets") or []:
-        if bool(ticket.get("specced")) is not want_specced:
-            continue
-        item = dict(entry)
-        item["ticket_id"] = str(ticket["id"])
-        item["ticket_title"] = ticket.get("title", "")
-        item["ticket_notes"] = ticket.get("notes", "")
-        item["key"] = f"{entry['repo']}/{entry['task']}/{item['ticket_id']}"
-        out.append(item)
-    return out
 
 
 def cmd_validate(args: list) -> int:
@@ -507,8 +546,11 @@ def cmd_validate(args: list) -> int:
     root = repo_root(manifest)
     data = load(manifest)
     merged_policy(data)
-    for slot in VALID_SLOTS:
-        build_queue(data, slot, root)
+    entries = [entry for slot in VALID_SLOTS for entry in build_queue(data, slot, root)]
+    # A stranded state/stages row is not a reason to refuse the manifest, but
+    # validate is the one step that runs exactly once per fire, so this is
+    # where the journal hears about it.
+    warn_unconsumed_rows(load_stages(root), consumed_keys(entries))
     print(f"ok: {manifest}")
     return 0
 
@@ -529,16 +571,6 @@ def cmd_queue(args: list) -> int:
     return 0
 
 
-def cmd_plan_queue(args: list) -> int:
-    manifest, path, slot = args[0], args[1], args[2]
-    if slot not in (*VALID_SLOTS, "all"):
-        raise ManifestError(f"unknown slot {slot!r} (expected daily, weekly, or all)")
-    root = repo_root(manifest)
-    for entry in build_plan_queue(load(manifest), path, slot, root):
-        print(json.dumps(entry))
-    return 0
-
-
 def cmd_render(args: list) -> int:
     template, assignments = args[0], args[1:]
     variables = {}
@@ -555,53 +587,6 @@ def cmd_render(args: list) -> int:
     for key, value in variables.items():
         body = body.replace("{{" + key + "}}", value)
     sys.stdout.write(body)
-    return 0
-
-
-def cmd_add_ticket(args: list) -> int:
-    """Append one machine-written ticket. Never touches repos.yaml."""
-    manifest, repo_name, payload = args[0], args[1], args[2]
-    root = repo_root(manifest)
-    data = load(manifest)
-    tasks = checked_tasks(data, checked_tiers(data), root)
-
-    project = None
-    for key in ("repos", "community"):
-        for candidate in checked_projects(data, key, tasks, root):
-            if candidate["name"] == repo_name:
-                project = candidate
-    if project is None:
-        raise ManifestError(f"unknown repo {repo_name!r} - not in repos.yaml")
-
-    try:
-        ticket = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise ManifestError(f"add-ticket: payload is not valid JSON: {error}") from error
-    if not isinstance(ticket, dict) or not ticket.get("title"):
-        raise ManifestError("add-ticket: ticket needs at least a title")
-
-    path = tickets_path(root)
-    stored = {}
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as handle:
-            stored = yaml.safe_load(handle) or {}
-    tickets = stored.get("tickets") or {}
-    existing = list(tickets.get(repo_name) or [])
-
-    known = existing + list(project.get("tickets") or [])
-    if not ticket.get("id"):
-        ticket["id"] = derive_ticket_id(repo_name, known)
-    if str(ticket["id"]) in {str(t.get("id")) for t in known}:
-        raise ManifestError(f"ticket id {ticket['id']!r} already exists for {repo_name}")
-    ticket.setdefault("specced", True)
-
-    updated = {**stored, "tickets": {**tickets, repo_name: existing + [ticket]}}
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("# Tickets written by `meute promote`. Machine-owned - edit repos.yaml\n"
-                     "# for hand-authored tickets instead; this file is rewritten wholesale.\n")
-        yaml.safe_dump(updated, handle, sort_keys=False, default_flow_style=False)
-    print(ticket["id"])
     return 0
 
 
@@ -649,113 +634,49 @@ def cmd_list_tasks(args: list) -> int:
     return 0
 
 
-def cmd_add_repo(args: list) -> int:
-    """Append one repo to a personal manifest. Refuses to touch repos.yaml.
+def cmd_list_images(args: list) -> int:
+    """Raw runtime + image pin for every configured repo, personal and community.
 
-    repos.yaml is the tracked schema doc, hand-written and commented; PyYAML
-    cannot round-trip it without destroying those comments (see
-    load_machine_tickets's docstring for the same reasoning applied to
-    tickets). repos.local.yaml is gitignored and already machine-editable --
-    that split is exactly why this command exists as a separate path instead
-    of extending add-ticket.
+    `meute image bump` and `doctor` read this. Like list-repos it does not
+    validate -- the manifest that needs a digest bump is exactly one that
+    fails rule 1 today, and doctor exists to report a broken manifest.
     """
-    manifest, payload = args[0], args[1]
-    if os.path.basename(manifest) == "repos.yaml":
-        raise ManifestError(
-            "add-repo: refusing to write repos.yaml (tracked schema doc, hand-commented). "
-            "Create repos.local.yaml first -- e.g. `cp repos.yaml repos.local.yaml` -- "
-            "it's gitignored, so no PR is needed for what you add to it.")
-    root = repo_root(manifest)
-
-    try:
-        fields = json.loads(payload)
-    except json.JSONDecodeError as error:
-        raise ManifestError(f"add-repo: payload is not valid JSON: {error}") from error
-    if not isinstance(fields, dict):
-        raise ManifestError("add-repo: payload must be a JSON object")
-    name = fields.get("name")
-    if not name or not SAFE_NAME.match(str(name)):
-        raise ManifestError(f"add-repo: name {name!r} must match {SAFE_NAME.pattern}")
-    if not fields.get("path"):
-        raise ManifestError("add-repo: path is required")
-    if not fields.get("spec"):
-        raise ManifestError("add-repo: spec is required (one line, injected into every prompt)")
-
-    data = load(manifest)
-    new_path = expand(str(fields["path"]))
+    data = load(args[0])
+    defaults = data.get("defaults") if isinstance(data.get("defaults"), dict) else {}
     for key in ("repos", "community"):
         for project in data.get(key) or []:
-            if not isinstance(project, dict):
+            if not isinstance(project, dict) or not project.get("name"):
                 continue
-            if project.get("name") == name:
-                raise ManifestError(f"add-repo: name {name!r} is already configured under {key}")
-            if project.get("path") and expand(str(project["path"])) == new_path:
-                raise ManifestError(
-                    f"add-repo: path {new_path!r} is already configured as "
-                    f"{project.get('name')!r} under {key}")
-
-    new_project = {"name": name, "path": fields["path"], "spec": fields["spec"]}
-    if fields.get("default_branch"):
-        new_project["default_branch"] = fields["default_branch"]
-    new_project["tasks"] = list(fields.get("tasks") or [])
-
-    new_data = {**data, "repos": list(data.get("repos") or []) + [new_project]}
-
-    # Validate the *merged* document, the same way `validate` does, before
-    # touching disk -- a bad payload must never leave the real file corrupt
-    # or half-written.
-    tiers = checked_tiers(new_data)
-    tasks = checked_tasks(new_data, tiers, root)
-    checked_projects(new_data, "repos", tasks, root)
-    merged_policy(new_data)
-    for slot in VALID_SLOTS:
-        build_queue(new_data, slot, root)
-
-    backup = f"{manifest}.bak"
-    with open(manifest, "r", encoding="utf-8") as handle:
-        original = handle.read()
-    with open(backup, "w", encoding="utf-8") as handle:
-        handle.write(original)
-    with open(manifest, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(new_data, handle, sort_keys=False, default_flow_style=False)
-    print(name)
+            image = project.get("image") if isinstance(project.get("image"), dict) else {}
+            print(json.dumps({
+                "kind": key,
+                "name": project["name"],
+                "runtime": project.get("runtime") or defaults.get("runtime") or ENTRY_DEFAULTS["runtime"],
+                "tag": str(image.get("tag") or ""),
+                "digest": str(image.get("digest") or ""),
+            }))
     return 0
 
 
-def cmd_mark_delivered(args: list) -> int:
-    """Retire a machine-written ticket once tier 3 has produced a branch for it.
-
-    Without this a ticket stays `specced: true` forever and every weekly slot
-    re-drafts work that is already sitting on a branch awaiting review.
-    Hand-written tickets in repos.yaml are left alone -- that file is yours.
-    """
-    manifest, repo_name, ticket_id, branch = args[0], args[1], args[2], args[3]
-    root = repo_root(manifest)
-    path = tickets_path(root)
-    if not os.path.isfile(path):
-        return 0
-    with open(path, "r", encoding="utf-8") as handle:
-        stored = yaml.safe_load(handle) or {}
-    tickets = stored.get("tickets") or {}
-    entries = tickets.get(repo_name) or []
-    found = False
-    updated = []
-    for ticket in entries:
-        if str(ticket.get("id")) == str(ticket_id) and ticket.get("specced"):
-            ticket = {**ticket, "specced": False,
-                      "delivered_branch": branch,
-                      "delivered": datetime.date.today().isoformat()}
-            found = True
-        updated.append(ticket)
-    if not found:
-        return 0
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("# Tickets written by `meute promote`. Machine-owned - edit repos.yaml\n"
-                     "# for hand-authored tickets instead; this file is rewritten wholesale.\n")
-        yaml.safe_dump({**stored, "tickets": {**tickets, repo_name: updated}},
-                       handle, sort_keys=False, default_flow_style=False)
-    print(ticket_id)
-    return 0
+# The stage machine, the plan queue and the machine-write path import this
+# module's schema by name, so they are imported here, below every definition
+# they need: at this point `from manifest import ...` inside them resolves,
+# and the queue builder, list-tasks and COMMANDS see their functions as
+# plain names.
+from plan_queue import cmd_plan_queue, plan_tier_class  # noqa: E402
+from stages import (  # noqa: E402
+    cmd_list_stages,
+    consumed_keys,
+    expand_tickets,
+    load_stages,
+    warn_unconsumed_rows,
+)
+from manifest_write import (  # noqa: E402
+    cmd_add_repo,
+    cmd_add_ticket,
+    cmd_mark_delivered,
+    cmd_set_image_digest,
+)
 
 
 COMMANDS = {
@@ -768,7 +689,10 @@ COMMANDS = {
     "mark-delivered": (cmd_mark_delivered, 4),
     "list-repos": (cmd_list_repos, 1),
     "list-tasks": (cmd_list_tasks, 1),
+    "list-images": (cmd_list_images, 1),
+    "list-stages": (cmd_list_stages, 1),
     "add-repo": (cmd_add_repo, 2),
+    "set-image-digest": (cmd_set_image_digest, 3),
 }
 
 

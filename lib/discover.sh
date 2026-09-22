@@ -6,7 +6,8 @@
 # yet and interactively adds the ones you pick. Only ever writes
 # repos.local.yaml; lib/manifest.py add-repo refuses repos.yaml itself.
 #
-# Expects from the caller: MEUTE_ROOT, MANIFEST_PY, MANIFEST, dir_id, note, die.
+# Expects from the caller: MEUTE_ROOT, MANIFEST_PY, MANIFEST, dir_id,
+# manifest_is_tracked, note, die.
 
 # The branch a repo's audits and drafts should be cut from: what origin calls
 # its default, else main, else master, else whatever is checked out. NOT
@@ -34,7 +35,7 @@ cmd_discover() {
   local scan_dir
   scan_dir="$(cd "$requested" 2>/dev/null && pwd)" || die "discover: no such directory: ${requested}"
 
-  [[ "$(basename "$MANIFEST")" != "repos.yaml" ]] \
+  ! manifest_is_tracked \
     || die "discover: no repos.local.yaml found -- create one first: cp repos.yaml repos.local.yaml (it's gitignored, so nothing you add to it needs a PR)"
 
   # Paths already configured, personal or community -- and this checkout
