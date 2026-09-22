@@ -6,11 +6,14 @@ state/.lock
 state/.kv.*
 .omc/
 # Your real fleet config: names your projects and describes what they do.
-# The harness is public; that list is yours.
-repos.local.yaml
-# `manifest.py add-repo` writes this before every edit, so `meute discover`
-# is recoverable. It is a copy of the gitignored manifest; it stays out too.
-repos.local.yaml.bak
+# The harness is public; that list is yours. Anchored on the prefix, because
+# every copy is the same list: `manifest.py add-repo` and `image bump` write
+# `.bak` before every edit so `meute discover` is recoverable, and a human
+# migrating the schema takes a dated one. Naming them individually left the
+# next copy untracked and visible, which is how this rule was found.
+repos.local.yaml*
+# A write-then-rename beside the manifest would land here.
+.repos.local.*
 
 # Everything about YOUR fleet stays local. The harness is public; what it
 # found in your private code, and which repos it even looks at, is not.

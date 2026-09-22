@@ -744,6 +744,23 @@ test_plan_state_ignored() {
   done
 }
 
+# `repos.local.yaml` and one exact backup name were listed individually, so
+# any other copy of the fleet config -- a dated backup taken before a schema
+# migration, the one a human makes before an edit -- was untracked and
+# visible. It is the same list of private repositories as the manifest, and
+# the harness is public. The rule is anchored on the prefix so every copy is
+# covered by the name it already has.
+test_private_manifest_copies_ignored() {
+  local f
+  for f in repos.local.yaml repos.local.yaml.bak \
+           repos.local.yaml.pre-prp004-20260922 \
+           repos.local.yaml.2026-09-22 repos.local.yaml.orig \
+           .repos.local.abc123; do
+    is "gitignore: ${f} never reaches the public harness" \
+      "$(git -C "$REPO" check-ignore -q -- "$f"; echo $?)" "0"
+  done
+}
+
 # The web gate reads a tier's `tools` as a comma-separated string. A YAML
 # list would read as "no web tools" and let a web entry through a plan that
 # never allowed one, so the shape is checked where every command validates.
@@ -3476,6 +3493,7 @@ test_suggest_features_queued
 test_add_repo
 test_discover
 test_plan_state_ignored
+test_private_manifest_copies_ignored
 test_tier_tools_must_be_string
 test_plan_tier_class
 test_plan_identity
