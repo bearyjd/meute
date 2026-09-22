@@ -3,6 +3,9 @@
 - **Status:** phase 1 implemented and accepted
 - **Created:** 2026-08-28
 - **Amended:** 2026-08-28 — subscription-only; API-key mode removed (see §7)
+- **See also:** PRP-004 (proposed, 2026-09-21) would amend §3 step 10 for
+  repos that opt in — scratch branches pushed as draft PRs; the runner still
+  never merges. Not in force until PRP-004 Phase 5 is accepted.
 - **Licence:** AGPL-3.0
 
 ## 1. Problem
