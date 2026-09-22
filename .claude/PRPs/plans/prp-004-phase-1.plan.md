@@ -127,3 +127,14 @@ block and validates.
 ## Out of scope
 `lib/container.sh`, the clone, in-container preflight, the review
 template, `lib/publish.sh`, `state/prs`, demotion, `meute prune`.
+
+## Outcome (2026-09-22)
+Built as five commits: feature, pure-move split (`stages.py`,
+`manifest_write.py`), review fixes, pure-move split (`plan_queue.py`), final
+fixes. 487 → 653 assertions, all new ones red first. Fourteen deviations from
+the decisions above were made deliberately and are recorded in PRP-004 §11
+("Phase 1"); the ones that changed the spec: `--runtime` never changes what
+runs in this phase; `network` is required per tier unless `runtime: host`;
+`state/stages` rows carry the build engine; stranded-row warnings come from
+`validate`, not `queue`. Reviewed by `code-reviewer` (Warning → Approve
+across three passes); the Codex light pass could not run — quota exhausted.
