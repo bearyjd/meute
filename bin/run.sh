@@ -189,6 +189,27 @@ cursor_key() {
   if (( PLAN_MODE )); then printf 'plan-cursor.%s\n' "$SLOT"; else printf 'cursor.%s\n' "$SLOT"; fi
 }
 
+# Would this entry be dispatched into a container, and is there a pin to
+# assert? A container entry whose image drifted, or whose egress proxy is
+# down, is stepped OVER -- not skipped: skip() ends the fire without
+# advancing the cursor, so every repo behind this one would starve on a
+# condition that has nothing to do with them. The fire runs the next
+# candidate instead, and doctor names what is wrong (PRP-004 Phase 2).
+#
+# `--runtime container` on a repo with no `image:` at all is deliberately NOT
+# claimed here: that is rule 5, which fails closed in run_entry with the
+# validator's own message and a state/log line. Everything that could
+# actually reach a container -- a repo whose manifest says so, or a CLI
+# override on a repo that has a pin -- is asserted first.
+container_entry_needs_pin() {
+  local entry="$1"
+  # `--runtime host` asks for the host, so no image would be run and there is
+  # nothing to assert -- run_entry refuses that downgrade on its own terms.
+  [[ "$RUNTIME_OVERRIDE" != "host" ]] || return 1
+  [[ "$(jq -r '.runtime // ""' <<< "$entry")" == "container" ]] && return 0
+  [[ "$RUNTIME_OVERRIDE" == "container" && -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]]
+}
+
 eligible() {
   local entry="$1" key kind path tier engine stage_entry
   { read -r key; read -r kind; read -r path; read -r tier; read -r engine; read -r stage_entry; } \
@@ -203,8 +224,17 @@ eligible() {
     (( PLAN_MODE )) && kv_set "$PLAN_DONE_FILE" "$key" missing
     return 1
   fi
-  # A forced selection is an explicit human decision; only the path check
-  # stands. That includes re-running a staged item already attempted.
+  # A forced selection is an explicit human decision about the QUEUE: it
+  # skips the share, cap and quota gates below. It does not skip the
+  # boundary's own readiness -- a drifted pin is not a gate the operator is
+  # overriding, it is an image they did not choose and cannot see. Phase 1's
+  # abort catches this today; Phase 2b removes that abort, and then a forced
+  # run would be the one dispatch with no digest assert in front of it.
+  if container_entry_needs_pin "$entry" && ! container_ready "$entry"; then
+    note "skipping ${key}: ${CONTAINER_BLOCKED}"
+    return 1
+  fi
+  # That includes re-running a staged item already attempted.
   (( FORCED )) && return 0
 
   if (( PLAN_MODE )) && [[ -n "$(kv_get "$PLAN_DONE_FILE" "$key")" ]]; then
@@ -224,16 +254,6 @@ eligible() {
       note "skipping ${key}: ${in_flight} tier-3 drafts already in flight (cap ${TIER3_CAP})"
       return 1
     fi
-  fi
-  # A container entry whose image drifted, or whose egress proxy is down, is
-  # stepped OVER -- not skipped: skip() ends the fire without advancing the
-  # cursor, so every repo behind this one would starve on a condition that
-  # has nothing to do with them. The fire runs the next candidate instead,
-  # and doctor names what is wrong (PRP-004 Phase 2, lib/container.sh).
-  if [[ "$(jq -r '.runtime // ""' <<< "$entry")" == "container" ]] \
-     && ! container_ready "$entry"; then
-    note "skipping ${key}: ${CONTAINER_BLOCKED}"
-    return 1
   fi
   # A publish stage runs no engine, so there is no pool to ask about.
   [[ -n "$engine" ]] || return 0
@@ -571,13 +591,20 @@ run_entry() {
   local rc=0
   # lib/engines.sh builds the argv and runs nothing; the working directory,
   # the timeout and the redirection are supplied here because they differ on
-  # the two sides of the container boundary. This is the host side.
+  # the two sides of the container boundary. This is the host side, and it
+  # runs each engine exactly where it has always run: claude from inside the
+  # worktree (under dontAsk a read outside cwd is refused), codex from the
+  # runner's own cwd with --cd naming the worktree. They are not unified,
+  # because what codex's `-s workspace-write` derives its writable root from
+  # -- cwd or --cd -- is unverified (PRP-004 §8), and moving the process
+  # would change the sandbox's shape on a guess.
+  local -a engine_cd=()
   case "$engine" in
-    claude) engine_argv_claude "$prompt_file" ;;
-    codex)  engine_argv_codex  "$prompt_file" "$WORKTREE" "$CODEX_LAST" ;;
+    claude) engine_argv_claude "$prompt_file"; engine_cd=( cd "$WORKTREE" ) ;;
+    codex)  engine_argv_codex  "$prompt_file" "$WORKTREE" "$CODEX_LAST"; engine_cd=( : ) ;;
     *) die "unknown engine: $engine" ;;
   esac
-  ( cd "$WORKTREE" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
+  ( "${engine_cd[@]}" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
       "${ENGINE_ENV[@]}" "${ENGINE_ARGV[@]}" ) > "$out" 2> "$err" || rc=$?
   case "$engine" in
     claude) extract_claude "$out" || true ;;

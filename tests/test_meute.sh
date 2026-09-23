@@ -3012,8 +3012,12 @@ STUB
   # A repo that opted into containers has nothing to run in before Phase 2;
   # the host must not quietly stand in for the isolation it asked for.
   p4_fixture "$root"
+  # The fixture pins an image this host does not have, so the boundary now
+  # refuses it in eligible() -- earlier than Phase 1's abort, and without a
+  # state/log line, because an entry that was never selected did not run.
   out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
-  has   "runtime: a container repo is refused until the credentials exist" "$out" "detail=container runtime needs the credential volumes; see PRP-004 §5 item 3"
+  has   "runtime: a container repo with an unverifiable pin is refused" "$out" "is not present on this host"
+  hasnt "runtime: ...and never reaches the credential abort"            "$out" "status=error"
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran" "the stub was invoked" || ok "runtime: ...and no engine ran"
   # Nor may the CLI talk it down: a repo that opted into isolation runs
   # isolated or not at all. --runtime never changes what runs in Phase 1.
@@ -3036,8 +3040,8 @@ STUB
   # not this fire would have invoked anything.
   : > "$root/state/cursor"
   out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --dry-run 2>&1)"
-  has   "runtime: --dry-run on a container entry still logs the error" "$out" "status=error"
-  is    "runtime: ...and still advances the cursor"                     "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  has   "runtime: --dry-run is refused at the same boundary" "$out" "is not present on this host"
+  hasnt "runtime: ...without inventing a run"                "$out" "would run:"
 }
 
 # Rule 6: the build engine is per ticket; the review engine is derived.
@@ -3446,6 +3450,9 @@ STUB
 # the reason -- a skipped isolation proof is visible; a faked one is not.
 readonly P2_IMAGE="agent-base:g691e067"
 readonly P2_DIGEST="sha256:9ac5558d3ffd9acb1d76948a8f4d99f6bcbb19fccfb95fb6295616dc0f1c999d"
+# The immutable ID the digest assert resolves to. A tag is a moving name; this
+# is what podman is actually given, so a re-tag between the two cannot swap it.
+readonly P2_ID="2e1dd114a47a8b0add24769829a16e88363f490c719238829eb007ae008e27f8"
 
 # The podman this host reaches, resolved the way lib/container.sh resolves it.
 p2_podman() {
@@ -3483,14 +3490,22 @@ p2_source_repo() {
 # is pinned field by field rather than spot-checked.
 test_p2_container_argv() {
   local root="$FIXTURE/p2-argv"; mkdir -p "$root/stub" "$root/work" "$root/out"
-  printf '#!/usr/bin/env bash\necho 10.89.14.10\n' > "$root/stub/podman"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
+  *"{{.Digest}}"*) printf '%s\n' "$P2_DIGEST" ;;
+  *) printf '10.89.14.10\n' ;;
+esac
+STUB
   chmod +x "$root/stub/podman"
   local entry argv
   entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
     '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:1800}')"
 
   ( source "$REPO/lib/container.sh"
-    MEUTE_PODMAN="$root/stub/podman" container_argv "$entry" build "$root/work" "$root/out" -- git status
+    MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
+    container_argv "$entry" build "$root/work" "$root/out" -- git status
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-none"
   argv="$(tr '\n' ' ' < "$root/argv-none")"
 
@@ -3506,7 +3521,12 @@ test_p2_container_argv() {
   has "argv: the cwd is the scratch tree"     "$argv" "--workdir /work"
   has "argv: the run is bounded"              "$argv" "--timeout 1800"
   has "argv: ...and so is the stop"           "$argv" "--stop-timeout"
-  has "argv: the image is named"              "$argv" "$P2_IMAGE"
+  # The pin is verified against a tag, but a tag is a moving name: anything
+  # that re-tags the image between the assert and the run would substitute
+  # what executes. podman is given the immutable ID the assert resolved.
+  has   "argv: the verified image ID is what runs"   "$argv" "$P2_ID"
+  hasnt "argv: ...and the tag never reaches podman"  "$argv" "$P2_IMAGE"
+  has   "argv: a vanished image is an error, not a pull" "$argv" "--pull=never"
   has "argv: the command follows the image"   "$argv" "git status"
   # The owner's checkout is never mounted, and no host path reaches the
   # container except the two scratch directories this phase creates.
@@ -3517,8 +3537,9 @@ test_p2_container_argv() {
   hasnt "argv (none): and no host alias"      "$argv" "--add-host"
 
   ( source "$REPO/lib/container.sh"
-    MEUTE_PODMAN="$root/stub/podman" \
-      container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build "$root/work" "$root/out" -- git status
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build "$root/work" "$root/out" -- git status
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-proxied"
   argv="$(tr '\n' ' ' < "$root/argv-proxied")"
   has "argv (proxied): on the internal network"      "$argv" "--network=atelier-internal"
@@ -3531,8 +3552,9 @@ test_p2_container_argv() {
   # The preflight of Phase 2b is the one stage that takes no network at all,
   # whatever the tier says, because it only reads a credential.
   ( source "$REPO/lib/container.sh"
-    MEUTE_PODMAN="$root/stub/podman" \
-      container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight "$root/work" "$root/out" -- true
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight "$root/work" "$root/out" -- true
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-pre"
   argv="$(tr '\n' ' ' < "$root/argv-pre")"
   has   "argv (preflight): takes no network whatever the tier says" "$argv" "--network=none"
@@ -3576,6 +3598,8 @@ SH
   entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
     '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:120}')"
   out="$( source "$REPO/lib/container.sh"
+          container_ready "$entry" >/dev/null 2>&1 \
+            || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
           BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" \
           container_run "$entry" build "$root/work" "$root/out" -- \
             env BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" sh -c "$probe" 2>&1 )"
@@ -3714,6 +3738,7 @@ test_p2_fail_closed() {
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
+  *"image inspect"*"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
   *"image inspect"*) printf '%s\n' "\${STUB_DIGEST-$P2_DIGEST}" ;;
   *"container inspect"*"State.Running"*) printf '%s\n' "\${STUB_EGRESS:-true}" ;;
   *"NetworkSettings"*) printf '%s\n' "\${STUB_IP-10.89.14.10}" ;;
@@ -3727,6 +3752,11 @@ STUB
         && printf 'ready\n' || printf '%s\n' "$CONTAINER_BLOCKED" ) 2>/dev/null
   }
   is "fail closed: a matching pin and a live proxy are ready" "$(ready)" "ready"
+  # The ID the assert resolved is what the caller must run.
+  is "fail closed: a verified pin exports the image ID" \
+     "$( source "$REPO/lib/container.sh"
+         MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
+         printf '%s\n' "${CONTAINER_IMAGE_ID:-unset}" )" "$P2_ID"
   has "fail closed: a drifted image is not" \
       "$(STUB_DIGEST=sha256:$(printf 'f%.0s' {1..64}) ready)" \
       "alpha: image ${P2_IMAGE} is not at the pinned digest"
@@ -3793,6 +3823,20 @@ d["repos"].append(beta); d["community"] = []'
   hasnt "step-over: ...and it is not the drifted repo's"   "$(cat "$root/state/log")" "repo=netlens"
   is    "step-over: the cursor sits on the entry that ran" \
         "$(kv_get_test "$root/state/cursor" cursor.daily)" "beta/audit-security"
+
+  # --repo is a human overriding the QUEUE's gates (share, cap, quota), not
+  # the boundary's readiness: a forced run on a drifted pin is the one case
+  # where the operator is least able to see what they would be running.
+  local forced
+  forced="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+            "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has   "step-over: a forced selection is still refused on a drifted pin" \
+        "$forced" "is not at the pinned digest"
+  hasnt "step-over: ...and never reaches the engine" "$forced" "status=ok"
+  # Forced and nothing else eligible: the fire declines, as it does for any
+  # empty round. A decline is one line; a run that never happened is none.
+  has   "step-over: ...and the forced fire declines rather than running something else" \
+        "$forced" "status=skipped"
 }
 
 # `meute container probe <repo>`: what a human runs to see whether a repo is
@@ -3892,6 +3936,9 @@ test_p2_proxied_egress() {
 getent hosts atelier-egress >/dev/null 2>&1 && echo "addhost=resolved" || echo "addhost=failed"
 echo "https_upper=${HTTPS_PROXY:-unset}"
 echo "https_lower=${https_proxy:-unset}"
+echo "http_upper=${HTTP_PROXY:-unset}"
+echo "http_lower=${http_proxy:-unset}"
+echo "plain=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://github.com/ 2>/dev/null)"
 echo "noproxy=${NO_PROXY-unset}"
 echo "allowed=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://github.com/ 2>/dev/null)"
 curl -s -o /dev/null --max-time 20 https://example.com/ 2>/dev/null
@@ -3899,12 +3946,20 @@ echo "denied_rc=$?"
 SH
 )"
   out="$( source "$REPO/lib/container.sh"
+          container_ready "$entry" >/dev/null 2>&1 \
+            || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
           container_run "$entry" build "$root/work" "$root/out" -- sh -c "$probe" 2>&1 )"
   local field; field() { grep -m1 "^$1=" <<< "$out" | cut -d= -f2-; }
   is "egress: the proxy resolves through --add-host, not DNS" "$(field addhost)"    "resolved"
   is "egress: HTTPS_PROXY is set inside"                      "$(field https_upper)" "http://atelier-egress:3128"
   is "egress: ...and https_proxy, for clients that read only that spelling" "$(field https_lower)" "http://atelier-egress:3128"
   is "egress: nothing is exempted from the proxy"             "$(field noproxy)"    ""
+  # Plain http has its own pair, and curl reads only the lowercase one there:
+  # it refuses uppercase HTTP_PROXY on purpose, because a CGI request header
+  # called `Proxy:` lands in the environment under exactly that name.
+  is "egress: HTTP_PROXY is set inside"                       "$(field http_upper)" "http://atelier-egress:3128"
+  is "egress: ...and http_proxy, the only one curl reads"     "$(field http_lower)" "http://atelier-egress:3128"
+  is "egress: a plain-http fetch goes through the allow-list too" "$(field plain)"   "301"
   is "egress: an allow-listed host is reachable"              "$(field allowed)"    "200"
   # Not a timeout and not a DNS failure: the proxy refused the CONNECT.
   is "egress: a host off the allow-list is refused"           "$(field denied_rc)"  "56"
@@ -3982,13 +4037,113 @@ PY
   local codex_pwd codex_cd
   codex_pwd="$(cat "$root/stub/codex-pwd" 2>/dev/null || echo none)"
   codex_cd="$(cat "$root/stub/codex-cd" 2>/dev/null || echo none)"
+  # codex names its working directory rather than inheriting it, and on the
+  # host it has always run from the runner's own cwd. The argv split must not
+  # change that: what `-s workspace-write` derives its writable root from --
+  # cwd or --cd -- is unverified (PRP-004 §8), so moving the process is a
+  # change to the sandbox's shape that nobody has measured.
   case "$codex_pwd" in
-    "$root"/.worktrees/c-t-*) ok "cwd: codex is started inside the run's worktree too" ;;
-    *) bad "cwd: codex is started inside the run's worktree too" "started in [$codex_pwd]" ;;
+    "$root"/.worktrees/c-t-*) bad "cwd: codex on the host keeps the runner's cwd" "it was moved into the worktree" ;;
+    *) ok "cwd: codex on the host keeps the runner's cwd" ;;
   esac
-  # The contract, not the coincidence: the directory codex is told to use is
-  # the one it is started in. They were allowed to differ before the split.
-  is "cwd: codex's --cd is the directory it was started in" "$codex_cd" "$codex_pwd"
+  case "$codex_cd" in
+    "$root"/.worktrees/c-t-*) ok "cwd: ...and is told the worktree through --cd, as before" ;;
+    *) bad "cwd: ...and is told the worktree through --cd, as before" "--cd was [$codex_cd]" ;;
+  esac
+  [[ "$codex_cd" != "$codex_pwd" ]] \
+    && ok "cwd: the two differ on the host, which is the behaviour that shipped" \
+    || bad "cwd: the two differ on the host, which is the behaviour that shipped" "both were [$codex_pwd]"
+}
+
+
+# podman's --timeout bounds the CONTAINER; it does nothing about a podman
+# client or control-plane call that stalls. Under a timer that is the whole
+# fleet wedged behind one flock, so the run carries its own wall clock --
+# deliberately slack above the inner one, so it can only fire when podman
+# itself is stuck rather than pre-empting a run that is merely slow.
+test_p2_outer_bound() {
+  source "$REPO/lib/container.sh"
+  is "outer bound: slack above the container's own timeout" \
+     "$(container_outer_bound 1800)" "$(( 1800 + 30 + 60 ))"
+  is "outer bound: ...at every size"  "$(container_outer_bound 60)" "$(( 60 + 30 + 60 ))"
+  # A missing or unreadable timeout is not a licence to run forever.
+  is "outer bound: a missing timeout still has one" "$(container_outer_bound "")" "$(( 1800 + 30 + 60 ))"
+  is "outer bound: so does a nonsense one"          "$(container_outer_bound abc)" "$(( 1800 + 30 + 60 ))"
+  # The wiring itself: a stalled podman must be killed, not waited on. There
+  # is no way to assert this without waiting out a real bound, so the call is
+  # pinned by reading it -- the same way the --runtime guard is.
+  is "outer bound: container_run wraps podman in that wall clock" \
+     "$(grep -c 'timeout --kill-after="\$CONTAINER_STOP_TIMEOUT" "\$(container_outer_bound' "$REPO/lib/container.sh")" "1"
+}
+
+# The pin verifying is what makes Phase 1's abort reachable at all. With a
+# real image the entry passes eligible() and reaches run_entry, which still
+# refuses to dispatch it -- that refusal is the one keeping an unverifiable
+# engine run out of a timer fire, so it needs a test that proves it fires
+# rather than one that only proves something earlier fired first.
+test_p2_credential_abort() {
+  if ! p2_image_present; then
+    skip "credentials: the abort a verified pin reaches" "${P2_IMAGE} is not on this host (expected in CI)"
+    return 0
+  fi
+  local root="$FIXTURE/p2-cred"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+echo invoked >> "$(dirname "$0")/invocations"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['image'] = {'tag': '$P2_IMAGE', 'digest': '$P2_DIGEST'}
+d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has "credentials: a verified pin gets past the boundary check" "$out" "status=error"
+  has "credentials: ...and run_entry refuses to dispatch it"     "$out" "detail=container runtime needs the credential volumes; see PRP-004 §5 item 3"
+  [[ -f "$root/stub/invocations" ]] \
+    && bad "credentials: ...with no engine run" "the stub was invoked" \
+    || ok "credentials: ...with no engine run"
+  is  "credentials: the entry is logged once and stepped past" \
+      "$(grep -c 'repo=netlens' "$root/state/log")" "1"
+}
+
+# The probe makes two scratch directories. If the second cannot be made, the
+# first must still go: a leaked clone of a private repo under /tmp is exactly
+# what the boundary exists to avoid. Needs no image -- the failure is before
+# any container starts.
+test_p2_probe_cleanup() {
+  local root="$FIXTURE/p2-probe-clean"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub" "$root/tmp"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
+  *"{{.Digest}}"*) printf '%s\n' "$P2_DIGEST" ;;
+  *) exit 125 ;;
+esac
+STUB
+  # Succeeds for the scratch clone, fails for the capture directory.
+  cat > "$root/stub/mktemp" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *meute-probe-out-*) echo "mktemp: stubbed failure" >&2; exit 1 ;;
+  *) exec /usr/bin/mktemp "$@" ;;
+esac
+STUB
+  chmod +x "$root/stub/podman" "$root/stub/mktemp"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['image'] = {'tag': '$P2_IMAGE', 'digest': '$P2_DIGEST'}"
+
+  local out rc
+  out="$(PATH="$root/stub:$PATH" TMPDIR="$root/tmp" MEUTE_PODMAN="$root/stub/podman" \
+         "$root/bin/meute" container probe netlens 2>&1)"; rc=$?
+  is "probe cleanup: a failed second mktemp fails the probe" "$rc" "1"
+  is "probe cleanup: ...and the first scratch tree is still removed" \
+     "$(ls "$root/tmp" 2>/dev/null | wc -l)" "0"
 }
 
 # ------------------------------------------------------------------- main ---
@@ -4061,9 +4216,12 @@ test_p2_scratch_import
 test_p2_fail_closed
 test_p2_step_over
 test_p2_engine_cwd
+test_p2_outer_bound
 test_p2_isolation
 test_p2_proxied_egress
 test_p2_container_probe
+test_p2_credential_abort
+test_p2_probe_cleanup
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

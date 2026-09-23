@@ -358,7 +358,7 @@ Fixed by Atelier's audit; Meute does not re-decide them:
 | Digest assert | `podman image inspect --format '{{.Digest}}'` must equal the manifest's `digest` | 3.2 |
 | Run flags | `--userns=keep-id:uid=1000,gid=1000 --volume "$SCRATCH:/work:Z" --cap-drop=ALL --security-opt=no-new-privileges --init --pids-limit=2048 --rm` | 4.3 |
 | Podman wrapper | `distrobox-host-exec podman` when `/run/.containerenv` exists; `MEUTE_PODMAN` override | 4.4 |
-| Egress proxy | `atelier-egress` on the internal network; `HTTPS_PROXY` **and** `https_proxy` (curl ignores the uppercase form) injected at `podman run`; the internal subnet is pinned in Atelier's Justfile and the proxy's `Allow` is narrowed to it | 4.2, response below |
+| Egress proxy | `atelier-egress` on the internal network; all four of `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy` injected at `podman run`; the internal subnet is pinned in Atelier's Justfile and the proxy's `Allow` is narrowed to it. Measured on `agent-base:g691e067` in Phase 2a: curl honours either spelling of the **https** pair, and of the **http** pair only the lowercase one — it refuses uppercase `HTTP_PROXY` by design, because a CGI request header named `Proxy:` arrives in the environment under that name. An earlier draft of this row scoped that refusal to `HTTPS_PROXY`, which is wrong; other clients read the spelling curl will not, so all four are set | 4.2, response below, Phase 2a measurement |
 | Proxy name resolution | `atelier-internal` is created with `--disable-dns` (podman ordered the proxy's nameservers non-deterministically on two networks; ~1 start in 4 lost public DNS), so container names do not resolve there. Every `proxied` run passes `--add-host atelier-egress:<ip>`, `<ip>` read at run time: `podman inspect atelier-egress --format '{{(index .NetworkSettings.Networks "atelier-internal").IPAddress}}'`. `HTTPS_PROXY=http://atelier-egress:3128` unchanged; `none` unaffected | 4.2, Atelier Phase 2 finding 2026-09-21 |
 | Tag availability | `g<sha>` is emitted only from a clean committed tree; until Atelier's first commit there is no pinnable tag, and the digest assertion is the thing Meute relies on | response below |
 | Credential import | `scripts/auth-import.sh <volume> <file>` (generic); the owner mints the two PATs. Volumes populated before 2026-09-21 are invalid (files landed as uid 999 under `keep-id`; fixed that day) | response below |
@@ -672,6 +672,7 @@ phase cannot quietly change them.
 | Whether a Fable pass on Phase 7's design is wanted before it is built (`AUDIT.md` §8 item 7) | owner |
 | `--read-only` root and `/work:ro` for the review stage | Phase 2, if the CLIs tolerate it |
 | Pack-transfer cost of `--no-local --single-branch` clones on the largest fleet repo | Phase 2, recorded in §11 |
+| Which directory codex's `-s workspace-write` sandbox derives its writable root from — the process's cwd or `--cd`. On the host codex runs from the runner's own cwd (this checkout) with `--cd` naming the worktree; if the root follows cwd rather than `--cd`, an unattended codex run has this checkout as its writable root, which would be a real finding. Phase 2a left the host behaviour exactly as it shipped rather than change it on a guess, and pinned it with a test | Phase 3 observation week, from a live run |
 
 ## 9. Acceptance
 

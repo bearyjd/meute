@@ -50,6 +50,13 @@ image_digest_on_host() {
   podman_run image inspect --format '{{.Digest}}' -- "$1" 2>/dev/null
 }
 
+# The image's immutable ID. A tag is a moving name: whatever verified its
+# digest a moment ago can be re-tagged onto something else before the run,
+# and the pin would have proven nothing. The ID cannot be moved.
+image_id_on_host() {
+  podman_run image inspect --format '{{.Id}}' -- "$1" 2>/dev/null
+}
+
 egress_running() {
   [[ "$(podman_run container inspect --format '{{.State.Running}}' -- "$CONTAINER_EGRESS" 2>/dev/null)" == "true" ]]
 }
@@ -77,7 +84,9 @@ egress_ip() {
 # cursor and would starve every repo behind this one.
 #
 # Sets CONTAINER_BLOCKED to the reason, in the voice `eligible()` notes and
-# `doctor` prints. Returns 0 when the entry may run in a container.
+# `doctor` prints. On success sets CONTAINER_IMAGE_ID to the immutable ID the
+# digest assert resolved, which is what the run must then be given. Returns 0
+# when the entry may run in a container.
 # --------------------------------------------------------------------------
 container_ready() {
   local entry="$1" repo tag digest network actual
@@ -103,6 +112,13 @@ container_ready() {
   # and the tag is what podman is then given.
   if [[ "$actual" != "$digest" ]]; then
     CONTAINER_BLOCKED="${repo}: image ${tag} is not at the pinned digest (manifest ${digest:0:19}…, host ${actual:0:19}…)"
+    return 1
+  fi
+  # Close the window between this assert and the run. The tag stays in every
+  # message a human reads; podman is handed the ID.
+  CONTAINER_IMAGE_ID="$(image_id_on_host "$tag")" || CONTAINER_IMAGE_ID=""
+  if [[ -z "$CONTAINER_IMAGE_ID" ]]; then
+    CONTAINER_BLOCKED="${repo}: image ${tag} has no resolvable image ID"
     return 1
   fi
   # A tier that takes no network needs neither the proxy nor its address.
@@ -133,9 +149,13 @@ container_argv() {
   local entry="$1" stage="$2" workdir="$3" outdir="$4"
   shift 4
   [[ "${1:-}" == "--" ]] && shift
-  local tag network timeout_seconds
-  { read -r tag; read -r network; read -r timeout_seconds; } \
-    < <(jq -r '(.image.tag // ""), (.network // ""), (.timeout_seconds // 1800)' <<< "$entry")
+  local network timeout_seconds
+  { read -r network; read -r timeout_seconds; } \
+    < <(jq -r '(.network // ""), (.timeout_seconds // 1800)' <<< "$entry")
+  # container_ready resolved this from the tag it verified; without it there
+  # is no proven image to run, and guessing one is the whole risk.
+  local image="${CONTAINER_IMAGE_ID:-}"
+  [[ -n "$image" ]] || { container_note "no verified image ID; call container_ready first"; return 1; }
 
   # shellcheck disable=SC2054  # the commas are inside podman's own --userns
   # value (uid=1000,gid=1000), not argv separators.
@@ -151,11 +171,14 @@ container_argv() {
     --workdir /work
     --timeout "$timeout_seconds"
     --stop-timeout "$CONTAINER_STOP_TIMEOUT"
+    # An image that vanished between the assert and now is an error. Without
+    # this podman would go and fetch something by that name from a registry.
+    --pull=never
   )
   local -a profile=()
   container_network_argv "$stage" "$network" || return 1
   profile=( "${CONTAINER_NETWORK_ARGV[@]}" )
-  CONTAINER_ARGV+=( "${profile[@]}" "$tag" "$@" )
+  CONTAINER_ARGV+=( "${profile[@]}" "$image" "$@" )
 }
 
 # The stage's network profile (§4.4). `preflight` reads a credential and
@@ -170,27 +193,52 @@ container_network_argv() {
   fi
   local ip
   ip="$(egress_ip)" || { container_note "no ${CONTAINER_EGRESS} address on ${CONTAINER_NETWORK}"; return 1; }
-  # Both spellings, because HTTP clients disagree about which they read and
-  # setting both costs nothing. (Measured on agent-base:g691e067: curl there
-  # honours either, so the uppercase-only claim in Atelier's note does not
-  # reproduce on this image -- but a client that reads only one spelling is
-  # the kind of thing that surfaces as an unexplained timeout in an
-  # unattended run, so neither is left out.) NO_PROXY is emptied so nothing
-  # decides for itself that a host is local and skips the allow-list.
+  # Both schemes, both spellings. https and plain http are separate variables
+  # -- without the http pair a git http remote or a package mirror fails with
+  # curl rc 6 rather than going through the allow-list, which is fail-closed
+  # but reads like a broken network. Both cases because clients disagree:
+  # measured on agent-base:g691e067, curl honours HTTPS_PROXY and https_proxy
+  # alike, but of the http pair it reads ONLY the lowercase one -- it refuses
+  # uppercase HTTP_PROXY by design, because a CGI request header named
+  # `Proxy:` arrives in the environment under exactly that name. Other
+  # clients read the spelling curl won't, so all four are set.
+  # NO_PROXY is emptied so nothing decides for itself that a host is local
+  # and skips the allow-list.
   CONTAINER_NETWORK_ARGV=(
     "--network=${CONTAINER_NETWORK}"
     --add-host "${CONTAINER_EGRESS}:${ip}"
     --env "HTTPS_PROXY=${CONTAINER_PROXY_URL}"
     --env "https_proxy=${CONTAINER_PROXY_URL}"
+    --env "HTTP_PROXY=${CONTAINER_PROXY_URL}"
+    --env "http_proxy=${CONTAINER_PROXY_URL}"
     --env "NO_PROXY="
   )
+}
+
+# How long the runner waits on podman itself.
+#
+# Deliberately NOT PODMAN_TIMEOUT: that bounds an inspect, and this bounds a
+# run that is supposed to take the whole timeout_seconds. podman's own
+# --timeout bounds the CONTAINER; it says nothing about a client or a
+# control-plane call that stalls, and under a timer a stalled client holds
+# the lock and starves every repo behind it. So the outer bound is always
+# slack above the inner one -- the container's own timeout, its stop grace,
+# and a minute for podman to do its work -- and can only fire when podman
+# itself is stuck, never to pre-empt a run that is merely slow.
+container_outer_bound() {
+  local seconds="$1"
+  [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=1800
+  printf '%s\n' "$(( seconds + CONTAINER_STOP_TIMEOUT + 60 ))"
 }
 
 # Assemble and execute. Writes nothing to stdout of its own -- the command's
 # output is the caller's to redirect, exactly as the host path's is -- and
 # returns the command's exit status.
 container_run() {
+  local entry="$1"
   container_argv "$@" || return 1
   local -a podman; read -ra podman <<< "$(podman_cmd)"
-  "${podman[@]}" "${CONTAINER_ARGV[@]}"
+  local seconds; seconds="$(jq -r '.timeout_seconds // ""' <<< "$entry")"
+  timeout --kill-after="$CONTAINER_STOP_TIMEOUT" "$(container_outer_bound "$seconds")" \
+    "${podman[@]}" "${CONTAINER_ARGV[@]}"
 }

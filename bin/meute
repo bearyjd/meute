@@ -540,9 +540,11 @@ cmd_container_probe() {
   # Globals, and an EXIT trap: the scratch tree must go whether the probe
   # finishes, dies on a failed clone, or is interrupted -- and a RETURN trap
   # cannot read a local that has already gone out of scope under `set -u`.
+  # The trap goes up with the FIRST directory, not after the second: a failed
+  # second mktemp would otherwise leak the first.
   PROBE_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/meute-probe-XXXXXX")"
-  PROBE_OUT="$(mktemp -d "${TMPDIR:-/tmp}/meute-probe-out-XXXXXX")"
   trap 'rm -rf "${PROBE_SCRATCH:-}" "${PROBE_OUT:-}"' EXIT
+  PROBE_OUT="$(mktemp -d "${TMPDIR:-/tmp}/meute-probe-out-XXXXXX")"
   # The clone is the point: what the agent sees is a repository of its own,
   # holding one branch, and never the owner's checkout.
   scratch_clone "$path" "$PROBE_SCRATCH" "$default_branch" "meute/probe-$(date +%F)" HEAD \
