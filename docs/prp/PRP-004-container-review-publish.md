@@ -858,6 +858,94 @@ not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
 `requires_specced_ticket` tasks on one repo would each emit a stage entry
 for the same row — Phase 4 dedupes by row, not by task.
 
+### Phase 2a — the container boundary, proven without a credential (2026-09-22 – 23)
+
+Plan: `.claude/PRPs/plans/prp-004-phase-2a.plan.md`. Baseline 671
+assertions -> 835. Review: `code-reviewer`, then four **Codex adversarial**
+passes, mandatory and non-downgradable for this phase. Rounds 1–3 returned
+**Block**; round 4 returned **Approve**. The record below includes the
+coordinator's own errors, because they are half of what the history is
+worth.
+
+What running it disclosed, in the order it changed the design:
+
+- **A fix aimed at the wrong half of a race does not close it.** Round 1
+  found a TOCTOU: `container_ready` verified a digest for a TAG, then the
+  run executed that tag, with clone work in the window. The instruction
+  given for the fix was to resolve the immutable image ID with a second
+  `image inspect` — which moved the window rather than closing it, and
+  round 2 found the TOCTOU **still open**: two observations of a moving
+  name can see two different images, validating A and running B. One
+  inspect now returns `{{.Digest}} {{.Id}}` together, so the digest checked
+  and the ID run are the same observation, with `--pull=never` so a
+  vanished image is an error rather than a fetch. The instruction was the
+  coordinator's; the lesson is that "resolve it again, immutably" is not
+  the same as "resolve it once".
+
+- **An identity that outlives what proved it.** The same round found
+  `CONTAINER_IMAGE_ID` cleared on no path, so a failure before the ID was
+  resolved left the previous entry's value in place and `container_argv`
+  asked only whether it was non-empty. Readiness passing for repo A and
+  then failing for repo B could put A's image into B's run. It is now
+  cleared on the way IN and bound to the tag and digest that produced it;
+  the argv refuses an entry that record is not for. Same defect as the
+  TOCTOU at a different scale, which is why both are worth naming together.
+
+- **A refusal that retires what it refuses.** Round 3: a forced readiness
+  failure went through `abort_entry`, which advances the cursor AND marks
+  a staged plan item done. A transient condition — an image not built yet,
+  a proxy restarting, a pin mid-bump — permanently retired the item the
+  operator had explicitly asked for, and `retire_completed_plan` then
+  archived the whole plan. The rule that came out of it: **a precondition
+  the operator can remediate stays retryable; a failure of the attempt
+  itself advances.** An unforced entry that cannot run is queue rotation
+  and must advance, or the fleet stalls behind it (PRP-001 §10); a forced
+  one is a request that failed on something the human can fix.
+
+- **Two reachability arguments, both wrong, in opposite directions.** The
+  coordinator named the credential abort as the plan-loss path, then
+  narrowed the claim. Running it showed the opposite: a staged plan entry
+  is built from a synthetic project, so its `image` is always null, the
+  pin check stops it in `eligible()`, and that abort is unreachable in plan
+  mode entirely. The site that actually archived a plan was the
+  `--runtime host` downgrade refusal. Neither of us would have found that
+  by reading.
+
+- **A test can pass by reading a file that no longer exists.** The first
+  draft of "the staged item is still pending" passed before the fix,
+  because `retire_completed_plan` had deleted the file it consulted. The
+  assertion that genuinely went red was "the plan is not retired". Both
+  are kept: together they say the item survived, not that the file did.
+
+- **A guarantee gated on a machine's contents is not covered.** The test
+  standing between an unverifiable engine run and a timer fire pinned the
+  real image, so on any machine without it — CI, a fresh checkout — it
+  skipped silently. It needs no image: the abort fires before anything
+  starts a container, so a stub podman answering the readiness calls
+  reaches it. Proved by mutation under that condition: removing the abort
+  now fails on an imageless machine, where before it passed clean.
+
+- **A test that inherits the host's podman is not deterministic.**
+  `container_ready` distinguishes "podman absent from PATH" from "podman
+  present, image missing", with different refusal messages. Two assertions
+  pinned the second and got the first on a machine with no podman
+  installed — the ordinary state of CI. The fixture now writes its own
+  podman stub, so the assertion is about the boundary rather than about
+  what is installed.
+
+- **`--force` overrode more than it was asked to.** `(( FORCED )) && return
+  0` returned before the readiness check, so a forced run skipped the
+  digest assert entirely. Phase 1's abort hid it; Phase 2b would have made
+  it a dispatch. A forced selection now overrides the queue's gates —
+  share, cap, quota — and never the boundary's readiness.
+
+- **A "unification" that changed behaviour nobody had measured.** The argv
+  split moved codex's host invocation from the runner's cwd into the
+  worktree, which is contrary to the phase's own host-parity claim. It was
+  reverted, and what `-s workspace-write` derives its writable root from —
+  cwd or `--cd` — went to §8 as an open item for Phase 3 rather than being
+  settled by preference.
+
 ### Phase 2b — the engine runs inside the boundary (2026-09-23)
 
 Plan: `.claude/PRPs/plans/prp-004-phase-2b.plan.md`. Baseline 848
@@ -876,6 +964,14 @@ What running it disclosed:
   no other broken instance (`.is_error // false` and `.captured_at // 0`
   are harmless, their defaults matching what `//` does), but the next
   `// true` on a boolean will be just as quiet.
+
+- **Twice now, a command that silently did nothing and reported success.**
+  The jq trap above is one shape of it. The other: the command that was to
+  write this section for Phase 2b was chained behind a `grep` that matched
+  nothing, so `&&` short-circuited, the write never ran, and it was
+  reported as done without the file being checked. Both are the
+  silent-success failure PRP-001 §10a is about, and both were found only
+  by looking at the artefact rather than at the exit status.
 
 - **`/work:ro` holds, provided the mount keeps `Z`.** The first measurement
   said the opposite: `git status` inside reported "not a git repository".
