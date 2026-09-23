@@ -85,6 +85,13 @@ extract_claude() {
         RATE_LIMITED=1
         ENGINE_DETAIL="rate-limited: ${msg}"
       else
+        # Only a 429 sets the hold, and that is a decision rather than an
+        # oversight. The hold exists because a spent pool stays spent for
+        # hours, so every slot until it refills would fail identically for
+        # nothing (PRP-001 §11). No other status has that property: a 401
+        # is fixed by re-authenticating, a 5xx is usually gone by the next
+        # fire, and standing the whole fleet down for either would turn one
+        # repo's problem into every repo's outage.
         ENGINE_DETAIL="api ${status_code}: ${msg}"
       fi
     else

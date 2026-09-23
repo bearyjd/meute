@@ -2266,6 +2266,13 @@ test_engines() {
   has   "engines: ...and carries the real message"     "$ENGINE_DETAIL" "OAuth access token has been revoked"
   hasnt "engines: ...and never reads as success"       "$ENGINE_DETAIL" "success"
   is    "engines: a 401 is not a rate limit"           "$RATE_LIMITED" "0"
+  # And so does not stand the fleet down: the hold exists for a pool that
+  # stays spent for hours, which is not what a 401 or a 5xx is.
+  out="$root/server-error.json"
+  printf '%s' '{"result":"upstream hiccup","is_error":true,"subtype":"success","api_error_status":503}' > "$out"
+  extract_claude "$out" || true
+  is "engines: nor is a 5xx"                           "$RATE_LIMITED" "0"
+  has "engines: ...though it still names itself"       "$ENGINE_DETAIL" "api 503"
 
   # A detail with a tab or newline in it would break the log line it lands
   # in -- state/log is tab-separated and one line per fire.
