@@ -503,6 +503,12 @@ run_entry() {
   # PRP-004 Phase 1 built the stage machine's schema and nothing that runs a
   # stage -- Phase 4 does. Until then a state/stages row must never reach an
   # engine: aborted here, cursor advanced, so a stray row cannot wedge the slot.
+  #
+  # abort_entry, not abort_precondition: Phase 4 is what unblocks this, and
+  # nothing an operator does today makes the entry runnable, so there is no
+  # retry to preserve. It also cannot retire a staged plan item -- a plan
+  # stages repositories, never tickets, so build_plan_queue's entries carry
+  # stage_entry: false and never reach this line (verified, not assumed).
   [[ "$(jq -r '.stage_entry' <<< "$entry")" != "true" ]] \
     || abort_entry "$entry" "stage entries are not runnable before Phase 4"
   # Rule 5, fail closed. A container run needs a pinned image to run in;
@@ -518,11 +524,11 @@ run_entry() {
   manifest_runtime="$(jq -r '.runtime // ""' <<< "$entry")"
   runtime="${RUNTIME_OVERRIDE:-$manifest_runtime}"
   [[ "$RUNTIME_OVERRIDE" != "host" || "$manifest_runtime" == "host" ]] \
-    || abort_entry "$entry" "repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
+    || abort_precondition "$entry" "repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
   if [[ "$runtime" != "host" ]]; then
     [[ -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]] \
-      || abort_entry "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
-    abort_entry "$entry" "container runtime needs the credential volumes; see PRP-004 §5 item 3"
+      || abort_precondition "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
+    abort_precondition "$entry" "container runtime needs the credential volumes; see PRP-004 §5 item 3"
   fi
 
   # Rotating lens: one narrow angle per run, advanced only on success.
@@ -679,6 +685,26 @@ manifest_section() {
     community) printf 'community\n' ;;
     *)         printf '%s\n' "$1" ;;
   esac
+}
+
+# Which of the two an entry gets, by one rule: a PRECONDITION the operator
+# can remediate stays retryable; a failure of the ATTEMPT itself advances.
+#
+# Unforced, both are the same thing -- the rotation must move past an entry
+# it cannot run, or the whole fleet stalls behind it (PRP-001 §10). Forced,
+# they differ: the operator named this entry, and advancing would move the
+# cursor they did not ask to rotate and, in plan mode, mark the staged item
+# done and archive the plan. They fix the flag, the pin or the credential,
+# re-run, and it has to still be there.
+#
+# Failures of the attempt -- an unborn HEAD, a worktree that would not cut --
+# stay on abort_entry even when forced: nothing about them is a precondition
+# waiting on the operator, and a poisoned entry that never advances is the
+# stall §10 exists to prevent.
+abort_precondition() {
+  local entry="$1" detail="$2"
+  (( FORCED )) && refuse_entry "$entry" "$detail"
+  abort_entry "$entry" "$detail"
 }
 
 # A forced entry refused on a precondition. Logged like any failure, with the

@@ -3037,7 +3037,8 @@ STUB
   has   "runtime: ...as an error line"                            "$out" "status=error"
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran either" "the stub was invoked" || ok "runtime: ...and no engine ran either"
   is    "runtime: ...no worktree was cut"                         "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
-  is    "runtime: ...and the cursor moved past it"                "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  # A flag the operator can simply drop: logged, and left where it was.
+  is    "runtime: ...and stays retryable"                         "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
   # --runtime host is accepted only where it changes nothing. The one case a
   # fixture cannot reach -- an entry with no runtime at all -- is pinned by
   # reading the guard, since manifest.py always emits one.
@@ -3052,6 +3053,39 @@ STUB
   out="$(run daily --repo netlens --dry-run)"
   has   "runtime: --dry-run is refused at the same boundary" "$out" "is not present on this host"
   hasnt "runtime: ...without inventing a run"                "$out" "would run:"
+
+  # Every precondition a forced run can hit leaves the entry where it was.
+  # The operator fixes the flag, the pin or the credential and re-runs; the
+  # cursor is rotation state and they did not ask to rotate.
+  p4_fixture "$root"
+  printf '#!/usr/bin/env bash\necho "Error: no such image" >&2\nexit 125\n' > "$root/stub/podman"
+  chmod +x "$root/stub/podman"
+  : > "$root/state/cursor"
+  out="$(run daily --repo netlens --runtime host)"
+  has "precondition: the downgrade refusal is logged"   "$out" "is not a downgrade path"
+  is  "precondition: ...and stays retryable"            "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+  yaml_edit "$root/repos.yaml" "$root/nopin.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  out="$(MEUTE_MANIFEST="$root/nopin.yaml" run daily --repo netlens --runtime container)"
+  has "precondition: rule 5 is logged"                  "$out" "tag and digest are required when runtime is container"
+  is  "precondition: ...and stays retryable too"        "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+  # And the credential abort, which needs a pin that verifies to be reached.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  out="$(run daily --repo netlens)"
+  has "precondition: the credential abort is logged"    "$out" "needs the credential volumes"
+  is  "precondition: ...and stays retryable as well"    "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+  # Unforced, the rotation still advances: an entry it cannot run must not
+  # stall every repo behind it (PRP-001 §10).
+  out="$(run daily)"
+  is  "precondition: unforced, the rotation moves on"   "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
 }
 
 # Rule 6: the build engine is per ticket; the review engine is derived.
@@ -4304,6 +4338,18 @@ PY
   is "retryable: ...and the plan is not retired"  "$([[ -f "$root/state/plan-queue.json" ]] && echo staged || echo gone)" "staged"
   is "retryable: ...and the cursor did not move past it" \
      "$(kv_get_test "$root/state/cursor" plan-cursor.daily)" ""
+
+  # The same rule at the other precondition a staged item can reach. A plan
+  # entry never carries an image of its own -- build_plan_queue builds from a
+  # synthetic project -- so the pin checks stop it in eligible(); what reaches
+  # run_entry is the downgrade refusal, and that one archived the whole plan.
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo "$key" --runtime host 2>&1)"
+  has "retryable: a forced downgrade refusal is logged too" "$out" "is not a downgrade path"
+  has "retryable: ...naming the staged repo"                "$out" "repo=${key}"
+  is  "retryable: ...and the plan survives it"              "$([[ -f "$root/state/plan-queue.json" ]] && echo staged || echo archived)" "staged"
+  is  "retryable: ...with the item still pending"           "$(kv_get_test "$root/state/plan-complete" "plan/${key}/audit-security")" ""
+  is  "retryable: ...and no archive left behind"            "$(ls "$root"/state/plan-queue.completed-* 2>/dev/null | wc -l)" "0"
 }
 
 # ------------------------------------------------------------------- main ---
