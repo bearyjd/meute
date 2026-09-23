@@ -23,6 +23,9 @@
 #   branches                      tier-3 drafts currently in flight
 #   image bump <repo>             pin the repo's container image: record the digest
 #                                  podman has for its image.tag into repos.local.yaml
+#   container probe <repo>        start the repo's pinned image over a clone of its
+#                                  default branch and report what the agent would see:
+#                                  uid, capabilities, /work, /out, the network
 #   pause [--for 3d] [-r why]     stand the fleet down; every slot declines until it expires
 #   resume                        lift the pause early
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
@@ -82,6 +85,8 @@ source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
 source "${MEUTE_ROOT}/lib/timers.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
+source "${MEUTE_ROOT}/lib/container.sh"
+source "${MEUTE_ROOT}/lib/scratch.sh"
 
 SCRUBBED=""
 AUTH_MODE=""
@@ -443,41 +448,11 @@ cmd_branches() {
 }
 
 # --------------------------------------------------------------------------
-# Containers (PRP-004). Phase 1 pins images and reports on them; nothing here
-# runs one. The podman these reach is the HOST's: from inside a distrobox
-# (/run/.containerenv exists) that means distrobox-host-exec, and MEUTE_PODMAN
-# names a wrapper outright and wins. Phase 2's lib/container.sh takes these
-# over; the runner will resolve podman the same way.
+# Containers (PRP-004). podman lives in lib/container.sh, sourced above with
+# the rest: one file owns the boundary, so widening it is a diff against that
+# file. Nothing here starts a container except `container probe`, which is
+# run by a human -- a timer fire still cannot dispatch one before Phase 2b.
 # --------------------------------------------------------------------------
-podman_cmd() {
-  if [[ -n "${MEUTE_PODMAN:-}" ]]; then printf '%s\n' "$MEUTE_PODMAN"
-  elif [[ -e /run/.containerenv ]]; then printf 'distrobox-host-exec podman\n'
-  else printf 'podman\n'; fi
-}
-
-# Is the resolved podman even on PATH? A wrapper that is not is a different
-# failure from an image that is not, and doctor must say which.
-podman_available() {
-  local -a podman; read -ra podman <<< "$(podman_cmd)"
-  command -v "${podman[0]}" >/dev/null 2>&1
-}
-
-# Every podman call is bounded: doctor and image bump run interactively, and a
-# podman waiting on a stuck socket (or distrobox-host-exec on a host that is
-# not answering) would otherwise hang them with no message at all.
-readonly PODMAN_TIMEOUT=15
-
-# The digest podman holds for a tag, or non-zero when it has no such image.
-image_digest_on_host() {
-  local -a podman; read -ra podman <<< "$(podman_cmd)"
-  timeout "$PODMAN_TIMEOUT" "${podman[@]}" image inspect --format '{{.Digest}}' -- "$1" 2>/dev/null
-}
-
-egress_running() {
-  local -a podman; read -ra podman <<< "$(podman_cmd)"
-  [[ "$(timeout "$PODMAN_TIMEOUT" "${podman[@]}" container inspect --format '{{.State.Running}}' -- atelier-egress 2>/dev/null)" == "true" ]]
-}
-
 # The only writer of image.digest. Reads the tag from the manifest as it is --
 # a manifest that needs this is exactly one rule 1 rejects today, tag set and
 # digest not -- and lets set-image-digest validate the manifest as it will be.
@@ -504,6 +479,89 @@ cmd_image_bump() {
     || die "image bump: the digest was not written"
   note "${repo}: image.digest -> ${digest:0:19}… for ${tag}"
   note "backup of the previous manifest: $(basename -- "$(manifest_resolves_to)").bak"
+}
+
+# --------------------------------------------------------------------------
+# `meute container probe <repo>` -- what Phase 2b will do, minus the engine.
+#
+# It asserts the pin, cuts the §4.2 clone of the repo's default branch, and
+# runs one container over a fixed diagnostic script with no network at all.
+# That is the whole isolation boundary answered from inside it, without a
+# credential and without an engine: a human can check a repo is
+# container-ready today, and the suite drives this same path.
+# --------------------------------------------------------------------------
+readonly CONTAINER_PROBE_SCRIPT='
+printf "uid %s\n" "$(id -u)"
+printf "gid %s\n" "$(id -g)"
+case "$(awk "/^CapBnd/{print \$2}" /proc/self/status)" in
+  0000000000000000) printf "capabilities none\n" ;;
+  *) printf "capabilities %s -- NOT empty\n" "$(awk "/^CapBnd/{print \$2}" /proc/self/status)" ;;
+esac
+case "$(awk "/^NoNewPrivs/{print \$2}" /proc/self/status)" in
+  1) printf "no-new-privs yes\n" ;;
+  *) printf "no-new-privs NO\n" ;;
+esac
+printf "home %s\n" "$HOME"
+if git -C /work status --porcelain >/dev/null 2>&1; then
+  printf "git in /work ok (%s, %s)\n" "$(git -C /work rev-parse --abbrev-ref HEAD)" "$(git -C /work rev-parse --short HEAD)"
+else
+  printf "git in /work FAILED\n"
+fi
+printf "branches in /work %s\n" "$(git -C /work for-each-ref --format="%(refname:short)" refs/heads | tr "\n" " ")"
+if touch /out/.probe 2>/dev/null; then printf "/out writable\n"; rm -f /out/.probe; else printf "/out NOT writable\n"; fi
+if getent hosts example.com >/dev/null 2>&1; then printf "dns RESOLVED -- the network is open\n"; else printf "dns blocked\n"; fi
+'
+
+cmd_container_probe() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "container probe: which repo? (try: meute container probe <name>)"
+  local row
+  row="$(python3 "$MANIFEST_PY" list-images "$MANIFEST" | jq -c --arg r "$name" 'select(.name == $r)')" \
+    || die "container probe: could not read ${MANIFEST}"
+  [[ -n "$row" ]] || die "container probe: unknown repo '${name}' - not in $(basename "$MANIFEST")"
+  [[ "$(jq -r '.runtime' <<< "$row")" == "container" ]] \
+    || die "container probe: ${name} runs on the host (runtime: host) - nothing to probe"
+
+  local path default_branch
+  path="$(python3 "$MANIFEST_PY" list-repos "$MANIFEST" | jq -r --arg r "$name" 'select(.name == $r) | .path')"
+  [[ -d "$path/.git" || -f "$path/.git" ]] || die "container probe: ${path} is not a git repository"
+  default_branch="$(repo_default_branch "$path")"
+
+  # The entry the container code consumes. Built here rather than taken from
+  # the queue on purpose: the probe answers "is this repo container-ready",
+  # which must not depend on a task being scheduled for it today.
+  local entry
+  entry="$(jq -cn --arg repo "$name" --arg tag "$(jq -r '.tag' <<< "$row")" \
+    --arg digest "$(jq -r '.digest' <<< "$row")" \
+    '{repo:$repo, runtime:"container", image:{tag:$tag, digest:$digest},
+      network:"none", timeout_seconds:120}')"
+  container_ready "$entry" || die "container probe: ${CONTAINER_BLOCKED}"
+
+  # Globals, and an EXIT trap: the scratch tree must go whether the probe
+  # finishes, dies on a failed clone, or is interrupted -- and a RETURN trap
+  # cannot read a local that has already gone out of scope under `set -u`.
+  # The trap goes up with the FIRST directory, not after the second: a failed
+  # second mktemp would otherwise leak the first.
+  PROBE_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/meute-probe-XXXXXX")"
+  trap 'rm -rf "${PROBE_SCRATCH:-}" "${PROBE_OUT:-}"' EXIT
+  PROBE_OUT="$(mktemp -d "${TMPDIR:-/tmp}/meute-probe-out-XXXXXX")"
+  # The clone is the point: what the agent sees is a repository of its own,
+  # holding one branch, and never the owner's checkout.
+  scratch_clone "$path" "$PROBE_SCRATCH" "$default_branch" "meute/probe-$(date +%F)" HEAD \
+    || die "container probe: could not cut a scratch clone of ${path}"
+
+  note "probing ${name} with $(jq -r '.tag' <<< "$row") at the pinned digest, network none"
+  note "  scratch clone: $(git -C "$PROBE_SCRATCH" rev-parse --short HEAD) on $(git -C "$PROBE_SCRATCH" rev-parse --abbrev-ref HEAD)"
+  container_run "$entry" probe "$PROBE_SCRATCH" "$PROBE_OUT" -- sh -c "$CONTAINER_PROBE_SCRIPT" \
+    || die "container probe: the container did not run to completion"
+}
+
+cmd_container() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    probe) cmd_container_probe "$@" ;;
+    *)     die "container: unknown subcommand '${sub}' (try: meute container probe <repo>)" ;;
+  esac
 }
 
 cmd_image() {
@@ -644,6 +702,7 @@ main() {
     dismiss)  cmd_dismiss "$@" ;;
     branches) cmd_branches "$@" ;;
     image)    cmd_image "$@" ;;
+    container) cmd_container "$@" ;;
     pause)    cmd_pause "$@" ;;
     resume)   cmd_resume "$@" ;;
     discover) cmd_discover "$@" ;;

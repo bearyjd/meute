@@ -3028,44 +3028,92 @@ if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max",
 echo invoked >> "$(dirname "$0")/invocations"
 jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
 STUB
-  chmod +x "$root/stub/claude"
+  # A podman that EXISTS and holds no such image. Without this the fixture
+  # inherits the machine's: where podman is absent entirely the boundary
+  # refuses for a different, equally correct reason, and these assertions
+  # would be about what is installed rather than about the boundary.
+  printf '#!/usr/bin/env bash\necho "Error: no such image" >&2\nexit 125\n' > "$root/stub/podman"
+  chmod +x "$root/stub/claude" "$root/stub/podman"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
   local out
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --runtime container 2>&1)"
+  local run; run() { PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" "$@" 2>&1; }
+  out="$(run daily --repo netlens --runtime container)"
   has   "rule 5: refused with rule 1's message" "$out" "repos.netlens.image: tag and digest are required when runtime is container"
   has   "rule 5: ...as an error line"           "$out" "status=error"
   [[ -f "$root/stub/invocations" ]] && bad "rule 5: no engine ran" "the stub was invoked" || ok "rule 5: no engine ran"
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --runtime vm 2>&1 || true)"
+  out="$(run daily --runtime vm || true)"
   has   "rule 5: --runtime takes host or container" "$out" "unknown runtime"
   # A repo that opted into containers has nothing to run in before Phase 2;
   # the host must not quietly stand in for the isolation it asked for.
   p4_fixture "$root"
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
-  has   "runtime: a container repo is refused before Phase 2" "$out" "detail=container runtime is not available before Phase 2"
+  # The fixture pins an image this host does not have, so the boundary now
+  # refuses it in eligible() -- earlier than Phase 1's abort, and without a
+  # state/log line, because an entry that was never selected did not run.
+  out="$(run daily --repo netlens)"
+  has   "runtime: a container repo with an unverifiable pin is refused" "$out" "is not present on this host"
+  # Forced, so the refusal is logged rather than stepped over silently --
+  # but with the boundary's reason, not the credential abort's: the entry
+  # never got far enough to be refused for having no credentials.
+  has   "runtime: ...and logged with the boundary's own reason"          "$out" "status=error"
+  hasnt "runtime: ...not the credential abort's"                        "$out" "needs the credential volumes"
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran" "the stub was invoked" || ok "runtime: ...and no engine ran"
   # Nor may the CLI talk it down: a repo that opted into isolation runs
   # isolated or not at all. --runtime never changes what runs in Phase 1.
   : > "$root/state/cursor"
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --runtime host 2>&1)"
+  out="$(run daily --repo netlens --runtime host)"
   has   "runtime: --runtime host on a container repo is refused" "$out" "detail=repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
   has   "runtime: ...as an error line"                            "$out" "status=error"
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran either" "the stub was invoked" || ok "runtime: ...and no engine ran either"
   is    "runtime: ...no worktree was cut"                         "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
-  is    "runtime: ...and the cursor moved past it"                "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  # A flag the operator can simply drop: logged, and left where it was.
+  is    "runtime: ...and stays retryable"                         "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
   # --runtime host is accepted only where it changes nothing. The one case a
   # fixture cannot reach -- an entry with no runtime at all -- is pinned by
   # reading the guard, since manifest.py always emits one.
   yaml_edit "$root/repos.yaml" "$root/hostrepo.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_MANIFEST="$root/hostrepo.yaml" "$root/bin/run.sh" daily --repo netlens --runtime host 2>&1)"
+  out="$(MEUTE_MANIFEST="$root/hostrepo.yaml" run daily --repo netlens --runtime host)"
   has   "runtime: --runtime host on a host repo runs as before" "$out" "status=ok"
   is    "runtime: the guard accepts host only against a manifest runtime of exactly host" \
         "$(grep -c '\[\[ "$RUNTIME_OVERRIDE" != "host" || "$manifest_runtime" == "host" \]\]' "$REPO/bin/run.sh")" "1"
   # A dry run records the same refusal: the entry is unrunnable whether or
   # not this fire would have invoked anything.
   : > "$root/state/cursor"
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --dry-run 2>&1)"
-  has   "runtime: --dry-run on a container entry still logs the error" "$out" "status=error"
-  is    "runtime: ...and still advances the cursor"                     "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  out="$(run daily --repo netlens --dry-run)"
+  has   "runtime: --dry-run is refused at the same boundary" "$out" "is not present on this host"
+  hasnt "runtime: ...without inventing a run"                "$out" "would run:"
+
+  # Every precondition a forced run can hit leaves the entry where it was.
+  # The operator fixes the flag, the pin or the credential and re-runs; the
+  # cursor is rotation state and they did not ask to rotate.
+  p4_fixture "$root"
+  printf '#!/usr/bin/env bash\necho "Error: no such image" >&2\nexit 125\n' > "$root/stub/podman"
+  chmod +x "$root/stub/podman"
+  : > "$root/state/cursor"
+  out="$(run daily --repo netlens --runtime host)"
+  has "precondition: the downgrade refusal is logged"   "$out" "is not a downgrade path"
+  is  "precondition: ...and stays retryable"            "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+  yaml_edit "$root/repos.yaml" "$root/nopin.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  out="$(MEUTE_MANIFEST="$root/nopin.yaml" run daily --repo netlens --runtime container)"
+  has "precondition: rule 5 is logged"                  "$out" "tag and digest are required when runtime is container"
+  is  "precondition: ...and stays retryable too"        "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+  # And the credential abort, which needs a pin that verifies to be reached.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  out="$(run daily --repo netlens)"
+  has "precondition: the credential abort is logged"    "$out" "needs the credential volumes"
+  is  "precondition: ...and stays retryable as well"    "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+  # Unforced, the rotation still advances: an entry it cannot run must not
+  # stall every repo behind it (PRP-001 §10).
+  out="$(run daily)"
+  is  "precondition: unforced, the rotation moves on"   "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
 }
 
 # Rule 6: the build engine is per ticket; the review engine is derived.
@@ -3335,7 +3383,7 @@ test_p4_image_bump() {
 #!/usr/bin/env bash
 echo "\$*" >> "$root/stub/podman-calls"
 [[ "\$*" == *"agent-netlens:g3f9a1c2"* ]] || { echo "Error: no such image" >&2; exit 125; }
-printf '%s\n' "$new"
+printf '%s %s\n' "$new" "$P2_ID"
 STUB
   chmod +x "$root/stub/podman"
   local bump; bump() { MEUTE_PODMAN="$root/stub/podman" "$root/bin/meute" image bump "$@" 2>&1; }
@@ -3353,7 +3401,7 @@ STUB
   out="$(bump netlens)"
   has   "image bump: writes repos.local.yaml"  "$out" "netlens: image.digest -> ${new:0:19}"
   is    "image bump: the digest landed"        "$(python3 -c "import yaml; print(yaml.safe_load(open('$root/repos.local.yaml'))['repos'][0]['image']['digest'])")" "$new"
-  is    "image bump: ...for the manifest's tag" "$(cat "$root/stub/podman-calls")" "image inspect --format {{.Digest}} -- agent-netlens:g3f9a1c2"
+  is    "image bump: ...for the manifest's tag" "$(cat "$root/stub/podman-calls")" "image inspect --format {{.Digest}} {{.Id}} -- agent-netlens:g3f9a1c2"
   [[ -f "$root/repos.local.yaml.bak" ]] && ok "image bump: backs the manifest up first" || bad "image bump: backs the manifest up first" "no .bak"
   is    "image bump: the backup is the old manifest" "$(cat "$root/repos.local.yaml.bak")" "$before"
   has   "image bump: the result validates"     "$(validate "$root/repos.local.yaml" "$root")" "ok:"
@@ -3455,8 +3503,9 @@ test_p4_doctor_containers() {
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
-  "image inspect --format {{.Digest}} -- agent-netlens:g3f9a1c2") printf '%s\n' "\${STUB_DIGEST:-$P4_DIGEST}" ;;
+  "image inspect --format {{.Digest}} {{.Id}} -- agent-netlens:g3f9a1c2") printf '%s %s\n' "\${STUB_DIGEST:-$P4_DIGEST}" "$P2_ID" ;;
   "container inspect --format {{.State.Running}} -- atelier-egress") printf '%s\n' "\${STUB_EGRESS:-true}" ;;
+  "inspect atelier-egress --format "*) printf '%s\n' "\${STUB_IP-10.89.14.10}" ;;
   *) echo "Error: no such object" >&2; exit 125 ;;
 esac
 STUB
@@ -3466,7 +3515,8 @@ STUB
   local out
   out="$(doc)"
   has "doctor: image at the pinned digest"        "$out" "ok   image agent-netlens:g3f9a1c2 present at pinned digest"
-  has "doctor: egress proxy running"              "$out" "ok   atelier-egress running"
+  has "doctor: egress proxy running"              "$out" "ok   atelier-egress running at 10.89.14.10"
+  has "doctor: an unreadable proxy address is a FAIL" "$(STUB_IP= doc)" "FAIL atelier-egress has no address on atelier-internal"
   out="$(STUB_DIGEST="sha256:$(printf 'c%.0s' {1..64})" doc)"
   has "doctor: digest drift is a FAIL"            "$out" "FAIL image agent-netlens:g3f9a1c2 is not at the pinned digest"
   has "doctor: ...and says how to re-pin"         "$out" "meute image bump netlens"
@@ -3493,6 +3543,873 @@ STUB
   out="$(doc)"
   hasnt "doctor: no container repo, no image check" "$out" "pinned digest"
   hasnt "doctor: ...and no proxy check"             "$out" "atelier-egress"
+}
+
+
+# ------------------------------------------------- PRP-004 phase 2a --------
+# The isolation boundary. These run the REAL Atelier base image where one is
+# present, because a stub cannot answer the only questions that matter here:
+# what uid the process has, which capabilities it kept, what the filesystem
+# looks like from inside. Where it is absent (CI), each such test skips with
+# the reason -- a skipped isolation proof is visible; a faked one is not.
+readonly P2_IMAGE="agent-base:g691e067"
+readonly P2_DIGEST="sha256:9ac5558d3ffd9acb1d76948a8f4d99f6bcbb19fccfb95fb6295616dc0f1c999d"
+# The immutable ID the digest assert resolves to. A tag is a moving name; this
+# is what podman is actually given, so a re-tag between the two cannot swap it.
+readonly P2_ID="2e1dd114a47a8b0add24769829a16e88363f490c719238829eb007ae008e27f8"
+
+# The podman this host reaches, resolved the way lib/container.sh resolves it.
+p2_podman() {
+  if [[ -n "${MEUTE_PODMAN:-}" ]]; then printf '%s\n' "$MEUTE_PODMAN"
+  elif [[ -e /run/.containerenv ]]; then printf 'distrobox-host-exec podman\n'
+  else printf 'podman\n'; fi
+}
+
+# Is the real image here, at the digest these tests pin? Everything that runs
+# a container asks first.
+p2_image_present() {
+  local -a podman; read -ra podman <<< "$(p2_podman)"
+  [[ "$(timeout 20 "${podman[@]}" image inspect --format '{{.Digest}}' -- "$P2_IMAGE" 2>/dev/null)" == "$P2_DIGEST" ]]
+}
+
+# A git repo with a `secret` branch whose blob is reachable from nowhere else.
+# Prints the blob's sha so the clone can be asked whether it has it.
+p2_source_repo() {
+  local repo="$1"
+  mkdir -p "$repo"
+  git -C "$repo" init -q -b main
+  echo public > "$repo/f.txt"
+  git -C "$repo" add -A
+  git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init
+  git -C "$repo" checkout -q -b secret
+  echo 'a credential nobody outside this branch may read' > "$repo/secret.txt"
+  git -C "$repo" add -A
+  git -C "$repo" -c user.email=t@t -c user.name=t commit -qm secret
+  git -C "$repo" rev-parse secret:secret.txt
+  git -C "$repo" checkout -q main
+}
+
+# The flag set of decision 4, asserted without starting anything. A container
+# that runs with the wrong flags is the whole risk of this phase, so the argv
+# is pinned field by field rather than spot-checked.
+test_p2_container_argv() {
+  local root="$FIXTURE/p2-argv"; mkdir -p "$root/stub" "$root/work" "$root/out"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P2_DIGEST" "$P2_ID" ;;
+  *) printf '10.89.14.10\n' ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  local entry argv
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:1800}')"
+
+  ( source "$REPO/lib/container.sh"
+    MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
+    container_argv "$entry" build "$root/work" "$root/out" -- git status
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-none"
+  argv="$(tr '\n' ' ' < "$root/argv-none")"
+
+  has "argv: it is a podman run"              "$argv" "run "
+  has "argv: the container is removed"        "$argv" "--rm"
+  has "argv: the host uid is kept"            "$argv" "--userns=keep-id:uid=1000,gid=1000"
+  has "argv: every capability is dropped"     "$argv" "--cap-drop=ALL"
+  has "argv: privileges cannot be regained"   "$argv" "--security-opt=no-new-privileges"
+  has "argv: pid 1 reaps"                     "$argv" "--init"
+  has "argv: the pid count is bounded"        "$argv" "--pids-limit=2048"
+  has "argv: the scratch tree is /work"       "$argv" "--volume ${root}/work:/work:Z"
+  has "argv: captures land in /out"           "$argv" "--volume ${root}/out:/out:Z"
+  has "argv: the cwd is the scratch tree"     "$argv" "--workdir /work"
+  has "argv: the run is bounded"              "$argv" "--timeout 1800"
+  has "argv: ...and so is the stop"           "$argv" "--stop-timeout"
+  # The pin is verified against a tag, but a tag is a moving name: anything
+  # that re-tags the image between the assert and the run would substitute
+  # what executes. podman is given the immutable ID the assert resolved.
+  has   "argv: the verified image ID is what runs"   "$argv" "$P2_ID"
+  hasnt "argv: ...and the tag never reaches podman"  "$argv" "$P2_IMAGE"
+  has   "argv: a vanished image is an error, not a pull" "$argv" "--pull=never"
+  has "argv: the command follows the image"   "$argv" "git status"
+  # The owner's checkout is never mounted, and no host path reaches the
+  # container except the two scratch directories this phase creates.
+  is  "argv: nothing else is mounted"         "$(grep -c '^--volume$' "$root/argv-none")" "2"
+
+  has "argv (none): the network is off"       "$argv" "--network=none"
+  hasnt "argv (none): no proxy is injected"   "$argv" "HTTPS_PROXY"
+  hasnt "argv (none): and no host alias"      "$argv" "--add-host"
+
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build "$root/work" "$root/out" -- git status
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-proxied"
+  argv="$(tr '\n' ' ' < "$root/argv-proxied")"
+  has "argv (proxied): on the internal network"      "$argv" "--network=atelier-internal"
+  has "argv (proxied): the proxy resolves by address" "$argv" "--add-host atelier-egress:10.89.14.10"
+  has "argv (proxied): HTTPS_PROXY is injected"       "$argv" "HTTPS_PROXY=http://atelier-egress:3128"
+  # Atelier's finding: curl reads the lowercase form and ignores the other.
+  has "argv (proxied): ...and https_proxy too"        "$argv" "https_proxy=http://atelier-egress:3128"
+  has "argv (proxied): nothing bypasses the proxy"    "$argv" "NO_PROXY="
+
+  # The preflight of Phase 2b is the one stage that takes no network at all,
+  # whatever the tier says, because it only reads a credential.
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-pre"
+  argv="$(tr '\n' ' ' < "$root/argv-pre")"
+  has   "argv (preflight): takes no network whatever the tier says" "$argv" "--network=none"
+  hasnt "argv (preflight): and no proxy"                            "$argv" "HTTPS_PROXY"
+}
+
+# What the flags actually buy, asked of the kernel rather than of the argv.
+# One container start answers every question: a probe per assertion would
+# make the suite pay a container start each time for nothing.
+test_p2_isolation() {
+  if ! p2_image_present; then
+    skip "isolation: the real container boundary" "${P2_IMAGE} is not on this host (expected in CI)"
+    return 0
+  fi
+  local root="$FIXTURE/p2-iso"; mkdir -p "$root/out"
+  local blob; blob="$(p2_source_repo "$root/src")"
+  local base; base="$(git -C "$root/src" rev-parse HEAD)"
+
+  # The scratch tree the container will see: a clone, not the repo.
+  ( source "$REPO/lib/container.sh"; source "$REPO/lib/scratch.sh"
+    scratch_clone "$root/src" "$root/work" main "meute/probe-2026-09-22" "$base" ) >/dev/null 2>&1
+
+  local probe; probe="$(cat <<'SH'
+echo "uid=$(id -u)"
+echo "gid=$(id -g)"
+echo "capbnd=$(awk '/^CapBnd/{print $2}' /proc/self/status)"
+echo "nonewprivs=$(awk '/^NoNewPrivs/{print $2}' /proc/self/status)"
+echo "home=$HOME"
+touch /work/written-inside 2>/dev/null && echo "work=writable" || echo "work=readonly"
+touch /out/capture 2>/dev/null && echo "out=writable" || echo "out=readonly"
+git -C /work status --porcelain >/dev/null 2>&1 && echo "gitstatus=ok" || echo "gitstatus=failed"
+git -C /work diff "$BASE_SHA"...HEAD >/dev/null 2>&1 && echo "gitdiff=ok" || echo "gitdiff=failed"
+git -C /work cat-file -e SECRET_BLOB 2>/dev/null && echo "secret=present" || echo "secret=absent"
+getent hosts example.com >/dev/null 2>&1 && echo "dns=resolved" || echo "dns=failed"
+test -e "$HOST_HOME/.claude" && echo "hosthome=visible" || echo "hosthome=absent"
+test -e "$HOST_ROOT" && echo "hostroot=visible" || echo "hostroot=absent"
+SH
+)"
+  probe="${probe//SECRET_BLOB/$blob}"
+  local entry out
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:120}')"
+  out="$( source "$REPO/lib/container.sh"
+          container_ready "$entry" >/dev/null 2>&1 \
+            || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
+          BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" \
+          container_run "$entry" build "$root/work" "$root/out" -- \
+            env BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" sh -c "$probe" 2>&1 )"
+
+  local field; field() { grep -m1 "^$1=" <<< "$out" | cut -d= -f2-; }
+  is "isolation: the agent is uid 1000, not root"      "$(field uid)"        "1000"
+  is "isolation: ...and gid 1000"                      "$(field gid)"        "1000"
+  is "isolation: the capability bounding set is empty"  "$(field capbnd)"     "0000000000000000"
+  is "isolation: privileges cannot be regained"         "$(field nonewprivs)" "1"
+  is "isolation: /work is writable"                     "$(field work)"       "writable"
+  is "isolation: /out is writable"                      "$(field out)"        "writable"
+  # The defect that made §4.2 choose a clone over a linked worktree, proven
+  # from inside: a worktree's .git points at a host path that is not there.
+  is "isolation: git status works on the scratch tree"  "$(field gitstatus)"  "ok"
+  is "isolation: git diff <base>...HEAD works too"      "$(field gitdiff)"    "ok"
+  is "isolation: the source's other branches are absent" "$(field secret)"    "absent"
+  is "isolation: under network none, nothing resolves"  "$(field dns)"        "failed"
+  is "isolation: the owner's home is not mounted"       "$(field hosthome)"   "absent"
+  is "isolation: nor is the meute checkout"             "$(field hostroot)"   "absent"
+  hasnt "isolation: \$HOME is the image's, not the owner's" "$(field home)"   "$HOME"
+
+  # What the container wrote is the host user's afterwards -- keep-id's whole
+  # purpose, and what lets commit_worktree run host-side over the result.
+  [[ -f "$root/work/written-inside" ]] \
+    && is "isolation: a file written inside belongs to the host user afterwards" \
+          "$(stat -c '%u' "$root/work/written-inside")" "$(id -u)" \
+    || bad "isolation: a file written inside belongs to the host user afterwards" "nothing was written"
+}
+
+# The clone is not the repository. §4.2's claim, asserted in both directions
+# so --no-local cannot be quietly dropped later.
+test_p2_scratch_clone() {
+  local root="$FIXTURE/p2-clone"; mkdir -p "$root"
+  local blob; blob="$(p2_source_repo "$root/src")"
+  local base; base="$(git -C "$root/src" rev-parse HEAD)"
+  source "$REPO/lib/scratch.sh"
+
+  scratch_clone "$root/src" "$root/work" main "meute/lint-2026-09-22" "$base" >/dev/null 2>&1
+  is  "clone: the branch is cut at the recorded base" \
+      "$(git -C "$root/work" rev-parse HEAD)" "$base"
+  is  "clone: ...and checked out under the run's name" \
+      "$(git -C "$root/work" rev-parse --abbrev-ref HEAD)" "meute/lint-2026-09-22"
+  # The transport path honours --single-branch and cannot hardlink; a
+  # local-path clone copies the whole object store, purged history included.
+  ( cd "$root/work" && git cat-file -e "$blob" 2>/dev/null ) \
+    && bad "clone: an unrelated branch's object is absent" "the secret blob came across" \
+    || ok "clone: an unrelated branch's object is absent"
+  is  "clone: ...and so is its branch" \
+      "$(git -C "$root/work" branch -a --list '*secret*' | wc -l)" "0"
+  # The other direction, so the flag cannot be dropped without a failure.
+  git clone -q "$root/src" "$root/local-clone" 2>/dev/null
+  ( cd "$root/local-clone" && git cat-file -e "$blob" 2>/dev/null ) \
+    && ok "clone: a local clone WOULD have carried it -- the flag is what stops it" \
+    || bad "clone: a local clone WOULD have carried it -- the flag is what stops it" "absent either way; the assertion above proves nothing"
+  is  "clone: the owner's checkout is untouched" \
+      "$(git -C "$root/src" status --porcelain | wc -l)" "0"
+
+  # A repo with no resolvable default branch takes the source's HEAD, as the
+  # host path already does.
+  scratch_clone "$root/src" "$root/work2" "" "meute/lint-2026-09-22" "$base" >/dev/null 2>&1
+  is  "clone: no default branch falls back to HEAD" \
+      "$(git -C "$root/work2" rev-parse HEAD)" "$base"
+
+  # A later stage clones the branch it is continuing, not the default one.
+  git -C "$root/src" branch meute/draft-2026-09-01 main
+  scratch_clone "$root/src" "$root/work3" "" "meute/draft-2026-09-01" "$base" >/dev/null 2>&1
+  is  "clone: a later stage checks out the recorded branch" \
+      "$(git -C "$root/work3" rev-parse --abbrev-ref HEAD)" "meute/draft-2026-09-01"
+
+  # gitignored build plumbing travels into the clone exactly as into a worktree.
+  printf 'sdk.dir=/opt/sdk\n' > "$root/src/local.properties"
+  printf 'local.properties\n' > "$root/src/.gitignore"
+  git -C "$root/src" add .gitignore
+  git -C "$root/src" -c user.email=t@t -c user.name=t commit -qm ignore
+  scratch_copy_files "$root/src" "$root/work4" local.properties >/dev/null 2>&1 || true
+  [[ -f "$root/work4/local.properties" ]] \
+    && ok "clone: worktree_files are carried into the clone" \
+    || bad "clone: worktree_files are carried into the clone" "local.properties did not arrive"
+}
+
+# Work is never left only in the clone cleanup removes.
+test_p2_scratch_import() {
+  local root="$FIXTURE/p2-import"; mkdir -p "$root"
+  p2_source_repo "$root/src" >/dev/null
+  local base; base="$(git -C "$root/src" rev-parse main)"
+  source "$REPO/lib/scratch.sh"
+
+  # The ordinary path: the branch does not exist in the source, so it arrives.
+  scratch_clone "$root/src" "$root/work" main "meute/lint-2026-09-22" "$base" >/dev/null 2>&1
+  echo change > "$root/work/new.txt"
+  git -C "$root/work" add -A
+  git -C "$root/work" -c user.email=t@t -c user.name=t commit -qm work
+  local tip; tip="$(git -C "$root/work" rev-parse HEAD)"
+  scratch_import "$root/src" "$root/work" "meute/lint-2026-09-22" 2026-09-22 >/dev/null 2>&1
+  is "import: the branch lands in the owner's repo" \
+     "$(git -C "$root/src" rev-parse meute/lint-2026-09-22 2>/dev/null)" "$tip"
+  is "import: ...as a branch, not aside" "$SCRATCH_IMPORT" "branch"
+
+  # A non-fast-forward: the owner moved the branch on while the run worked.
+  # git refuses, and the work goes to a ref nothing has checked out.
+  scratch_clone "$root/src" "$root/work2" main "meute/lint-2026-09-23" "$base" >/dev/null 2>&1
+  echo one > "$root/work2/a.txt"; git -C "$root/work2" add -A
+  git -C "$root/work2" -c user.email=t@t -c user.name=t commit -qm one
+  local aside_tip; aside_tip="$(git -C "$root/work2" rev-parse HEAD)"
+  git -C "$root/src" branch meute/lint-2026-09-23 secret
+  scratch_import "$root/src" "$root/work2" "meute/lint-2026-09-23" 2026-09-23 >/dev/null 2>&1
+  is "import: a non-fast-forward goes aside, not nowhere" "$SCRATCH_IMPORT" "aside"
+  is "import: ...to a dated ref under refs/meute/import" \
+     "$(git -C "$root/src" rev-parse refs/meute/import/meute/lint-2026-09-23-2026-09-23 2>/dev/null)" "$aside_tip"
+  is "import: ...and the owner's branch is left alone" \
+     "$(git -C "$root/src" rev-parse meute/lint-2026-09-23)" "$(git -C "$root/src" rev-parse secret)"
+
+  # A branch checked out somewhere is stepped over BEFORE the run: git would
+  # refuse the import afterwards, and the run's work would have nowhere to go.
+  git -C "$root/src" worktree add -q "$root/wt" -b meute/checked-out main 2>/dev/null
+  scratch_branch_is_checked_out "$root/src" meute/checked-out \
+    && ok "import: a branch checked out in a worktree is seen before the run" \
+    || bad "import: a branch checked out in a worktree is seen before the run" "not detected"
+  scratch_branch_is_checked_out "$root/src" meute/lint-2026-09-22 \
+    && bad "import: ...and one that is not is not" "false positive" \
+    || ok "import: ...and one that is not is not"
+  is "import: the checked-out branch still holds what the owner had" \
+     "$(git -C "$root/src" rev-parse meute/checked-out)" "$base"
+}
+
+# Fail closed: a pin that does not match, a proxy that is not running, an
+# address that cannot be read. Each is a step-over -- the fire runs the next
+# entry -- never a skip, which would end the fire and starve the queue.
+test_p2_fail_closed() {
+  local root="$FIXTURE/p2-closed"; mkdir -p "$root/stub"
+  local entry
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", runtime:"container", image:{tag:$tag, digest:$digest}, network:"proxied"}')"
+
+  # Everything as it should be.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "\${STUB_DIGEST-$P2_DIGEST}" "$P2_ID" ;;
+  *"container inspect"*"State.Running"*) printf '%s\n' "\${STUB_EGRESS:-true}" ;;
+  *"NetworkSettings"*) printf '%s\n' "\${STUB_IP-10.89.14.10}" ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  local ready; ready() {
+    ( source "$REPO/lib/container.sh"
+      MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1 \
+        && printf 'ready\n' || printf '%s\n' "$CONTAINER_BLOCKED" ) 2>/dev/null
+  }
+  is "fail closed: a matching pin and a live proxy are ready" "$(ready)" "ready"
+  # The ID the assert resolved is what the caller must run.
+  is "fail closed: a verified pin exports the image ID" \
+     "$( source "$REPO/lib/container.sh"
+         MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
+         printf '%s\n' "${CONTAINER_IMAGE_ID:-unset}" )" "$P2_ID"
+  has "fail closed: a drifted image is not" \
+      "$(STUB_DIGEST=sha256:$(printf 'f%.0s' {1..64}) ready)" \
+      "alpha: image ${P2_IMAGE} is not at the pinned digest"
+  is "fail closed: an absent image is not" \
+     "$(STUB_DIGEST= ready)" \
+     "alpha: image ${P2_IMAGE} is not present on this host"
+  is "fail closed: a stopped egress proxy is not" \
+     "$(STUB_EGRESS=false ready)" \
+     "alpha: atelier-egress is not running"
+  is "fail closed: an unreadable proxy address is not" \
+     "$(STUB_IP= ready)" \
+     "alpha: atelier-egress has no address on atelier-internal"
+  # A tier that takes no network does not need the proxy at all.
+  is "fail closed: a network: none entry needs no proxy" \
+     "$(STUB_EGRESS=false ready_none)" "ready"
+}
+ready_none() {
+  local root="$FIXTURE/p2-closed"
+  ( source "$REPO/lib/container.sh"
+    MEUTE_PODMAN="$root/stub/podman" container_ready \
+      "$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+         '{repo:"alpha", runtime:"container", image:{tag:$tag, digest:$digest}, network:"none"}')" \
+      >/dev/null 2>&1 && printf 'ready\n' || printf '%s\n' "$CONTAINER_BLOCKED" ) 2>/dev/null
+}
+
+# The same conditions, seen by the runner: the entry is stepped over in
+# eligible(), the fire runs the next entry, and state/log never gets a line
+# for the one that was passed -- one line per fire is what week_runs and the
+# inbox consume.
+test_p2_step_over() {
+  local root="$FIXTURE/p2-step"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf 'sha256:%s %s\n' "\$(printf 'f%.0s' {1..64})" "$P2_ID" ;;
+  *"container inspect"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  # Two repos: the container one drifts, the host one is fine.
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    'import copy
+beta = copy.deepcopy(d["repos"][0]); beta["name"] = "beta"; beta["runtime"] = "host"
+del beta["image"]; del beta["push"]; del beta["repo"]; beta["tickets"] = []
+beta["tasks"] = ["audit-security"]; beta["path"] = d["repos"][0]["path"]
+d["repos"][0]["tasks"] = ["audit-security"]; d["repos"][0]["tickets"] = []
+d["repos"].append(beta); d["community"] = []'
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily 2>&1)"
+  has   "step-over: the drifted repo is named on stderr"   "$out" "is not at the pinned digest"
+  has   "step-over: ...and the fire runs the next entry"   "$out" "repo=beta"
+  is    "step-over: exactly one log line for the fire"     "$(wc -l < "$root/state/log")" "1"
+  hasnt "step-over: ...and it is not the drifted repo's"   "$(cat "$root/state/log")" "repo=netlens"
+  is    "step-over: the cursor sits on the entry that ran" \
+        "$(kv_get_test "$root/state/cursor" cursor.daily)" "beta/audit-security"
+
+  # --repo is a human overriding the QUEUE's gates (share, cap, quota), not
+  # the boundary's readiness: a forced run on a drifted pin is the one case
+  # where the operator is least able to see what they would be running.
+  local forced
+  forced="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+            "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has   "step-over: a forced selection is still refused on a drifted pin" \
+        "$forced" "is not at the pinned digest"
+  hasnt "step-over: ...and never reaches the engine" "$forced" "status=ok"
+  # An operator who named the repo is owed the reason in state/log, not a
+  # generic "nothing was eligible". This is the one path where the drift is
+  # otherwise invisible: the queue held exactly the entry they asked for.
+  local forced_line; forced_line="$(tail -1 "$root/state/log")"
+  has   "step-over: a forced refusal is logged as an error"   "$forced_line" "status=error"
+  has   "step-over: ...naming the repo the operator asked for" "$forced_line" "repo=netlens"
+  has   "step-over: ...and saying the pin did not match"       "$forced_line" "detail=netlens: image"
+  has   "step-over: ...with the digest as the reason"          "$forced_line" "is not at the pinned digest"
+  hasnt "step-over: ...not a generic empty round"              "$forced_line" "status=skipped"
+  # Logged, but not retired: the cursor stays where the last successful fire
+  # left it, so the entry the operator asked for is still there to retry once
+  # the image is built. Only the unforced rotation advances past an entry.
+  is    "step-over: ...but the forced entry stays retryable"   "$(kv_get_test "$root/state/cursor" cursor.daily)" "beta/audit-security"
+}
+
+# `meute container probe <repo>`: what a human runs to see whether a repo is
+# container-ready, and what these tests drive. It is the only new reachable
+# code path in this phase -- a timer fire still cannot dispatch a container.
+test_p2_container_probe() {
+  local root="$FIXTURE/p2-probe"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['image'] = {'tag': '$P2_IMAGE', 'digest': '$P2_DIGEST'}"
+  # These two refuse before anything touches podman, so they are asserted
+  # here rather than behind the image gate below.
+  local out rc
+  out="$("$root/bin/meute" container probe beta 2>&1)"; rc=$?
+  is  "probe: an unknown repo is refused"            "$rc" "1"
+  has "probe: ...by name"                            "$out" "unknown repo 'beta'"
+  yaml_edit "$root/repos.yaml" "$root/hostrepo.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  out="$(MEUTE_MANIFEST="$root/hostrepo.yaml" "$root/bin/meute" container probe netlens 2>&1)"; rc=$?
+  is  "probe: a host repo has nothing to probe"      "$rc" "1"
+  has "probe: ...and is told so"                     "$out" "runs on the host"
+
+  if ! p2_image_present; then
+    skip "probe: against the real image" "${P2_IMAGE} is not on this host (expected in CI)"
+    return 0
+  fi
+  out="$("$root/bin/meute" container probe netlens 2>&1)"; rc=$?
+  is  "probe: it succeeds on a container-ready repo" "$rc" "0"
+  has "probe: it reports the uid"                    "$out" "uid 1000"
+  has "probe: it reports the capability set"         "$out" "capabilities none"
+  has "probe: it reports no-new-privileges"          "$out" "no-new-privs yes"
+  has "probe: it reports git working in /work"       "$out" "git in /work ok"
+  has "probe: it reports /out writable"              "$out" "/out writable"
+  has "probe: it reports the network is closed"      "$out" "dns blocked"
+  has "probe: it names the pin it asserted"          "$out" "$P2_IMAGE"
+  is  "probe: it leaves no scratch tree behind"      "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
+  is  "probe: the owner's checkout is untouched"     "$(git -C "$root/git-netlens" status --porcelain | wc -l)" "0"
+}
+
+# The engine adapters build argv and run nothing, so the same array can be
+# handed to the host or to podman. The host path must not change shape.
+test_p2_engine_argv() {
+  local root="$FIXTURE/p2-engine"; mkdir -p "$root"
+  printf 'do the thing\n' > "$root/prompt"
+  local argv
+  argv="$( source "$REPO/lib/engines.sh"
+           MODEL=sonnet TOOLS="Read,Edit" PERMISSION_MODE=acceptEdits ALLOWED_TOOLS="Bash(pytest:*)" \
+           MEUTE_SETTING_SOURCES= engine_argv_claude "$root/prompt"
+           printf '%s\n' "${ENGINE_ARGV[@]}" )"
+  is  "engine argv: claude is the command"      "$(head -1 <<< "$argv")" "claude"
+  has "engine argv: the prompt is passed"       "$argv" "do the thing"
+  has "engine argv: json envelope"              "$argv" "--output-format"
+  has "engine argv: the model"                  "$argv" "sonnet"
+  has "engine argv: the tier's tools"           "$argv" "Read,Edit"
+  has "engine argv: the permission mode"        "$argv" "acceptEdits"
+  has "engine argv: the allowlist"              "$argv" "Bash(pytest:*)"
+  hasnt "engine argv: it does not cd"           "$argv" "cd"
+  hasnt "engine argv: nor time itself out"      "$argv" "timeout"
+
+  argv="$( source "$REPO/lib/engines.sh"
+           WRITES_CODE=1 MEUTE_CODEX_MODEL= engine_argv_codex "$root/prompt" /work /out/codex-last
+           printf '%s\n' "${ENGINE_ARGV[@]}" )"
+  is  "engine argv: codex is the command"        "$(head -1 <<< "$argv")" "codex"
+  has "engine argv: the workdir is a parameter"  "$argv" "/work"
+  has "engine argv: so is the final-message file" "$argv" "/out/codex-last"
+  has "engine argv: a writing tier gets workspace-write" "$argv" "workspace-write"
+  argv="$( source "$REPO/lib/engines.sh"
+           WRITES_CODE=0 MEUTE_CODEX_MODEL= engine_argv_codex "$root/prompt" /work /out/codex-last
+           printf '%s\n' "${ENGINE_ARGV[@]}" )"
+  has "engine argv: a reading tier gets read-only" "$argv" "read-only"
+}
+
+
+# The `proxied` profile, run rather than argued. Every tier but tier2-web
+# uses it, all of Phase 2b depends on it, and the allow-list is what PRP-004
+# §1 sells the container on -- so the claim "the agent reaches the provider
+# and nothing else" is asked of the proxy itself, once, in one start.
+test_p2_proxied_egress() {
+  if ! p2_image_present; then
+    skip "egress: the proxied profile" "${P2_IMAGE} is not on this host (expected in CI)"
+    return 0
+  fi
+  local ip
+  ip="$( source "$REPO/lib/container.sh"; egress_running && egress_ip )" || ip=""
+  if [[ -z "$ip" ]]; then
+    skip "egress: the proxied profile" "atelier-egress is not running on this host (expected in CI)"
+    return 0
+  fi
+  local root="$FIXTURE/p2-egress"; mkdir -p "$root/work" "$root/out"
+  local entry out
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", runtime:"container", image:{tag:$tag, digest:$digest},
+      network:"proxied", timeout_seconds:120}')"
+  is "egress: a proxied entry is ready when the proxy is up" \
+     "$( source "$REPO/lib/container.sh"; container_ready "$entry" && echo ready || echo "$CONTAINER_BLOCKED" )" "ready"
+
+  # github.com is on Atelier's allow-list; example.com is not. 56 is curl's
+  # "recv failure" -- the proxy closing a CONNECT it refuses to open.
+  local probe; probe="$(cat <<'SH'
+getent hosts atelier-egress >/dev/null 2>&1 && echo "addhost=resolved" || echo "addhost=failed"
+echo "https_upper=${HTTPS_PROXY:-unset}"
+echo "https_lower=${https_proxy:-unset}"
+echo "http_upper=${HTTP_PROXY:-unset}"
+echo "http_lower=${http_proxy:-unset}"
+echo "plain=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://github.com/ 2>/dev/null)"
+echo "noproxy=${NO_PROXY-unset}"
+echo "allowed=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://github.com/ 2>/dev/null)"
+curl -s -o /dev/null --max-time 20 https://example.com/ 2>/dev/null
+echo "denied_rc=$?"
+SH
+)"
+  out="$( source "$REPO/lib/container.sh"
+          container_ready "$entry" >/dev/null 2>&1 \
+            || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
+          container_run "$entry" build "$root/work" "$root/out" -- sh -c "$probe" 2>&1 )"
+  local field; field() { grep -m1 "^$1=" <<< "$out" | cut -d= -f2-; }
+  is "egress: the proxy resolves through --add-host, not DNS" "$(field addhost)"    "resolved"
+  is "egress: HTTPS_PROXY is set inside"                      "$(field https_upper)" "http://atelier-egress:3128"
+  is "egress: ...and https_proxy, for clients that read only that spelling" "$(field https_lower)" "http://atelier-egress:3128"
+  is "egress: nothing is exempted from the proxy"             "$(field noproxy)"    ""
+  # Plain http has its own pair, and curl reads only the lowercase one there:
+  # it refuses uppercase HTTP_PROXY on purpose, because a CGI request header
+  # called `Proxy:` lands in the environment under exactly that name.
+  is "egress: HTTP_PROXY is set inside"                       "$(field http_upper)" "http://atelier-egress:3128"
+  is "egress: ...and http_proxy, the only one curl reads"     "$(field http_lower)" "http://atelier-egress:3128"
+  is "egress: a plain-http fetch goes through the allow-list too" "$(field plain)"   "301"
+  is "egress: an allow-listed host is reachable"              "$(field allowed)"    "200"
+  # Not a timeout and not a DNS failure: the proxy refused the CONNECT.
+  is "egress: a host off the allow-list is refused"           "$(field denied_rc)"  "56"
+}
+
+# The caller contract the argv split changed: lib/engines.sh no longer cds or
+# times out, so bin/run.sh does both -- for BOTH engines. codex used to run
+# from the runner's own cwd with --cd pointing at the worktree; it now runs
+# from the worktree as claude always did. A live run would prove it weeks
+# from now; a stub that reports its own pwd proves it here.
+test_p2_engine_cwd() {
+  local root="$FIXTURE/p2-cwd" repo="$FIXTURE/p2-cwd/git-c"
+  mkdir -p "$root"/{state,tasks,stub} "$repo"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  printf 'Task {{REPO_NAME}} {{REPO_PATH}} {{FILE_BUDGET}} {{LENS}} {{REPORT_PATH}} {{DATE}} {{BRANCH}} {{TASK}} {{TIER}} {{REPO_SPEC}} {{ALLOWED_COMMANDS}} {{DEFAULT_BRANCH}} {{UPSTREAM}} {{ETIQUETTE}} {{ETIQUETTE_CONTENT}} {{TICKET_ID}} {{TICKET_TITLE}} {{TICKET_NOTES}}\n' > "$root/tasks/t.md"
+  git -C "$repo" init -q -b main
+  echo x > "$repo/f.txt"; git -C "$repo" add -A
+  git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init
+
+  # Each stub records the directory it was started in, and codex also records
+  # the directory it was TOLD to use, so the two can be compared.
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+pwd > "$(dirname "$0")/claude-pwd"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  cat > "$root/stub/codex" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "login" ]]; then printf 'Logged in using ChatGPT\n'; exit 0; fi
+pwd > "$(dirname "$0")/codex-pwd"
+last=""; cd_arg=""
+while (( $# )); do
+  case "$1" in
+    -o) last="$2"; shift ;;
+    --cd) cd_arg="$2"; shift ;;
+  esac
+  shift
+done
+printf '%s\n' "$cd_arg" > "$(dirname "$0")/codex-cd"
+printf '## Summary\nstub ran\n' > "$last"
+STUB
+  chmod +x "$root/stub/claude" "$root/stub/codex"
+
+  python3 - "$root" "$repo" <<'PY'
+import sys, pathlib, yaml
+root, repo = sys.argv[1], sys.argv[2]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5,
+                 "timeout_seconds": 60, "runtime": "host"},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read", "permission_mode": "dontAsk",
+                        "writes_code": False, "network": "proxied"}},
+    "tasks": {"t": {"tier": "tier2", "template": "tasks/t.md", "slots": ["daily"]}},
+    "repos": [{"name": "c", "path": repo, "spec": "cwd fixture", "tasks": ["t"]}],
+    "community": [],
+}, open(pathlib.Path(root) / "repos.yaml", "w"), sort_keys=False)
+PY
+
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily 2>&1)"
+  has "cwd: the claude run completes"  "$out" "status=ok"
+  local claude_pwd; claude_pwd="$(cat "$root/stub/claude-pwd" 2>/dev/null || echo none)"
+  case "$claude_pwd" in
+    "$root"/.worktrees/c-t-*) ok "cwd: claude is started inside the run's worktree" ;;
+    *) bad "cwd: claude is started inside the run's worktree" "started in [$claude_pwd]" ;;
+  esac
+
+  : > "$root/state/cursor"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_CODEX_QUOTA_CMD='echo 100' \
+         "$root/bin/run.sh" daily --engine codex 2>&1)"
+  has "cwd: the codex run completes" "$out" "status=ok"
+  local codex_pwd codex_cd
+  codex_pwd="$(cat "$root/stub/codex-pwd" 2>/dev/null || echo none)"
+  codex_cd="$(cat "$root/stub/codex-cd" 2>/dev/null || echo none)"
+  # codex names its working directory rather than inheriting it, and on the
+  # host it has always run from the runner's own cwd. The argv split must not
+  # change that: what `-s workspace-write` derives its writable root from --
+  # cwd or --cd -- is unverified (PRP-004 §8), so moving the process is a
+  # change to the sandbox's shape that nobody has measured.
+  case "$codex_pwd" in
+    "$root"/.worktrees/c-t-*) bad "cwd: codex on the host keeps the runner's cwd" "it was moved into the worktree" ;;
+    *) ok "cwd: codex on the host keeps the runner's cwd" ;;
+  esac
+  case "$codex_cd" in
+    "$root"/.worktrees/c-t-*) ok "cwd: ...and is told the worktree through --cd, as before" ;;
+    *) bad "cwd: ...and is told the worktree through --cd, as before" "--cd was [$codex_cd]" ;;
+  esac
+  [[ "$codex_cd" != "$codex_pwd" ]] \
+    && ok "cwd: the two differ on the host, which is the behaviour that shipped" \
+    || bad "cwd: the two differ on the host, which is the behaviour that shipped" "both were [$codex_pwd]"
+}
+
+
+# podman's --timeout bounds the CONTAINER; it does nothing about a podman
+# client or control-plane call that stalls. Under a timer that is the whole
+# fleet wedged behind one flock, so the run carries its own wall clock --
+# deliberately slack above the inner one, so it can only fire when podman
+# itself is stuck rather than pre-empting a run that is merely slow.
+test_p2_outer_bound() {
+  source "$REPO/lib/container.sh"
+  is "outer bound: slack above the container's own timeout" \
+     "$(container_outer_bound 1800)" "$(( 1800 + 30 + 60 ))"
+  is "outer bound: ...at every size"  "$(container_outer_bound 60)" "$(( 60 + 30 + 60 ))"
+  # A missing or unreadable timeout is not a licence to run forever.
+  is "outer bound: a missing timeout still has one" "$(container_outer_bound "")" "$(( 1800 + 30 + 60 ))"
+  is "outer bound: so does a nonsense one"          "$(container_outer_bound abc)" "$(( 1800 + 30 + 60 ))"
+  # The wiring itself: a stalled podman must be killed, not waited on. There
+  # is no way to assert this without waiting out a real bound, so the call is
+  # pinned by reading it -- the same way the --runtime guard is.
+  is "outer bound: container_run wraps podman in that wall clock" \
+     "$(grep -c 'timeout --kill-after="\$CONTAINER_STOP_TIMEOUT" "\$(container_outer_bound' "$REPO/lib/container.sh")" "1"
+}
+
+# No timer fire can dispatch a container. That is the guarantee this whole
+# phase rests on, so it is asserted WITHOUT a real image: a machine that
+# happens not to have one -- CI, a fresh checkout -- would otherwise skip
+# the only test standing between an unverifiable engine run and a timer.
+#
+# A stub podman answering the two calls container_ready makes is enough,
+# because the abort fires before anything would start a container: the
+# entry passes the boundary, reaches run_entry, and is refused there.
+test_p2_credential_abort() {
+  local root="$FIXTURE/p2-cred"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+echo invoked >> "$(dirname "$0")/invocations"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  # The fixture's own pin, answered as podman would: a verified boundary is
+  # the precondition for reaching the abort, not the thing under test here.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/claude" "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has "credentials: a verified pin gets past the boundary check" "$out" "status=error"
+  has "credentials: ...and run_entry refuses to dispatch it"     "$out" "detail=container runtime needs the credential volumes; see PRP-004 §5 item 3"
+  [[ -f "$root/stub/invocations" ]] \
+    && bad "credentials: ...with no engine run" "the stub was invoked" \
+    || ok "credentials: ...with no engine run"
+  is  "credentials: the entry is logged once and stepped past" \
+      "$(grep -c 'repo=netlens' "$root/state/log")" "1"
+  # The boundary was really crossed: had the pin failed, the entry would have
+  # been stepped over in eligible() and the abort above would never have run.
+  has "credentials: the pin was asserted on the way"   "$(cat "$root/stub/podman-calls")" "{{.Digest}}"
+  has "credentials: ...and the image ID resolved with it" "$(cat "$root/stub/podman-calls")" "{{.Id}}"
+  hasnt "credentials: no container was ever started"   "$(cat "$root/stub/podman-calls")" "run --rm"
+}
+
+# The probe makes two scratch directories. If the second cannot be made, the
+# first must still go: a leaked clone of a private repo under /tmp is exactly
+# what the boundary exists to avoid. Needs no image -- the failure is before
+# any container starts.
+test_p2_probe_cleanup() {
+  local root="$FIXTURE/p2-probe-clean"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub" "$root/tmp"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P2_DIGEST" "$P2_ID" ;;
+  *) exit 125 ;;
+esac
+STUB
+  # Succeeds for the scratch clone, fails for the capture directory.
+  cat > "$root/stub/mktemp" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *meute-probe-out-*) echo "mktemp: stubbed failure" >&2; exit 1 ;;
+  *) exec /usr/bin/mktemp "$@" ;;
+esac
+STUB
+  chmod +x "$root/stub/podman" "$root/stub/mktemp"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['image'] = {'tag': '$P2_IMAGE', 'digest': '$P2_DIGEST'}"
+
+  local out rc
+  out="$(PATH="$root/stub:$PATH" TMPDIR="$root/tmp" MEUTE_PODMAN="$root/stub/podman" \
+         "$root/bin/meute" container probe netlens 2>&1)"; rc=$?
+  is "probe cleanup: a failed second mktemp fails the probe" "$rc" "1"
+  is "probe cleanup: ...and the first scratch tree is still removed" \
+     "$(ls "$root/tmp" 2>/dev/null | wc -l)" "0"
+}
+
+
+# The pin has to be ONE observation, not two agreeing ones. Two inspects of
+# the same tag can see two different images -- a retag between them passes
+# the digest assert for one and runs the other -- and an identity that
+# outlives what proved it is the same defect wherever it appears.
+test_p2_pin_is_one_snapshot() {
+  local root="$FIXTURE/p2-pin"; mkdir -p "$root/stub"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "\${STUB_DIGEST-$P2_DIGEST}" "\${STUB_ID-$P2_ID}" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  local entry
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", runtime:"container", image:{tag:$tag, digest:$digest}, network:"proxied"}')"
+
+  : > "$root/stub/calls"
+  local id
+  id="$( source "$REPO/lib/container.sh"
+         MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
+         printf '%s\n' "${CONTAINER_IMAGE_ID:-unset}" )"
+  is "pin: the digest and the ID come from one observation" \
+     "$(grep -c 'image inspect' "$root/stub/calls")" "1"
+  is "pin: ...and that observation's ID is what will run" "$id" "$P2_ID"
+
+  # Binding: an ID is only usable for the entry whose pin produced it.
+  # Non-empty is not proof it belongs here -- readiness passing for one repo
+  # and failing for the next must not leave the first repo's image behind.
+  local leaked
+  leaked="$( source "$REPO/lib/container.sh"
+             export MEUTE_PODMAN="$root/stub/podman"
+             container_ready "$entry" >/dev/null 2>&1
+             # A second repo whose pin cannot be verified at all.
+             STUB_DIGEST= container_ready \
+               "$(jq -c '.repo = "beta" | .image.tag = "agent-beta:gfeed"' <<< "$entry")" >/dev/null 2>&1
+             printf '%s\n' "${CONTAINER_IMAGE_ID:-cleared}" )"
+  is "pin: a failed readiness check leaves no previous image behind" "$leaked" "cleared"
+
+  # Even with an ID in hand, the argv must refuse an entry it does not belong to.
+  local refused rc
+  refused="$( source "$REPO/lib/container.sh"
+              export MEUTE_PODMAN="$root/stub/podman"
+              container_ready "$entry" >/dev/null 2>&1
+              container_argv "$(jq -c '.repo = "beta" | .image.tag = "agent-beta:gfeed"' <<< "$entry")" \
+                build "$root" "$root" -- true 2>&1 )"; rc=$?
+  is  "pin: the argv refuses an entry the verified ID is not for" "$rc" "1"
+  has "pin: ...and says why"                                      "$refused" "verified"
+  # The entry it IS for still builds, so the refusal is about identity.
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$entry" build "$root" "$root" -- true ) >/dev/null 2>&1 \
+    && ok "pin: the entry it was verified for still builds" \
+    || bad "pin: the entry it was verified for still builds" "refused its own entry"
+}
+
+# A forced refusal must stay retryable. The operator named this repo, the
+# precondition they hit is one they can remediate -- build the image, start
+# the proxy, bump the pin -- and the whole point of logging it is that they
+# come back. Retiring the item they asked for turns a transient condition
+# into a permanent loss, and in plan mode the loss is silent: the staged
+# item is marked attempted and the next fire never offers it again.
+test_p2_forced_refusal_is_retryable() {
+  local universe="$FIXTURE/p2-retry" root="$FIXTURE/p2-retry/meute-stand-in"
+  mkdir -p "$root"/{state,tasks,stub} "$universe/repo-one"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/contrib" "$root/contrib"
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  git -C "$universe/repo-one" init -q -b main
+  echo x > "$universe/repo-one/f.txt"; git -C "$universe/repo-one" add -A
+  git -C "$universe/repo-one" -c user.email=t@t -c user.name=t commit -qm init
+  # A podman that exists and holds no such image, so the refusal is the
+  # boundary's and not this machine's.
+  printf '#!/usr/bin/env bash\necho "Error: no such image" >&2\nexit 125\n' > "$root/stub/podman"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+echo invoked >> "$(dirname "$0")/invocations"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/podman" "$root/stub/claude"
+  # A fleet that runs in containers by default: a staged plan item inherits
+  # that runtime and has no pin of its own, so it cannot be verified.
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5,
+                 "timeout_seconds": 60, "runtime": "container"},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk",
+                        "writes_code": False, "network": "proxied"}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
+                                 "slots": ["daily"]}},
+    "repos": [], "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  local key; key="$(jq -r '.entries[] | select(.path | endswith("/repo-one")) | .name' "$root/state/plan-queue.json" | head -1)"
+  [[ -n "$key" ]] || { bad "retryable: the plan staged an item to force" "nothing staged"; return 0; }
+
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo "$key" 2>&1)"
+  has "retryable: the forced refusal is logged"        "$out" "status=error"
+  has "retryable: ...naming the repo asked for"        "$out" "repo=${key}"
+  has "retryable: ...with the boundary's reason"       "$out" "detail=${key}: no image pinned"
+  [[ -f "$root/stub/invocations" ]] \
+    && bad "retryable: ...and no engine ran" "the stub was invoked" \
+    || ok "retryable: ...and no engine ran"
+  # The remediable part: the item the operator asked for is still theirs to
+  # retry once they have built the image.
+  is "retryable: the staged item is not marked attempted" \
+     "$(kv_get_test "$root/state/plan-complete" "plan/${key}/audit-security")" ""
+  is "retryable: ...and the plan is not retired"  "$([[ -f "$root/state/plan-queue.json" ]] && echo staged || echo gone)" "staged"
+  is "retryable: ...and the cursor did not move past it" \
+     "$(kv_get_test "$root/state/cursor" plan-cursor.daily)" ""
+
+  # The same rule at the other precondition a staged item can reach. A plan
+  # entry never carries an image of its own -- build_plan_queue builds from a
+  # synthetic project -- so the pin checks stop it in eligible(); what reaches
+  # run_entry is the downgrade refusal, and that one archived the whole plan.
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo "$key" --runtime host 2>&1)"
+  has "retryable: a forced downgrade refusal is logged too" "$out" "is not a downgrade path"
+  has "retryable: ...naming the staged repo"                "$out" "repo=${key}"
+  is  "retryable: ...and the plan survives it"              "$([[ -f "$root/state/plan-queue.json" ]] && echo staged || echo archived)" "staged"
+  is  "retryable: ...with the item still pending"           "$(kv_get_test "$root/state/plan-complete" "plan/${key}/audit-security")" ""
+  is  "retryable: ...and no archive left behind"            "$(ls "$root"/state/plan-queue.completed-* 2>/dev/null | wc -l)" "0"
 }
 
 # ------------------------------------------------------------------- main ---
@@ -3560,6 +4477,21 @@ test_p4_log_columns
 test_p4_image_bump
 test_doctor_manifest_ignored
 test_p4_doctor_containers
+test_p2_container_argv
+test_p2_engine_argv
+test_p2_scratch_clone
+test_p2_scratch_import
+test_p2_fail_closed
+test_p2_step_over
+test_p2_forced_refusal_is_retryable
+test_p2_engine_cwd
+test_p2_outer_bound
+test_p2_pin_is_one_snapshot
+test_p2_isolation
+test_p2_proxied_egress
+test_p2_container_probe
+test_p2_credential_abort
+test_p2_probe_cleanup
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

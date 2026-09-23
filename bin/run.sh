@@ -46,6 +46,8 @@ export MEUTE_ROOT
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
+source "${MEUTE_ROOT}/lib/container.sh"
+source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 # The harness is public; a real fleet config names private projects and says what
@@ -187,6 +189,27 @@ cursor_key() {
   if (( PLAN_MODE )); then printf 'plan-cursor.%s\n' "$SLOT"; else printf 'cursor.%s\n' "$SLOT"; fi
 }
 
+# Would this entry be dispatched into a container, and is there a pin to
+# assert? A container entry whose image drifted, or whose egress proxy is
+# down, is stepped OVER -- not skipped: skip() ends the fire without
+# advancing the cursor, so every repo behind this one would starve on a
+# condition that has nothing to do with them. The fire runs the next
+# candidate instead, and doctor names what is wrong (PRP-004 Phase 2).
+#
+# `--runtime container` on a repo with no `image:` at all is deliberately NOT
+# claimed here: that is rule 5, which fails closed in run_entry with the
+# validator's own message and a state/log line. Everything that could
+# actually reach a container -- a repo whose manifest says so, or a CLI
+# override on a repo that has a pin -- is asserted first.
+container_entry_needs_pin() {
+  local entry="$1"
+  # `--runtime host` asks for the host, so no image would be run and there is
+  # nothing to assert -- run_entry refuses that downgrade on its own terms.
+  [[ "$RUNTIME_OVERRIDE" != "host" ]] || return 1
+  [[ "$(jq -r '.runtime // ""' <<< "$entry")" == "container" ]] && return 0
+  [[ "$RUNTIME_OVERRIDE" == "container" && -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]]
+}
+
 eligible() {
   local entry="$1" key kind path tier engine stage_entry
   { read -r key; read -r kind; read -r path; read -r tier; read -r engine; read -r stage_entry; } \
@@ -201,8 +224,26 @@ eligible() {
     (( PLAN_MODE )) && kv_set "$PLAN_DONE_FILE" "$key" missing
     return 1
   fi
-  # A forced selection is an explicit human decision; only the path check
-  # stands. That includes re-running a staged item already attempted.
+  # A forced selection is an explicit human decision about the QUEUE: it
+  # skips the share, cap and quota gates below. It does not skip the
+  # boundary's own readiness -- a drifted pin is not a gate the operator is
+  # overriding, it is an image they did not choose and cannot see. Phase 1's
+  # abort catches this today; Phase 2b removes that abort, and then a forced
+  # run would be the one dispatch with no digest assert in front of it.
+  if container_entry_needs_pin "$entry" && ! container_ready "$entry"; then
+    # The asymmetry is deliberate. An unforced entry that cannot run is
+    # queue rotation: the fire moves on and the entry that DOES run writes
+    # the fire's one line. A forced one is a human's explicit request that
+    # failed on a precondition they can remediate -- build the image, start
+    # the proxy, bump the pin -- so it must be logged, and must stay
+    # retryable. Not abort_entry: that also advances the cursor and marks a
+    # staged plan item done, which would retire the very item they asked for
+    # over a condition they are about to fix.
+    (( FORCED )) && refuse_entry "$entry" "$CONTAINER_BLOCKED"
+    note "skipping ${key}: ${CONTAINER_BLOCKED}"
+    return 1
+  fi
+  # That includes re-running a staged item already attempted.
   (( FORCED )) && return 0
 
   if (( PLAN_MODE )) && [[ -n "$(kv_get "$PLAN_DONE_FILE" "$key")" ]]; then
@@ -462,11 +503,17 @@ run_entry() {
   # PRP-004 Phase 1 built the stage machine's schema and nothing that runs a
   # stage -- Phase 4 does. Until then a state/stages row must never reach an
   # engine: aborted here, cursor advanced, so a stray row cannot wedge the slot.
+  #
+  # abort_entry, not abort_precondition: Phase 4 is what unblocks this, and
+  # nothing an operator does today makes the entry runnable, so there is no
+  # retry to preserve. It also cannot retire a staged plan item -- a plan
+  # stages repositories, never tickets, so build_plan_queue's entries carry
+  # stage_entry: false and never reach this line (verified, not assumed).
   [[ "$(jq -r '.stage_entry' <<< "$entry")" != "true" ]] \
     || abort_entry "$entry" "stage entries are not runnable before Phase 4"
   # Rule 5, fail closed. A container run needs a pinned image to run in;
   # without one the answer is the validator's, not a fallback to the host.
-  # And with one, Phase 2 has yet to build the path -- a repo that opted into
+  # And with one, Phase 2b has yet to put a credential inside it -- a repo that
   # isolation must not be quietly run without it, and the CLI may not talk
   # it down either: --runtime host is accepted only where the manifest
   # already says host, so it changes nothing; against anything else -- a
@@ -477,11 +524,11 @@ run_entry() {
   manifest_runtime="$(jq -r '.runtime // ""' <<< "$entry")"
   runtime="${RUNTIME_OVERRIDE:-$manifest_runtime}"
   [[ "$RUNTIME_OVERRIDE" != "host" || "$manifest_runtime" == "host" ]] \
-    || abort_entry "$entry" "repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
+    || abort_precondition "$entry" "repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
   if [[ "$runtime" != "host" ]]; then
     [[ -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]] \
-      || abort_entry "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
-    abort_entry "$entry" "container runtime is not available before Phase 2"
+      || abort_precondition "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
+    abort_precondition "$entry" "container runtime needs the credential volumes; see PRP-004 §5 item 3"
   fi
 
   # Rotating lens: one narrow angle per run, advanced only on success.
@@ -557,10 +604,26 @@ run_entry() {
   CODEX_LAST="$(mktemp)"
   REPORT=""; ENGINE_STATUS="error"; ENGINE_DETAIL=""; COST="-"; TURNS="-"; RATE_LIMITED=0
   local rc=0
+  # lib/engines.sh builds the argv and runs nothing; the working directory,
+  # the timeout and the redirection are supplied here because they differ on
+  # the two sides of the container boundary. This is the host side, and it
+  # runs each engine exactly where it has always run: claude from inside the
+  # worktree (under dontAsk a read outside cwd is refused), codex from the
+  # runner's own cwd with --cd naming the worktree. They are not unified,
+  # because what codex's `-s workspace-write` derives its writable root from
+  # -- cwd or --cd -- is unverified (PRP-004 §8), and moving the process
+  # would change the sandbox's shape on a guess.
+  local -a engine_cd=()
   case "$engine" in
-    claude) invoke_claude "$prompt_file" "$out" "$err" || rc=$?; extract_claude "$out" || true ;;
-    codex)  invoke_codex  "$prompt_file" "$out" "$err" || rc=$?; extract_codex        || true ;;
+    claude) engine_argv_claude "$prompt_file"; engine_cd=( cd "$WORKTREE" ) ;;
+    codex)  engine_argv_codex  "$prompt_file" "$WORKTREE" "$CODEX_LAST"; engine_cd=( : ) ;;
     *) die "unknown engine: $engine" ;;
+  esac
+  ( "${engine_cd[@]}" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
+      "${ENGINE_ENV[@]}" "${ENGINE_ARGV[@]}" ) > "$out" 2> "$err" || rc=$?
+  case "$engine" in
+    claude) extract_claude "$out" || true ;;
+    codex)  extract_codex        || true ;;
   esac
   if (( rc != 0 )) && [[ "$ENGINE_STATUS" == "ok" ]]; then
     ENGINE_STATUS="error"; ENGINE_DETAIL="engine exited ${rc}"
@@ -622,6 +685,37 @@ manifest_section() {
     community) printf 'community\n' ;;
     *)         printf '%s\n' "$1" ;;
   esac
+}
+
+# Which of the two an entry gets, by one rule: a PRECONDITION the operator
+# can remediate stays retryable; a failure of the ATTEMPT itself advances.
+#
+# Unforced, both are the same thing -- the rotation must move past an entry
+# it cannot run, or the whole fleet stalls behind it (PRP-001 §10). Forced,
+# they differ: the operator named this entry, and advancing would move the
+# cursor they did not ask to rotate and, in plan mode, mark the staged item
+# done and archive the plan. They fix the flag, the pin or the credential,
+# re-run, and it has to still be there.
+#
+# Failures of the attempt -- an unborn HEAD, a worktree that would not cut --
+# stay on abort_entry even when forced: nothing about them is a precondition
+# waiting on the operator, and a poisoned entry that never advances is the
+# stall §10 exists to prevent.
+abort_precondition() {
+  local entry="$1" detail="$2"
+  (( FORCED )) && refuse_entry "$entry" "$detail"
+  abort_entry "$entry" "$detail"
+}
+
+# A forced entry refused on a precondition. Logged like any failure, with the
+# cause in detail=, and then the fire ends -- leaving the cursor where it was
+# and any staged plan item still pending, because the operator asked for THIS
+# entry and will ask again once the condition is gone.
+refuse_entry() {
+  local entry="$1" detail="$2"
+  log_run "error" "kind=$(jq -r '.kind' <<< "$entry")" "repo=$(jq -r '.repo' <<< "$entry")" \
+          "task=$(jq -r '.task' <<< "$entry")" "detail=${detail}"
+  exit 1
 }
 
 # An entry the runner cannot even start on. Logged as an error with the cause
