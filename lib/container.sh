@@ -186,15 +186,23 @@ container_ready() {
 # The flag set (PRP-004 §5, Atelier §4.3), built but not run, so a test can
 # assert it field by field without starting anything.
 #
-#   container_argv <entry-json> <stage> <workdir> <outdir> -- <argv...>
+#   container_argv <entry-json> <stage> <engine> <workdir> <outdir> -- <argv...>
+#
+# The engine is a PARAMETER, never read back out of the entry. `--engine`
+# makes the engine that actually runs differ from the one the entry names,
+# and a credential mount derived here from the entry would then put one
+# provider's agent in front of the other's OAuth token -- in a writing
+# container, holding danger-full-access over it. The effective engine is
+# decided once, in run_entry, and travels down. Nothing in this file reads
+# `.engine`; a second derivation is exactly how that defect arrived.
 #
 # Sets CONTAINER_ARGV. The only host paths that reach the container are the
 # two directories named here: the scratch clone at /work and the capture
 # directory at /out. The owner's checkout and its .git are never mounted.
 # --------------------------------------------------------------------------
 container_argv() {
-  local entry="$1" stage="$2" workdir="$3" outdir="$4"
-  shift 4
+  local entry="$1" stage="$2" engine="$3" workdir="$4" outdir="$5"
+  shift 5
   [[ "${1:-}" == "--" ]] && shift
   local network timeout_seconds
   { read -r network; read -r timeout_seconds; } \
@@ -254,7 +262,7 @@ container_argv() {
   # cannot sweep it into the branch.
   [[ -z "$outdir" ]] || CONTAINER_ARGV+=( --volume "${outdir}:/out:Z" )
   local auth
-  if auth="$(container_auth_mount "$(jq -r '.engine // ""' <<< "$entry")")"; then
+  if auth="$(container_auth_mount "$engine")"; then
     CONTAINER_ARGV+=( --volume "$auth" )
   fi
   local -a profile=()

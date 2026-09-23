@@ -78,7 +78,7 @@ preflight_container() {
 # below are the same ones the host path applies.
 preflight_container_claude() {
   local entry="$1" status key_source plan
-  status="$(container_run "$entry" preflight "" "" -- claude auth status --json 2>/dev/null)" \
+  status="$(container_run "$entry" preflight claude "" "" -- claude auth status --json 2>/dev/null)" \
     || { PREFLIGHT_DETAIL="claude auth status failed inside the container - the volume may be empty; run: just auth"; return 1; }
   if [[ "$(jq -r '.loggedIn // false' <<< "$status" 2>/dev/null)" != "true" ]]; then
     PREFLIGHT_DETAIL="claude is not logged in inside the container; run: just auth"
@@ -99,7 +99,7 @@ preflight_container_claude() {
 
 preflight_container_codex() {
   local entry="$1" status
-  status="$(container_run "$entry" preflight "" "" -- codex login status 2>&1)" \
+  status="$(container_run "$entry" preflight codex "" "" -- codex login status 2>&1)" \
     || { PREFLIGHT_DETAIL="codex login status failed inside the container - the volume may be empty; run: just auth"; return 1; }
   if ! grep -qi 'chatgpt' <<< "$status"; then
     PREFLIGHT_DETAIL="codex did not report a ChatGPT subscription inside the container (got: ${status})"

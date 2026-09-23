@@ -558,10 +558,17 @@ run_entry() {
   fi
 
   if (( CONTAINER_MODE )); then
+    # Named before the probe, not after it: a preflight that fails exits
+    # here, and §7's demotion rule excludes `stage=preflight` lines BY NAME.
+    # Logged as `-`, a signed-out credential would count toward demoting the
+    # repo for a reason that has nothing to do with the repo.
+    LOG_RUNTIME="$runtime"; LOG_IMAGE="${CONTAINER_IMAGE_ID:0:12}"; LOG_STAGE="preflight"
     preflight_container "$entry" "$engine" \
       || abort_precondition "$entry" "preflight: ${PREFLIGHT_DETAIL}"
+    LOG_STAGE="build"
   else
     preflight "$engine"
+    LOG_RUNTIME="$runtime"
   fi
 
   # Unique branch and report path even if the slot fires twice in one day.
@@ -663,7 +670,7 @@ run_entry() {
       codex)  engine_argv_codex  "$prompt_file" /work /out/codex-last container ;;
       *) die "unknown engine: $engine" ;;
     esac
-    container_run "$entry" build "$WORKTREE" "$OUT_DIR" -- \
+    container_run "$entry" build "$engine" "$WORKTREE" "$OUT_DIR" -- \
       "${ENGINE_ARGV[@]}" > "$out" 2> "$err" || rc=$?
   else
     case "$engine" in
@@ -726,8 +733,6 @@ run_entry() {
   [[ "$lens" == "none" || "$ENGINE_STATUS" != "ok" ]] \
     || state_set "lens.${repo}.${task}" "$(( lens_index + 1 ))"
 
-  LOG_RUNTIME="$runtime"
-  (( CONTAINER_MODE )) && LOG_IMAGE="${CONTAINER_IMAGE_ID:0:12}"
   log_run "$ENGINE_STATUS" "kind=${kind}" "repo=${repo}" "task=${task}" "tier=${tier}" \
           "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" "budget=${BUDGET_LEFT}" \
           ${SCRUBBED:+"scrubbed=${SCRUBBED// /,}"} "commit=${committed}" "report=${report_rel}" "cost=${COST}" "turns=${TURNS}" \
