@@ -278,14 +278,18 @@ container_argv() {
   # The credential is chosen from the engine parameter, and the command
   # comes from the caller's argv. Two callers passing two different things
   # is exactly the drift that put one provider's agent in front of the
-  # other's token, so where the command names an engine, bind them.
-  case "${1:-}" in
-    claude|codex)
-      [[ "$1" == "$engine" ]] || {
-        container_note "the command is $1 but the credential is for ${engine:-none}; refusing to run one engine on the other's token"
-        return 1
-      } ;;
-  esac
+  # other's token, so the two are bound -- by the BUILDER'S declaration,
+  # never by looking at the command. `claude`, `/usr/local/bin/claude` and
+  # `env FOO=1 claude` are the same engine and only one of them looks like
+  # it; a check that pattern-matched argv[0] would pass for the other two
+  # while the property was violated, and would start doing so the first
+  # time someone pinned the binary by path. Commands nobody built through
+  # lib/engines.sh -- the preflight probe, the diagnostic script -- make no
+  # claim and so have none to contradict.
+  if [[ -n "${ENGINE_ARGV_ENGINE:-}" && "$ENGINE_ARGV_ENGINE" != "$engine" ]]; then
+    container_note "the command was built for ${ENGINE_ARGV_ENGINE} but the credential is for ${engine:-none}; refusing to run one engine on the other's token"
+    return 1
+  fi
   local need auth
   need="$(container_stage_credential "$stage")" \
     || { container_note "unknown stage '${stage}'; refusing to guess what it may hold"; return 1; }

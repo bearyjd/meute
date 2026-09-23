@@ -12,6 +12,14 @@
 #
 # Add an engine by adding a pair here and a case arm in run_entry.
 #
+# Each builder also sets ENGINE_ARGV_ENGINE to the engine it just built a
+# command for. That declaration is what lib/container.sh checks before it
+# mounts a credential, rather than inspecting the command itself: argv[0]
+# can be `claude`, `/usr/local/bin/claude`, `env FOO=1 claude` or any
+# wrapper, and a check that recognised only the bare name would pass while
+# one provider's agent ran on the other's OAuth token. The builder knows
+# what it built; the mount checks the claim.
+#
 # The argv builders RUN NOTHING. They populate ENGINE_ARGV and return; the
 # caller supplies the working directory, the timeout and the redirection,
 # because those three differ on the two sides of the container boundary
@@ -28,6 +36,9 @@
 # --------------------------------------------------------------------------
 engine_argv_claude() {
   local prompt_file="$1"
+  # The builder declares what it built, so the container's credential check
+  # never has to inspect the command. See the note above ENGINE_ARGV_ENGINE.
+  ENGINE_ARGV_ENGINE="claude"
   ENGINE_ARGV=(
     claude
     -p "$(cat "$prompt_file")"
@@ -111,6 +122,7 @@ codex_sandbox() {
 # the sandbox above, and it comes from the entry, never from the environment.
 engine_argv_codex() {
   local prompt_file="$1" workdir="$2" last_message="$3" runtime="${4:-host}"
+  ENGINE_ARGV_ENGINE="codex"
   local sandbox; sandbox="$(codex_sandbox "$runtime" "${WRITES_CODE:-0}")"
   ENGINE_ARGV=( codex exec --json -o "$last_message" -s "$sandbox"
                 -c approval_policy="never" --cd "$workdir" --skip-git-repo-check )

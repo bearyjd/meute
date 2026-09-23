@@ -1037,8 +1037,12 @@ prompt is in argv, so a backgrounded invocation without a redirect blocks
 on `Reading additional input from stdin...` until something kills it. The
 symptom is the one to remember: no output, no findings, and a round that
 looks like a slow review rather than a stalled one. `codex exec … <
-/dev/null` is the fix. Two of Phase 2a's rounds were lost to this before
-it was understood, and neither was a review that found nothing.
+/dev/null` is the fix. Every Phase 2a round produced a verdict (Block,
+Block, Warning, Approve), as did Phase 2b's first (Block); what hung was
+both attempts at Phase 2b round two, and the third attempt returned the
+Warning. Recorded precisely because a note written to stop the next person
+misreading a silent round should not itself misattribute which rounds were
+silent.
 
 
 **2026-09-21, first draft, adversarial review (Opus critic, read-only,

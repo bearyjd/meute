@@ -4688,16 +4688,48 @@ STUB
   # And the two are bound rather than trusted to agree: the credential is
   # chosen from the engine parameter while the command comes from the
   # caller's argv, so a mismatch between them is refused outright.
+  # The claim is made by the builder and checked by the mount, so it does
+  # not matter how the command is spelled. A check that pattern-matched
+  # argv[0] would pass for every line below while the property is violated,
+  # and would start doing so the first time someone pins the binary by path
+  # or prefixes an env var -- a change that would look entirely innocent.
   local mismatch rc
-  mismatch="$( source "$REPO/lib/container.sh"
-               export MEUTE_PODMAN="$root/stub/podman"
-               local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P4_DIGEST" \
-                 '{repo:"netlens", image:{tag:$tag, digest:$digest}, network:"none",
-                   writes_code:true, timeout_seconds:60}')"
-               container_ready "$e" >/dev/null 2>&1
-               container_argv "$e" build codex "$root" "$root" -- claude -p hello 2>&1 )"; rc=$?
+  refuse() { # <declared-engine> <mounting-for> <command...>
+    ( source "$REPO/lib/engines.sh"; source "$REPO/lib/container.sh"
+      export MEUTE_PODMAN="$root/stub/podman"
+      local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P4_DIGEST" \
+        '{repo:"netlens", image:{tag:$tag, digest:$digest}, network:"none",
+          writes_code:true, timeout_seconds:60}')"
+      container_ready "$e" >/dev/null 2>&1
+      ENGINE_ARGV_ENGINE="$1"; local for_engine="$2"; shift 2
+      container_argv "$e" build "$for_engine" "$root" "$root" -- "$@" 2>&1 )
+  }
+  mismatch="$(refuse claude codex claude -p hello)"; rc=$?
   is  "override: a credential that does not match the command is refused" "$rc" "1"
   has "override: ...and says which two disagree"                          "$mismatch" "codex"
+  has "override: ...naming the command's engine too"                      "$mismatch" "claude"
+  # The spellings a pattern match would have missed entirely.
+  mismatch="$(refuse claude codex /usr/local/bin/claude -p hello)"; rc=$?
+  is "override: an absolute path is still bound to its engine"   "$rc" "1"
+  mismatch="$(refuse claude codex env FOO=1 claude -p hello)"; rc=$?
+  is "override: an env-prefixed command too"                     "$rc" "1"
+  mismatch="$(refuse codex claude /opt/codex/bin/codex exec x)"; rc=$?
+  is "override: and the same in the other direction"             "$rc" "1"
+  # A matching declaration still builds, however the command is spelled.
+  refuse claude claude /usr/local/bin/claude -p hello >/dev/null 2>&1 \
+    && ok "override: a matching declaration builds, path or not" \
+    || bad "override: a matching declaration builds, path or not" "refused its own engine"
+  # The builders are what make the claim, so it is theirs to declare.
+  is "override: the claude builder declares what it built" \
+     "$( source "$REPO/lib/engines.sh"
+         MODEL=s TOOLS=Read PERMISSION_MODE=dontAsk ALLOWED_TOOLS= MEUTE_SETTING_SOURCES= \
+           engine_argv_claude "$root/../p2-engine/prompt" >/dev/null 2>&1
+         printf '%s\n' "${ENGINE_ARGV_ENGINE:-unset}" )" "claude"
+  is "override: ...and the codex builder likewise" \
+     "$( source "$REPO/lib/engines.sh"
+         WRITES_CODE=0 MEUTE_CODEX_MODEL= \
+           engine_argv_codex "$root/../p2-engine/prompt" /work /out/last host >/dev/null 2>&1
+         printf '%s\n' "${ENGINE_ARGV_ENGINE:-unset}" )" "codex"
 }
 
 # ------------------------------------------------------------------- main ---
