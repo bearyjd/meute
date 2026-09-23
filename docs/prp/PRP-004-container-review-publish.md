@@ -671,7 +671,7 @@ phase cannot quietly change them.
 |---|---|
 | A Codex quota probe, or an explicit stubbed reading for the observation week | owner, before Phase 3 |
 | `just auth` — putting real credentials into the Atelier volumes, which is what verifies the OAuth-refresh hostnames and unblocks Phase 2's gate; held by Atelier because of the rotation risk (§5 item 3) | **owner** |
-| ~~Atelier's first commit — no `g<sha>` tag exists before it~~ — done: `691e067`, tags and digests verified on the host (§11) | resolved 2026-09-22 |
+| ~~Atelier's first commit — no `g<sha>` tag exists before it~~ — done: `691e067`, tags and digests verified on the host (§11). The pin is deliberately **not** Atelier HEAD, which has moved on; a pin follows a human reading the diff and running `meute image bump`, which is the whole point of pinning | resolved 2026-09-22 |
 | OAuth refresh-token rotation across the host copy and the auth volume | Phase 2 test; finding to Atelier §4.1 |
 | `gh pr checks` exit status on a PR with zero checks | Phase 5 test |
 | `claude -p --model fable` alias vs. full id | Phase 7 first run |
@@ -841,9 +841,15 @@ What running it disclosed, in the order it changed the design:
   Pinning `latest`, which Atelier §3.2 rejected on principle, would have
   been wrong within minutes in practice; and since a same-commit rebuild
   does not reproduce a digest, the **digest is the identity and the tag is
-  only a label**. If a `g<sha>` tag is ever re-applied, Meute declines with
-  `image drift` until a human runs `image bump`. That is the intended
-  behaviour, not a false alarm.
+  only a label**. If a `g<sha>` tag is ever re-applied, the pin stops
+  matching: today that surfaces as a `doctor` FAIL, and the run-path decline
+  is the Phase 2 step-over §6 specifies — `eligible()` has no digest check
+  on `main`, so the sentence describes what will decline, not what does.
+  Either way it is the intended behaviour and not a false alarm. Atelier
+  adopted the finding in `9b3d0de` and states it as policy: same-commit
+  rebuilds do not reproduce a digest, and a `g<sha>` tag is never
+  force-retagged. That policy, not reproducibility, is what makes the tag
+  immutable.
 
 Carried, not fixed here: `write_with_backup` is `open(…, "w")` then dump,
 not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
