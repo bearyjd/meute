@@ -1018,7 +1018,31 @@ What running it disclosed:
   illusory anyway -- reaching it means naming that volume in a mount, and
   whoever can do that has already lost.
 
-- **No refresh has been observed yet.** After ten real container runs the
+- **The refresh-token collision happened, and the preflight cannot see
+  it.** §5 item 3 stopped being hypothetical on 2026-09-23. The host
+  refreshed its access token; the volume kept the old one; the next
+  container run failed with `401 OAuth access token has been revoked`,
+  reproducibly, while the same repo on the host succeeded at the same
+  moment. Host credential md5 `45bfbb8c…`, volume copy still `c8499207…`.
+  That is single-use refresh semantics in practice: refreshing on one copy
+  invalidates the other.
+
+  The part that matters for the design is the failure shape. `claude auth
+  status` reads a local file, so BOTH the host and the in-container
+  preflight still report `loggedIn: true` with a revoked token — the
+  preflight passes and the API call then fails. And the run records
+  `status=error cost=0 detail=success`, because the CLI's envelope carries
+  `is_error: true` with `subtype: "success"`; the real message, "Failed to
+  authenticate. API Error: 401", reaches only the report body. So the
+  fleet's log line for a revoked credential says "success" in the one
+  field an operator greps. Two things follow, neither of them in this
+  phase: a 401 should surface in `detail=` rather than the subtype, and
+  the preflight cannot be made to detect revocation locally — only a
+  cheap authenticated call could, which is no longer a zero-cost probe.
+  Atelier's per-volume `just auth-login` remains the fix that removes the
+  collision entirely.
+
+- **Before that, no refresh had been observed.** After ten real container runs the
   host credential and the volume copy remain byte-identical, with ~3.5
   hours left on the access token. s5 item 3 stays open with its window
   unchanged: refresh can only matter near expiry, and the fleet's cadence
