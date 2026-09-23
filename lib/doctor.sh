@@ -7,8 +7,8 @@
 # the scheduler will really provide, not the one you are typing in.
 #
 # Expects from the caller: MEUTE_ROOT, MANIFEST_PY, MANIFEST, SCRUBBED,
-# AUTH_MODE, die, podman_cmd, podman_available, image_digest_on_host,
-# egress_running, plus lib/fleet.sh,
+# AUTH_MODE, die, lib/container.sh (podman_cmd, podman_available,
+# image_digest_on_host, egress_running, egress_ip), plus lib/fleet.sh,
 # lib/preflight.sh, lib/status.sh (next_for_slot) and lib/timers.sh
 # (unit_path_line, timer_state, linger_state).
 
@@ -276,9 +276,13 @@ doctor_containers() {
     fi
   done <<< "$images"
 
-  if egress_running; then
-    d_ok "atelier-egress running"
-  else
+  if ! egress_running; then
     d_err "atelier-egress is not running — every proxied run would be stepped over; start it with Atelier"
+  elif ! actual="$(egress_ip)"; then
+    # atelier-internal runs with --disable-dns, so a proxied run carries the
+    # proxy's address as --add-host. No address, no proxied run.
+    d_err "atelier-egress has no address on atelier-internal — every proxied run would be stepped over"
+  else
+    d_ok "atelier-egress running at ${actual}"
   fi
 }

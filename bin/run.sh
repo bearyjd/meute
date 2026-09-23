@@ -46,6 +46,8 @@ export MEUTE_ROOT
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
+source "${MEUTE_ROOT}/lib/container.sh"
+source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 # The harness is public; a real fleet config names private projects and says what
@@ -222,6 +224,16 @@ eligible() {
       note "skipping ${key}: ${in_flight} tier-3 drafts already in flight (cap ${TIER3_CAP})"
       return 1
     fi
+  fi
+  # A container entry whose image drifted, or whose egress proxy is down, is
+  # stepped OVER -- not skipped: skip() ends the fire without advancing the
+  # cursor, so every repo behind this one would starve on a condition that
+  # has nothing to do with them. The fire runs the next candidate instead,
+  # and doctor names what is wrong (PRP-004 Phase 2, lib/container.sh).
+  if [[ "$(jq -r '.runtime // ""' <<< "$entry")" == "container" ]] \
+     && ! container_ready "$entry"; then
+    note "skipping ${key}: ${CONTAINER_BLOCKED}"
+    return 1
   fi
   # A publish stage runs no engine, so there is no pool to ask about.
   [[ -n "$engine" ]] || return 0
@@ -466,7 +478,7 @@ run_entry() {
     || abort_entry "$entry" "stage entries are not runnable before Phase 4"
   # Rule 5, fail closed. A container run needs a pinned image to run in;
   # without one the answer is the validator's, not a fallback to the host.
-  # And with one, Phase 2 has yet to build the path -- a repo that opted into
+  # And with one, Phase 2b has yet to put a credential inside it -- a repo that
   # isolation must not be quietly run without it, and the CLI may not talk
   # it down either: --runtime host is accepted only where the manifest
   # already says host, so it changes nothing; against anything else -- a
@@ -481,7 +493,7 @@ run_entry() {
   if [[ "$runtime" != "host" ]]; then
     [[ -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]] \
       || abort_entry "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
-    abort_entry "$entry" "container runtime is not available before Phase 2"
+    abort_entry "$entry" "container runtime needs the credential volumes; see PRP-004 §5 item 3"
   fi
 
   # Rotating lens: one narrow angle per run, advanced only on success.
@@ -557,10 +569,19 @@ run_entry() {
   CODEX_LAST="$(mktemp)"
   REPORT=""; ENGINE_STATUS="error"; ENGINE_DETAIL=""; COST="-"; TURNS="-"; RATE_LIMITED=0
   local rc=0
+  # lib/engines.sh builds the argv and runs nothing; the working directory,
+  # the timeout and the redirection are supplied here because they differ on
+  # the two sides of the container boundary. This is the host side.
   case "$engine" in
-    claude) invoke_claude "$prompt_file" "$out" "$err" || rc=$?; extract_claude "$out" || true ;;
-    codex)  invoke_codex  "$prompt_file" "$out" "$err" || rc=$?; extract_codex        || true ;;
+    claude) engine_argv_claude "$prompt_file" ;;
+    codex)  engine_argv_codex  "$prompt_file" "$WORKTREE" "$CODEX_LAST" ;;
     *) die "unknown engine: $engine" ;;
+  esac
+  ( cd "$WORKTREE" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
+      "${ENGINE_ENV[@]}" "${ENGINE_ARGV[@]}" ) > "$out" 2> "$err" || rc=$?
+  case "$engine" in
+    claude) extract_claude "$out" || true ;;
+    codex)  extract_codex        || true ;;
   esac
   if (( rc != 0 )) && [[ "$ENGINE_STATUS" == "ok" ]]; then
     ENGINE_STATUS="error"; ENGINE_DETAIL="engine exited ${rc}"

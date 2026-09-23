@@ -2,7 +2,7 @@
 #
 # Engine adapters for the meute runner. Sourced by bin/run.sh.
 #
-# Each invoke_*/extract_* pair normalises one CLI onto the same four globals:
+# Each engine_argv_*/extract_* pair normalises one CLI onto the same four globals:
 #   REPORT         the engine's final message (the report body)
 #   ENGINE_STATUS  ok | error
 #   ENGINE_DETAIL  short reason when status is error
@@ -11,6 +11,14 @@
 #                  only for now -- codex's failure shape is not yet observed)
 #
 # Add an engine by adding a pair here and a case arm in run_entry.
+#
+# The argv builders RUN NOTHING. They populate ENGINE_ARGV and return; the
+# caller supplies the working directory, the timeout and the redirection,
+# because those three differ on the two sides of the container boundary
+# (PRP-004 §4.4): on the host the runner cds into the worktree and wraps the
+# call in `timeout`, while in a container the working directory is /work,
+# podman enforces the timeout, and the paths the engine is told about are the
+# container's. The host path is reconstructed by bin/run.sh exactly as it was.
 
 # --------------------------------------------------------------------------
 # Engine invocation. Returns a normalised (report, status, cost, turns) via
@@ -18,9 +26,10 @@
 # claude puts the final message in a JSON envelope on stdout, codex streams
 # JSONL events and writes the final message to a file.
 # --------------------------------------------------------------------------
-invoke_claude() {
-  local prompt_file="$1" out="$2" err="$3"
-  local args=(
+engine_argv_claude() {
+  local prompt_file="$1"
+  ENGINE_ARGV=(
+    claude
     -p "$(cat "$prompt_file")"
     --output-format json
     --model "$MODEL"
@@ -33,9 +42,8 @@ invoke_claude() {
   # A narrow Bash allowlist is what lets a write tier actually run its own test
   # suite: acceptEdits auto-approves edits but still denies arbitrary execution,
   # so without this a "self-verifying" task cannot verify anything.
-  [[ -n "$ALLOWED_TOOLS" ]] && args+=( --allowed-tools "$ALLOWED_TOOLS" )
-  ( cd "$WORKTREE" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
-      "${ENGINE_ENV[@]}" claude "${args[@]}" ) > "$out" 2> "$err"
+  [[ -n "$ALLOWED_TOOLS" ]] && ENGINE_ARGV+=( --allowed-tools "$ALLOWED_TOOLS" )
+  return 0
 }
 
 extract_claude() {
@@ -66,15 +74,20 @@ extract_claude() {
   return 0
 }
 
-invoke_codex() {
-  local prompt_file="$1" out="$2" err="$3"
+# codex names its working directory and its final-message file on the command
+# line rather than inheriting them, so both are parameters: the host passes
+# the worktree and a mktemp, a container passes /work and a path under /out
+# (nothing the runner reads may land in the branch -- commit_worktree runs
+# `git add -A`).
+engine_argv_codex() {
+  local prompt_file="$1" workdir="$2" last_message="$3"
   local sandbox="read-only"
   (( WRITES_CODE )) && sandbox="workspace-write"
-  local args=( exec --json -o "$CODEX_LAST" -s "$sandbox"
-               -c approval_policy="never" --cd "$WORKTREE" --skip-git-repo-check )
-  [[ -n "${MEUTE_CODEX_MODEL:-}" ]] && args+=( -m "${MEUTE_CODEX_MODEL}" )
-  args+=( "$(cat "$prompt_file")" )
-  ( timeout --kill-after=30 "$TIMEOUT_SECONDS" "${ENGINE_ENV[@]}" codex "${args[@]}" ) > "$out" 2> "$err"
+  ENGINE_ARGV=( codex exec --json -o "$last_message" -s "$sandbox"
+                -c approval_policy="never" --cd "$workdir" --skip-git-repo-check )
+  [[ -n "${MEUTE_CODEX_MODEL:-}" ]] && ENGINE_ARGV+=( -m "${MEUTE_CODEX_MODEL}" )
+  ENGINE_ARGV+=( "$(cat "$prompt_file")" )
+  return 0
 }
 
 extract_codex() {
