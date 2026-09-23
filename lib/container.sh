@@ -47,6 +47,20 @@ readonly CONTAINER_STOP_TIMEOUT=30
 # this volume at all means naming it in a mount, and whoever can do that has
 # already lost. /work and /out keep `:Z`: those are private per-run
 # directories, where private relabel is exactly right.
+# Which stages run an engine, and so must carry exactly one credential
+# (§4.4). `publish` carries a GitHub token instead (Phase 5) and `probe`
+# carries nothing at all -- both deliberately, and neither by falling
+# through the engine branch, which is how "no credential" would otherwise
+# become the quiet default for a typo. An unknown stage is refused rather
+# than guessed at.
+container_stage_credential() {
+  case "$1" in
+    preflight|build|review|review-2|resolve) printf 'engine\n' ;;
+    probe|publish) printf 'none\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 container_auth_mount() {
   case "$1" in
     claude) printf 'atelier-auth-claude:/home/agent/.claude:z\n' ;;
@@ -261,8 +275,27 @@ container_argv() {
   # capture back from, and it is NOT /work, so commit_worktree's `git add -A`
   # cannot sweep it into the branch.
   [[ -z "$outdir" ]] || CONTAINER_ARGV+=( --volume "${outdir}:/out:Z" )
-  local auth
-  if auth="$(container_auth_mount "$engine")"; then
+  # The credential is chosen from the engine parameter, and the command
+  # comes from the caller's argv. Two callers passing two different things
+  # is exactly the drift that put one provider's agent in front of the
+  # other's token, so where the command names an engine, bind them.
+  case "${1:-}" in
+    claude|codex)
+      [[ "$1" == "$engine" ]] || {
+        container_note "the command is $1 but the credential is for ${engine:-none}; refusing to run one engine on the other's token"
+        return 1
+      } ;;
+  esac
+  local need auth
+  need="$(container_stage_credential "$stage")" \
+    || { container_note "unknown stage '${stage}'; refusing to guess what it may hold"; return 1; }
+  if [[ "$need" == "engine" ]]; then
+    # Fail closed: a stage that runs an engine and cannot be given that
+    # engine's credential must be refused here, with a reason. Mounting
+    # nothing and carrying on puts the failure inside the container, as an
+    # auth error that names neither the stage nor the engine.
+    auth="$(container_auth_mount "$engine")" \
+      || { container_note "stage ${stage} runs an engine, and '${engine:-<none>}' has no credential volume"; return 1; }
     CONTAINER_ARGV+=( --volume "$auth" )
   fi
   local -a profile=()

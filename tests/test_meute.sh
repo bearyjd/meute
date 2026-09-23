@@ -3697,6 +3697,41 @@ STUB
   hasnt "argv: ...and /out stays writable"          "$argv" "/out:ro"
   argv="$(tr '\n' ' ' < "$root/argv-none")"
   has   "argv: a writing tier keeps /work writable" "$argv" "${root}/work:/work:Z"
+
+  # A stage that runs an engine must carry exactly one credential. An empty
+  # or unknown engine used to mean "mount nothing and carry on", which is
+  # right for the probe and wrong for a build: the run would reach the
+  # container and fail there with an auth error, rather than being refused
+  # here with a reason.
+  local rc out
+  for stage in build preflight; do
+    out="$( source "$REPO/lib/container.sh"
+            export MEUTE_PODMAN="$root/stub/podman"
+            container_ready "$entry" >/dev/null 2>&1
+            container_argv "$entry" "$stage" "" "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+    is  "argv: ${stage} refuses an engine it cannot mount a credential for" "$rc" "1"
+    has "argv: ...with a reason rather than a silent no-credential run"     "$out" "credential"
+  done
+  out="$( source "$REPO/lib/container.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          container_ready "$entry" >/dev/null 2>&1
+          container_argv "$entry" build gpt "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+  is "argv: an unrecognised engine is refused too" "$rc" "1"
+  # The probe holds no credential deliberately, and says so by taking a
+  # path of its own rather than falling through the engine branch.
+  out="$( source "$REPO/lib/container.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          container_ready "$entry" >/dev/null 2>&1
+          container_argv "$entry" probe "" "$root/work" "$root/out" -- true
+          printf '%s\n' "${CONTAINER_ARGV[@]}" | tr '\n' ' ' )"; rc=$?
+  is    "argv: the probe needs no engine and no credential" "$rc" "0"
+  hasnt "argv: ...and mounts none"                          "$out" "atelier-auth"
+  # An unknown stage is refused rather than guessed at.
+  out="$( source "$REPO/lib/container.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          container_ready "$entry" >/dev/null 2>&1
+          container_argv "$entry" teatime claude "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+  is "argv: an unknown stage is refused, not guessed" "$rc" "1"
 }
 
 # What the flags actually buy, asked of the kernel rather than of the argv.
@@ -4638,11 +4673,26 @@ STUB
   has   "override: --engine claude on a codex entry mounts claude's" "$calls" "atelier-auth-claude"
   hasnt "override: ...and never codex's"                             "$calls" "atelier-auth-codex"
 
-  # The invariant that keeps it fixed: the engine is decided once, in
-  # run_entry, and passed down. A second derivation inside the boundary code
-  # is how this defect arrived, so nothing there may read it from the entry.
-  is "override: container.sh never re-derives the engine from the entry" \
-     "$(grep -c "jq -r '\.engine" "$REPO/lib/container.sh")" "0"
+  # The invariant that keeps this fixed is these assertions, not a grep for
+  # a spelling. A lexical check for `jq -r '.engine` passes for `jq
+  # '.engine'`, for `. as $e | .engine`, or for a helper that reads it --
+  # a guard whose passing means less than it looks like, which is the same
+  # class as the two silent-success failures §11 records. The override tests
+  # above exercise the property in both directions instead.
+
+  # And the two are bound rather than trusted to agree: the credential is
+  # chosen from the engine parameter while the command comes from the
+  # caller's argv, so a mismatch between them is refused outright.
+  local mismatch rc
+  mismatch="$( source "$REPO/lib/container.sh"
+               export MEUTE_PODMAN="$root/stub/podman"
+               local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P4_DIGEST" \
+                 '{repo:"netlens", image:{tag:$tag, digest:$digest}, network:"none",
+                   writes_code:true, timeout_seconds:60}')"
+               container_ready "$e" >/dev/null 2>&1
+               container_argv "$e" build codex "$root" "$root" -- claude -p hello 2>&1 )"; rc=$?
+  is  "override: a credential that does not match the command is refused" "$rc" "1"
+  has "override: ...and says which two disagree"                          "$mismatch" "codex"
 }
 
 # ------------------------------------------------------------------- main ---
