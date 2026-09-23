@@ -81,6 +81,10 @@ readonly THIS_WEEK="$(date +%G-%V)"
 readonly START_EPOCH=0
 
 SLOT=""
+LOG_RUNTIME=""
+LOG_IMAGE=""
+LOG_STAGE=""
+LOG_PR=""
 QUOTA_SOURCE="?"
 remaining_at_start="?"
 BUDGET_LEFT="-"
@@ -96,6 +100,8 @@ PLAN_MODE=0
 # Populated during a run; the EXIT trap reads them.
 REPO_PATH=""
 WORKTREE=""
+CONTAINER_MODE=0
+OUT_DIR=""
 BRANCH=""
 BASE_SHA=""
 
@@ -122,11 +128,11 @@ log_run() {
   for field in "$@"; do line+="$(printf '\t%s' "$field")"; done
   line+="$(printf '\tdur=%ss' "$duration")"
   # PRP-004's columns, on every line class so a reader can rely on them:
-  # runtime= (host|container), image= (12-hex digest prefix), stage=
-  # (preflight|build|review|resolve|publish), pr= (URL). Written as `-`
-  # until the phase that fills each one; a line differs from a pre-PRP-004
-  # one by this suffix and nothing else.
-  line+="$(printf '\truntime=%s\timage=%s\tstage=%s\tpr=%s' "-" "-" "-" "-")"
+  # runtime= (host|container), image= (12 hex of the image ID actually run),
+  # stage= (preflight|build|review|resolve|publish), pr= (URL). Phase 2b
+  # fills the first two; the rest stay `-` until the phase that fills them.
+  line+="$(printf '\truntime=%s\timage=%s\tstage=%s\tpr=%s' \
+             "${LOG_RUNTIME:--}" "${LOG_IMAGE:--}" "${LOG_STAGE:--}" "${LOG_PR:--}")"
   printf '%s\n' "$line" >> "$LOG_FILE"
   printf '%s\n' "$line" >&2
 }
@@ -146,9 +152,16 @@ usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^#( |$)/, ""); print }' "$
 # --------------------------------------------------------------------------
 cleanup() {
   local rc=$?
+  [[ -z "$OUT_DIR" ]] || rm -rf "$OUT_DIR"
   if [[ -n "$WORKTREE" && -d "$WORKTREE" ]]; then
-    git -C "$REPO_PATH" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || rm -rf "$WORKTREE"
-    git -C "$REPO_PATH" worktree prune >/dev/null 2>&1 || true
+    if (( CONTAINER_MODE )); then
+      # A clone is a directory of its own: the owner's repository never
+      # registered it, so there is nothing to `worktree remove` or prune.
+      rm -rf "$WORKTREE"
+    else
+      git -C "$REPO_PATH" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || rm -rf "$WORKTREE"
+      git -C "$REPO_PATH" worktree prune >/dev/null 2>&1 || true
+    fi
   fi
   if [[ -n "$BRANCH" && -n "$REPO_PATH" && -n "$BASE_SHA" ]] \
      && git -C "$REPO_PATH" rev-parse --verify -q "$BRANCH" >/dev/null 2>&1; then
@@ -525,10 +538,14 @@ run_entry() {
   runtime="${RUNTIME_OVERRIDE:-$manifest_runtime}"
   [[ "$RUNTIME_OVERRIDE" != "host" || "$manifest_runtime" == "host" ]] \
     || abort_precondition "$entry" "repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
+  CONTAINER_MODE=0
   if [[ "$runtime" != "host" ]]; then
     [[ -n "$(jq -r '.image.tag // ""' <<< "$entry")" ]] \
       || abort_precondition "$entry" "$(manifest_section "$kind").${repo}.image: tag and digest are required when runtime is container"
-    abort_precondition "$entry" "container runtime needs the credential volumes; see PRP-004 §5 item 3"
+    # Phase 2b: the entry is dispatched into the container rather than
+    # refused. eligible() has already asserted the pin and the proxy for it
+    # -- everything 2a built to fail closed is load-bearing from here.
+    CONTAINER_MODE=1
   fi
 
   # Rotating lens: one narrow angle per run, advanced only on success.
@@ -540,7 +557,19 @@ run_entry() {
     lens="${lens_list[$(( lens_index % ${#lens_list[@]} ))]}"
   fi
 
-  preflight "$engine"
+  if (( CONTAINER_MODE )); then
+    # Named before the probe, not after it: a preflight that fails exits
+    # here, and §7's demotion rule excludes `stage=preflight` lines BY NAME.
+    # Logged as `-`, a signed-out credential would count toward demoting the
+    # repo for a reason that has nothing to do with the repo.
+    LOG_RUNTIME="$runtime"; LOG_IMAGE="${CONTAINER_IMAGE_ID:0:12}"; LOG_STAGE="preflight"
+    preflight_container "$entry" "$engine" \
+      || abort_precondition "$entry" "preflight: ${PREFLIGHT_DETAIL}"
+    LOG_STAGE="build"
+  else
+    preflight "$engine"
+    LOG_RUNTIME="$runtime"
+  fi
 
   # Unique branch and report path even if the slot fires twice in one day.
   BRANCH="${BRANCH_PREFIX}/${task}-${DATE}"
@@ -573,9 +602,14 @@ run_entry() {
   # market-comparison run had every Read/Glob of the original path denied.
   # Fixed here rather than at the call site because it is deterministic.
   WORKTREE="${WORKTREE_DIR}/${repo}-${task}-${DATE}.$$"
+  # Inside the container the scratch tree is mounted at /work, so that is
+  # what the prompt must call "checked out at": a host path the agent cannot
+  # reach would fail every Read the template asks for.
+  local agent_path="$WORKTREE"
+  (( CONTAINER_MODE )) && agent_path="/work"
   local prompt_file; prompt_file="$(mktemp)"
   python3 "$MANIFEST_PY" render "$template" \
-    "REPO_NAME=${repo}" "REPO_SPEC=${spec}" "REPO_PATH=${WORKTREE}" \
+    "REPO_NAME=${repo}" "REPO_SPEC=${spec}" "REPO_PATH=${agent_path}" \
     "TASK=${task}" "TIER=${tier}" "DATE=${DATE}" "BRANCH=${BRANCH}" \
     "FILE_BUDGET=${file_budget}" "LENS=${lens}" "REPORT_PATH=${report_rel}" \
     "ALLOWED_COMMANDS=${ALLOWED_TOOLS:-<none: no shell command is pre-approved>}" \
@@ -588,7 +622,7 @@ run_entry() {
     > "$prompt_file" || die "prompt render failed for ${template}"
 
   if (( DRY_RUN )); then
-    note "would run: key=${key} tier=${tier} engine=${engine} model=${MODEL} lens=${lens}"
+    note "would run: key=${key} tier=${tier} engine=${engine} model=${MODEL} lens=${lens} runtime=${runtime}"
     note "  branch=${BRANCH} base=${base_ref}@${BASE_SHA:0:8} tools=${TOOLS} mode=${PERMISSION_MODE}"
     note "  allowed=${ALLOWED_TOOLS:-<none>}"
     note "  report=${report_rel} auth=${AUTH_MODE} prompt=${prompt_file} ($(wc -c < "$prompt_file") bytes)"
@@ -596,12 +630,26 @@ run_entry() {
   fi
 
   trap cleanup EXIT
-  git -C "$REPO_PATH" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
-    || abort_entry "$entry" "worktree-add-failed"
+  if (( CONTAINER_MODE )); then
+    # A linked worktree's .git points at a host path that is not there on the
+    # other side of the mount, so the container gets a self-contained clone
+    # (PRP-004 §4.2). The owner's checkout is never mounted.
+    scratch_branch_is_checked_out "$REPO_PATH" "$BRANCH" \
+      && abort_entry "$entry" "branch ${BRANCH} is checked out in the owner's repository"
+    scratch_clone "$REPO_PATH" "$WORKTREE" "$base_ref" "$BRANCH" "$BASE_SHA" \
+      || abort_entry "$entry" "scratch-clone-failed"
+  else
+    git -C "$REPO_PATH" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
+      || abort_entry "$entry" "worktree-add-failed"
+  fi
   copy_worktree_files "$entry"
 
   local out err; out="$(mktemp)"; err="$(mktemp)"
+  # Everything the runner reads back lands here, never in /work: the capture
+  # would otherwise be swept into the branch by commit_worktree's `git add -A`.
+  OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/meute-out-XXXXXX")"
   CODEX_LAST="$(mktemp)"
+  (( CONTAINER_MODE )) && CODEX_LAST="${OUT_DIR}/codex-last"
   REPORT=""; ENGINE_STATUS="error"; ENGINE_DETAIL=""; COST="-"; TURNS="-"; RATE_LIMITED=0
   local rc=0
   # lib/engines.sh builds the argv and runs nothing; the working directory,
@@ -614,13 +662,25 @@ run_entry() {
   # -- cwd or --cd -- is unverified (PRP-004 §8), and moving the process
   # would change the sandbox's shape on a guess.
   local -a engine_cd=()
-  case "$engine" in
-    claude) engine_argv_claude "$prompt_file"; engine_cd=( cd "$WORKTREE" ) ;;
-    codex)  engine_argv_codex  "$prompt_file" "$WORKTREE" "$CODEX_LAST"; engine_cd=( : ) ;;
-    *) die "unknown engine: $engine" ;;
-  esac
-  ( "${engine_cd[@]}" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
-      "${ENGINE_ENV[@]}" "${ENGINE_ARGV[@]}" ) > "$out" 2> "$err" || rc=$?
+  if (( CONTAINER_MODE )); then
+    # The paths the engine is told about are the container's, and podman
+    # enforces the timeout, so neither cd nor `timeout` belongs here.
+    case "$engine" in
+      claude) engine_argv_claude "$prompt_file" ;;
+      codex)  engine_argv_codex  "$prompt_file" /work /out/codex-last container ;;
+      *) die "unknown engine: $engine" ;;
+    esac
+    container_run "$entry" build "$engine" "$WORKTREE" "$OUT_DIR" -- \
+      "${ENGINE_ARGV[@]}" > "$out" 2> "$err" || rc=$?
+  else
+    case "$engine" in
+      claude) engine_argv_claude "$prompt_file"; engine_cd=( cd "$WORKTREE" ) ;;
+      codex)  engine_argv_codex  "$prompt_file" "$WORKTREE" "$CODEX_LAST" host; engine_cd=( : ) ;;
+      *) die "unknown engine: $engine" ;;
+    esac
+    ( "${engine_cd[@]}" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
+        "${ENGINE_ENV[@]}" "${ENGINE_ARGV[@]}" ) > "$out" 2> "$err" || rc=$?
+  fi
   case "$engine" in
     claude) extract_claude "$out" || true ;;
     codex)  extract_codex        || true ;;
@@ -642,8 +702,22 @@ run_entry() {
 
   write_report "$report_rel" "$entry" "$engine" "$lens" "$base_ref" "$err"
 
-  local committed="-"
+  local committed="-" imported=""
   if (( WRITES_CODE )); then committed="$(commit_worktree "$repo" "$task" "$lens")"; fi
+  # cleanup removes the clone, so anything committed in it has to reach the
+  # owner's repository first (PRP-004 §4.2). A fetch git refuses -- the
+  # branch moved on, or is checked out -- lands on a dated aside ref rather
+  # than being lost with the directory.
+  if (( CONTAINER_MODE )) && [[ "$committed" != "-" && "$committed" != "none" ]]; then
+    if scratch_import "$REPO_PATH" "$WORKTREE" "$BRANCH" "$DATE"; then
+      imported="$SCRATCH_IMPORT"
+      [[ "$imported" == "branch" ]] \
+        || ENGINE_DETAIL="${ENGINE_DETAIL:+${ENGINE_DETAIL}; }branch-imported-aside:${SCRATCH_IMPORT_REF}"
+    else
+      ENGINE_STATUS="error"
+      ENGINE_DETAIL="${ENGINE_DETAIL:+${ENGINE_DETAIL}; }could not import ${BRANCH} from the scratch tree"
+    fi
+  fi
 
   # A tier-3 ticket that produced a branch is delivered; retire it so the next
   # weekly slot does not redo work already awaiting review.

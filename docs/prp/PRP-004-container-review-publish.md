@@ -670,6 +670,7 @@ phase cannot quietly change them.
 | Item | Resolved by |
 |---|---|
 | A Codex quota probe, or an explicit stubbed reading for the observation week | owner, before Phase 3 |
+| **Do not read Phase 3's first data as a provider difference.** `atelier-auth-claude` is revoked (§11, Phase 2b): until per-volume `just auth-login`, a container claude run 401s at cost 0 while codex runs green. Side by side in `state/log` that reads exactly like a codex-vs-claude finding and is a credential one. Fix the credential before the observation week, or the week measures the wrong thing | owner, before Phase 3 |
 | `just auth` — putting real credentials into the Atelier volumes, which is what verifies the OAuth-refresh hostnames and unblocks Phase 2's gate; held by Atelier because of the rotation risk (§5 item 3) | **owner** |
 | ~~Atelier's first commit — no `g<sha>` tag exists before it~~ — done: `691e067`, tags and digests verified on the host (§11). The pin is deliberately **not** Atelier HEAD, which has moved on; a pin follows a human reading the diff and running `meute image bump`, which is the whole point of pinning | resolved 2026-09-22 |
 | OAuth refresh-token rotation across the host copy and the auth volume | Phase 2 test; finding to Atelier §4.1 |
@@ -679,6 +680,7 @@ phase cannot quietly change them.
 | Whether a Fable pass on Phase 7's design is wanted before it is built (`AUDIT.md` §8 item 7) | owner |
 | `--read-only` root and `/work:ro` for the review stage | Phase 2, if the CLIs tolerate it |
 | Pack-transfer cost of `--no-local --single-branch` clones on the largest fleet repo | Phase 2, recorded in §11 |
+| The in-container preflight cannot detect a revoked credential. `claude auth status` and `codex login status` read a local file, so both report `loggedIn: true` against a token the provider has revoked — the probe passes and the API call then fails. Only an authenticated call could tell, which would stop it being the zero-cost probe §4.4 and Phase 2b's decision 1 specify. Left as a hole in the preflight's promise rather than repaired with something that spends on every fire; Atelier's per-volume `just auth-login` removes the cause instead | owner (auth-login), then re-assess whether any probe is still wanted |
 | Which directory codex's `-s workspace-write` sandbox derives its writable root from — the process's cwd or `--cd`. On the host codex runs from the runner's own cwd (this checkout) with `--cd` naming the worktree; if the root follows cwd rather than `--cd`, an unattended codex run has this checkout as its writable root, which would be a real finding. Phase 2a left the host behaviour exactly as it shipped rather than change it on a guess, and pinned it with a test | Phase 3 observation week, from a live run |
 
 ## 9. Acceptance
@@ -858,7 +860,229 @@ not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
 `requires_specced_ticket` tasks on one repo would each emit a stage entry
 for the same row — Phase 4 dedupes by row, not by task.
 
+### Phase 2a — the container boundary, proven without a credential (2026-09-22 – 23)
+
+Plan: `.claude/PRPs/plans/prp-004-phase-2a.plan.md`. Baseline 671
+assertions -> 835. Review: `code-reviewer`, then four **Codex adversarial**
+passes, mandatory and non-downgradable for this phase. Rounds 1–3 returned
+**Block**; round 4 returned **Approve**. The record below includes the
+coordinator's own errors, because they are half of what the history is
+worth.
+
+What running it disclosed, in the order it changed the design:
+
+- **A fix aimed at the wrong half of a race does not close it.** Round 1
+  found a TOCTOU: `container_ready` verified a digest for a TAG, then the
+  run executed that tag, with clone work in the window. The instruction
+  given for the fix was to resolve the immutable image ID with a second
+  `image inspect` — which moved the window rather than closing it, and
+  round 2 found the TOCTOU **still open**: two observations of a moving
+  name can see two different images, validating A and running B. One
+  inspect now returns `{{.Digest}} {{.Id}}` together, so the digest checked
+  and the ID run are the same observation, with `--pull=never` so a
+  vanished image is an error rather than a fetch. The instruction was the
+  coordinator's; the lesson is that "resolve it again, immutably" is not
+  the same as "resolve it once".
+
+- **An identity that outlives what proved it.** The same round found
+  `CONTAINER_IMAGE_ID` cleared on no path, so a failure before the ID was
+  resolved left the previous entry's value in place and `container_argv`
+  asked only whether it was non-empty. Readiness passing for repo A and
+  then failing for repo B could put A's image into B's run. It is now
+  cleared on the way IN and bound to the tag and digest that produced it;
+  the argv refuses an entry that record is not for. Same defect as the
+  TOCTOU at a different scale, which is why both are worth naming together.
+
+- **A refusal that retires what it refuses.** Round 3: a forced readiness
+  failure went through `abort_entry`, which advances the cursor AND marks
+  a staged plan item done. A transient condition — an image not built yet,
+  a proxy restarting, a pin mid-bump — permanently retired the item the
+  operator had explicitly asked for, and `retire_completed_plan` then
+  archived the whole plan. The rule that came out of it: **a precondition
+  the operator can remediate stays retryable; a failure of the attempt
+  itself advances.** An unforced entry that cannot run is queue rotation
+  and must advance, or the fleet stalls behind it (PRP-001 §10); a forced
+  one is a request that failed on something the human can fix.
+
+- **Two reachability arguments, both wrong, in opposite directions.** The
+  coordinator named the credential abort as the plan-loss path, then
+  narrowed the claim. Running it showed the opposite: a staged plan entry
+  is built from a synthetic project, so its `image` is always null, the
+  pin check stops it in `eligible()`, and that abort is unreachable in plan
+  mode entirely. The site that actually archived a plan was the
+  `--runtime host` downgrade refusal. Neither of us would have found that
+  by reading.
+
+- **A test can pass by reading a file that no longer exists.** The first
+  draft of "the staged item is still pending" passed before the fix,
+  because `retire_completed_plan` had deleted the file it consulted. The
+  assertion that genuinely went red was "the plan is not retired". Both
+  are kept: together they say the item survived, not that the file did.
+
+- **A guarantee gated on a machine's contents is not covered.** The test
+  standing between an unverifiable engine run and a timer fire pinned the
+  real image, so on any machine without it — CI, a fresh checkout — it
+  skipped silently. It needs no image: the abort fires before anything
+  starts a container, so a stub podman answering the readiness calls
+  reaches it. Proved by mutation under that condition: removing the abort
+  now fails on an imageless machine, where before it passed clean.
+
+- **A test that inherits the host's podman is not deterministic.**
+  `container_ready` distinguishes "podman absent from PATH" from "podman
+  present, image missing", with different refusal messages. Two assertions
+  pinned the second and got the first on a machine with no podman
+  installed — the ordinary state of CI. The fixture now writes its own
+  podman stub, so the assertion is about the boundary rather than about
+  what is installed.
+
+- **`--force` overrode more than it was asked to.** `(( FORCED )) && return
+  0` returned before the readiness check, so a forced run skipped the
+  digest assert entirely. Phase 1's abort hid it; Phase 2b would have made
+  it a dispatch. A forced selection now overrides the queue's gates —
+  share, cap, quota — and never the boundary's readiness.
+
+- **A "unification" that changed behaviour nobody had measured.** The argv
+  split moved codex's host invocation from the runner's cwd into the
+  worktree, which is contrary to the phase's own host-parity claim. It was
+  reverted, and what `-s workspace-write` derives its writable root from —
+  cwd or `--cd` — went to §8 as an open item for Phase 3 rather than being
+  settled by preference.
+
+### Phase 2b — the engine runs inside the boundary (2026-09-23)
+
+Plan: `.claude/PRPs/plans/prp-004-phase-2b.plan.md`. Baseline 848
+assertions -> 884. This is the phase that removed the Phase 1 abort, so a
+timer fire can now dispatch a container: everything Phase 2a built to fail
+closed became load-bearing on that commit rather than precautionary.
+
+What running it disclosed:
+
+- **`jq`'s `//` treats `false` as empty, so a boolean default is a trap.**
+  `jq -r '.writes_code // true'` returns `true` for a tier that declares
+  `writes_code: false`, because `//` selects the alternative for `null`
+  **and** for `false`. The read-only `/work` mount was therefore never
+  applied -- silently, including in the first real container run that was
+  meant to prove it. Read the value and compare it instead. A sweep found
+  no other broken instance (`.is_error // false` and `.captured_at // 0`
+  are harmless, their defaults matching what `//` does), but the next
+  `// true` on a boolean will be just as quiet.
+
+- **Twice now, a command that silently did nothing and reported success.**
+  The jq trap above is one shape of it. The other: the command that was to
+  write this section for Phase 2b was chained behind a `grep` that matched
+  nothing, so `&&` short-circuited, the write never ran, and it was
+  reported as done without the file being checked. Both are the
+  silent-success failure PRP-001 §10a is about, and both were found only
+  by looking at the artefact rather than at the exit status.
+
+- **`/work:ro` holds, provided the mount keeps `Z`.** The first measurement
+  said the opposite: `git status` inside reported "not a git repository".
+  That was SELinux, not read-only -- `:ro` alone does not relabel. With
+  `:ro,Z`, `git status`, `git diff <base>...HEAD`, `git log` and `git show`
+  all succeed on a branch the agent cannot write. Adopted for every tier
+  whose `writes_code` is false.
+
+- **`--read-only` root is tolerated by both CLIs**, with `--tmpfs /tmp` the
+  only exception needed. A real `claude -p` and a real `codex exec` both
+  complete under it. Adopted.
+
+- **codex's own sandbox cannot initialise inside the container, and fails
+  green.** With `-s workspace-write` it reports "both available write
+  methods failed due to environment permissions", and the run finishes
+  `status=ok` with `commit=none` and a report explaining it could not
+  write -- the silent-success shape PRP-001 s10a exists to catch. A plain
+  `touch /work/x` under identical flags succeeds and removing `--read-only`
+  does not help, so it is codex's layer, not the mount. Inside the
+  container it now runs `-s danger-full-access`; on the host it keeps
+  `workspace-write`, because there its own sandbox is the only boundary.
+  Measured inside the hardened container, everything writable is already
+  the agent's own: `/work`, `/out`, `/tmp`, `/var/tmp` and codex's
+  credential volume (a copy). `/`, `/etc`, `/usr`, `/var`, `/run` and
+  `/home/agent` are read-only -- note `/run` is read-only here, contrary to
+  a first reading of the mount options.
+
+- **A credential volume must be relabelled `:z`, not `:Z`, and this was
+  invisible until a second container looked.** Private relabel rewrites the
+  volume's SELinux categories to the calling container's, so a single run
+  always succeeds and then works -- every one-run check passes. But these
+  volumes are shared with Atelier's interactive `agent-enter` containers by
+  design (s5), so each fire would steal the label. Measured: after a `:Z`
+  mount the volume reads `container_file_t:s0:c534,c848` and a second
+  container is **denied**; after `:z` it reads `container_file_t:s0` and
+  any container can read it. The owner's interactive container would have
+  been locked out of its own credentials until it relabelled back, and then
+  the next fire would have been -- a ping-pong surfacing as an intermittent
+  "not logged in", which at a glance is indistinguishable from the
+  refresh-token collision this phase is already watching for. That is why
+  it is written down rather than merely fixed. `/work` and `/out` keep
+  `:Z`: they are private per-run directories, where private relabel is
+  correct. The isolation `:Z` appears to buy on a credential volume is
+  illusory anyway -- reaching it means naming that volume in a mount, and
+  whoever can do that has already lost.
+
+- **The refresh-token collision happened, and the preflight cannot see
+  it.** §5 item 3 stopped being hypothetical on 2026-09-23. The host
+  refreshed its access token; the volume kept the old one; the next
+  container run failed with `401 OAuth access token has been revoked`,
+  reproducibly, while the same repo on the host succeeded at the same
+  moment. Host credential md5 `45bfbb8c…`, volume copy still `c8499207…`.
+  That is single-use refresh semantics in practice: refreshing on one copy
+  invalidates the other.
+
+  The part that matters for the design is the failure shape. `claude auth
+  status` reads a local file, so BOTH the host and the in-container
+  preflight still report `loggedIn: true` with a revoked token — the
+  preflight passes and the API call then fails. And the run records
+  `status=error cost=0 detail=success`, because the CLI's envelope carries
+  `is_error: true` with `subtype: "success"`; the real message, "Failed to
+  authenticate. API Error: 401", reaches only the report body. So the
+  fleet's log line for a revoked credential says "success" in the one
+  field an operator greps. Two things follow, neither of them in this
+  phase: a 401 should surface in `detail=` rather than the subtype, and
+  the preflight cannot be made to detect revocation locally — only a
+  cheap authenticated call could, which is no longer a zero-cost probe.
+  Atelier's per-volume `just auth-login` remains the fix that removes the
+  collision entirely, and `just auth` was deliberately NOT re-run: copying
+  the host's credential in again would restore container runs and set up
+  the reverse failure, where a container refreshes and revokes the HOST,
+  breaking the owner's live session mid-work. A container run failing at
+  cost 0 is the better of the two.
+
+  Half of this is fixed and half is not, deliberately. The `detail=success`
+  half is fixed: any `api_error_status` now reaches `detail=` with its
+  message, so the log reads `api 401: ... OAuth access token has been
+  revoked`. The preflight half is NOT, and is in §8: no local probe can see
+  a server-side revocation, and only an authenticated call could, which
+  would stop it being the zero-cost probe decision 1 specifies. A hole in
+  the preflight's promise is better visible than repaired with something
+  that spends money on every fire.
+
+- **Before that, no refresh had been observed.** After ten real container runs the
+  host credential and the volume copy remain byte-identical, with ~3.5
+  hours left on the access token. s5 item 3 stays open with its window
+  unchanged: refresh can only matter near expiry, and the fleet's cadence
+  makes a collision likely rather than hypothetical. Atelier's per-volume
+  login is still the fix.
+
+- **A tier that refuses to act is not a failed run.** `lint-sweep` ran green
+  in both runtimes and changed nothing, reporting that the repository has
+  adopted no linter and that introducing one is the owner's decision. Worth
+  keeping in mind when reading `commit=none`.
+
 ## 12. Review record
+
+**Running the Codex passes.** `codex exec` reads stdin even when the
+prompt is in argv, so a backgrounded invocation without a redirect blocks
+on `Reading additional input from stdin...` until something kills it. The
+symptom is the one to remember: no output, no findings, and a round that
+looks like a slow review rather than a stalled one. `codex exec … <
+/dev/null` is the fix. Every Phase 2a round produced a verdict (Block,
+Block, Warning, Approve), as did Phase 2b's first (Block); what hung was
+both attempts at Phase 2b round two, and the third attempt returned the
+Warning. Recorded precisely because a note written to stop the next person
+misreading a silent round should not itself misattribute which rounds were
+silent.
+
 
 **2026-09-21, first draft, adversarial review (Opus critic, read-only,
 against this repo, PRP-001, and Atelier's audit): rejected.** One

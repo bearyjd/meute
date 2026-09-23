@@ -552,7 +552,9 @@ cmd_container_probe() {
 
   note "probing ${name} with $(jq -r '.tag' <<< "$row") at the pinned digest, network none"
   note "  scratch clone: $(git -C "$PROBE_SCRATCH" rev-parse --short HEAD) on $(git -C "$PROBE_SCRATCH" rev-parse --abbrev-ref HEAD)"
-  container_run "$entry" probe "$PROBE_SCRATCH" "$PROBE_OUT" -- sh -c "$CONTAINER_PROBE_SCRIPT" \
+  # No engine: the probe runs a diagnostic script, so no credential is
+  # mounted and none should be.
+  container_run "$entry" probe "" "$PROBE_SCRATCH" "$PROBE_OUT" -- sh -c "$CONTAINER_PROBE_SCRIPT" \
     || die "container probe: the container did not run to completion"
 }
 
