@@ -3847,11 +3847,21 @@ test_p2_container_probe() {
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
     "d['repos'][0]['image'] = {'tag': '$P2_IMAGE', 'digest': '$P2_DIGEST'}"
+  # These two refuse before anything touches podman, so they are asserted
+  # here rather than behind the image gate below.
+  local out rc
+  out="$("$root/bin/meute" container probe beta 2>&1)"; rc=$?
+  is  "probe: an unknown repo is refused"            "$rc" "1"
+  has "probe: ...by name"                            "$out" "unknown repo 'beta'"
+  yaml_edit "$root/repos.yaml" "$root/hostrepo.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
+  out="$(MEUTE_MANIFEST="$root/hostrepo.yaml" "$root/bin/meute" container probe netlens 2>&1)"; rc=$?
+  is  "probe: a host repo has nothing to probe"      "$rc" "1"
+  has "probe: ...and is told so"                     "$out" "runs on the host"
+
   if ! p2_image_present; then
     skip "probe: against the real image" "${P2_IMAGE} is not on this host (expected in CI)"
     return 0
   fi
-  local out rc
   out="$("$root/bin/meute" container probe netlens 2>&1)"; rc=$?
   is  "probe: it succeeds on a container-ready repo" "$rc" "0"
   has "probe: it reports the uid"                    "$out" "uid 1000"
@@ -3863,14 +3873,6 @@ test_p2_container_probe() {
   has "probe: it names the pin it asserted"          "$out" "$P2_IMAGE"
   is  "probe: it leaves no scratch tree behind"      "$(ls "$root/.worktrees" 2>/dev/null | wc -l)" "0"
   is  "probe: the owner's checkout is untouched"     "$(git -C "$root/git-netlens" status --porcelain | wc -l)" "0"
-
-  out="$("$root/bin/meute" container probe beta 2>&1)"; rc=$?
-  is  "probe: an unknown repo is refused"            "$rc" "1"
-  has "probe: ...by name"                            "$out" "unknown repo 'beta'"
-  yaml_edit "$root/repos.yaml" "$root/hostrepo.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
-  out="$(MEUTE_MANIFEST="$root/hostrepo.yaml" "$root/bin/meute" container probe netlens 2>&1)"; rc=$?
-  is  "probe: a host repo has nothing to probe"      "$rc" "1"
-  has "probe: ...and is told so"                     "$out" "runs on the host"
 }
 
 # The engine adapters build argv and run nothing, so the same array can be
@@ -4076,16 +4078,15 @@ test_p2_outer_bound() {
      "$(grep -c 'timeout --kill-after="\$CONTAINER_STOP_TIMEOUT" "\$(container_outer_bound' "$REPO/lib/container.sh")" "1"
 }
 
-# The pin verifying is what makes Phase 1's abort reachable at all. With a
-# real image the entry passes eligible() and reaches run_entry, which still
-# refuses to dispatch it -- that refusal is the one keeping an unverifiable
-# engine run out of a timer fire, so it needs a test that proves it fires
-# rather than one that only proves something earlier fired first.
+# No timer fire can dispatch a container. That is the guarantee this whole
+# phase rests on, so it is asserted WITHOUT a real image: a machine that
+# happens not to have one -- CI, a fresh checkout -- would otherwise skip
+# the only test standing between an unverifiable engine run and a timer.
+#
+# A stub podman answering the two calls container_ready makes is enough,
+# because the abort fires before anything would start a container: the
+# entry passes the boundary, reaches run_entry, and is refused there.
 test_p2_credential_abort() {
-  if ! p2_image_present; then
-    skip "credentials: the abort a verified pin reaches" "${P2_IMAGE} is not on this host (expected in CI)"
-    return 0
-  fi
   local root="$FIXTURE/p2-cred"; p4_fixture "$root"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
   mkdir -p "$root/stub"
@@ -4095,12 +4096,25 @@ if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max",
 echo invoked >> "$(dirname "$0")/invocations"
 jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
 STUB
-  chmod +x "$root/stub/claude"
+  # The fixture's own pin, answered as podman would: a verified boundary is
+  # the precondition for reaching the abort, not the thing under test here.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
+  *"{{.Digest}}"*) printf '%s\n' "$P4_DIGEST" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/claude" "$root/stub/podman"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
-    "d['repos'][0]['image'] = {'tag': '$P2_IMAGE', 'digest': '$P2_DIGEST'}
-d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
   local out
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo netlens 2>&1)"
   has "credentials: a verified pin gets past the boundary check" "$out" "status=error"
   has "credentials: ...and run_entry refuses to dispatch it"     "$out" "detail=container runtime needs the credential volumes; see PRP-004 §5 item 3"
   [[ -f "$root/stub/invocations" ]] \
@@ -4108,6 +4122,11 @@ d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['c
     || ok "credentials: ...with no engine run"
   is  "credentials: the entry is logged once and stepped past" \
       "$(grep -c 'repo=netlens' "$root/state/log")" "1"
+  # The boundary was really crossed: had the pin failed, the entry would have
+  # been stepped over in eligible() and the abort above would never have run.
+  has "credentials: the pin was asserted on the way"   "$(cat "$root/stub/podman-calls")" "{{.Digest}}"
+  has "credentials: ...and the image ID resolved with it" "$(cat "$root/stub/podman-calls")" "{{.Id}}"
+  hasnt "credentials: no container was ever started"   "$(cat "$root/stub/podman-calls")" "run --rm"
 }
 
 # The probe makes two scratch directories. If the second cannot be made, the
