@@ -1032,6 +1032,15 @@ What running it disclosed:
 
 ## 12. Review record
 
+**Running the Codex passes.** `codex exec` reads stdin even when the
+prompt is in argv, so a backgrounded invocation without a redirect blocks
+on `Reading additional input from stdin...` until something kills it. The
+symptom is the one to remember: no output, no findings, and a round that
+looks like a slow review rather than a stalled one. `codex exec … <
+/dev/null` is the fix. Two of Phase 2a's rounds were lost to this before
+it was understood, and neither was a review that found nothing.
+
+
 **2026-09-21, first draft, adversarial review (Opus critic, read-only,
 against this repo, PRP-001, and Atelier's audit): rejected.** One
 CRITICAL and seven HIGH findings, all confirmed against the code, all

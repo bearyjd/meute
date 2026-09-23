@@ -4674,11 +4674,16 @@ STUB
   hasnt "override: ...and never codex's"                             "$calls" "atelier-auth-codex"
 
   # The invariant that keeps this fixed is these assertions, not a grep for
-  # a spelling. A lexical check for `jq -r '.engine` passes for `jq
-  # '.engine'`, for `. as $e | .engine`, or for a helper that reads it --
-  # a guard whose passing means less than it looks like, which is the same
-  # class as the two silent-success failures §11 records. The override tests
-  # above exercise the property in both directions instead.
+  # a spelling. There WAS such a grep here -- `jq -r '.engine` counted in
+  # lib/container.sh, asserted zero -- and it is gone on purpose, so if the
+  # instinct to "restore it, it is only one line" arrives, this is the
+  # answer: it passes for `jq '.engine'`, for `. as $e | .engine`, and for
+  # any helper that reads the field, while the property it claims to guard
+  # is broken. A check that is cheap to write and hard to trust is worse
+  # than no check, because it occupies the space where a real one would go
+  # and makes that space look filled. The override tests above exercise the
+  # property in both directions and fail when it breaks; a bash test parsing
+  # bash would be a weaker guard sitting next to a stronger one.
 
   # And the two are bound rather than trusted to agree: the credential is
   # chosen from the engine parameter while the command comes from the
