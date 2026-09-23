@@ -679,6 +679,7 @@ phase cannot quietly change them.
 | Whether a Fable pass on Phase 7's design is wanted before it is built (`AUDIT.md` §8 item 7) | owner |
 | `--read-only` root and `/work:ro` for the review stage | Phase 2, if the CLIs tolerate it |
 | Pack-transfer cost of `--no-local --single-branch` clones on the largest fleet repo | Phase 2, recorded in §11 |
+| The in-container preflight cannot detect a revoked credential. `claude auth status` and `codex login status` read a local file, so both report `loggedIn: true` against a token the provider has revoked — the probe passes and the API call then fails. Only an authenticated call could tell, which would stop it being the zero-cost probe §4.4 and Phase 2b's decision 1 specify. Left as a hole in the preflight's promise rather than repaired with something that spends on every fire; Atelier's per-volume `just auth-login` removes the cause instead | owner (auth-login), then re-assess whether any probe is still wanted |
 | Which directory codex's `-s workspace-write` sandbox derives its writable root from — the process's cwd or `--cd`. On the host codex runs from the runner's own cwd (this checkout) with `--cd` naming the worktree; if the root follows cwd rather than `--cd`, an unattended codex run has this checkout as its writable root, which would be a real finding. Phase 2a left the host behaviour exactly as it shipped rather than change it on a guess, and pinned it with a test | Phase 3 observation week, from a live run |
 
 ## 9. Acceptance
@@ -1040,7 +1041,20 @@ What running it disclosed:
   the preflight cannot be made to detect revocation locally — only a
   cheap authenticated call could, which is no longer a zero-cost probe.
   Atelier's per-volume `just auth-login` remains the fix that removes the
-  collision entirely.
+  collision entirely, and `just auth` was deliberately NOT re-run: copying
+  the host's credential in again would restore container runs and set up
+  the reverse failure, where a container refreshes and revokes the HOST,
+  breaking the owner's live session mid-work. A container run failing at
+  cost 0 is the better of the two.
+
+  Half of this is fixed and half is not, deliberately. The `detail=success`
+  half is fixed: any `api_error_status` now reaches `detail=` with its
+  message, so the log reads `api 401: ... OAuth access token has been
+  revoked`. The preflight half is NOT, and is in §8: no local probe can see
+  a server-side revocation, and only an authenticated call could, which
+  would stop it being the zero-cost probe decision 1 specifies. A hole in
+  the preflight's promise is better visible than repaired with something
+  that spends money on every fire.
 
 - **Before that, no refresh had been observed.** After ten real container runs the
   host credential and the volume copy remain byte-identical, with ~3.5
