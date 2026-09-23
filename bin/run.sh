@@ -231,12 +231,15 @@ eligible() {
   # abort catches this today; Phase 2b removes that abort, and then a forced
   # run would be the one dispatch with no digest assert in front of it.
   if container_entry_needs_pin "$entry" && ! container_ready "$entry"; then
-    # An operator who named this repo is owed the reason where failures are
-    # read. Unforced, the rotation simply moves on and the entry that DOES
-    # run writes the fire's one line; forced, the queue holds nothing else,
-    # so a silent step-over would leave only "nothing was eligible" -- the
-    # one path where a drifted pin is invisible in state/log.
-    (( FORCED )) && abort_entry "$entry" "$CONTAINER_BLOCKED"
+    # The asymmetry is deliberate. An unforced entry that cannot run is
+    # queue rotation: the fire moves on and the entry that DOES run writes
+    # the fire's one line. A forced one is a human's explicit request that
+    # failed on a precondition they can remediate -- build the image, start
+    # the proxy, bump the pin -- so it must be logged, and must stay
+    # retryable. Not abort_entry: that also advances the cursor and marks a
+    # staged plan item done, which would retire the very item they asked for
+    # over a condition they are about to fix.
+    (( FORCED )) && refuse_entry "$entry" "$CONTAINER_BLOCKED"
     note "skipping ${key}: ${CONTAINER_BLOCKED}"
     return 1
   fi
@@ -676,6 +679,17 @@ manifest_section() {
     community) printf 'community\n' ;;
     *)         printf '%s\n' "$1" ;;
   esac
+}
+
+# A forced entry refused on a precondition. Logged like any failure, with the
+# cause in detail=, and then the fire ends -- leaving the cursor where it was
+# and any staged plan item still pending, because the operator asked for THIS
+# entry and will ask again once the condition is gone.
+refuse_entry() {
+  local entry="$1" detail="$2"
+  log_run "error" "kind=$(jq -r '.kind' <<< "$entry")" "repo=$(jq -r '.repo' <<< "$entry")" \
+          "task=$(jq -r '.task' <<< "$entry")" "detail=${detail}"
+  exit 1
 }
 
 # An entry the runner cannot even start on. Logged as an error with the cause

@@ -3850,7 +3850,10 @@ d["repos"].append(beta); d["community"] = []'
   has   "step-over: ...and saying the pin did not match"       "$forced_line" "detail=netlens: image"
   has   "step-over: ...with the digest as the reason"          "$forced_line" "is not at the pinned digest"
   hasnt "step-over: ...not a generic empty round"              "$forced_line" "status=skipped"
-  is    "step-over: ...and the cursor moves past it"           "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  # Logged, but not retired: the cursor stays where the last successful fire
+  # left it, so the entry the operator asked for is still there to retry once
+  # the image is built. Only the unforced rotation advances past an entry.
+  is    "step-over: ...but the forced entry stays retryable"   "$(kv_get_test "$root/state/cursor" cursor.daily)" "beta/audit-security"
 }
 
 # `meute container probe <repo>`: what a human runs to see whether a repo is
@@ -4239,6 +4242,70 @@ STUB
     || bad "pin: the entry it was verified for still builds" "refused its own entry"
 }
 
+# A forced refusal must stay retryable. The operator named this repo, the
+# precondition they hit is one they can remediate -- build the image, start
+# the proxy, bump the pin -- and the whole point of logging it is that they
+# come back. Retiring the item they asked for turns a transient condition
+# into a permanent loss, and in plan mode the loss is silent: the staged
+# item is marked attempted and the next fire never offers it again.
+test_p2_forced_refusal_is_retryable() {
+  local universe="$FIXTURE/p2-retry" root="$FIXTURE/p2-retry/meute-stand-in"
+  mkdir -p "$root"/{state,tasks,stub} "$universe/repo-one"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/contrib" "$root/contrib"
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  git -C "$universe/repo-one" init -q -b main
+  echo x > "$universe/repo-one/f.txt"; git -C "$universe/repo-one" add -A
+  git -C "$universe/repo-one" -c user.email=t@t -c user.name=t commit -qm init
+  # A podman that exists and holds no such image, so the refusal is the
+  # boundary's and not this machine's.
+  printf '#!/usr/bin/env bash\necho "Error: no such image" >&2\nexit 125\n' > "$root/stub/podman"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+echo invoked >> "$(dirname "$0")/invocations"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/podman" "$root/stub/claude"
+  # A fleet that runs in containers by default: a staged plan item inherits
+  # that runtime and has no pin of its own, so it cannot be verified.
+  python3 - "$root" <<'PY'
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5,
+                 "timeout_seconds": 60, "runtime": "container"},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk",
+                        "writes_code": False, "network": "proxied"}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md",
+                                 "slots": ["daily"]}},
+    "repos": [], "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  local key; key="$(jq -r '.entries[] | select(.path | endswith("/repo-one")) | .name' "$root/state/plan-queue.json" | head -1)"
+  [[ -n "$key" ]] || { bad "retryable: the plan staged an item to force" "nothing staged"; return 0; }
+
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo "$key" 2>&1)"
+  has "retryable: the forced refusal is logged"        "$out" "status=error"
+  has "retryable: ...naming the repo asked for"        "$out" "repo=${key}"
+  has "retryable: ...with the boundary's reason"       "$out" "detail=${key}: no image pinned"
+  [[ -f "$root/stub/invocations" ]] \
+    && bad "retryable: ...and no engine ran" "the stub was invoked" \
+    || ok "retryable: ...and no engine ran"
+  # The remediable part: the item the operator asked for is still theirs to
+  # retry once they have built the image.
+  is "retryable: the staged item is not marked attempted" \
+     "$(kv_get_test "$root/state/plan-complete" "plan/${key}/audit-security")" ""
+  is "retryable: ...and the plan is not retired"  "$([[ -f "$root/state/plan-queue.json" ]] && echo staged || echo gone)" "staged"
+  is "retryable: ...and the cursor did not move past it" \
+     "$(kv_get_test "$root/state/cursor" plan-cursor.daily)" ""
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(real_state_snapshot)"
@@ -4308,6 +4375,7 @@ test_p2_scratch_clone
 test_p2_scratch_import
 test_p2_fail_closed
 test_p2_step_over
+test_p2_forced_refusal_is_retryable
 test_p2_engine_cwd
 test_p2_outer_bound
 test_p2_pin_is_one_snapshot
