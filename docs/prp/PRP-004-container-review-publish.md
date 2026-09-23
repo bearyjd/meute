@@ -2,8 +2,15 @@
 
 **Status:** Proposed; **Phase 1 built** (2026-09-22, §11) — hardened from the 2026-09-20 "Cross-Provider Agent
 Dispatch Fleet" PRP by `AUDIT.md`, then rewritten after an adversarial
-review of the first draft (§12). **Phase 2 is blocked on Atelier**
-producing `agent-base` and `tests/smoke.sh` (zero commits there at filing).
+review of the first draft (§12). **Phase 2's remaining blocker is the
+owner's `just auth`** (§5 item 1, §8): Atelier's side is delivered —
+`691e067`, `agent-base` on the host, `tests/smoke.sh` present — and what is
+left is putting real credentials into the volumes, which Atelier is holding
+because copying one could invalidate the owner's live token. The earlier
+wording here ("blocked on Atelier producing `agent-base` and
+`tests/smoke.sh`, zero commits there at filing") was true at filing and is
+not now; a status line that names a blocker which has cleared is how a
+document starts lying about the thing it exists to track.
 **Created:** 2026-09-21
 **Depends on:** PRP-001 (complete); Atelier (`../atelier-harness`, contract
 in its `AUDIT.md` §3.2, §4.1–4.4, with the four changes §5 sends back)
@@ -360,7 +367,7 @@ Fixed by Atelier's audit; Meute does not re-decide them:
 | Podman wrapper | `distrobox-host-exec podman` when `/run/.containerenv` exists; `MEUTE_PODMAN` override | 4.4 |
 | Egress proxy | `atelier-egress` on the internal network; `HTTPS_PROXY` **and** `https_proxy` (curl ignores the uppercase form) injected at `podman run`; the internal subnet is pinned in Atelier's Justfile and the proxy's `Allow` is narrowed to it | 4.2, response below |
 | Proxy name resolution | `atelier-internal` is created with `--disable-dns` (podman ordered the proxy's nameservers non-deterministically on two networks; ~1 start in 4 lost public DNS), so container names do not resolve there. Every `proxied` run passes `--add-host atelier-egress:<ip>`, `<ip>` read at run time: `podman inspect atelier-egress --format '{{(index .NetworkSettings.Networks "atelier-internal").IPAddress}}'`. `HTTPS_PROXY=http://atelier-egress:3128` unchanged; `none` unaffected | 4.2, Atelier Phase 2 finding 2026-09-21 |
-| Tag availability | `g<sha>` is emitted only from a clean committed tree; until Atelier's first commit there is no pinnable tag, and the digest assertion is the thing Meute relies on | response below |
+| Tag availability | `g<sha>` is emitted only from a clean committed tree. **Atelier's first commit is `691e067` (2026-09-22)**, so the tags exist: `agent-base:g691e067` = `sha256:9ac5558d3ffd…`, `agent-example:g691e067` = `sha256:10878437f596…`. `agent-example` is the reference overlay, not a fleet project; per-project images come from `containers/<project>/` as they are added | response below, verified on the host |
 | Credential import | `scripts/auth-import.sh <volume> <file>` (generic); the owner mints the two PATs. Volumes populated before 2026-09-21 are invalid (files landed as uid 999 under `keep-id`; fixed that day) | response below |
 | Smoke test | Atelier's `tests/smoke.sh` is Phase 2's precondition | 5 |
 
@@ -664,7 +671,7 @@ phase cannot quietly change them.
 |---|---|
 | A Codex quota probe, or an explicit stubbed reading for the observation week | owner, before Phase 3 |
 | `just auth` — putting real credentials into the Atelier volumes, which is what verifies the OAuth-refresh hostnames and unblocks Phase 2's gate; held by Atelier because of the rotation risk (§5 item 3) | **owner** |
-| Atelier's first commit — no `g<sha>` tag exists before it | Atelier |
+| ~~Atelier's first commit — no `g<sha>` tag exists before it~~ — done: `691e067`, tags and digests verified on the host (§11). The pin is deliberately **not** Atelier HEAD, which has moved on; a pin follows a human reading the diff and running `meute image bump`, which is the whole point of pinning | resolved 2026-09-22 |
 | OAuth refresh-token rotation across the host copy and the auth volume | Phase 2 test; finding to Atelier §4.1 |
 | `gh pr checks` exit status on a PR with zero checks | Phase 5 test |
 | `claude -p --model fable` alias vs. full id | Phase 7 first run |
@@ -816,6 +823,33 @@ What running it disclosed, in the order it changed the design:
   phase.** `tier3-review` is deliberately not added there yet — nothing
   emits a review row before Phase 4, and the validation error names the
   tier if one ever appears first.
+
+- **The pin met a real image, and `latest` had already drifted off it.**
+  Atelier's first commit (`691e067`) produced the first tags Meute could
+  pin, so Phase 1's digest path ran against real podman instead of a stub:
+  a deliberately wrong pin made `doctor` FAIL naming both digests and the
+  remedy, `meute image bump` recorded `sha256:9ac5558d3ffd…` for
+  `agent-base:g691e067` with its backup, and `doctor` then passed. The
+  podman wrapper resolved itself through `distrobox-host-exec` with no
+  `MEUTE_PODMAN` set — the §5 contract clause that had only ever been
+  stub-tested — and `atelier-egress` was already running, so that check
+  passed on its first real reading too. The incidental finding is the one
+  that matters: within two minutes of the first build,
+  `agent-example:latest` and `:20260922` pointed at `sha256:442ec91b…`
+  while `agent-example:g691e067` still pointed at `sha256:10878437…` — a
+  rebuild moved the floating tags and left the immutable one behind.
+  Pinning `latest`, which Atelier §3.2 rejected on principle, would have
+  been wrong within minutes in practice; and since a same-commit rebuild
+  does not reproduce a digest, the **digest is the identity and the tag is
+  only a label**. If a `g<sha>` tag is ever re-applied, the pin stops
+  matching: today that surfaces as a `doctor` FAIL, and the run-path decline
+  is the Phase 2 step-over §6 specifies — `eligible()` has no digest check
+  on `main`, so the sentence describes what will decline, not what does.
+  Either way it is the intended behaviour and not a false alarm. Atelier
+  adopted the finding in `9b3d0de` and states it as policy: same-commit
+  rebuilds do not reproduce a digest, and a `g<sha>` tag is never
+  force-retagged. That policy, not reproducibility, is what makes the tag
+  immutable.
 
 Carried, not fixed here: `write_with_backup` is `open(…, "w")` then dump,
 not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
