@@ -12,7 +12,10 @@ state/.kv.*
 # migrating the schema takes a dated one. Naming them individually left the
 # next copy untracked and visible, which is how this rule was found.
 repos.local.yaml*
-# A write-then-rename beside the manifest would land here.
+# A write-then-rename beside the manifest would land here: the convention is
+# a dot-prefixed temp name next to the target (lib/state.sh, lib/plan.sh).
+# manifest_write.py is Python, and tempfile's default `tmp` prefix matches
+# neither rule -- a conversion there has to pass prefix=".repos.local.yaml.".
 .repos.local.*
 
 # Everything about YOUR fleet stays local. The harness is public; what it
@@ -23,7 +26,7 @@ reports/*/
 state/log
 state/cursor
 state/reports
-state/tickets.yaml
+state/tickets.yaml*
 state/quota-override
 # A staged portfolio plan lists every unconfigured repo on the machine by
 # absolute path; its archives and mktemp leftovers carry the same list.

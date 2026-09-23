@@ -189,6 +189,26 @@ cmd_doctor() {
     else
       d_ok "state and reports are gitignored; the runner never commits them"
     fi
+    # The ignore rules cover the manifest by name, and MEUTE_MANIFEST can
+    # point at any name -- with write_with_backup dropping a .bak beside
+    # whatever it resolves to. Ask git about the real file instead of
+    # guessing: that covers every name, including the ones nobody thought of.
+    local real rel
+    real="$(manifest_resolves_to)"
+    case "$real" in
+      "${MEUTE_ROOT}"/*)
+        rel="${real#"${MEUTE_ROOT}"/}"
+        if [[ "$rel" == "repos.yaml" ]]; then
+          d_ok "manifest is repos.yaml, the tracked schema doc the runner refuses to write"
+        elif git -C "$MEUTE_ROOT" check-ignore -q -- "$rel" \
+             && git -C "$MEUTE_ROOT" check-ignore -q -- "${rel}.bak"; then
+          d_ok "manifest ${rel} and its .bak are gitignored"
+        else
+          d_err "manifest ${rel} or ${rel}.bak is not gitignored - it names your repos, and this harness is public"
+        fi
+        ;;
+      *) d_ok "manifest lives outside the harness (${real})" ;;
+    esac
   fi
 
   if hold_active; then
