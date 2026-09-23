@@ -78,6 +78,11 @@ preflight_container() {
 # below are the same ones the host path applies.
 preflight_container_claude() {
   local entry="$1" status key_source plan
+  # The probe declares its engine like any argv builder. Its command is
+  # fixed in this file, so the claim is trivially true -- the point is that
+  # it travels the same path as every other credential-bearing dispatch
+  # rather than around it, because the exception is what rots.
+  local ENGINE_ARGV_ENGINE="claude"
   status="$(container_run "$entry" preflight claude "" "" -- claude auth status --json 2>/dev/null)" \
     || { PREFLIGHT_DETAIL="claude auth status failed inside the container - the volume may be empty; run: just auth"; return 1; }
   if [[ "$(jq -r '.loggedIn // false' <<< "$status" 2>/dev/null)" != "true" ]]; then
@@ -99,6 +104,7 @@ preflight_container_claude() {
 
 preflight_container_codex() {
   local entry="$1" status
+  local ENGINE_ARGV_ENGINE="codex"
   status="$(container_run "$entry" preflight codex "" "" -- codex login status 2>&1)" \
     || { PREFLIGHT_DETAIL="codex login status failed inside the container - the volume may be empty; run: just auth"; return 1; }
   if ! grep -qi 'chatgpt' <<< "$status"; then

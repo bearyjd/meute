@@ -53,12 +53,24 @@ readonly CONTAINER_STOP_TIMEOUT=30
 # through the engine branch, which is how "no credential" would otherwise
 # become the quiet default for a typo. An unknown stage is refused rather
 # than guessed at.
+# One authority for the set, so it cannot grow in a case arm nobody's test
+# enumerates: the arrays ARE the definition, and a test pins them.
+# Not `readonly`: lib/ is sourced more than once in some shells (the suite
+# does it), and a readonly array turns that into an error on stderr, which
+# then lands in any caller capturing 2>&1. The constants above predate that
+# lesson; these do not repeat it.
+CONTAINER_ENGINE_STAGES=(preflight build review review-2 resolve)
+CONTAINER_UNCREDENTIALED_STAGES=(probe publish)
+
 container_stage_credential() {
-  case "$1" in
-    preflight|build|review|review-2|resolve) printf 'engine\n' ;;
-    probe|publish) printf 'none\n' ;;
-    *) return 1 ;;
-  esac
+  local want="$1" stage
+  for stage in "${CONTAINER_ENGINE_STAGES[@]}"; do
+    [[ "$want" != "$stage" ]] || { printf 'engine\n'; return 0; }
+  done
+  for stage in "${CONTAINER_UNCREDENTIALED_STAGES[@]}"; do
+    [[ "$want" != "$stage" ]] || { printf 'none\n'; return 0; }
+  done
+  return 1
 }
 
 container_auth_mount() {
@@ -275,25 +287,34 @@ container_argv() {
   # capture back from, and it is NOT /work, so commit_worktree's `git add -A`
   # cannot sweep it into the branch.
   [[ -z "$outdir" ]] || CONTAINER_ARGV+=( --volume "${outdir}:/out:Z" )
-  # The credential is chosen from the engine parameter, and the command
-  # comes from the caller's argv. Two callers passing two different things
-  # is exactly the drift that put one provider's agent in front of the
-  # other's token, so the two are bound -- by the BUILDER'S declaration,
-  # never by looking at the command. `claude`, `/usr/local/bin/claude` and
-  # `env FOO=1 claude` are the same engine and only one of them looks like
-  # it; a check that pattern-matched argv[0] would pass for the other two
-  # while the property was violated, and would start doing so the first
-  # time someone pinned the binary by path. Commands nobody built through
-  # lib/engines.sh -- the preflight probe, the diagnostic script -- make no
-  # claim and so have none to contradict.
-  if [[ -n "${ENGINE_ARGV_ENGINE:-}" && "$ENGINE_ARGV_ENGINE" != "$engine" ]]; then
-    container_note "the command was built for ${ENGINE_ARGV_ENGINE} but the credential is for ${engine:-none}; refusing to run one engine on the other's token"
-    return 1
-  fi
   local need auth
   need="$(container_stage_credential "$stage")" \
     || { container_note "unknown stage '${stage}'; refusing to guess what it may hold"; return 1; }
   if [[ "$need" == "engine" ]]; then
+    # The credential is chosen from the engine parameter, and the command
+    # comes from the caller's argv. Two callers passing two different things
+    # is the drift that put one provider's agent in front of the other's
+    # token, so the two are bound -- by the CALLER'S declaration, never by
+    # looking at the command. `claude`, `/usr/local/bin/claude` and `env
+    # FOO=1 claude` are one engine and only one of them looks like it; a
+    # check that pattern-matched argv[0] would pass for the other two while
+    # the property was violated.
+    #
+    # An absent claim is a REFUSAL, not a pass. A guard that is skipped
+    # when its input is missing stops working the moment a caller arrives
+    # without one, and nothing announces that -- which is how this same
+    # mistake arrived three times in this branch. Every dispatch that
+    # mounts a credential declares what it is; stages that legitimately
+    # hold none take the other branch, where no claim and no credential are
+    # correct together.
+    if [[ -z "${ENGINE_ARGV_ENGINE:-}" ]]; then
+      container_note "stage ${stage} mounts a credential but the dispatch declared no engine; refusing"
+      return 1
+    fi
+    if [[ "$ENGINE_ARGV_ENGINE" != "$engine" ]]; then
+      container_note "the command was built for ${ENGINE_ARGV_ENGINE} but the credential is for ${engine:-none}; refusing to run one engine on the other's token"
+      return 1
+    fi
     # Fail closed: a stage that runs an engine and cannot be given that
     # engine's credential must be refused here, with a reason. Mounting
     # nothing and carrying on puts the failure inside the container, as an

@@ -3603,6 +3603,7 @@ STUB
 
   ( source "$REPO/lib/container.sh"
     MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=claude
     container_argv "$entry" build claude "$root/work" "$root/out" -- git status
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-none"
   argv="$(tr '\n' ' ' < "$root/argv-none")"
@@ -3639,6 +3640,7 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=claude
     container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build claude "$root/work" "$root/out" -- git status
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-proxied"
   argv="$(tr '\n' ' ' < "$root/argv-proxied")"
@@ -3654,6 +3656,7 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=claude
     container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight claude "" "" -- true
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-pre"
   argv="$(tr '\n' ' ' < "$root/argv-pre")"
@@ -3678,6 +3681,7 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$(jq -c '.engine = "codex"' <<< "$entry")" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=codex
     container_argv "$(jq -c '.engine = "codex"' <<< "$entry")" build codex "$root/work" "$root/out" -- true
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-codex"
   argv="$(tr '\n' ' ' < "$root/argv-codex")"
@@ -3690,6 +3694,7 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=claude
     container_argv "$(jq -c '.writes_code = false' <<< "$entry")" build claude "$root/work" "$root/out" -- true
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-ro"
   argv="$(tr '\n' ' ' < "$root/argv-ro")"
@@ -3774,6 +3779,7 @@ SH
           container_ready "$entry" >/dev/null 2>&1 \
             || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
           BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" \
+          ENGINE_ARGV_ENGINE=claude \
           container_run "$entry" build claude "$root/work" "$root/out" -- \
             env BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" sh -c "$probe" 2>&1 )"
 
@@ -4146,6 +4152,7 @@ SH
   out="$( source "$REPO/lib/container.sh"
           container_ready "$entry" >/dev/null 2>&1 \
             || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
+          ENGINE_ARGV_ENGINE=claude \
           container_run "$entry" build claude "$root/work" "$root/out" -- sh -c "$probe" 2>&1 )"
   local field; field() { grep -m1 "^$1=" <<< "$out" | cut -d= -f2-; }
   is "egress: the proxy resolves through --add-host, not DNS" "$(field addhost)"    "resolved"
@@ -4478,6 +4485,7 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=claude
     container_argv "$entry" build claude "$root" "$root" -- true ) >/dev/null 2>&1 \
     && ok "pin: the entry it was verified for still builds" \
     || bad "pin: the entry it was verified for still builds" "refused its own entry"
@@ -4613,6 +4621,7 @@ STUB
              '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none",
                engine:"claude", writes_code:true, timeout_seconds:60}')"
            container_ready "$e" >/dev/null 2>&1
+           ENGINE_ARGV_ENGINE=claude
            container_argv "$e" build claude "$root/work" "$root/out" -- true
            printf '%s\n' "${CONTAINER_ARGV[@]}" | tr '\n' ' ' )"
   has "volume: the scratch tree stays privately labelled" "$argv" "${root}/work:/work:Z"
@@ -4719,6 +4728,45 @@ STUB
   refuse claude claude /usr/local/bin/claude -p hello >/dev/null 2>&1 \
     && ok "override: a matching declaration builds, path or not" \
     || bad "override: a matching declaration builds, path or not" "refused its own engine"
+  # THE RULE, not the instance: a dispatch that mounts a credential requires
+  # a non-empty, exact claim. Unset is a refusal, because a guard that is
+  # skipped when its input is missing stops working the moment a caller
+  # arrives without one, and nothing announces that.
+  #
+  # The stage set is pinned below so it cannot grow quietly: add a sixth
+  # credential-bearing stage to container_stage_credential and that
+  # assertion fails, which brings the author here, and this loop then
+  # requires the new stage to refuse a claimless dispatch too.
+  # The loop walks the SET ITSELF, so a stage added to container.sh is
+  # covered here the moment it exists rather than when someone remembers to
+  # list it. An empty claim is used rather than an unset one on purpose: an
+  # unset variable would abort under `set -u` and the test would pass on an
+  # error instead of on the rule.
+  local stage
+  for stage in $( source "$REPO/lib/container.sh"; printf '%s\n' "${CONTAINER_ENGINE_STAGES[@]}" ); do
+    rc=0
+    ( source "$REPO/lib/container.sh"
+      export MEUTE_PODMAN="$root/stub/podman"
+      local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P4_DIGEST" \
+        '{repo:"netlens", image:{tag:$tag, digest:$digest}, network:"none",
+          writes_code:true, timeout_seconds:60}')"
+      container_ready "$e" >/dev/null 2>&1
+      ENGINE_ARGV_ENGINE=""
+      container_argv "$e" "$stage" claude "$root" "$root" -- claude -p hello ) >/dev/null 2>&1 || rc=$?
+    is "override: ${stage} refuses a dispatch that claims no engine" "$rc" "1"
+  done
+  # And the set is pinned, so growing it is a visible act: add a stage and
+  # this fails, which brings the author here, and the loop above then covers
+  # the new stage automatically because it reads the same array.
+  is "override: the credential-bearing stages are exactly these" \
+     "$( source "$REPO/lib/container.sh"; printf '%s' "${CONTAINER_ENGINE_STAGES[*]}" )" \
+     "preflight build review review-2 resolve"
+  is "override: ...and these hold no credential at all" \
+     "$( source "$REPO/lib/container.sh"; printf '%s' "${CONTAINER_UNCREDENTIALED_STAGES[*]}" )" \
+     "probe publish"
+  is "override: anything else is refused rather than guessed" \
+     "$( source "$REPO/lib/container.sh"; container_stage_credential teatime || echo refused )" "refused"
+
   # The builders are what make the claim, so it is theirs to declare.
   is "override: the claude builder declares what it built" \
      "$( source "$REPO/lib/engines.sh"
