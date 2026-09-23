@@ -74,15 +74,44 @@ extract_claude() {
   return 0
 }
 
+# Which sandbox codex runs under, decided by what else is holding the line.
+#
+# On the host, codex's own sandbox IS the only boundary: the agent shares the
+# owner's filesystem, home directory and network, and nothing else stands
+# between a write and any of it. There it keeps workspace-write.
+#
+# Inside the container that boundary has been replaced and exceeded -- no
+# $HOME, no other repositories, no unrestricted network, every capability
+# dropped, no-new-privileges, a read-only image root. Measured inside that
+# container, everything writable is already the agent's own: /work (its
+# scratch clone), /out (the capture directory the runner reads back), /tmp
+# and /var/tmp (tmpfs, gone at --rm), and codex's own credential volume,
+# which is a COPY and which it must read to authenticate at all. /etc, /usr,
+# /var, /run, / and /home/agent are read-only.
+#
+# And codex's in-process sandbox cannot initialise there: it reports "both
+# available write methods failed due to environment permissions" and the run
+# completes GREEN having changed nothing -- status=ok, commit=none, and a
+# report explaining it could not write. A second layer that cannot start is
+# not security; it is the silent-success failure PRP-001 §10a is about.
+#
+# A tier that writes nothing relaxes nothing, in either runtime.
+codex_sandbox() {
+  local runtime="$1" writes_code="$2"
+  [[ "$writes_code" == "1" ]] || { printf 'read-only\n'; return 0; }
+  [[ "$runtime" == "container" ]] || { printf 'workspace-write\n'; return 0; }
+  printf 'danger-full-access\n'
+}
+
 # codex names its working directory and its final-message file on the command
 # line rather than inheriting them, so both are parameters: the host passes
 # the worktree and a mktemp, a container passes /work and a path under /out
 # (nothing the runner reads may land in the branch -- commit_worktree runs
-# `git add -A`).
+# `git add -A`). The runtime is a parameter for the same reason -- it decides
+# the sandbox above, and it comes from the entry, never from the environment.
 engine_argv_codex() {
-  local prompt_file="$1" workdir="$2" last_message="$3"
-  local sandbox="read-only"
-  (( WRITES_CODE )) && sandbox="workspace-write"
+  local prompt_file="$1" workdir="$2" last_message="$3" runtime="${4:-host}"
+  local sandbox; sandbox="$(codex_sandbox "$runtime" "${WRITES_CODE:-0}")"
   ENGINE_ARGV=( codex exec --json -o "$last_message" -s "$sandbox"
                 -c approval_policy="never" --cd "$workdir" --skip-git-repo-check )
   [[ -n "${MEUTE_CODEX_MODEL:-}" ]] && ENGINE_ARGV+=( -m "${MEUTE_CODEX_MODEL}" )

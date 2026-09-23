@@ -3096,24 +3096,14 @@ STUB
   out="$(MEUTE_MANIFEST="$root/nopin.yaml" run daily --repo netlens --runtime container)"
   has "precondition: rule 5 is logged"                  "$out" "tag and digest are required when runtime is container"
   is  "precondition: ...and stays retryable too"        "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
-  # And the credential abort, which needs a pin that verifies to be reached.
-  cat > "$root/stub/podman" <<STUB
-#!/usr/bin/env bash
-case "\$*" in
-  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
-  *"{{.State.Running}}"*) printf 'true\n' ;;
-  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
-  *) exit 125 ;;
-esac
-STUB
-  chmod +x "$root/stub/podman"
-  out="$(run daily --repo netlens)"
-  has "precondition: the credential abort is logged"    "$out" "needs the credential volumes"
-  is  "precondition: ...and stays retryable as well"    "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
-  # Unforced, the rotation still advances: an entry it cannot run must not
-  # stall every repo behind it (PRP-001 §10).
-  out="$(run daily)"
-  is  "precondition: unforced, the rotation moves on"   "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  # The credential abort that used to sit here is gone: Phase 2b dispatches a
+  # verified entry into the container rather than refusing it, and the last
+  # precondition before an engine runs is now the in-container preflight,
+  # asserted in test_p2b_preflight. Unforced, the rotation still advances: an
+  # entry it cannot run must not stall every repo behind it (PRP-001 §10).
+  out="$(MEUTE_MANIFEST="$root/nopin.yaml" run daily --runtime container)"
+  has "precondition: unforced, the same refusal is logged" "$out" "tag and digest are required when runtime is container"
+  is  "precondition: ...and the rotation moves on"      "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
 }
 
 # Rule 6: the build engine is per ticket; the review engine is derived.
@@ -3351,20 +3341,24 @@ jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_tur
 STUB
   chmod +x "$root/stub/claude"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
-  local suffix=$'\truntime=-\timage=-\tstage=-\tpr=-'
+  # Phase 2b fills runtime= on a line that selected an entry; image= only for
+  # a container run, and stage=/pr= wait for Phases 4 and 5.
+  local suffix=$'\truntime=host\timage=-\tstage=-\tpr=-'
+  local unselected=$'\truntime=-\timage=-\tstage=-\tpr=-'
   local run; run() { PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB="$1" "$root/bin/run.sh" daily "${@:2}" >/dev/null 2>&1 || true; }
   run 100 --repo netlens
   local line; line="$(grep 'status=ok' "$root/state/log" | tail -1)"
   is  "log: an ok line ends with the four columns"  "${line: -${#suffix}}" "$suffix"
   has "log: ...after the last existing column"      "${line%"$suffix"}" $'\tdur='
-  hasnt "log: ...and nowhere else"                  "${line%"$suffix"}" "runtime="
+  hasnt "log: ...and nowhere else"                  "${line%"$suffix"}" "image="
   run 10 --repo netlens
   line="$(grep 'status=skipped' "$root/state/log" | tail -1)"
-  is  "log: a skipped line carries them too"        "${line: -${#suffix}}" "$suffix"
+  # A skip happens before an entry is selected, so there is no runtime to name.
+  is  "log: a skipped line carries them too"        "${line: -${#unselected}}" "$unselected"
   printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tcodex\n' > "$root/state/stages"
   PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly >/dev/null 2>&1 || true
   line="$(grep 'status=error' "$root/state/log" | tail -1)"
-  is  "log: an error line carries them too"         "${line: -${#suffix}}" "$suffix"
+  is  "log: an error line carries them too"         "${line: -${#unselected}}" "$unselected"
   # Everything that reads the log still counts this week.
   local status_out
   status_out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)"
@@ -3604,7 +3598,8 @@ STUB
   chmod +x "$root/stub/podman"
   local entry argv
   entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
-    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:1800}')"
+    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:1800,
+      engine:"claude", writes_code:true}')"
 
   ( source "$REPO/lib/container.sh"
     MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
@@ -3633,7 +3628,9 @@ STUB
   has "argv: the command follows the image"   "$argv" "git status"
   # The owner's checkout is never mounted, and no host path reaches the
   # container except the two scratch directories this phase creates.
-  is  "argv: nothing else is mounted"         "$(grep -c '^--volume$' "$root/argv-none")" "2"
+  # /work, /out, and one credential volume -- nothing else reaches the
+  # container, and in particular never the owner's checkout.
+  is  "argv: nothing else is mounted"         "$(grep -c '^--volume$' "$root/argv-none")" "3"
 
   has "argv (none): the network is off"       "$argv" "--network=none"
   hasnt "argv (none): no proxy is injected"   "$argv" "HTTPS_PROXY"
@@ -3657,11 +3654,49 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
-    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight "$root/work" "$root/out" -- true
+    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight "" "" -- true
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-pre"
   argv="$(tr '\n' ' ' < "$root/argv-pre")"
   has   "argv (preflight): takes no network whatever the tier says" "$argv" "--network=none"
   hasnt "argv (preflight): and no proxy"                            "$argv" "HTTPS_PROXY"
+  # §4.4 gives the preflight no mounts: it reads a credential, and a scratch
+  # tree it cannot use is a scratch tree it should not have.
+  hasnt "argv (preflight): no scratch tree"   "$argv" "/work"
+  hasnt "argv (preflight): no capture tree"   "$argv" "/out"
+
+  # Phase 2b. The image root is not the agent's to change -- it is pinned by
+  # digest, so a write there is lost at --rm anyway and is one more place to
+  # hide. Measured: both CLIs complete under this.
+  argv="$(tr '\n' ' ' < "$root/argv-none")"
+  has "argv: the image root is read-only"     "$argv" "--read-only"
+  has "argv: ...with /tmp the one exception"  "$argv" "--tmpfs /tmp"
+  # One credential, the entry's own engine's, and never the GitHub token --
+  # `just auth` fills that one with the owner's full-scope interactive login.
+  has "argv: the engine's own credential is mounted" "$argv" "atelier-auth-claude:/home/agent/.claude:Z"
+  hasnt "argv: ...and no other engine's"             "$argv" "atelier-auth-codex"
+  hasnt "argv: ...and never the GitHub token"        "$argv" "atelier-auth-gh"
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$(jq -c '.engine = "codex"' <<< "$entry")" >/dev/null 2>&1
+    container_argv "$(jq -c '.engine = "codex"' <<< "$entry")" build "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-codex"
+  argv="$(tr '\n' ' ' < "$root/argv-codex")"
+  has "argv: a codex entry mounts the codex credential" "$argv" "atelier-auth-codex:/home/agent/.codex:Z"
+  hasnt "argv: ...and not claude's"                     "$argv" "atelier-auth-claude"
+
+  # A tier that does not write code cannot write the branch it is reading.
+  # git still works there: status, diff <base>...HEAD, log and show all
+  # succeed on a read-only mount, provided it is still relabelled.
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$(jq -c '.writes_code = false' <<< "$entry")" build "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-ro"
+  argv="$(tr '\n' ' ' < "$root/argv-ro")"
+  has   "argv: a reading tier gets /work read-only" "$argv" "${root}/work:/work:ro,Z"
+  hasnt "argv: ...and /out stays writable"          "$argv" "/out:ro"
+  argv="$(tr '\n' ' ' < "$root/argv-none")"
+  has   "argv: a writing tier keeps /work writable" "$argv" "${root}/work:/work:Z"
 }
 
 # What the flags actually buy, asked of the kernel rather than of the argv.
@@ -4017,6 +4052,21 @@ test_p2_engine_argv() {
            WRITES_CODE=0 MEUTE_CODEX_MODEL= engine_argv_codex "$root/prompt" /work /out/codex-last
            printf '%s\n' "${ENGINE_ARGV[@]}" )"
   has "engine argv: a reading tier gets read-only" "$argv" "read-only"
+
+  # The whole sandbox decision, in one table. On the host codex's own sandbox
+  # is the only boundary, so it keeps workspace-write; inside the container
+  # that boundary has been replaced by a stronger one AND codex's own cannot
+  # initialise there, which produces a green run that changed nothing.
+  local sb; sb() { ( source "$REPO/lib/engines.sh"; codex_sandbox "$1" "$2" ); }
+  is "sandbox: host, writing tier -- codex guards itself"   "$(sb host 1)"      "workspace-write"
+  is "sandbox: host, reading tier -- nothing to relax"      "$(sb host 0)"      "read-only"
+  is "sandbox: container, reading tier -- still nothing"    "$(sb container 0)" "read-only"
+  is "sandbox: container, writing tier -- the container is the boundary" \
+     "$(sb container 1)" "danger-full-access"
+  # Anything that is not plainly the container keeps codex's own sandbox: an
+  # unset, empty or unexpected runtime must never reach full access.
+  is "sandbox: an empty runtime is not the container"       "$(sb "" 1)"        "workspace-write"
+  is "sandbox: nor is an unrecognised one"                  "$(sb vm 1)"        "workspace-write"
 }
 
 
@@ -4104,15 +4154,17 @@ STUB
 #!/usr/bin/env bash
 if [[ "$1" == "login" ]]; then printf 'Logged in using ChatGPT\n'; exit 0; fi
 pwd > "$(dirname "$0")/codex-pwd"
-last=""; cd_arg=""
+last=""; cd_arg=""; sandbox=""
 while (( $# )); do
   case "$1" in
     -o) last="$2"; shift ;;
     --cd) cd_arg="$2"; shift ;;
+    -s) sandbox="$2"; shift ;;
   esac
   shift
 done
 printf '%s\n' "$cd_arg" > "$(dirname "$0")/codex-cd"
+printf '%s\n' "$sandbox" > "$(dirname "$0")/codex-sandbox"
 printf '## Summary\nstub ran\n' > "$last"
 STUB
   chmod +x "$root/stub/claude" "$root/stub/codex"
@@ -4166,6 +4218,11 @@ PY
   [[ "$codex_cd" != "$codex_pwd" ]] \
     && ok "cwd: the two differ on the host, which is the behaviour that shipped" \
     || bad "cwd: the two differ on the host, which is the behaviour that shipped" "both were [$codex_pwd]"
+  # On the host nothing has replaced codex's own sandbox, so nothing may
+  # relax it -- asserted on the real invocation, not only on the table.
+  local host_sandbox; host_sandbox="$(cat "$root/stub/codex-sandbox" 2>/dev/null || echo none)"
+  is    "sandbox: a host run keeps codex's own sandbox"  "$host_sandbox" "read-only"
+  hasnt "sandbox: ...and never full access on the host"  "$host_sandbox" "danger"
 }
 
 
@@ -4189,15 +4246,13 @@ test_p2_outer_bound() {
      "$(grep -c 'timeout --kill-after="\$CONTAINER_STOP_TIMEOUT" "\$(container_outer_bound' "$REPO/lib/container.sh")" "1"
 }
 
-# No timer fire can dispatch a container. That is the guarantee this whole
-# phase rests on, so it is asserted WITHOUT a real image: a machine that
-# happens not to have one -- CI, a fresh checkout -- would otherwise skip
-# the only test standing between an unverifiable engine run and a timer.
-#
-# A stub podman answering the two calls container_ready makes is enough,
-# because the abort fires before anything would start a container: the
-# entry passes the boundary, reaches run_entry, and is refused there.
-test_p2_credential_abort() {
+# Phase 2b removes the abort that kept a timer fire from dispatching a
+# container, so what has to be asserted now is the opposite: that a verified
+# entry IS dispatched, into a container carrying the flags 2a settled, and
+# that the log says which image actually ran. Asserted without a real image,
+# so a machine that has none -- CI, a fresh checkout -- still covers the
+# dispatch path; the stub podman stands in for the engine's envelope.
+test_p2b_container_dispatch() {
   local root="$FIXTURE/p2-cred"; p4_fixture "$root"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
   mkdir -p "$root/stub"
@@ -4216,6 +4271,8 @@ case "\$*" in
   *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
   *"{{.State.Running}}"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *"claude auth status"*) printf '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}\n' ;;
+  *" -p "*) printf '{"is_error":false,"result":"## Summary ran inside the container","total_cost_usd":0.01,"num_turns":1}\n' ;;
   *) exit 125 ;;
 esac
 STUB
@@ -4225,18 +4282,65 @@ STUB
   local out
   out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
          "$root/bin/run.sh" daily --repo netlens 2>&1)"
-  has "credentials: a verified pin gets past the boundary check" "$out" "status=error"
-  has "credentials: ...and run_entry refuses to dispatch it"     "$out" "detail=container runtime needs the credential volumes; see PRP-004 §5 item 3"
-  [[ -f "$root/stub/invocations" ]] \
-    && bad "credentials: ...with no engine run" "the stub was invoked" \
-    || ok "credentials: ...with no engine run"
-  is  "credentials: the entry is logged once and stepped past" \
-      "$(grep -c 'repo=netlens' "$root/state/log")" "1"
-  # The boundary was really crossed: had the pin failed, the entry would have
-  # been stepped over in eligible() and the abort above would never have run.
-  has "credentials: the pin was asserted on the way"   "$(cat "$root/stub/podman-calls")" "{{.Digest}}"
-  has "credentials: ...and the image ID resolved with it" "$(cat "$root/stub/podman-calls")" "{{.Id}}"
-  hasnt "credentials: no container was ever started"   "$(cat "$root/stub/podman-calls")" "run --rm"
+  has "dispatch: a verified entry runs rather than being refused" "$out" "status=ok"
+  hasnt "dispatch: ...and the Phase 1 refusal is gone"            "$out" "needs the credential volumes"
+  is  "dispatch: the entry is logged once"  "$(grep -c 'repo=netlens' "$root/state/log")" "1"
+  # The boundary was really crossed, and the log says what ran: the image ID
+  # the digest assert resolved, not the tag it was asked about.
+  has "dispatch: the log names the runtime"  "$out" "runtime=container"
+  has "dispatch: ...and the image that ran"  "$out" "image=${P2_ID:0:12}"
+  has "dispatch: the pin was asserted first" "$(cat "$root/stub/podman-calls")" "{{.Digest}}"
+  # Two containers, in order: the credential probe with no network and no
+  # trees, then the engine with /work, /out and the proxied profile.
+  is  "dispatch: the preflight ran in a container of its own" \
+      "$(grep -c 'claude auth status' "$root/stub/podman-calls")" "1"
+  has "dispatch: ...on no network at all"   "$(grep 'claude auth status' "$root/stub/podman-calls")" "--network=none"
+  hasnt "dispatch: ...with no scratch tree" "$(grep 'claude auth status' "$root/stub/podman-calls")" "/work"
+  has "dispatch: ...and only its own credential" \
+      "$(grep 'claude auth status' "$root/stub/podman-calls")" "atelier-auth-claude:/home/agent/.claude"
+  local engine_call; engine_call="$(grep -- '-p ' "$root/stub/podman-calls" | tail -1)"
+  has "dispatch: the engine got the scratch tree at /work" "$engine_call" ":/work:"
+  has "dispatch: ...and /out for its captures"             "$engine_call" ":/out:Z"
+  has "dispatch: ...the image root read-only"              "$engine_call" "--read-only"
+  has "dispatch: ...its own credential volume"             "$engine_call" "atelier-auth-claude"
+  hasnt "dispatch: ...and never the GitHub token"          "$(cat "$root/stub/podman-calls")" "atelier-auth-gh"
+}
+
+# The last precondition before an engine runs. The host may be logged in
+# while the volume the container reads is empty, signed out, or absent -- so
+# the probe runs inside, and a failure is remediable (`just auth`), which
+# makes it retryable under force rather than a discarded request.
+test_p2b_preflight() {
+  local root="$FIXTURE/p2b-preflight"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  # A podman whose image verifies, but whose container reports a signed-out
+  # credential -- exactly the shape of an unpopulated auth volume.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *"claude auth status"*) printf '{"loggedIn":false}\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has "preflight: a signed-out volume stops the run"   "$out" "status=error"
+  has "preflight: ...saying what to do about it"       "$out" "not logged in inside the container"
+  has "preflight: ...and naming just auth"             "$out" "just auth"
+  hasnt "preflight: ...before any engine was invoked"  "$(cat "$root/stub/podman-calls")" "\-p "
+  # Remediable, so forced it stays retryable -- the operator runs `just auth`
+  # and asks for the same repo again.
+  is  "preflight: a forced refusal leaves the cursor alone" \
+      "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
 }
 
 # The probe makes two scratch directories. If the second cannot be made, the
@@ -4490,7 +4594,8 @@ test_p2_pin_is_one_snapshot
 test_p2_isolation
 test_p2_proxied_egress
 test_p2_container_probe
-test_p2_credential_abort
+test_p2b_container_dispatch
+test_p2b_preflight
 test_p2_probe_cleanup
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"

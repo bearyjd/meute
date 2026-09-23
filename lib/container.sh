@@ -24,6 +24,24 @@ readonly PODMAN_TIMEOUT=15
 # The host path's own kill grace, so a container that ignores SIGTERM dies on
 # the same schedule as an engine that ignores it on the host.
 readonly CONTAINER_STOP_TIMEOUT=30
+# One volume per engine, holding a COPY of that engine's credential (PRP-004
+# §4.4). Mounted read-write on purpose: both CLIs write to their config
+# directory, and a refresh that cannot be written is a refresh that fails --
+# `:ro` would not prevent a rotation, only break it. The copy is why that is
+# safe: a write here does not touch the host's file.
+#
+# No stage mounts more than one, and no engine stage mounts the GitHub
+# volume: `just auth` fills atelier-auth-gh with the owner's interactive
+# token, which is full-scope, so nothing unattended may hold it. Publishing
+# waits for the two fine-grained PATs (§5 item 2).
+container_auth_mount() {
+  case "$1" in
+    claude) printf 'atelier-auth-claude:/home/agent/.claude:Z\n' ;;
+    codex)  printf 'atelier-auth-codex:/home/agent/.codex:Z\n' ;;
+    "")     return 1 ;;
+    *)      return 1 ;;
+  esac
+}
 
 container_note() { printf 'meute: %s\n' "$*" >&2; }
 
@@ -191,15 +209,41 @@ container_argv() {
     --security-opt=no-new-privileges
     --init
     --pids-limit=2048
-    --volume "${workdir}:/work:Z"
-    --volume "${outdir}:/out:Z"
-    --workdir /work
     --timeout "$timeout_seconds"
     --stop-timeout "$CONTAINER_STOP_TIMEOUT"
     # An image that vanished between the assert and now is an error. Without
     # this podman would go and fetch something by that name from a registry.
     --pull=never
+    # The image's own filesystem is not the agent's to change: it is pinned
+    # by digest, so anything written there would be lost at --rm anyway, and
+    # a writable root is one more place a compromised run could hide. /tmp is
+    # the one thing both CLIs need to write outside their mounts. Measured:
+    # a real `claude -p` and a real `codex exec` both complete under this
+    # (PRP-004 §5 item 4, answered in Phase 2b).
+    --read-only
+    --tmpfs /tmp
   )
+  # The preflight reads a credential and nothing else, so it takes neither
+  # tree -- §4.4 gives it no mounts at all.
+  if [[ -n "$workdir" ]]; then
+    # A tier that does not write code has no business writing the branch it
+    # was given to read. Measured: git status, diff <base>...HEAD, log and
+    # show all work on a read-only mount, provided it is still relabelled.
+    # `.writes_code // true` would be wrong here: jq's alternative operator
+    # treats false as empty, so a reading tier would have come back "true"
+    # and been given a writable branch. Ask for the value itself.
+    local work_flags="Z"
+    [[ "$(jq -r '.writes_code' <<< "$entry")" != "false" ]] || work_flags="ro,Z"
+    CONTAINER_ARGV+=( --volume "${workdir}:/work:${work_flags}" --workdir /work )
+  fi
+  # /out is always writable: it is where the runner reads the engine's
+  # capture back from, and it is NOT /work, so commit_worktree's `git add -A`
+  # cannot sweep it into the branch.
+  [[ -z "$outdir" ]] || CONTAINER_ARGV+=( --volume "${outdir}:/out:Z" )
+  local auth
+  if auth="$(container_auth_mount "$(jq -r '.engine // ""' <<< "$entry")")"; then
+    CONTAINER_ARGV+=( --volume "$auth" )
+  fi
   local -a profile=()
   container_network_argv "$stage" "$network" || return 1
   profile=( "${CONTAINER_NETWORK_ARGV[@]}" )
