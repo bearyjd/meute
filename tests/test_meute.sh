@@ -744,6 +744,34 @@ test_plan_state_ignored() {
   done
 }
 
+# `repos.local.yaml` and one exact backup name were listed individually, so
+# any other copy of the fleet config -- a dated backup taken before a schema
+# migration, the one a human makes before an edit -- was untracked and
+# visible. It is the same list of private repositories as the manifest, and
+# the harness is public. The rule is anchored on the prefix so every copy is
+# covered by the name it already has.
+# The temp name is the one lib/state.sh's convention would produce, not an
+# invented one, so the assertion exercises the rule it defends. `-v` names the
+# file the match came from: a global core.excludesFile with *.bak or *.orig in
+# it would otherwise let two of these pass without .gitignore doing any work.
+test_private_manifest_copies_ignored() {
+  local f
+  for f in repos.local.yaml repos.local.yaml.bak \
+           repos.local.yaml.pre-prp004-20260922 \
+           repos.local.yaml.2026-09-22 repos.local.yaml.orig \
+           .repos.local.yaml.Xa3Kd9 docs/repos.local.yaml; do
+    is "gitignore: ${f} never reaches the public harness" \
+      "$(git -C "$REPO" check-ignore -v -- "$f" | cut -d: -f1)" ".gitignore"
+  done
+  # The negative control: the rule is unanchored and matches at every depth,
+  # which is right for a private list but would silently swallow the tracked
+  # schema doc if the prefix ever slipped.
+  is "gitignore: repos.yaml stays tracked" \
+    "$(git -C "$REPO" check-ignore -q -- repos.yaml; echo $?)" "1"
+  is "gitignore: state/tickets.yaml.bak never reaches the public harness" \
+    "$(git -C "$REPO" check-ignore -v -- state/tickets.yaml.bak | cut -d: -f1)" ".gitignore"
+}
+
 # The web gate reads a tier's `tools` as a comma-separated string. A YAML
 # list would read as "no web tools" and let a web entry through a plan that
 # never allowed one, so the shape is checked where every command validates.
@@ -3388,6 +3416,38 @@ STUB
 
 # doctor: image present at the pinned digest, per container repo, and the
 # egress proxy running, fleet-wide -- only when some repo runs in a container.
+# The ignore rules cover the manifest by name, and MEUTE_MANIFEST can name
+# anything -- with write_with_backup dropping a .bak beside whatever it
+# resolves to. Naming patterns cannot cover a name nobody predicted, so
+# doctor asks git about the real file. Raised in review of the ignore fix:
+# the rule closed the documented path and left the override open.
+test_doctor_manifest_ignored() {
+  local root="$FIXTURE/doctor-manifest"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  # doctor asks git, so the fixture needs a repo and this harness's own rules.
+  # p4_fixture writes repos.yaml; the two copies are the manifest a fleet
+  # actually uses and one under a name no ignore rule predicts.
+  git -C "$root" init -q
+  cp "$REPO/.gitignore" "$root/.gitignore"
+  cp "$root/repos.yaml" "$root/repos.local.yaml"
+  cp "$root/repos.yaml" "$root/fleet.local.yaml"
+  local doc; doc() { "$root/bin/meute" doctor 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g'; }
+  local out
+  out="$(doc)"
+  has "doctor: the documented manifest and its .bak are ignored" \
+    "$out" "ok   manifest repos.local.yaml and its .bak are gitignored"
+  out="$(MEUTE_MANIFEST="$root/fleet.local.yaml" doc)"
+  has "doctor: a manifest the rules do not cover is a FAIL" \
+    "$out" "FAIL manifest fleet.local.yaml or fleet.local.yaml.bak is not gitignored"
+  out="$(MEUTE_MANIFEST="$root/repos.yaml" doc)"
+  has "doctor: the tracked schema doc is not mistaken for a leak" \
+    "$out" "ok   manifest is repos.yaml, the tracked schema doc"
+  cp "$root/repos.local.yaml" "$FIXTURE/outside.yaml"
+  out="$(MEUTE_MANIFEST="$FIXTURE/outside.yaml" doc)"
+  has "doctor: a manifest outside the harness cannot be published by it" \
+    "$out" "ok   manifest lives outside the harness"
+}
+
 test_p4_doctor_containers() {
   local root="$FIXTURE/p4-doctor"; p4_fixture "$root"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
@@ -3476,6 +3536,7 @@ test_suggest_features_queued
 test_add_repo
 test_discover
 test_plan_state_ignored
+test_private_manifest_copies_ignored
 test_tier_tools_must_be_string
 test_plan_tier_class
 test_plan_identity
@@ -3497,6 +3558,7 @@ test_p4_rule9_push_needs_repo
 test_p4_stage_entry_cap_and_abort
 test_p4_log_columns
 test_p4_image_bump
+test_doctor_manifest_ignored
 test_p4_doctor_containers
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
