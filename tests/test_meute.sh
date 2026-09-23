@@ -2249,6 +2249,43 @@ test_engines() {
   is  "engines: a 429 status is still error"   "$ENGINE_STATUS" "error"
   has "engines: detail says what happened, not the misleading subtype" "$ENGINE_DETAIL" "rate-limited:"
   has "engines: detail carries the provider's own message"             "$ENGINE_DETAIL" "hit your weekly limit"
+
+  # Any api_error_status reaches detail=, not just the one that was hurting
+  # when this was written. The CLI reports is_error: true with subtype
+  # "success" for an auth failure too, so a revoked credential used to be
+  # logged as `detail=success` -- the word an operator greps for, on the
+  # line that says the run failed. PRP-001 §11 records the same shape for
+  # 429; this is that fix generalised, which Phase 2b makes urgent because
+  # until per-volume login lands every container claude run 401s the moment
+  # the host refreshes its token.
+  out="$root/revoked.json"
+  printf '%s' '{"result":"Failed to authenticate. API Error: 401 OAuth access token has been revoked.","is_error":true,"subtype":"success","api_error_status":401}' > "$out"
+  extract_claude "$out" || true
+  is    "engines: a 401 is an error"                   "$ENGINE_STATUS" "error"
+  has   "engines: ...whose detail names the status"    "$ENGINE_DETAIL" "401"
+  has   "engines: ...and carries the real message"     "$ENGINE_DETAIL" "OAuth access token has been revoked"
+  hasnt "engines: ...and never reads as success"       "$ENGINE_DETAIL" "success"
+  is    "engines: a 401 is not a rate limit"           "$RATE_LIMITED" "0"
+
+  # A detail with a tab or newline in it would break the log line it lands
+  # in -- state/log is tab-separated and one line per fire.
+  out="$root/multiline.json"
+  printf '%s' '{"result":"first line\nsecond\tline","is_error":true,"subtype":"success","api_error_status":500}' > "$out"
+  extract_claude "$out" || true
+  # Counted rather than matched: $(printf '\n') strips to an empty needle,
+  # and `hasnt` against "" can never pass -- a test that always fails is as
+  # useless as one that always passes, just louder.
+  is "engines: a detail carries no newline into the log" \
+     "$(printf '%s' "$ENGINE_DETAIL" | wc -l)" "0"
+  hasnt "engines: ...nor a tab"                             "$ENGINE_DETAIL" "$(printf '\t')"
+  has   "engines: ...while keeping the message"             "$ENGINE_DETAIL" "second line"
+
+  # An error the provider did not give a status for keeps its own subtype,
+  # which is the most specific thing available in that case.
+  out="$root/no-status.json"
+  printf '%s' '{"result":"","is_error":true,"subtype":"error_during_execution"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: without a status, the subtype is still the detail" "$ENGINE_DETAIL" "error_during_execution"
 }
 
 

@@ -69,13 +69,24 @@ extract_claude() {
   if [[ "$(jq -r '.is_error // false' "$out")" == "true" ]]; then
     ENGINE_STATUS="error"
     # subtype is the CLI's own event name and reads as "success" even when
-    # is_error is true and this was actually an HTTP 429 -- report the thing
-    # that actually happened instead of parroting a misleading field.
-    if [[ "$(jq -r '.api_error_status // empty' "$out")" == "429" ]]; then
-      RATE_LIMITED=1
-      local msg; msg="$(jq -r '.result // "no message"' "$out")"
+    # is_error is true and the call actually failed -- first observed on a
+    # 429, and again on the 401 a revoked credential returns. Whenever the
+    # provider gave a status, report THAT and the message it came with;
+    # parroting the field that is easiest to print puts the word "success"
+    # on the line an operator greps to find failures.
+    local status_code msg
+    status_code="$(jq -r '.api_error_status // empty' "$out")"
+    if [[ -n "$status_code" ]]; then
+      msg="$(jq -r '.result // "no message"' "$out")"
+      # state/log is tab-separated, one line per fire; a detail carrying
+      # either would split the record it is part of.
       msg="${msg//$'\t'/ }"; msg="${msg//$'\n'/ }"
-      ENGINE_DETAIL="rate-limited: ${msg}"
+      if [[ "$status_code" == "429" ]]; then
+        RATE_LIMITED=1
+        ENGINE_DETAIL="rate-limited: ${msg}"
+      else
+        ENGINE_DETAIL="api ${status_code}: ${msg}"
+      fi
     else
       ENGINE_DETAIL="$(jq -r '.subtype // "unknown"' "$out")"
     fi
