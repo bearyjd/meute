@@ -858,6 +858,82 @@ not write-then-rename (pre-existing in `add-repo`); `find_project` prefers
 `requires_specced_ticket` tasks on one repo would each emit a stage entry
 for the same row — Phase 4 dedupes by row, not by task.
 
+### Phase 2b — the engine runs inside the boundary (2026-09-23)
+
+Plan: `.claude/PRPs/plans/prp-004-phase-2b.plan.md`. Baseline 848
+assertions -> 884. This is the phase that removed the Phase 1 abort, so a
+timer fire can now dispatch a container: everything Phase 2a built to fail
+closed became load-bearing on that commit rather than precautionary.
+
+What running it disclosed:
+
+- **`jq`'s `//` treats `false` as empty, so a boolean default is a trap.**
+  `jq -r '.writes_code // true'` returns `true` for a tier that declares
+  `writes_code: false`, because `//` selects the alternative for `null`
+  **and** for `false`. The read-only `/work` mount was therefore never
+  applied -- silently, including in the first real container run that was
+  meant to prove it. Read the value and compare it instead. A sweep found
+  no other broken instance (`.is_error // false` and `.captured_at // 0`
+  are harmless, their defaults matching what `//` does), but the next
+  `// true` on a boolean will be just as quiet.
+
+- **`/work:ro` holds, provided the mount keeps `Z`.** The first measurement
+  said the opposite: `git status` inside reported "not a git repository".
+  That was SELinux, not read-only -- `:ro` alone does not relabel. With
+  `:ro,Z`, `git status`, `git diff <base>...HEAD`, `git log` and `git show`
+  all succeed on a branch the agent cannot write. Adopted for every tier
+  whose `writes_code` is false.
+
+- **`--read-only` root is tolerated by both CLIs**, with `--tmpfs /tmp` the
+  only exception needed. A real `claude -p` and a real `codex exec` both
+  complete under it. Adopted.
+
+- **codex's own sandbox cannot initialise inside the container, and fails
+  green.** With `-s workspace-write` it reports "both available write
+  methods failed due to environment permissions", and the run finishes
+  `status=ok` with `commit=none` and a report explaining it could not
+  write -- the silent-success shape PRP-001 s10a exists to catch. A plain
+  `touch /work/x` under identical flags succeeds and removing `--read-only`
+  does not help, so it is codex's layer, not the mount. Inside the
+  container it now runs `-s danger-full-access`; on the host it keeps
+  `workspace-write`, because there its own sandbox is the only boundary.
+  Measured inside the hardened container, everything writable is already
+  the agent's own: `/work`, `/out`, `/tmp`, `/var/tmp` and codex's
+  credential volume (a copy). `/`, `/etc`, `/usr`, `/var`, `/run` and
+  `/home/agent` are read-only -- note `/run` is read-only here, contrary to
+  a first reading of the mount options.
+
+- **A credential volume must be relabelled `:z`, not `:Z`, and this was
+  invisible until a second container looked.** Private relabel rewrites the
+  volume's SELinux categories to the calling container's, so a single run
+  always succeeds and then works -- every one-run check passes. But these
+  volumes are shared with Atelier's interactive `agent-enter` containers by
+  design (s5), so each fire would steal the label. Measured: after a `:Z`
+  mount the volume reads `container_file_t:s0:c534,c848` and a second
+  container is **denied**; after `:z` it reads `container_file_t:s0` and
+  any container can read it. The owner's interactive container would have
+  been locked out of its own credentials until it relabelled back, and then
+  the next fire would have been -- a ping-pong surfacing as an intermittent
+  "not logged in", which at a glance is indistinguishable from the
+  refresh-token collision this phase is already watching for. That is why
+  it is written down rather than merely fixed. `/work` and `/out` keep
+  `:Z`: they are private per-run directories, where private relabel is
+  correct. The isolation `:Z` appears to buy on a credential volume is
+  illusory anyway -- reaching it means naming that volume in a mount, and
+  whoever can do that has already lost.
+
+- **No refresh has been observed yet.** After ten real container runs the
+  host credential and the volume copy remain byte-identical, with ~3.5
+  hours left on the access token. s5 item 3 stays open with its window
+  unchanged: refresh can only matter near expiry, and the fleet's cadence
+  makes a collision likely rather than hypothetical. Atelier's per-volume
+  login is still the fix.
+
+- **A tier that refuses to act is not a failed run.** `lint-sweep` ran green
+  in both runtimes and changed nothing, reporting that the repository has
+  adopted no linter and that introducing one is the owner's decision. Worth
+  keeping in mind when reading `commit=none`.
+
 ## 12. Review record
 
 **2026-09-21, first draft, adversarial review (Opus critic, read-only,

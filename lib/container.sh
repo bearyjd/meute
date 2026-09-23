@@ -34,10 +34,23 @@ readonly CONTAINER_STOP_TIMEOUT=30
 # volume: `just auth` fills atelier-auth-gh with the owner's interactive
 # token, which is full-scope, so nothing unattended may hold it. Publishing
 # waits for the two fine-grained PATs (§5 item 2).
+#
+# `:z`, not `:Z`, and the difference is load-bearing. Private relabel (`:Z`)
+# rewrites the volume's SELinux categories to the calling container's, so it
+# works -- for that run. These volumes are SHARED with Atelier's interactive
+# `agent-enter` containers by design (§5), so each fire would steal the label
+# and the owner's own container would be denied its own credentials until it
+# stole it back, and then the next fire would be. Measured: after a `:Z`
+# mount the volume reads container_file_t:s0:c534,c848 and a second container
+# is DENIED; after `:z` it reads container_file_t:s0 and any container can
+# read it. The isolation `:Z` appears to buy here is illusory -- reaching
+# this volume at all means naming it in a mount, and whoever can do that has
+# already lost. /work and /out keep `:Z`: those are private per-run
+# directories, where private relabel is exactly right.
 container_auth_mount() {
   case "$1" in
-    claude) printf 'atelier-auth-claude:/home/agent/.claude:Z\n' ;;
-    codex)  printf 'atelier-auth-codex:/home/agent/.codex:Z\n' ;;
+    claude) printf 'atelier-auth-claude:/home/agent/.claude:z\n' ;;
+    codex)  printf 'atelier-auth-codex:/home/agent/.codex:z\n' ;;
     "")     return 1 ;;
     *)      return 1 ;;
   esac

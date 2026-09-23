@@ -3672,7 +3672,7 @@ STUB
   has "argv: ...with /tmp the one exception"  "$argv" "--tmpfs /tmp"
   # One credential, the entry's own engine's, and never the GitHub token --
   # `just auth` fills that one with the owner's full-scope interactive login.
-  has "argv: the engine's own credential is mounted" "$argv" "atelier-auth-claude:/home/agent/.claude:Z"
+  has "argv: the engine's own credential is mounted" "$argv" "atelier-auth-claude:/home/agent/.claude:z"
   hasnt "argv: ...and no other engine's"             "$argv" "atelier-auth-codex"
   hasnt "argv: ...and never the GitHub token"        "$argv" "atelier-auth-gh"
   ( source "$REPO/lib/container.sh"
@@ -3681,7 +3681,7 @@ STUB
     container_argv "$(jq -c '.engine = "codex"' <<< "$entry")" build "$root/work" "$root/out" -- true
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-codex"
   argv="$(tr '\n' ' ' < "$root/argv-codex")"
-  has "argv: a codex entry mounts the codex credential" "$argv" "atelier-auth-codex:/home/agent/.codex:Z"
+  has "argv: a codex entry mounts the codex credential" "$argv" "atelier-auth-codex:/home/agent/.codex:z"
   hasnt "argv: ...and not claude's"                     "$argv" "atelier-auth-claude"
 
   # A tier that does not write code cannot write the branch it is reading.
@@ -4297,7 +4297,7 @@ STUB
   has "dispatch: ...on no network at all"   "$(grep 'claude auth status' "$root/stub/podman-calls")" "--network=none"
   hasnt "dispatch: ...with no scratch tree" "$(grep 'claude auth status' "$root/stub/podman-calls")" "/work"
   has "dispatch: ...and only its own credential" \
-      "$(grep 'claude auth status' "$root/stub/podman-calls")" "atelier-auth-claude:/home/agent/.claude"
+      "$(grep 'claude auth status' "$root/stub/podman-calls")" "atelier-auth-claude:/home/agent/.claude:z"
   local engine_call; engine_call="$(grep -- '-p ' "$root/stub/podman-calls" | tail -1)"
   has "dispatch: the engine got the scratch tree at /work" "$engine_call" ":/work:"
   has "dispatch: ...and /out for its captures"             "$engine_call" ":/out:Z"
@@ -4516,6 +4516,66 @@ PY
   is  "retryable: ...and no archive left behind"            "$(ls "$root"/state/plan-queue.completed-* 2>/dev/null | wc -l)" "0"
 }
 
+# A credential volume has to survive being used. Meute shares these with
+# Atelier's interactive `agent-enter` containers by design, so the property
+# that matters is not which flag is spelled but this: after a Meute run, a
+# container that mounts the same volume with NO relabel flag can still read
+# it. Private relabel (:Z) passes every single-run check and fails this one,
+# which is why it went unnoticed -- a run always relabels successfully and
+# then works. The failure it causes is an intermittent "not logged in" that
+# looks exactly like the refresh-token collision §5 item 3 is watching for.
+test_p2b_credential_volume_is_shared() {
+  if ! p2_image_present; then
+    skip "volume: shared after use" "${P2_IMAGE} is not on this host (expected in CI)"
+    return 0
+  fi
+  local vol="meute-test-shared-$$"
+  local -a podman; read -ra podman <<< "$( source "$REPO/lib/container.sh"; podman_cmd )"
+  "${podman[@]}" volume create "$vol" >/dev/null 2>&1 \
+    || { skip "volume: shared after use" "cannot create a podman volume here"; return 0; }
+  # Seed it the way `just auth` does, then hand it to a run the way
+  # container_argv would -- taking the flag from the code, not from a literal.
+  local mount; mount="$( source "$REPO/lib/container.sh"; container_auth_mount claude )"
+  local flag="${mount##*:}"
+  "${podman[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --network=none \
+    -v "${vol}:/seed:z" "$P2_IMAGE" sh -c 'printf secret > /seed/.credentials.json' >/dev/null 2>&1
+  "${podman[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --network=none \
+    -v "${vol}:/home/agent/.claude:${flag}" "$P2_IMAGE" \
+    sh -c 'cat /home/agent/.claude/.credentials.json >/dev/null' >/dev/null 2>&1 \
+    && ok "volume: the run reads its own credential" \
+    || bad "volume: the run reads its own credential" "denied with flag ${flag}"
+  # The assertion that :Z fails: somebody else's container, afterwards.
+  local second
+  second="$("${podman[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --network=none \
+    -v "${vol}:/home/agent/.claude" "$P2_IMAGE" \
+    sh -c 'cat /home/agent/.claude/.credentials.json 2>/dev/null || echo DENIED' 2>&1)"
+  is "volume: ...and leaves it readable by the next container" "$second" "secret"
+  "${podman[@]}" volume rm "$vol" >/dev/null 2>&1 || true
+
+  # And the fix must not be over-applied: the per-run trees are private, and
+  # private relabel is exactly right for them.
+  local root="$FIXTURE/p2b-vol"; mkdir -p "$root/stub" "$root/work" "$root/out"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P2_DIGEST" "$P2_ID" ;;
+  *) printf '10.89.14.10\n' ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  local argv
+  argv="$( source "$REPO/lib/container.sh"
+           export MEUTE_PODMAN="$root/stub/podman"
+           local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+             '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none",
+               engine:"claude", writes_code:true, timeout_seconds:60}')"
+           container_ready "$e" >/dev/null 2>&1
+           container_argv "$e" build "$root/work" "$root/out" -- true
+           printf '%s\n' "${CONTAINER_ARGV[@]}" | tr '\n' ' ' )"
+  has "volume: the scratch tree stays privately labelled" "$argv" "${root}/work:/work:Z"
+  has "volume: ...and so does the capture tree"           "$argv" "${root}/out:/out:Z"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(real_state_snapshot)"
@@ -4596,6 +4656,7 @@ test_p2_proxied_egress
 test_p2_container_probe
 test_p2b_container_dispatch
 test_p2b_preflight
+test_p2b_credential_volume_is_shared
 test_p2_probe_cleanup
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
