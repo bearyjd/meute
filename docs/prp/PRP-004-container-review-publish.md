@@ -2,8 +2,15 @@
 
 **Status:** Proposed; **Phase 1 built** (2026-09-22, §11) — hardened from the 2026-09-20 "Cross-Provider Agent
 Dispatch Fleet" PRP by `AUDIT.md`, then rewritten after an adversarial
-review of the first draft (§12). **Phase 2 is blocked on Atelier**
-producing `agent-base` and `tests/smoke.sh` (zero commits there at filing).
+review of the first draft (§12). **Phase 2's remaining blocker is the
+owner's `just auth`** (§5 item 1, §8): Atelier's side is delivered —
+`691e067`, `agent-base` on the host, `tests/smoke.sh` present — and what is
+left is putting real credentials into the volumes, which Atelier is holding
+because copying one could invalidate the owner's live token. The earlier
+wording here ("blocked on Atelier producing `agent-base` and
+`tests/smoke.sh`, zero commits there at filing") was true at filing and is
+not now; a status line that names a blocker which has cleared is how a
+document starts lying about the thing it exists to track.
 **Created:** 2026-09-21
 **Depends on:** PRP-001 (complete); Atelier (`../atelier-harness`, contract
 in its `AUDIT.md` §3.2, §4.1–4.4, with the four changes §5 sends back)
