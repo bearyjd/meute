@@ -231,6 +231,12 @@ eligible() {
   # abort catches this today; Phase 2b removes that abort, and then a forced
   # run would be the one dispatch with no digest assert in front of it.
   if container_entry_needs_pin "$entry" && ! container_ready "$entry"; then
+    # An operator who named this repo is owed the reason where failures are
+    # read. Unforced, the rotation simply moves on and the entry that DOES
+    # run writes the fire's one line; forced, the queue holds nothing else,
+    # so a silent step-over would leave only "nothing was eligible" -- the
+    # one path where a drifted pin is invisible in state/log.
+    (( FORCED )) && abort_entry "$entry" "$CONTAINER_BLOCKED"
     note "skipping ${key}: ${CONTAINER_BLOCKED}"
     return 1
   fi

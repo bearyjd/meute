@@ -3017,7 +3017,11 @@ STUB
   # state/log line, because an entry that was never selected did not run.
   out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
   has   "runtime: a container repo with an unverifiable pin is refused" "$out" "is not present on this host"
-  hasnt "runtime: ...and never reaches the credential abort"            "$out" "status=error"
+  # Forced, so the refusal is logged rather than stepped over silently --
+  # but with the boundary's reason, not the credential abort's: the entry
+  # never got far enough to be refused for having no credentials.
+  has   "runtime: ...and logged with the boundary's own reason"          "$out" "status=error"
+  hasnt "runtime: ...not the credential abort's"                        "$out" "needs the credential volumes"
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran" "the stub was invoked" || ok "runtime: ...and no engine ran"
   # Nor may the CLI talk it down: a repo that opted into isolation runs
   # isolated or not at all. --runtime never changes what runs in Phase 1.
@@ -3311,7 +3315,7 @@ test_p4_image_bump() {
 #!/usr/bin/env bash
 echo "\$*" >> "$root/stub/podman-calls"
 [[ "\$*" == *"agent-netlens:g3f9a1c2"* ]] || { echo "Error: no such image" >&2; exit 125; }
-printf '%s\n' "$new"
+printf '%s %s\n' "$new" "$P2_ID"
 STUB
   chmod +x "$root/stub/podman"
   local bump; bump() { MEUTE_PODMAN="$root/stub/podman" "$root/bin/meute" image bump "$@" 2>&1; }
@@ -3329,7 +3333,7 @@ STUB
   out="$(bump netlens)"
   has   "image bump: writes repos.local.yaml"  "$out" "netlens: image.digest -> ${new:0:19}"
   is    "image bump: the digest landed"        "$(python3 -c "import yaml; print(yaml.safe_load(open('$root/repos.local.yaml'))['repos'][0]['image']['digest'])")" "$new"
-  is    "image bump: ...for the manifest's tag" "$(cat "$root/stub/podman-calls")" "image inspect --format {{.Digest}} -- agent-netlens:g3f9a1c2"
+  is    "image bump: ...for the manifest's tag" "$(cat "$root/stub/podman-calls")" "image inspect --format {{.Digest}} {{.Id}} -- agent-netlens:g3f9a1c2"
   [[ -f "$root/repos.local.yaml.bak" ]] && ok "image bump: backs the manifest up first" || bad "image bump: backs the manifest up first" "no .bak"
   is    "image bump: the backup is the old manifest" "$(cat "$root/repos.local.yaml.bak")" "$before"
   has   "image bump: the result validates"     "$(validate "$root/repos.local.yaml" "$root")" "ok:"
@@ -3399,7 +3403,7 @@ test_p4_doctor_containers() {
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
-  "image inspect --format {{.Digest}} -- agent-netlens:g3f9a1c2") printf '%s\n' "\${STUB_DIGEST:-$P4_DIGEST}" ;;
+  "image inspect --format {{.Digest}} {{.Id}} -- agent-netlens:g3f9a1c2") printf '%s %s\n' "\${STUB_DIGEST:-$P4_DIGEST}" "$P2_ID" ;;
   "container inspect --format {{.State.Running}} -- atelier-egress") printf '%s\n' "\${STUB_EGRESS:-true}" ;;
   "inspect atelier-egress --format "*) printf '%s\n' "\${STUB_IP-10.89.14.10}" ;;
   *) echo "Error: no such object" >&2; exit 125 ;;
@@ -3493,8 +3497,7 @@ test_p2_container_argv() {
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
-  *"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
-  *"{{.Digest}}"*) printf '%s\n' "$P2_DIGEST" ;;
+  *"image inspect"*) printf '%s %s\n' "$P2_DIGEST" "$P2_ID" ;;
   *) printf '10.89.14.10\n' ;;
 esac
 STUB
@@ -3738,8 +3741,7 @@ test_p2_fail_closed() {
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
-  *"image inspect"*"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
-  *"image inspect"*) printf '%s\n' "\${STUB_DIGEST-$P2_DIGEST}" ;;
+  *"image inspect"*) printf '%s %s\n' "\${STUB_DIGEST-$P2_DIGEST}" "$P2_ID" ;;
   *"container inspect"*"State.Running"*) printf '%s\n' "\${STUB_EGRESS:-true}" ;;
   *"NetworkSettings"*) printf '%s\n' "\${STUB_IP-10.89.14.10}" ;;
   *) exit 125 ;;
@@ -3799,7 +3801,7 @@ STUB
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
-  *"image inspect"*) printf 'sha256:%s\n' "\$(printf 'f%.0s' {1..64})" ;;
+  *"image inspect"*) printf 'sha256:%s %s\n' "\$(printf 'f%.0s' {1..64})" "$P2_ID" ;;
   *"container inspect"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
   *) exit 125 ;;
@@ -3833,10 +3835,16 @@ d["repos"].append(beta); d["community"] = []'
   has   "step-over: a forced selection is still refused on a drifted pin" \
         "$forced" "is not at the pinned digest"
   hasnt "step-over: ...and never reaches the engine" "$forced" "status=ok"
-  # Forced and nothing else eligible: the fire declines, as it does for any
-  # empty round. A decline is one line; a run that never happened is none.
-  has   "step-over: ...and the forced fire declines rather than running something else" \
-        "$forced" "status=skipped"
+  # An operator who named the repo is owed the reason in state/log, not a
+  # generic "nothing was eligible". This is the one path where the drift is
+  # otherwise invisible: the queue held exactly the entry they asked for.
+  local forced_line; forced_line="$(tail -1 "$root/state/log")"
+  has   "step-over: a forced refusal is logged as an error"   "$forced_line" "status=error"
+  has   "step-over: ...naming the repo the operator asked for" "$forced_line" "repo=netlens"
+  has   "step-over: ...and saying the pin did not match"       "$forced_line" "detail=netlens: image"
+  has   "step-over: ...with the digest as the reason"          "$forced_line" "is not at the pinned digest"
+  hasnt "step-over: ...not a generic empty round"              "$forced_line" "status=skipped"
+  is    "step-over: ...and the cursor moves past it"           "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
 }
 
 # `meute container probe <repo>`: what a human runs to see whether a repo is
@@ -4102,8 +4110,7 @@ STUB
 #!/usr/bin/env bash
 echo "\$*" >> "$root/stub/podman-calls"
 case "\$*" in
-  *"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
-  *"{{.Digest}}"*) printf '%s\n' "$P4_DIGEST" ;;
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
   *"{{.State.Running}}"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
   *) exit 125 ;;
@@ -4140,8 +4147,7 @@ test_p2_probe_cleanup() {
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 case "\$*" in
-  *"{{.Id}}"*) printf '%s\n' "$P2_ID" ;;
-  *"{{.Digest}}"*) printf '%s\n' "$P2_DIGEST" ;;
+  *"image inspect"*) printf '%s %s\n' "$P2_DIGEST" "$P2_ID" ;;
   *) exit 125 ;;
 esac
 STUB
@@ -4163,6 +4169,68 @@ STUB
   is "probe cleanup: a failed second mktemp fails the probe" "$rc" "1"
   is "probe cleanup: ...and the first scratch tree is still removed" \
      "$(ls "$root/tmp" 2>/dev/null | wc -l)" "0"
+}
+
+
+# The pin has to be ONE observation, not two agreeing ones. Two inspects of
+# the same tag can see two different images -- a retag between them passes
+# the digest assert for one and runs the other -- and an identity that
+# outlives what proved it is the same defect wherever it appears.
+test_p2_pin_is_one_snapshot() {
+  local root="$FIXTURE/p2-pin"; mkdir -p "$root/stub"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "\${STUB_DIGEST-$P2_DIGEST}" "\${STUB_ID-$P2_ID}" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  local entry
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", runtime:"container", image:{tag:$tag, digest:$digest}, network:"proxied"}')"
+
+  : > "$root/stub/calls"
+  local id
+  id="$( source "$REPO/lib/container.sh"
+         MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
+         printf '%s\n' "${CONTAINER_IMAGE_ID:-unset}" )"
+  is "pin: the digest and the ID come from one observation" \
+     "$(grep -c 'image inspect' "$root/stub/calls")" "1"
+  is "pin: ...and that observation's ID is what will run" "$id" "$P2_ID"
+
+  # Binding: an ID is only usable for the entry whose pin produced it.
+  # Non-empty is not proof it belongs here -- readiness passing for one repo
+  # and failing for the next must not leave the first repo's image behind.
+  local leaked
+  leaked="$( source "$REPO/lib/container.sh"
+             export MEUTE_PODMAN="$root/stub/podman"
+             container_ready "$entry" >/dev/null 2>&1
+             # A second repo whose pin cannot be verified at all.
+             STUB_DIGEST= container_ready \
+               "$(jq -c '.repo = "beta" | .image.tag = "agent-beta:gfeed"' <<< "$entry")" >/dev/null 2>&1
+             printf '%s\n' "${CONTAINER_IMAGE_ID:-cleared}" )"
+  is "pin: a failed readiness check leaves no previous image behind" "$leaked" "cleared"
+
+  # Even with an ID in hand, the argv must refuse an entry it does not belong to.
+  local refused rc
+  refused="$( source "$REPO/lib/container.sh"
+              export MEUTE_PODMAN="$root/stub/podman"
+              container_ready "$entry" >/dev/null 2>&1
+              container_argv "$(jq -c '.repo = "beta" | .image.tag = "agent-beta:gfeed"' <<< "$entry")" \
+                build "$root" "$root" -- true 2>&1 )"; rc=$?
+  is  "pin: the argv refuses an entry the verified ID is not for" "$rc" "1"
+  has "pin: ...and says why"                                      "$refused" "verified"
+  # The entry it IS for still builds, so the refusal is about identity.
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$entry" build "$root" "$root" -- true ) >/dev/null 2>&1 \
+    && ok "pin: the entry it was verified for still builds" \
+    || bad "pin: the entry it was verified for still builds" "refused its own entry"
 }
 
 # ------------------------------------------------------------------- main ---
@@ -4236,6 +4304,7 @@ test_p2_fail_closed
 test_p2_step_over
 test_p2_engine_cwd
 test_p2_outer_bound
+test_p2_pin_is_one_snapshot
 test_p2_isolation
 test_p2_proxied_egress
 test_p2_container_probe

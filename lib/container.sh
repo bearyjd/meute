@@ -45,16 +45,22 @@ podman_run() {
   timeout "$PODMAN_TIMEOUT" "${podman[@]}" "$@"
 }
 
-# The digest podman holds for a tag, or non-zero when it has no such image.
-image_digest_on_host() {
-  podman_run image inspect --format '{{.Digest}}' -- "$1" 2>/dev/null
+# What the tag points at right now: "<digest> <id>", from ONE inspect.
+#
+# One call, not two, because a tag is a moving name. Asking for the digest
+# and then asking for the ID is two observations of something that can change
+# between them: the first sees image A and passes the pin, the second
+# resolves image B, and B is what runs. A single snapshot cannot disagree
+# with itself, so the digest that is checked and the ID that is run are the
+# same observation of the same image.
+image_pin_on_host() {
+  podman_run image inspect --format '{{.Digest}} {{.Id}}' -- "$1" 2>/dev/null
 }
 
-# The image's immutable ID. A tag is a moving name: whatever verified its
-# digest a moment ago can be re-tagged onto something else before the run,
-# and the pin would have proven nothing. The ID cannot be moved.
-image_id_on_host() {
-  podman_run image inspect --format '{{.Id}}' -- "$1" 2>/dev/null
+# Digest alone, for doctor, which reports on an image rather than running one.
+image_digest_on_host() {
+  local pin; pin="$(image_pin_on_host "$1")" || return 1
+  printf '%s\n' "${pin%% *}"
 }
 
 egress_running() {
@@ -89,10 +95,15 @@ egress_ip() {
 # when the entry may run in a container.
 # --------------------------------------------------------------------------
 container_ready() {
-  local entry="$1" repo tag digest network actual
+  local entry="$1" repo tag digest network pin actual
   { read -r repo; read -r tag; read -r digest; read -r network; } \
     < <(jq -r '.repo, (.image.tag // ""), (.image.digest // ""), (.network // "")' <<< "$entry")
   CONTAINER_BLOCKED=""
+  # Cleared on the way in, not only on the way out: a value left over from a
+  # repo that verified a moment ago must never be available to one that did
+  # not. An identity that outlives what proved it is the defect this whole
+  # function exists to prevent, at a different scale.
+  CONTAINER_IMAGE_ID=""; CONTAINER_IMAGE_FOR=""
 
   if ! podman_available; then
     CONTAINER_BLOCKED="${repo}: podman not found (MEUTE_PODMAN=${MEUTE_PODMAN:-unset}), resolved to '$(podman_cmd)'"
@@ -102,7 +113,8 @@ container_ready() {
     CONTAINER_BLOCKED="${repo}: no image pinned (rule 1 requires tag and digest for a container runtime)"
     return 1
   fi
-  actual="$(image_digest_on_host "$tag")" || actual=""
+  pin="$(image_pin_on_host "$tag")" || pin=""
+  actual="${pin%% *}"
   if [[ -z "$actual" ]]; then
     CONTAINER_BLOCKED="${repo}: image ${tag} is not present on this host"
     return 1
@@ -114,13 +126,17 @@ container_ready() {
     CONTAINER_BLOCKED="${repo}: image ${tag} is not at the pinned digest (manifest ${digest:0:19}…, host ${actual:0:19}…)"
     return 1
   fi
-  # Close the window between this assert and the run. The tag stays in every
+  # From the same snapshot the digest came from. The tag stays in every
   # message a human reads; podman is handed the ID.
-  CONTAINER_IMAGE_ID="$(image_id_on_host "$tag")" || CONTAINER_IMAGE_ID=""
-  if [[ -z "$CONTAINER_IMAGE_ID" ]]; then
+  CONTAINER_IMAGE_ID="${pin##* }"
+  if [[ -z "$CONTAINER_IMAGE_ID" || "$CONTAINER_IMAGE_ID" == "$actual" ]]; then
     CONTAINER_BLOCKED="${repo}: image ${tag} has no resolvable image ID"
+    CONTAINER_IMAGE_ID=""
     return 1
   fi
+  # Bound to what was verified, so a later entry cannot inherit it: the argv
+  # refuses unless the entry it is handed is the one this pin was for.
+  CONTAINER_IMAGE_FOR="${tag} ${digest}"
   # A tier that takes no network needs neither the proxy nor its address.
   if [[ "$network" == "proxied" ]]; then
     if ! egress_running; then
@@ -153,9 +169,18 @@ container_argv() {
   { read -r network; read -r timeout_seconds; } \
     < <(jq -r '(.network // ""), (.timeout_seconds // 1800)' <<< "$entry")
   # container_ready resolved this from the tag it verified; without it there
-  # is no proven image to run, and guessing one is the whole risk.
-  local image="${CONTAINER_IMAGE_ID:-}"
-  [[ -n "$image" ]] || { container_note "no verified image ID; call container_ready first"; return 1; }
+  # is no proven image to run, and guessing one is the whole risk. Non-empty
+  # is not enough -- it must have been verified for THIS entry's pin.
+  local image="${CONTAINER_IMAGE_ID:-}" want
+  want="$(jq -r '(.image.tag // "") + " " + (.image.digest // "")' <<< "$entry")"
+  if [[ -z "$image" ]]; then
+    container_note "no verified image ID; call container_ready first"
+    return 1
+  fi
+  if [[ "${CONTAINER_IMAGE_FOR:-}" != "$want" ]]; then
+    container_note "the verified image is for ${CONTAINER_IMAGE_FOR:-nothing}, not ${want}"
+    return 1
+  fi
 
   # shellcheck disable=SC2054  # the commas are inside podman's own --userns
   # value (uid=1000,gid=1000), not argv separators.
