@@ -670,6 +670,7 @@ phase cannot quietly change them.
 | Item | Resolved by |
 |---|---|
 | A Codex quota probe, or an explicit stubbed reading for the observation week | owner, before Phase 3 |
+| **Do not read Phase 3's first data as a provider difference.** `atelier-auth-claude` is revoked (§11, Phase 2b): until per-volume `just auth-login`, a container claude run 401s at cost 0 while codex runs green. Side by side in `state/log` that reads exactly like a codex-vs-claude finding and is a credential one. Fix the credential before the observation week, or the week measures the wrong thing | owner, before Phase 3 |
 | `just auth` — putting real credentials into the Atelier volumes, which is what verifies the OAuth-refresh hostnames and unblocks Phase 2's gate; held by Atelier because of the rotation risk (§5 item 3) | **owner** |
 | ~~Atelier's first commit — no `g<sha>` tag exists before it~~ — done: `691e067`, tags and digests verified on the host (§11). The pin is deliberately **not** Atelier HEAD, which has moved on; a pin follows a human reading the diff and running `meute image bump`, which is the whole point of pinning | resolved 2026-09-22 |
 | OAuth refresh-token rotation across the host copy and the auth volume | Phase 2 test; finding to Atelier §4.1 |
