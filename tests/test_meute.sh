@@ -3000,14 +3000,20 @@ if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max",
 echo invoked >> "$(dirname "$0")/invocations"
 jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
 STUB
-  chmod +x "$root/stub/claude"
+  # A podman that EXISTS and holds no such image. Without this the fixture
+  # inherits the machine's: where podman is absent entirely the boundary
+  # refuses for a different, equally correct reason, and these assertions
+  # would be about what is installed rather than about the boundary.
+  printf '#!/usr/bin/env bash\necho "Error: no such image" >&2\nexit 125\n' > "$root/stub/podman"
+  chmod +x "$root/stub/claude" "$root/stub/podman"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
   local out
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --runtime container 2>&1)"
+  local run; run() { PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" "$@" 2>&1; }
+  out="$(run daily --repo netlens --runtime container)"
   has   "rule 5: refused with rule 1's message" "$out" "repos.netlens.image: tag and digest are required when runtime is container"
   has   "rule 5: ...as an error line"           "$out" "status=error"
   [[ -f "$root/stub/invocations" ]] && bad "rule 5: no engine ran" "the stub was invoked" || ok "rule 5: no engine ran"
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --runtime vm 2>&1 || true)"
+  out="$(run daily --runtime vm || true)"
   has   "rule 5: --runtime takes host or container" "$out" "unknown runtime"
   # A repo that opted into containers has nothing to run in before Phase 2;
   # the host must not quietly stand in for the isolation it asked for.
@@ -3015,7 +3021,7 @@ STUB
   # The fixture pins an image this host does not have, so the boundary now
   # refuses it in eligible() -- earlier than Phase 1's abort, and without a
   # state/log line, because an entry that was never selected did not run.
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  out="$(run daily --repo netlens)"
   has   "runtime: a container repo with an unverifiable pin is refused" "$out" "is not present on this host"
   # Forced, so the refusal is logged rather than stepped over silently --
   # but with the boundary's reason, not the credential abort's: the entry
@@ -3026,7 +3032,7 @@ STUB
   # Nor may the CLI talk it down: a repo that opted into isolation runs
   # isolated or not at all. --runtime never changes what runs in Phase 1.
   : > "$root/state/cursor"
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --runtime host 2>&1)"
+  out="$(run daily --repo netlens --runtime host)"
   has   "runtime: --runtime host on a container repo is refused" "$out" "detail=repo opted into isolation; --runtime host is not a downgrade path before Phase 2"
   has   "runtime: ...as an error line"                            "$out" "status=error"
   [[ -f "$root/stub/invocations" ]] && bad "runtime: ...and no engine ran either" "the stub was invoked" || ok "runtime: ...and no engine ran either"
@@ -3036,14 +3042,14 @@ STUB
   # fixture cannot reach -- an entry with no runtime at all -- is pinned by
   # reading the guard, since manifest.py always emits one.
   yaml_edit "$root/repos.yaml" "$root/hostrepo.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_MANIFEST="$root/hostrepo.yaml" "$root/bin/run.sh" daily --repo netlens --runtime host 2>&1)"
+  out="$(MEUTE_MANIFEST="$root/hostrepo.yaml" run daily --repo netlens --runtime host)"
   has   "runtime: --runtime host on a host repo runs as before" "$out" "status=ok"
   is    "runtime: the guard accepts host only against a manifest runtime of exactly host" \
         "$(grep -c '\[\[ "$RUNTIME_OVERRIDE" != "host" || "$manifest_runtime" == "host" \]\]' "$REPO/bin/run.sh")" "1"
   # A dry run records the same refusal: the entry is unrunnable whether or
   # not this fire would have invoked anything.
   : > "$root/state/cursor"
-  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens --dry-run 2>&1)"
+  out="$(run daily --repo netlens --dry-run)"
   has   "runtime: --dry-run is refused at the same boundary" "$out" "is not present on this host"
   hasnt "runtime: ...without inventing a run"                "$out" "would run:"
 }
