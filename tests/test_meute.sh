@@ -734,7 +734,7 @@ PY
 # the archive pattern is anchored on the prefix only. kv_set's mktemp scratch
 # (lib/state.sh) lands beside plan-complete and carries the same content.
 test_plan_state_ignored() {
-  local f
+  local f rc out
   for f in state/plan-queue.json state/plan-complete \
            state/plan-queue.completed-20260918T000000.json \
            state/plan-queue.completed-20260918T000000.json.123 \
@@ -755,7 +755,7 @@ test_plan_state_ignored() {
 # file the match came from: a global core.excludesFile with *.bak or *.orig in
 # it would otherwise let two of these pass without .gitignore doing any work.
 test_private_manifest_copies_ignored() {
-  local f
+  local f rc out
   for f in repos.local.yaml repos.local.yaml.bak \
            repos.local.yaml.pre-prp004-20260922 \
            repos.local.yaml.2026-09-22 repos.local.yaml.orig \
@@ -3773,6 +3773,41 @@ STUB
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-override"
   has "argv (proxied): an overridden secret name is the one injected" \
       "$(tr '\n' ' ' < "$root/argv-override")" "--secret meute-other-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN"
+  # The container path's metered-billing defence. The host path strips the
+  # API-key, base-URL and cloud-provider variables from the child; inside the
+  # container the equivalent is --unsetenv, because the image's ENV (or a
+  # rebuilt one) could set ANTHROPIC_API_KEY, which outranks the token secret.
+  # The same list, not a copy of it, and every engine run carries it.
+  local want_unset
+  want_unset="$( source "$REPO/lib/container.sh"
+                 printf -- '--unsetenv=%s\n' "${ENGINE_BILLING_VARS[@]}" )"
+  has "argv: the billing list names ANTHROPIC_API_KEY" "$want_unset" "--unsetenv=ANTHROPIC_API_KEY"
+  has "argv: ...and CLAUDE_CODE_USE_BEDROCK"           "$want_unset" "--unsetenv=CLAUDE_CODE_USE_BEDROCK"
+  has "argv: ...and OPENAI_API_KEY"                    "$want_unset" "--unsetenv=OPENAI_API_KEY"
+  local f rc out
+  for f in argv-none argv-proxied argv-pre argv-codex argv-codex-proxied argv-ro; do
+    is "argv (${f#argv-}): every billing variable is unset in the container" \
+       "$(grep -x -- '--unsetenv=.*' "$root/$f")" "$want_unset"
+    # The proxy variables are the boundary's own, set by --env on a proxied
+    # run; unsetting them would be the one scrub that must not cross over.
+    hasnt "argv (${f#argv-}): ...but never the proxy's own variables" \
+          "$(tr '\n' ' ' < "$root/$f")" "--unsetenv=HTTPS_PROXY"
+  done
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    container_argv "$entry" probe "" "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-probe"
+  hasnt "argv (probe): no engine, so nothing to unset" "$(tr '\n' ' ' < "$root/argv-probe")" "--unsetenv"
+  # An empty list is a refusal, not a run with nothing unset.
+  out="$( source "$REPO/lib/container.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          container_ready "$entry" >/dev/null 2>&1
+          ENGINE_ARGV_ENGINE=claude; ENGINE_BILLING_VARS=()
+          container_argv "$entry" build claude "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+  is  "argv: an empty billing list refuses the engine run" "$rc" "1"
+  has "argv: ...with a reason"                             "$out" "billing"
+
   local bogus rc out
   for bogus in 'x,target=PATH' '' '-x' 'a b'; do
     out="$( source "$REPO/lib/container.sh"
@@ -3786,7 +3821,7 @@ STUB
       is "argv: an empty secret override falls back to the default" "$rc" "0"
     else
       is  "argv: a malformed secret name '${bogus}' is refused" "$rc" "1"
-      has "argv: ...with a reason"                                "$out" "secret"
+      has "argv: ...with a reason"                                "$out" "not a plain podman secret name"
     fi
   done
 
@@ -4518,21 +4553,80 @@ STUB
     has "preflight (rc ${secret_rc}): ...and the image it would run"  "$line" "image=${P2_ID:0:12}"
   done
 
+  # A fresh podman for what follows: the real name is present, any other
+  # name is absent, as podman itself answers.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  "secret exists atelier-claude-token") exit 0 ;;
+  "secret exists"*) exit 1 ;;
+  *" -p "*) printf '{"is_error":false,"result":"## Summary ran","total_cost_usd":0.01,"num_turns":1}\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  local fire; fire() { rm -f "$root/stub/podman-calls"; : > "$root/state/cursor"
+    PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+      "$root/bin/run.sh" daily --repo netlens 2>&1; }
+
   # The override names the secret that is checked, so the refusal can be
   # proven against a real host without touching the real secret.
-  rm -f "$root/stub/podman-calls"; : > "$root/state/cursor"
-  sed -i 's/^  "secret exists"\*) exit 125 ;;$/  "secret exists atelier-claude-token") exit 0 ;;\n  "secret exists"*) exit 1 ;;/' "$root/stub/podman"
-  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
-         MEUTE_CLAUDE_SECRET=meute-no-such-token "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  out="$(MEUTE_CLAUDE_SECRET=meute-no-such-token fire)"
   has   "preflight: an overridden secret name is the one checked" "$(cat "$root/stub/podman-calls")" "secret exists meute-no-such-token"
   has   "preflight: ...and its absence refuses"                   "$out" "meute-no-such-token"
   hasnt "preflight: ...before any engine was invoked"             "$(cat "$root/stub/podman-calls")" " -p "
+
+  # A malformed override is refused before podman is asked anything about
+  # it: the name would be spliced into `--secret name,opt=...`.
+  out="$(MEUTE_CLAUDE_SECRET='x,target=PATH' fire)"
+  line="$(tail -1 "$root/state/log")"
+  has   "preflight: a malformed secret name refuses the run"   "$line" "status=error"
+  has   "preflight: ...at the preflight stage"                 "$line" "stage=preflight"
+  has   "preflight: ...saying why"                             "$out" "not a plain podman secret name"
+  hasnt "preflight: ...without asking podman about it"         "$(cat "$root/stub/podman-calls")" "secret exists"
+  hasnt "preflight: ...or invoking an engine"                  "$(cat "$root/stub/podman-calls")" " -p "
+
+  # A claude container run takes its credential from the proxied network's
+  # secret; on any other network it would have none, and fall back to the
+  # volume file. So a non-proxied claude container entry is refused at the
+  # preflight rather than dispatched without its credential.
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" "d['tiers']['tier2']['network'] = 'none'"
+  out="$(fire)"
+  line="$(tail -1 "$root/state/log")"
+  has   "preflight: a claude entry on network none is refused" "$line" "status=error"
+  has   "preflight: ...at the preflight stage"                 "$line" "stage=preflight"
+  has   "preflight: ...saying it needs the proxied network"    "$out" "proxied"
+  hasnt "preflight: ...without checking a secret it cannot use" "$(cat "$root/stub/podman-calls")" "secret exists"
+  hasnt "preflight: ...or invoking an engine"                  "$(cat "$root/stub/podman-calls")" " -p "
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" "d['tiers']['tier2']['network'] = 'proxied'"
+
   # And the stub really does say yes to the real name: without the override
-  # the same fixture runs, so the refusal above is the override's doing.
-  rm -f "$root/stub/podman-calls"; : > "$root/state/cursor"
-  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
-         "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  # the same fixture runs, so each refusal above is its own condition's doing.
+  out="$(fire)"
   has "preflight: with the secret present the same entry runs" "$out" "status=ok"
+}
+
+# One list of billing variables, two consumers: the host strips them from the
+# child's env, the container --unsetenv's them. lib/container.sh owns the
+# list (it is self-contained, so a test can source it alone); preflight.sh
+# builds its host scrub from it and refuses to load without it, rather than
+# scrubbing nothing.
+test_billing_scrub_one_list() {
+  local scrub
+  scrub="$( source "$REPO/lib/container.sh"; source "$REPO/lib/preflight.sh"
+            printf '%s ' "${ENGINE_SCRUB_VARS[@]}" )"
+  is "scrub: the host strips the same variables it always did" "$scrub" \
+     "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy "
+  local out rc
+  # Both callers run under `set -e`, so a failed source ends them.
+  out="$( set -e; source "$REPO/lib/preflight.sh" 2>&1; printf 'loaded:%s\n' "${ENGINE_SCRUB_VARS[*]:-}" )"; rc=$?
+  is  "scrub: preflight.sh without the list refuses to load" "$rc" "1"
+  has "scrub: ...saying what it needs"                      "$out" "lib/container.sh"
+  hasnt "scrub: ...rather than loading with nothing to strip" "$out" "loaded:"
 }
 
 # The probe makes two scratch directories. If the second cannot be made, the
@@ -5009,6 +5103,7 @@ test_p2_proxied_egress
 test_p2_container_probe
 test_p2b_container_dispatch
 test_p2b_preflight
+test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
