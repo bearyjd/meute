@@ -4624,6 +4624,25 @@ test_billing_scrub_one_list() {
   is "scrub: the host strips the same variables it always did" "$scrub" \
      "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy "
   local out rc
+  # codex's remedy is its own in-container login. `just auth` now copies only
+  # gh, so pointing an operator at it would restore nothing.
+  local root="$FIXTURE/scrub-codex"; mkdir -p "$root/stub"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P2_DIGEST" "$P2_ID" ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  out="$( source "$REPO/lib/container.sh" 2>/dev/null; source "$REPO/lib/preflight.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          e="$(jq -cn --arg t "$P2_IMAGE" --arg d "$P2_DIGEST" '{repo:"alpha",image:{tag:$t,digest:$d},network:"none"}')"
+          container_ready "$e" >/dev/null 2>&1
+          preflight_container "$e" codex; printf 'rc=%s %s\n' "$?" "$PREFLIGHT_DETAIL" )"
+  has   "scrub: a failed codex probe refuses"          "$out" "rc=1"
+  has   "scrub: ...pointing at codex's own login"      "$out" "just auth-login codex"
+
   # Both callers run under `set -e`, so a failed source ends them.
   out="$( unset ENGINE_BILLING_VARS; set -e; source "$REPO/lib/preflight.sh" 2>&1; printf 'loaded:%s\n' "${ENGINE_SCRUB_VARS[*]:-}" )"; rc=$?
   is  "scrub: preflight.sh without the list refuses to load" "$rc" "1"
