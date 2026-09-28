@@ -24,6 +24,63 @@ readonly PODMAN_TIMEOUT=15
 # The host path's own kill grace, so a container that ignores SIGTERM dies on
 # the same schedule as an engine that ignores it on the host.
 readonly CONTAINER_STOP_TIMEOUT=30
+# One volume per engine, holding a COPY of that engine's credential (PRP-004
+# §4.4). Mounted read-write on purpose: both CLIs write to their config
+# directory, and a refresh that cannot be written is a refresh that fails --
+# `:ro` would not prevent a rotation, only break it. The copy is why that is
+# safe: a write here does not touch the host's file.
+#
+# No stage mounts more than one, and no engine stage mounts the GitHub
+# volume: `just auth` fills atelier-auth-gh with the owner's interactive
+# token, which is full-scope, so nothing unattended may hold it. Publishing
+# waits for the two fine-grained PATs (§5 item 2).
+#
+# `:z`, not `:Z`, and the difference is load-bearing. Private relabel (`:Z`)
+# rewrites the volume's SELinux categories to the calling container's, so it
+# works -- for that run. These volumes are SHARED with Atelier's interactive
+# `agent-enter` containers by design (§5), so each fire would steal the label
+# and the owner's own container would be denied its own credentials until it
+# stole it back, and then the next fire would be. Measured: after a `:Z`
+# mount the volume reads container_file_t:s0:c534,c848 and a second container
+# is DENIED; after `:z` it reads container_file_t:s0 and any container can
+# read it. The isolation `:Z` appears to buy here is illusory -- reaching
+# this volume at all means naming it in a mount, and whoever can do that has
+# already lost. /work and /out keep `:Z`: those are private per-run
+# directories, where private relabel is exactly right.
+# Which stages run an engine, and so must carry exactly one credential
+# (§4.4). `publish` carries a GitHub token instead (Phase 5) and `probe`
+# carries nothing at all -- both deliberately, and neither by falling
+# through the engine branch, which is how "no credential" would otherwise
+# become the quiet default for a typo. An unknown stage is refused rather
+# than guessed at.
+# One authority for the set, so it cannot grow in a case arm nobody's test
+# enumerates: the arrays ARE the definition, and a test pins them.
+# Not `readonly`: lib/ is sourced more than once in some shells (the suite
+# does it), and a readonly array turns that into an error on stderr, which
+# then lands in any caller capturing 2>&1. The constants above predate that
+# lesson; these do not repeat it.
+CONTAINER_ENGINE_STAGES=(preflight build review review-2 resolve)
+CONTAINER_UNCREDENTIALED_STAGES=(probe publish)
+
+container_stage_credential() {
+  local want="$1" stage
+  for stage in "${CONTAINER_ENGINE_STAGES[@]}"; do
+    [[ "$want" != "$stage" ]] || { printf 'engine\n'; return 0; }
+  done
+  for stage in "${CONTAINER_UNCREDENTIALED_STAGES[@]}"; do
+    [[ "$want" != "$stage" ]] || { printf 'none\n'; return 0; }
+  done
+  return 1
+}
+
+container_auth_mount() {
+  case "$1" in
+    claude) printf 'atelier-auth-claude:/home/agent/.claude:z\n' ;;
+    codex)  printf 'atelier-auth-codex:/home/agent/.codex:z\n' ;;
+    "")     return 1 ;;
+    *)      return 1 ;;
+  esac
+}
 
 container_note() { printf 'meute: %s\n' "$*" >&2; }
 
@@ -155,15 +212,23 @@ container_ready() {
 # The flag set (PRP-004 §5, Atelier §4.3), built but not run, so a test can
 # assert it field by field without starting anything.
 #
-#   container_argv <entry-json> <stage> <workdir> <outdir> -- <argv...>
+#   container_argv <entry-json> <stage> <engine> <workdir> <outdir> -- <argv...>
+#
+# The engine is a PARAMETER, never read back out of the entry. `--engine`
+# makes the engine that actually runs differ from the one the entry names,
+# and a credential mount derived here from the entry would then put one
+# provider's agent in front of the other's OAuth token -- in a writing
+# container, holding danger-full-access over it. The effective engine is
+# decided once, in run_entry, and travels down. Nothing in this file reads
+# `.engine`; a second derivation is exactly how that defect arrived.
 #
 # Sets CONTAINER_ARGV. The only host paths that reach the container are the
 # two directories named here: the scratch clone at /work and the capture
 # directory at /out. The owner's checkout and its .git are never mounted.
 # --------------------------------------------------------------------------
 container_argv() {
-  local entry="$1" stage="$2" workdir="$3" outdir="$4"
-  shift 4
+  local entry="$1" stage="$2" engine="$3" workdir="$4" outdir="$5"
+  shift 5
   [[ "${1:-}" == "--" ]] && shift
   local network timeout_seconds
   { read -r network; read -r timeout_seconds; } \
@@ -191,15 +256,73 @@ container_argv() {
     --security-opt=no-new-privileges
     --init
     --pids-limit=2048
-    --volume "${workdir}:/work:Z"
-    --volume "${outdir}:/out:Z"
-    --workdir /work
     --timeout "$timeout_seconds"
     --stop-timeout "$CONTAINER_STOP_TIMEOUT"
     # An image that vanished between the assert and now is an error. Without
     # this podman would go and fetch something by that name from a registry.
     --pull=never
+    # The image's own filesystem is not the agent's to change: it is pinned
+    # by digest, so anything written there would be lost at --rm anyway, and
+    # a writable root is one more place a compromised run could hide. /tmp is
+    # the one thing both CLIs need to write outside their mounts. Measured:
+    # a real `claude -p` and a real `codex exec` both complete under this
+    # (PRP-004 §5 item 4, answered in Phase 2b).
+    --read-only
+    --tmpfs /tmp
   )
+  # The preflight reads a credential and nothing else, so it takes neither
+  # tree -- §4.4 gives it no mounts at all.
+  if [[ -n "$workdir" ]]; then
+    # A tier that does not write code has no business writing the branch it
+    # was given to read. Measured: git status, diff <base>...HEAD, log and
+    # show all work on a read-only mount, provided it is still relabelled.
+    # `.writes_code // true` would be wrong here: jq's alternative operator
+    # treats false as empty, so a reading tier would have come back "true"
+    # and been given a writable branch. Ask for the value itself.
+    local work_flags="Z"
+    [[ "$(jq -r '.writes_code' <<< "$entry")" != "false" ]] || work_flags="ro,Z"
+    CONTAINER_ARGV+=( --volume "${workdir}:/work:${work_flags}" --workdir /work )
+  fi
+  # /out is always writable: it is where the runner reads the engine's
+  # capture back from, and it is NOT /work, so commit_worktree's `git add -A`
+  # cannot sweep it into the branch.
+  [[ -z "$outdir" ]] || CONTAINER_ARGV+=( --volume "${outdir}:/out:Z" )
+  local need auth
+  need="$(container_stage_credential "$stage")" \
+    || { container_note "unknown stage '${stage}'; refusing to guess what it may hold"; return 1; }
+  if [[ "$need" == "engine" ]]; then
+    # The credential is chosen from the engine parameter, and the command
+    # comes from the caller's argv. Two callers passing two different things
+    # is the drift that put one provider's agent in front of the other's
+    # token, so the two are bound -- by the CALLER'S declaration, never by
+    # looking at the command. `claude`, `/usr/local/bin/claude` and `env
+    # FOO=1 claude` are one engine and only one of them looks like it; a
+    # check that pattern-matched argv[0] would pass for the other two while
+    # the property was violated.
+    #
+    # An absent claim is a REFUSAL, not a pass. A guard that is skipped
+    # when its input is missing stops working the moment a caller arrives
+    # without one, and nothing announces that -- which is how this same
+    # mistake arrived three times in this branch. Every dispatch that
+    # mounts a credential declares what it is; stages that legitimately
+    # hold none take the other branch, where no claim and no credential are
+    # correct together.
+    if [[ -z "${ENGINE_ARGV_ENGINE:-}" ]]; then
+      container_note "stage ${stage} mounts a credential but the dispatch declared no engine; refusing"
+      return 1
+    fi
+    if [[ "$ENGINE_ARGV_ENGINE" != "$engine" ]]; then
+      container_note "the command was built for ${ENGINE_ARGV_ENGINE} but the credential is for ${engine:-none}; refusing to run one engine on the other's token"
+      return 1
+    fi
+    # Fail closed: a stage that runs an engine and cannot be given that
+    # engine's credential must be refused here, with a reason. Mounting
+    # nothing and carrying on puts the failure inside the container, as an
+    # auth error that names neither the stage nor the engine.
+    auth="$(container_auth_mount "$engine")" \
+      || { container_note "stage ${stage} runs an engine, and '${engine:-<none>}' has no credential volume"; return 1; }
+    CONTAINER_ARGV+=( --volume "$auth" )
+  fi
   local -a profile=()
   container_network_argv "$stage" "$network" || return 1
   profile=( "${CONTAINER_NETWORK_ARGV[@]}" )

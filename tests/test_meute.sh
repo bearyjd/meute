@@ -2249,6 +2249,50 @@ test_engines() {
   is  "engines: a 429 status is still error"   "$ENGINE_STATUS" "error"
   has "engines: detail says what happened, not the misleading subtype" "$ENGINE_DETAIL" "rate-limited:"
   has "engines: detail carries the provider's own message"             "$ENGINE_DETAIL" "hit your weekly limit"
+
+  # Any api_error_status reaches detail=, not just the one that was hurting
+  # when this was written. The CLI reports is_error: true with subtype
+  # "success" for an auth failure too, so a revoked credential used to be
+  # logged as `detail=success` -- the word an operator greps for, on the
+  # line that says the run failed. PRP-001 §11 records the same shape for
+  # 429; this is that fix generalised, which Phase 2b makes urgent because
+  # until per-volume login lands every container claude run 401s the moment
+  # the host refreshes its token.
+  out="$root/revoked.json"
+  printf '%s' '{"result":"Failed to authenticate. API Error: 401 OAuth access token has been revoked.","is_error":true,"subtype":"success","api_error_status":401}' > "$out"
+  extract_claude "$out" || true
+  is    "engines: a 401 is an error"                   "$ENGINE_STATUS" "error"
+  has   "engines: ...whose detail names the status"    "$ENGINE_DETAIL" "401"
+  has   "engines: ...and carries the real message"     "$ENGINE_DETAIL" "OAuth access token has been revoked"
+  hasnt "engines: ...and never reads as success"       "$ENGINE_DETAIL" "success"
+  is    "engines: a 401 is not a rate limit"           "$RATE_LIMITED" "0"
+  # And so does not stand the fleet down: the hold exists for a pool that
+  # stays spent for hours, which is not what a 401 or a 5xx is.
+  out="$root/server-error.json"
+  printf '%s' '{"result":"upstream hiccup","is_error":true,"subtype":"success","api_error_status":503}' > "$out"
+  extract_claude "$out" || true
+  is "engines: nor is a 5xx"                           "$RATE_LIMITED" "0"
+  has "engines: ...though it still names itself"       "$ENGINE_DETAIL" "api 503"
+
+  # A detail with a tab or newline in it would break the log line it lands
+  # in -- state/log is tab-separated and one line per fire.
+  out="$root/multiline.json"
+  printf '%s' '{"result":"first line\nsecond\tline","is_error":true,"subtype":"success","api_error_status":500}' > "$out"
+  extract_claude "$out" || true
+  # Counted rather than matched: $(printf '\n') strips to an empty needle,
+  # and `hasnt` against "" can never pass -- a test that always fails is as
+  # useless as one that always passes, just louder.
+  is "engines: a detail carries no newline into the log" \
+     "$(printf '%s' "$ENGINE_DETAIL" | wc -l)" "0"
+  hasnt "engines: ...nor a tab"                             "$ENGINE_DETAIL" "$(printf '\t')"
+  has   "engines: ...while keeping the message"             "$ENGINE_DETAIL" "second line"
+
+  # An error the provider did not give a status for keeps its own subtype,
+  # which is the most specific thing available in that case.
+  out="$root/no-status.json"
+  printf '%s' '{"result":"","is_error":true,"subtype":"error_during_execution"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: without a status, the subtype is still the detail" "$ENGINE_DETAIL" "error_during_execution"
 }
 
 
@@ -3096,24 +3140,14 @@ STUB
   out="$(MEUTE_MANIFEST="$root/nopin.yaml" run daily --repo netlens --runtime container)"
   has "precondition: rule 5 is logged"                  "$out" "tag and digest are required when runtime is container"
   is  "precondition: ...and stays retryable too"        "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
-  # And the credential abort, which needs a pin that verifies to be reached.
-  cat > "$root/stub/podman" <<STUB
-#!/usr/bin/env bash
-case "\$*" in
-  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
-  *"{{.State.Running}}"*) printf 'true\n' ;;
-  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
-  *) exit 125 ;;
-esac
-STUB
-  chmod +x "$root/stub/podman"
-  out="$(run daily --repo netlens)"
-  has "precondition: the credential abort is logged"    "$out" "needs the credential volumes"
-  is  "precondition: ...and stays retryable as well"    "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
-  # Unforced, the rotation still advances: an entry it cannot run must not
-  # stall every repo behind it (PRP-001 §10).
-  out="$(run daily)"
-  is  "precondition: unforced, the rotation moves on"   "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
+  # The credential abort that used to sit here is gone: Phase 2b dispatches a
+  # verified entry into the container rather than refusing it, and the last
+  # precondition before an engine runs is now the in-container preflight,
+  # asserted in test_p2b_preflight. Unforced, the rotation still advances: an
+  # entry it cannot run must not stall every repo behind it (PRP-001 §10).
+  out="$(MEUTE_MANIFEST="$root/nopin.yaml" run daily --runtime container)"
+  has "precondition: unforced, the same refusal is logged" "$out" "tag and digest are required when runtime is container"
+  is  "precondition: ...and the rotation moves on"      "$(kv_get_test "$root/state/cursor" cursor.daily)" "netlens/audit-security"
 }
 
 # Rule 6: the build engine is per ticket; the review engine is derived.
@@ -3351,20 +3385,24 @@ jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_tur
 STUB
   chmod +x "$root/stub/claude"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" 'd["repos"][0]["runtime"] = "host"; del d["repos"][0]["image"]'
-  local suffix=$'\truntime=-\timage=-\tstage=-\tpr=-'
+  # Phase 2b fills runtime= on a line that selected an entry; image= only for
+  # a container run, and stage=/pr= wait for Phases 4 and 5.
+  local suffix=$'\truntime=host\timage=-\tstage=-\tpr=-'
+  local unselected=$'\truntime=-\timage=-\tstage=-\tpr=-'
   local run; run() { PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB="$1" "$root/bin/run.sh" daily "${@:2}" >/dev/null 2>&1 || true; }
   run 100 --repo netlens
   local line; line="$(grep 'status=ok' "$root/state/log" | tail -1)"
   is  "log: an ok line ends with the four columns"  "${line: -${#suffix}}" "$suffix"
   has "log: ...after the last existing column"      "${line%"$suffix"}" $'\tdur='
-  hasnt "log: ...and nowhere else"                  "${line%"$suffix"}" "runtime="
+  hasnt "log: ...and nowhere else"                  "${line%"$suffix"}" "image="
   run 10 --repo netlens
   line="$(grep 'status=skipped' "$root/state/log" | tail -1)"
-  is  "log: a skipped line carries them too"        "${line: -${#suffix}}" "$suffix"
+  # A skip happens before an entry is selected, so there is no runtime to name.
+  is  "log: a skipped line carries them too"        "${line: -${#unselected}}" "$unselected"
   printf 'netlens/NL-14\treview\tmeute/x\tabc123\treports/x.md\tcodex\n' > "$root/state/stages"
   PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" weekly >/dev/null 2>&1 || true
   line="$(grep 'status=error' "$root/state/log" | tail -1)"
-  is  "log: an error line carries them too"         "${line: -${#suffix}}" "$suffix"
+  is  "log: an error line carries them too"         "${line: -${#unselected}}" "$unselected"
   # Everything that reads the log still counts this week.
   local status_out
   status_out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)"
@@ -3604,11 +3642,13 @@ STUB
   chmod +x "$root/stub/podman"
   local entry argv
   entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
-    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:1800}')"
+    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:1800,
+      engine:"claude", writes_code:true}')"
 
   ( source "$REPO/lib/container.sh"
     MEUTE_PODMAN="$root/stub/podman" container_ready "$entry" >/dev/null 2>&1
-    container_argv "$entry" build "$root/work" "$root/out" -- git status
+    ENGINE_ARGV_ENGINE=claude
+    container_argv "$entry" build claude "$root/work" "$root/out" -- git status
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-none"
   argv="$(tr '\n' ' ' < "$root/argv-none")"
 
@@ -3633,7 +3673,9 @@ STUB
   has "argv: the command follows the image"   "$argv" "git status"
   # The owner's checkout is never mounted, and no host path reaches the
   # container except the two scratch directories this phase creates.
-  is  "argv: nothing else is mounted"         "$(grep -c '^--volume$' "$root/argv-none")" "2"
+  # /work, /out, and one credential volume -- nothing else reaches the
+  # container, and in particular never the owner's checkout.
+  is  "argv: nothing else is mounted"         "$(grep -c '^--volume$' "$root/argv-none")" "3"
 
   has "argv (none): the network is off"       "$argv" "--network=none"
   hasnt "argv (none): no proxy is injected"   "$argv" "HTTPS_PROXY"
@@ -3642,7 +3684,8 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
-    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build "$root/work" "$root/out" -- git status
+    ENGINE_ARGV_ENGINE=claude
+    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build claude "$root/work" "$root/out" -- git status
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-proxied"
   argv="$(tr '\n' ' ' < "$root/argv-proxied")"
   has "argv (proxied): on the internal network"      "$argv" "--network=atelier-internal"
@@ -3657,11 +3700,87 @@ STUB
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
-    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight "$root/work" "$root/out" -- true
+    ENGINE_ARGV_ENGINE=claude
+    container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" preflight claude "" "" -- true
     printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-pre"
   argv="$(tr '\n' ' ' < "$root/argv-pre")"
   has   "argv (preflight): takes no network whatever the tier says" "$argv" "--network=none"
   hasnt "argv (preflight): and no proxy"                            "$argv" "HTTPS_PROXY"
+  # §4.4 gives the preflight no mounts: it reads a credential, and a scratch
+  # tree it cannot use is a scratch tree it should not have.
+  hasnt "argv (preflight): no scratch tree"   "$argv" "/work"
+  hasnt "argv (preflight): no capture tree"   "$argv" "/out"
+
+  # Phase 2b. The image root is not the agent's to change -- it is pinned by
+  # digest, so a write there is lost at --rm anyway and is one more place to
+  # hide. Measured: both CLIs complete under this.
+  argv="$(tr '\n' ' ' < "$root/argv-none")"
+  has "argv: the image root is read-only"     "$argv" "--read-only"
+  has "argv: ...with /tmp the one exception"  "$argv" "--tmpfs /tmp"
+  # One credential, the entry's own engine's, and never the GitHub token --
+  # `just auth` fills that one with the owner's full-scope interactive login.
+  has "argv: the engine's own credential is mounted" "$argv" "atelier-auth-claude:/home/agent/.claude:z"
+  hasnt "argv: ...and no other engine's"             "$argv" "atelier-auth-codex"
+  hasnt "argv: ...and never the GitHub token"        "$argv" "atelier-auth-gh"
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$(jq -c '.engine = "codex"' <<< "$entry")" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=codex
+    container_argv "$(jq -c '.engine = "codex"' <<< "$entry")" build codex "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-codex"
+  argv="$(tr '\n' ' ' < "$root/argv-codex")"
+  has "argv: a codex entry mounts the codex credential" "$argv" "atelier-auth-codex:/home/agent/.codex:z"
+  hasnt "argv: ...and not claude's"                     "$argv" "atelier-auth-claude"
+
+  # A tier that does not write code cannot write the branch it is reading.
+  # git still works there: status, diff <base>...HEAD, log and show all
+  # succeed on a read-only mount, provided it is still relabelled.
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=claude
+    container_argv "$(jq -c '.writes_code = false' <<< "$entry")" build claude "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-ro"
+  argv="$(tr '\n' ' ' < "$root/argv-ro")"
+  has   "argv: a reading tier gets /work read-only" "$argv" "${root}/work:/work:ro,Z"
+  hasnt "argv: ...and /out stays writable"          "$argv" "/out:ro"
+  argv="$(tr '\n' ' ' < "$root/argv-none")"
+  has   "argv: a writing tier keeps /work writable" "$argv" "${root}/work:/work:Z"
+
+  # A stage that runs an engine must carry exactly one credential. An empty
+  # or unknown engine used to mean "mount nothing and carry on", which is
+  # right for the probe and wrong for a build: the run would reach the
+  # container and fail there with an auth error, rather than being refused
+  # here with a reason.
+  local rc out
+  for stage in build preflight; do
+    out="$( source "$REPO/lib/container.sh"
+            export MEUTE_PODMAN="$root/stub/podman"
+            container_ready "$entry" >/dev/null 2>&1
+            container_argv "$entry" "$stage" "" "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+    is  "argv: ${stage} refuses an engine it cannot mount a credential for" "$rc" "1"
+    has "argv: ...with a reason rather than a silent no-credential run"     "$out" "credential"
+  done
+  out="$( source "$REPO/lib/container.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          container_ready "$entry" >/dev/null 2>&1
+          container_argv "$entry" build gpt "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+  is "argv: an unrecognised engine is refused too" "$rc" "1"
+  # The probe holds no credential deliberately, and says so by taking a
+  # path of its own rather than falling through the engine branch.
+  out="$( source "$REPO/lib/container.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          container_ready "$entry" >/dev/null 2>&1
+          container_argv "$entry" probe "" "$root/work" "$root/out" -- true
+          printf '%s\n' "${CONTAINER_ARGV[@]}" | tr '\n' ' ' )"; rc=$?
+  is    "argv: the probe needs no engine and no credential" "$rc" "0"
+  hasnt "argv: ...and mounts none"                          "$out" "atelier-auth"
+  # An unknown stage is refused rather than guessed at.
+  out="$( source "$REPO/lib/container.sh"
+          export MEUTE_PODMAN="$root/stub/podman"
+          container_ready "$entry" >/dev/null 2>&1
+          container_argv "$entry" teatime claude "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+  is "argv: an unknown stage is refused, not guessed" "$rc" "1"
 }
 
 # What the flags actually buy, asked of the kernel rather than of the argv.
@@ -3704,7 +3823,8 @@ SH
           container_ready "$entry" >/dev/null 2>&1 \
             || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
           BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" \
-          container_run "$entry" build "$root/work" "$root/out" -- \
+          ENGINE_ARGV_ENGINE=claude \
+          container_run "$entry" build claude "$root/work" "$root/out" -- \
             env BASE_SHA="$base" HOST_HOME="$HOME" HOST_ROOT="$REPO" sh -c "$probe" 2>&1 )"
 
   local field; field() { grep -m1 "^$1=" <<< "$out" | cut -d= -f2-; }
@@ -4017,6 +4137,21 @@ test_p2_engine_argv() {
            WRITES_CODE=0 MEUTE_CODEX_MODEL= engine_argv_codex "$root/prompt" /work /out/codex-last
            printf '%s\n' "${ENGINE_ARGV[@]}" )"
   has "engine argv: a reading tier gets read-only" "$argv" "read-only"
+
+  # The whole sandbox decision, in one table. On the host codex's own sandbox
+  # is the only boundary, so it keeps workspace-write; inside the container
+  # that boundary has been replaced by a stronger one AND codex's own cannot
+  # initialise there, which produces a green run that changed nothing.
+  local sb; sb() { ( source "$REPO/lib/engines.sh"; codex_sandbox "$1" "$2" ); }
+  is "sandbox: host, writing tier -- codex guards itself"   "$(sb host 1)"      "workspace-write"
+  is "sandbox: host, reading tier -- nothing to relax"      "$(sb host 0)"      "read-only"
+  is "sandbox: container, reading tier -- still nothing"    "$(sb container 0)" "read-only"
+  is "sandbox: container, writing tier -- the container is the boundary" \
+     "$(sb container 1)" "danger-full-access"
+  # Anything that is not plainly the container keeps codex's own sandbox: an
+  # unset, empty or unexpected runtime must never reach full access.
+  is "sandbox: an empty runtime is not the container"       "$(sb "" 1)"        "workspace-write"
+  is "sandbox: nor is an unrecognised one"                  "$(sb vm 1)"        "workspace-write"
 }
 
 
@@ -4061,7 +4196,8 @@ SH
   out="$( source "$REPO/lib/container.sh"
           container_ready "$entry" >/dev/null 2>&1 \
             || { printf 'container_ready refused: %s\n' "$CONTAINER_BLOCKED"; exit 1; }
-          container_run "$entry" build "$root/work" "$root/out" -- sh -c "$probe" 2>&1 )"
+          ENGINE_ARGV_ENGINE=claude \
+          container_run "$entry" build claude "$root/work" "$root/out" -- sh -c "$probe" 2>&1 )"
   local field; field() { grep -m1 "^$1=" <<< "$out" | cut -d= -f2-; }
   is "egress: the proxy resolves through --add-host, not DNS" "$(field addhost)"    "resolved"
   is "egress: HTTPS_PROXY is set inside"                      "$(field https_upper)" "http://atelier-egress:3128"
@@ -4104,15 +4240,17 @@ STUB
 #!/usr/bin/env bash
 if [[ "$1" == "login" ]]; then printf 'Logged in using ChatGPT\n'; exit 0; fi
 pwd > "$(dirname "$0")/codex-pwd"
-last=""; cd_arg=""
+last=""; cd_arg=""; sandbox=""
 while (( $# )); do
   case "$1" in
     -o) last="$2"; shift ;;
     --cd) cd_arg="$2"; shift ;;
+    -s) sandbox="$2"; shift ;;
   esac
   shift
 done
 printf '%s\n' "$cd_arg" > "$(dirname "$0")/codex-cd"
+printf '%s\n' "$sandbox" > "$(dirname "$0")/codex-sandbox"
 printf '## Summary\nstub ran\n' > "$last"
 STUB
   chmod +x "$root/stub/claude" "$root/stub/codex"
@@ -4166,6 +4304,11 @@ PY
   [[ "$codex_cd" != "$codex_pwd" ]] \
     && ok "cwd: the two differ on the host, which is the behaviour that shipped" \
     || bad "cwd: the two differ on the host, which is the behaviour that shipped" "both were [$codex_pwd]"
+  # On the host nothing has replaced codex's own sandbox, so nothing may
+  # relax it -- asserted on the real invocation, not only on the table.
+  local host_sandbox; host_sandbox="$(cat "$root/stub/codex-sandbox" 2>/dev/null || echo none)"
+  is    "sandbox: a host run keeps codex's own sandbox"  "$host_sandbox" "read-only"
+  hasnt "sandbox: ...and never full access on the host"  "$host_sandbox" "danger"
 }
 
 
@@ -4189,15 +4332,13 @@ test_p2_outer_bound() {
      "$(grep -c 'timeout --kill-after="\$CONTAINER_STOP_TIMEOUT" "\$(container_outer_bound' "$REPO/lib/container.sh")" "1"
 }
 
-# No timer fire can dispatch a container. That is the guarantee this whole
-# phase rests on, so it is asserted WITHOUT a real image: a machine that
-# happens not to have one -- CI, a fresh checkout -- would otherwise skip
-# the only test standing between an unverifiable engine run and a timer.
-#
-# A stub podman answering the two calls container_ready makes is enough,
-# because the abort fires before anything would start a container: the
-# entry passes the boundary, reaches run_entry, and is refused there.
-test_p2_credential_abort() {
+# Phase 2b removes the abort that kept a timer fire from dispatching a
+# container, so what has to be asserted now is the opposite: that a verified
+# entry IS dispatched, into a container carrying the flags 2a settled, and
+# that the log says which image actually ran. Asserted without a real image,
+# so a machine that has none -- CI, a fresh checkout -- still covers the
+# dispatch path; the stub podman stands in for the engine's envelope.
+test_p2b_container_dispatch() {
   local root="$FIXTURE/p2-cred"; p4_fixture "$root"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
   mkdir -p "$root/stub"
@@ -4216,6 +4357,8 @@ case "\$*" in
   *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
   *"{{.State.Running}}"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *"claude auth status"*) printf '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}\n' ;;
+  *" -p "*) printf '{"is_error":false,"result":"## Summary ran inside the container","total_cost_usd":0.01,"num_turns":1}\n' ;;
   *) exit 125 ;;
 esac
 STUB
@@ -4225,18 +4368,73 @@ STUB
   local out
   out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
          "$root/bin/run.sh" daily --repo netlens 2>&1)"
-  has "credentials: a verified pin gets past the boundary check" "$out" "status=error"
-  has "credentials: ...and run_entry refuses to dispatch it"     "$out" "detail=container runtime needs the credential volumes; see PRP-004 §5 item 3"
-  [[ -f "$root/stub/invocations" ]] \
-    && bad "credentials: ...with no engine run" "the stub was invoked" \
-    || ok "credentials: ...with no engine run"
-  is  "credentials: the entry is logged once and stepped past" \
-      "$(grep -c 'repo=netlens' "$root/state/log")" "1"
-  # The boundary was really crossed: had the pin failed, the entry would have
-  # been stepped over in eligible() and the abort above would never have run.
-  has "credentials: the pin was asserted on the way"   "$(cat "$root/stub/podman-calls")" "{{.Digest}}"
-  has "credentials: ...and the image ID resolved with it" "$(cat "$root/stub/podman-calls")" "{{.Id}}"
-  hasnt "credentials: no container was ever started"   "$(cat "$root/stub/podman-calls")" "run --rm"
+  has "dispatch: a verified entry runs rather than being refused" "$out" "status=ok"
+  hasnt "dispatch: ...and the Phase 1 refusal is gone"            "$out" "needs the credential volumes"
+  is  "dispatch: the entry is logged once"  "$(grep -c 'repo=netlens' "$root/state/log")" "1"
+  # The boundary was really crossed, and the log says what ran: the image ID
+  # the digest assert resolved, not the tag it was asked about.
+  has "dispatch: the log names the runtime"  "$out" "runtime=container"
+  has "dispatch: ...and the image that ran"  "$out" "image=${P2_ID:0:12}"
+  has "dispatch: ...and the stage that ran"  "$out" "stage=build"
+  has "dispatch: the pin was asserted first" "$(cat "$root/stub/podman-calls")" "{{.Digest}}"
+  # Two containers, in order: the credential probe with no network and no
+  # trees, then the engine with /work, /out and the proxied profile.
+  is  "dispatch: the preflight ran in a container of its own" \
+      "$(grep -c 'claude auth status' "$root/stub/podman-calls")" "1"
+  has "dispatch: ...on no network at all"   "$(grep 'claude auth status' "$root/stub/podman-calls")" "--network=none"
+  hasnt "dispatch: ...with no scratch tree" "$(grep 'claude auth status' "$root/stub/podman-calls")" "/work"
+  has "dispatch: ...and only its own credential" \
+      "$(grep 'claude auth status' "$root/stub/podman-calls")" "atelier-auth-claude:/home/agent/.claude:z"
+  local engine_call; engine_call="$(grep -- '-p ' "$root/stub/podman-calls" | tail -1)"
+  has "dispatch: the engine got the scratch tree at /work" "$engine_call" ":/work:"
+  has "dispatch: ...and /out for its captures"             "$engine_call" ":/out:Z"
+  has "dispatch: ...the image root read-only"              "$engine_call" "--read-only"
+  has "dispatch: ...its own credential volume"             "$engine_call" "atelier-auth-claude"
+  hasnt "dispatch: ...and never the GitHub token"          "$(cat "$root/stub/podman-calls")" "atelier-auth-gh"
+}
+
+# The last precondition before an engine runs. The host may be logged in
+# while the volume the container reads is empty, signed out, or absent -- so
+# the probe runs inside, and a failure is remediable (`just auth`), which
+# makes it retryable under force rather than a discarded request.
+test_p2b_preflight() {
+  local root="$FIXTURE/p2b-preflight"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  # A podman whose image verifies, but whose container reports a signed-out
+  # credential -- exactly the shape of an unpopulated auth volume.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *"claude auth status"*) printf '{"loggedIn":false}\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local out
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has "preflight: a signed-out volume stops the run"   "$out" "status=error"
+  has "preflight: ...saying what to do about it"       "$out" "not logged in inside the container"
+  has "preflight: ...and naming just auth"             "$out" "just auth"
+  hasnt "preflight: ...before any engine was invoked"  "$(cat "$root/stub/podman-calls")" "\-p "
+  # Remediable, so forced it stays retryable -- the operator runs `just auth`
+  # and asks for the same repo again.
+  is  "preflight: a forced refusal leaves the cursor alone" \
+      "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+  # §4.4 wants the stage named, and §7's demotion rule excludes
+  # stage=preflight lines BY NAME: logged as `-`, a signed-out credential
+  # counts toward demoting a repo for a reason that has nothing to do with it.
+  local line; line="$(tail -1 "$root/state/log")"
+  has "preflight: the line names the stage"       "$line" "stage=preflight"
+  has "preflight: ...and the runtime it was in"   "$line" "runtime=container"
+  has "preflight: ...and the image it would run"  "$line" "image=${P2_ID:0:12}"
 }
 
 # The probe makes two scratch directories. If the second cannot be made, the
@@ -4324,14 +4522,15 @@ STUB
               export MEUTE_PODMAN="$root/stub/podman"
               container_ready "$entry" >/dev/null 2>&1
               container_argv "$(jq -c '.repo = "beta" | .image.tag = "agent-beta:gfeed"' <<< "$entry")" \
-                build "$root" "$root" -- true 2>&1 )"; rc=$?
+                build claude "$root" "$root" -- true 2>&1 )"; rc=$?
   is  "pin: the argv refuses an entry the verified ID is not for" "$rc" "1"
   has "pin: ...and says why"                                      "$refused" "verified"
   # The entry it IS for still builds, so the refusal is about identity.
   ( source "$REPO/lib/container.sh"
     export MEUTE_PODMAN="$root/stub/podman"
     container_ready "$entry" >/dev/null 2>&1
-    container_argv "$entry" build "$root" "$root" -- true ) >/dev/null 2>&1 \
+    ENGINE_ARGV_ENGINE=claude
+    container_argv "$entry" build claude "$root" "$root" -- true ) >/dev/null 2>&1 \
     && ok "pin: the entry it was verified for still builds" \
     || bad "pin: the entry it was verified for still builds" "refused its own entry"
 }
@@ -4412,6 +4611,219 @@ PY
   is  "retryable: ...and no archive left behind"            "$(ls "$root"/state/plan-queue.completed-* 2>/dev/null | wc -l)" "0"
 }
 
+# A credential volume has to survive being used. Meute shares these with
+# Atelier's interactive `agent-enter` containers by design, so the property
+# that matters is not which flag is spelled but this: after a Meute run, a
+# container that mounts the same volume with NO relabel flag can still read
+# it. Private relabel (:Z) passes every single-run check and fails this one,
+# which is why it went unnoticed -- a run always relabels successfully and
+# then works. The failure it causes is an intermittent "not logged in" that
+# looks exactly like the refresh-token collision §5 item 3 is watching for.
+test_p2b_credential_volume_is_shared() {
+  if ! p2_image_present; then
+    skip "volume: shared after use" "${P2_IMAGE} is not on this host (expected in CI)"
+    return 0
+  fi
+  local vol="meute-test-shared-$$"
+  local -a podman; read -ra podman <<< "$( source "$REPO/lib/container.sh"; podman_cmd )"
+  "${podman[@]}" volume create "$vol" >/dev/null 2>&1 \
+    || { skip "volume: shared after use" "cannot create a podman volume here"; return 0; }
+  # Seed it the way `just auth` does, then hand it to a run the way
+  # container_argv would -- taking the flag from the code, not from a literal.
+  local mount; mount="$( source "$REPO/lib/container.sh"; container_auth_mount claude )"
+  local flag="${mount##*:}"
+  "${podman[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --network=none \
+    -v "${vol}:/seed:z" "$P2_IMAGE" sh -c 'printf secret > /seed/.credentials.json' >/dev/null 2>&1
+  "${podman[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --network=none \
+    -v "${vol}:/home/agent/.claude:${flag}" "$P2_IMAGE" \
+    sh -c 'cat /home/agent/.claude/.credentials.json >/dev/null' >/dev/null 2>&1 \
+    && ok "volume: the run reads its own credential" \
+    || bad "volume: the run reads its own credential" "denied with flag ${flag}"
+  # The assertion that :Z fails: somebody else's container, afterwards.
+  local second
+  second="$("${podman[@]}" run --rm --userns=keep-id:uid=1000,gid=1000 --cap-drop=ALL --network=none \
+    -v "${vol}:/home/agent/.claude" "$P2_IMAGE" \
+    sh -c 'cat /home/agent/.claude/.credentials.json 2>/dev/null || echo DENIED' 2>&1)"
+  is "volume: ...and leaves it readable by the next container" "$second" "secret"
+  "${podman[@]}" volume rm "$vol" >/dev/null 2>&1 || true
+
+  # And the fix must not be over-applied: the per-run trees are private, and
+  # private relabel is exactly right for them.
+  local root="$FIXTURE/p2b-vol"; mkdir -p "$root/stub" "$root/work" "$root/out"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P2_DIGEST" "$P2_ID" ;;
+  *) printf '10.89.14.10\n' ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  local argv
+  argv="$( source "$REPO/lib/container.sh"
+           export MEUTE_PODMAN="$root/stub/podman"
+           local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+             '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none",
+               engine:"claude", writes_code:true, timeout_seconds:60}')"
+           container_ready "$e" >/dev/null 2>&1
+           ENGINE_ARGV_ENGINE=claude
+           container_argv "$e" build claude "$root/work" "$root/out" -- true
+           printf '%s\n' "${CONTAINER_ARGV[@]}" | tr '\n' ' ' )"
+  has "volume: the scratch tree stays privately labelled" "$argv" "${root}/work:/work:Z"
+  has "volume: ...and so does the capture tree"           "$argv" "${root}/out:/out:Z"
+}
+
+# --engine is the one input that can make the effective engine differ from
+# the entry's. The credential mount has to follow the engine that actually
+# RUNS, or an override puts one provider's agent in front of the other's
+# OAuth credential -- and in a writing container that agent holds
+# danger-full-access over it. The sandbox ruling was conditioned on one
+# credential per stage; this is the way that inverts.
+test_p2b_engine_override_credential() {
+  local root="$FIXTURE/p2b-override"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  *"claude auth status"*) printf '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}\n' ;;
+  *"codex login status"*) printf 'Logged in using ChatGPT\n' ;;
+  *" -p "*) printf '{"is_error":false,"result":"## Summary ran","total_cost_usd":0.01,"num_turns":1}\n' ;;
+  *"codex exec"*) for a in "\$@"; do [[ -n "\${want:-}" ]] && { printf '## Summary ran\n' > "\$a"; unset want; }; [[ "\$a" == "-o" ]] && want=1; done ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local run; run() { : > "$root/stub/podman-calls"; : > "$root/state/cursor"
+    PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+      MEUTE_CODEX_QUOTA_CMD='echo 100' "$root/bin/run.sh" daily --repo netlens "$@" 2>&1; }
+
+  # The manifest says claude. Untouched, it is claude's volume and no other.
+  local out; out="$(run)"
+  has   "override: the entry's own engine mounts its own credential" \
+        "$(cat "$root/stub/podman-calls")" "atelier-auth-claude"
+  hasnt "override: ...and not the other engine's" \
+        "$(cat "$root/stub/podman-calls")" "atelier-auth-codex"
+
+  # --engine codex on a claude entry: codex runs, so codex's credential is
+  # the only one that may be in front of it.
+  out="$(run --engine codex)"
+  local calls; calls="$(cat "$root/stub/podman-calls")"
+  has   "override: --engine codex mounts the codex credential" "$calls" "atelier-auth-codex"
+  hasnt "override: ...and never claude's"                      "$calls" "atelier-auth-claude"
+  has   "override: ...and it is codex that is probed"          "$calls" "codex login status"
+  hasnt "override: ...not the engine the entry named"          "$calls" "claude auth status"
+
+  # And the reverse, so the fix is not one-directional.
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" "d['repos'][0]['engine'] = 'codex'"
+  out="$(run --engine claude)"
+  calls="$(cat "$root/stub/podman-calls")"
+  has   "override: --engine claude on a codex entry mounts claude's" "$calls" "atelier-auth-claude"
+  hasnt "override: ...and never codex's"                             "$calls" "atelier-auth-codex"
+
+  # The invariant that keeps this fixed is these assertions, not a grep for
+  # a spelling. There WAS such a grep here -- `jq -r '.engine` counted in
+  # lib/container.sh, asserted zero -- and it is gone on purpose, so if the
+  # instinct to "restore it, it is only one line" arrives, this is the
+  # answer: it passes for `jq '.engine'`, for `. as $e | .engine`, and for
+  # any helper that reads the field, while the property it claims to guard
+  # is broken. A check that is cheap to write and hard to trust is worse
+  # than no check, because it occupies the space where a real one would go
+  # and makes that space look filled. The override tests above exercise the
+  # property in both directions and fail when it breaks; a bash test parsing
+  # bash would be a weaker guard sitting next to a stronger one.
+
+  # And the two are bound rather than trusted to agree: the credential is
+  # chosen from the engine parameter while the command comes from the
+  # caller's argv, so a mismatch between them is refused outright.
+  # The claim is made by the builder and checked by the mount, so it does
+  # not matter how the command is spelled. A check that pattern-matched
+  # argv[0] would pass for every line below while the property is violated,
+  # and would start doing so the first time someone pins the binary by path
+  # or prefixes an env var -- a change that would look entirely innocent.
+  local mismatch rc
+  refuse() { # <declared-engine> <mounting-for> <command...>
+    ( source "$REPO/lib/engines.sh"; source "$REPO/lib/container.sh"
+      export MEUTE_PODMAN="$root/stub/podman"
+      local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P4_DIGEST" \
+        '{repo:"netlens", image:{tag:$tag, digest:$digest}, network:"none",
+          writes_code:true, timeout_seconds:60}')"
+      container_ready "$e" >/dev/null 2>&1
+      ENGINE_ARGV_ENGINE="$1"; local for_engine="$2"; shift 2
+      container_argv "$e" build "$for_engine" "$root" "$root" -- "$@" 2>&1 )
+  }
+  mismatch="$(refuse claude codex claude -p hello)"; rc=$?
+  is  "override: a credential that does not match the command is refused" "$rc" "1"
+  has "override: ...and says which two disagree"                          "$mismatch" "codex"
+  has "override: ...naming the command's engine too"                      "$mismatch" "claude"
+  # The spellings a pattern match would have missed entirely.
+  mismatch="$(refuse claude codex /usr/local/bin/claude -p hello)"; rc=$?
+  is "override: an absolute path is still bound to its engine"   "$rc" "1"
+  mismatch="$(refuse claude codex env FOO=1 claude -p hello)"; rc=$?
+  is "override: an env-prefixed command too"                     "$rc" "1"
+  mismatch="$(refuse codex claude /opt/codex/bin/codex exec x)"; rc=$?
+  is "override: and the same in the other direction"             "$rc" "1"
+  # A matching declaration still builds, however the command is spelled.
+  refuse claude claude /usr/local/bin/claude -p hello >/dev/null 2>&1 \
+    && ok "override: a matching declaration builds, path or not" \
+    || bad "override: a matching declaration builds, path or not" "refused its own engine"
+  # THE RULE, not the instance: a dispatch that mounts a credential requires
+  # a non-empty, exact claim. Unset is a refusal, because a guard that is
+  # skipped when its input is missing stops working the moment a caller
+  # arrives without one, and nothing announces that.
+  #
+  # The stage set is pinned below so it cannot grow quietly: add a sixth
+  # credential-bearing stage to container_stage_credential and that
+  # assertion fails, which brings the author here, and this loop then
+  # requires the new stage to refuse a claimless dispatch too.
+  # The loop walks the SET ITSELF, so a stage added to container.sh is
+  # covered here the moment it exists rather than when someone remembers to
+  # list it. An empty claim is used rather than an unset one on purpose: an
+  # unset variable would abort under `set -u` and the test would pass on an
+  # error instead of on the rule.
+  local stage
+  for stage in $( source "$REPO/lib/container.sh"; printf '%s\n' "${CONTAINER_ENGINE_STAGES[@]}" ); do
+    rc=0
+    ( source "$REPO/lib/container.sh"
+      export MEUTE_PODMAN="$root/stub/podman"
+      local e; e="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P4_DIGEST" \
+        '{repo:"netlens", image:{tag:$tag, digest:$digest}, network:"none",
+          writes_code:true, timeout_seconds:60}')"
+      container_ready "$e" >/dev/null 2>&1
+      ENGINE_ARGV_ENGINE=""
+      container_argv "$e" "$stage" claude "$root" "$root" -- claude -p hello ) >/dev/null 2>&1 || rc=$?
+    is "override: ${stage} refuses a dispatch that claims no engine" "$rc" "1"
+  done
+  # And the set is pinned, so growing it is a visible act: add a stage and
+  # this fails, which brings the author here, and the loop above then covers
+  # the new stage automatically because it reads the same array.
+  is "override: the credential-bearing stages are exactly these" \
+     "$( source "$REPO/lib/container.sh"; printf '%s' "${CONTAINER_ENGINE_STAGES[*]}" )" \
+     "preflight build review review-2 resolve"
+  is "override: ...and these hold no credential at all" \
+     "$( source "$REPO/lib/container.sh"; printf '%s' "${CONTAINER_UNCREDENTIALED_STAGES[*]}" )" \
+     "probe publish"
+  is "override: anything else is refused rather than guessed" \
+     "$( source "$REPO/lib/container.sh"; container_stage_credential teatime || echo refused )" "refused"
+
+  # The builders are what make the claim, so it is theirs to declare.
+  is "override: the claude builder declares what it built" \
+     "$( source "$REPO/lib/engines.sh"
+         MODEL=s TOOLS=Read PERMISSION_MODE=dontAsk ALLOWED_TOOLS= MEUTE_SETTING_SOURCES= \
+           engine_argv_claude "$root/../p2-engine/prompt" >/dev/null 2>&1
+         printf '%s\n' "${ENGINE_ARGV_ENGINE:-unset}" )" "claude"
+  is "override: ...and the codex builder likewise" \
+     "$( source "$REPO/lib/engines.sh"
+         WRITES_CODE=0 MEUTE_CODEX_MODEL= \
+           engine_argv_codex "$root/../p2-engine/prompt" /work /out/last host >/dev/null 2>&1
+         printf '%s\n' "${ENGINE_ARGV_ENGINE:-unset}" )" "codex"
+}
+
 # ------------------------------------------------------------------- main ---
 printf 'meute test suite\n'
 REAL_STATE_BEFORE="$(real_state_snapshot)"
@@ -4490,7 +4902,10 @@ test_p2_pin_is_one_snapshot
 test_p2_isolation
 test_p2_proxied_egress
 test_p2_container_probe
-test_p2_credential_abort
+test_p2b_container_dispatch
+test_p2b_preflight
+test_p2b_credential_volume_is_shared
+test_p2b_engine_override_credential
 test_p2_probe_cleanup
 test_real_repo_untouched
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
