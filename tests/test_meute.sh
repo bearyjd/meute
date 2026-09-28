@@ -4590,6 +4590,24 @@ STUB
   hasnt "preflight: ...without asking podman about it"         "$(cat "$root/stub/podman-calls")" "secret exists"
   hasnt "preflight: ...or invoking an engine"                  "$(cat "$root/stub/podman-calls")" " -p "
 
+  # A rejected value is never echoed: it is by definition not a secret
+  # name, so it may be anything -- a pasted token, a tab or newline that
+  # would split the tab-separated log record.
+  local before after evil
+  evil=$'x\tstatus=ok\nsk-ant-oat01-LEAKED'
+  before="$(wc -l < "$root/state/log")"
+  out="$(MEUTE_CLAUDE_SECRET="$evil" fire)"
+  after="$(wc -l < "$root/state/log")"
+  line="$(tail -1 "$root/state/log")"
+  is    "preflight: a rejected secret name adds exactly one log line" "$(( after - before ))" "1"
+  has   "preflight: ...a refusal"                          "$line" "status=error"
+  has   "preflight: ...with its fields intact"             "$line" "stage=preflight"
+  is    "preflight: ...and exactly one status field"       "$(grep -o 'status=' <<< "$line" | wc -l)" "1"
+  has   "preflight: ...saying what was wrong"              "$line" "MEUTE_CLAUDE_SECRET is not a plain podman secret name (value not shown)"
+  hasnt "preflight: ...without the value in state/log"     "$(cat "$root/state/log")" "LEAKED"
+  hasnt "preflight: ...or on the terminal"                 "$out" "LEAKED"
+  hasnt "preflight: ...or any piece of it"                 "$(cat "$root/state/log")" $'x\t'
+
   # A claude container run takes its credential from the proxied network's
   # secret; on any other network it would have none, and fall back to the
   # volume file. So a non-proxied claude container entry is refused at the
@@ -4608,6 +4626,63 @@ STUB
   # the same fixture runs, so each refusal above is its own condition's doing.
   out="$(fire)"
   has "preflight: with the secret present the same entry runs" "$out" "status=ok"
+}
+
+# The secret is checked at the preflight and used at the build, and it can
+# vanish between the two. podman then refuses to start the build -- fail
+# closed -- but the line would say stage=build, and §7's demotion counts
+# build errors against the REPO. So a failed claude container run re-asks
+# the same host-side question, and an absent secret is recorded as the
+# preflight failure it is. Decided by podman's exit status, never by
+# parsing its stderr.
+test_p2b_secret_vanishes() {
+  local root="$FIXTURE/p2b-vanish"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub"
+  # Present for the first `secret exists`, gone for every later one; and the
+  # engine run fails the way podman fails on a missing secret.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  "secret exists atelier-claude-token")
+    [[ -e "$root/stub/secret-gone" ]] && exit 1
+    touch "$root/stub/secret-gone"; exit 0 ;;
+  *" -p "*) echo 'Error: an unrelated message the runner must not parse' >&2; exit \${ENGINE_RC:-125} ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local fire; fire() { rm -f "$root/stub/podman-calls" "$root/stub/secret-gone"; : > "$root/state/cursor"
+    PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+      "$root/bin/run.sh" daily --repo netlens 2>&1; }
+  local out line
+  out="$(fire)"; line="$(tail -1 "$root/state/log")"
+  is  "vanish: the secret was checked twice, before and after" \
+      "$(grep -cx 'secret exists atelier-claude-token' "$root/stub/podman-calls")" "2"
+  has "vanish: the engine run was attempted in between"  "$(cat "$root/stub/podman-calls")" " -p "
+  has "vanish: the run is an error"                      "$line" "status=error"
+  has "vanish: ...recorded as the preflight's"           "$line" "stage=preflight"
+  hasnt "vanish: ...not the build's, which demotion counts" "$line" "stage=build"
+  has "vanish: ...with the preflight's own detail"       "$line" "not present on the host; in Atelier run: just auth-login claude"
+  hasnt "vanish: ...and not podman's stderr"             "$line" "unrelated message"
+  # §7's demotion keys on stage=: no build-stage error was recorded at all.
+  is  "vanish: nothing here can count toward demotion" \
+      "$(grep -c $'\tstage=build\t' "$root/state/log")" "0"
+
+  # The converse: a build that fails with the secret still present is the
+  # build's own failure, and stays stage=build.
+  sed -i "s|    \[\[ -e \"$root/stub/secret-gone\" \]\] \&\& exit 1|    :|" "$root/stub/podman"
+  out="$(ENGINE_RC=1 fire)"; line="$(tail -1 "$root/state/log")"
+  is  "vanish: a build failure with the secret present re-checks once more" \
+      "$(grep -cx 'secret exists atelier-claude-token' "$root/stub/podman-calls")" "2"
+  has "vanish: ...and stays the build's failure"         "$line" "stage=build"
+  has "vanish: ...an error"                              "$line" "status=error"
 }
 
 # One list of billing variables, two consumers: the host strips them from the
@@ -5124,6 +5199,7 @@ test_p2_proxied_egress
 test_p2_container_probe
 test_p2b_container_dispatch
 test_p2b_preflight
+test_p2b_secret_vanishes
 test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
