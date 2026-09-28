@@ -73,6 +73,40 @@ container_stage_credential() {
   return 1
 }
 
+# Claude's credential is not the volume any more (PRP-004 §5, Atelier
+# 317b951): it is a podman secret holding a long-lived `claude setup-token`
+# token, injected as CLAUDE_CODE_OAUTH_TOKEN. That token has no refresh, so
+# the refresh race that revoked the volume's copy (§11, Phase 2b) cannot
+# recur. The volume stays mounted beside it, as the contract says: under a
+# read-only root it is claude's only writable config directory, and the
+# env var takes precedence over the revoked .credentials.json left there.
+#
+# The name is overridable so the refusal can be proven on a real host
+# without deleting the real secret. It is validated, because it is spliced
+# into podman's `--secret name,opt=...` syntax: a comma in it would carry a
+# second `target=` into the flag. Not `readonly`, for the reason the stage
+# arrays above give.
+CONTAINER_CLAUDE_SECRET_DEFAULT="atelier-claude-token"
+CONTAINER_CLAUDE_SECRET_ENV="CLAUDE_CODE_OAUTH_TOKEN"
+
+container_claude_secret() {
+  local name="${MEUTE_CLAUDE_SECRET:-$CONTAINER_CLAUDE_SECRET_DEFAULT}"
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    container_note "claude secret name '${name}' is not a plain podman secret name; refusing"
+    return 1
+  fi
+  printf '%s\n' "$name"
+}
+
+# Host-side, and only whether it exists: nothing here reads the value.
+# Returns podman's own status -- 0 present, 1 absent, anything else means
+# podman could not answer -- so the caller can say which, and refuse on all
+# but 0.
+container_claude_secret_exists() {
+  local name; name="$(container_claude_secret)" || return 2
+  podman_run secret exists "$name" >/dev/null 2>&1
+}
+
 container_auth_mount() {
   case "$1" in
     claude) printf 'atelier-auth-claude:/home/agent/.claude:z\n' ;;
@@ -326,6 +360,16 @@ container_argv() {
   local -a profile=()
   container_network_argv "$stage" "$network" || return 1
   profile=( "${CONTAINER_NETWORK_ARGV[@]}" )
+  # Claude's token secret goes where the network does, and nowhere else: a
+  # run on --network=none cannot use it (§5). Decided from the profile just
+  # chosen rather than by re-asking "preflight, or not proxied?" -- one
+  # authority for which runs are networked. The engine is the parameter
+  # the credential volume was chosen by, already bound to the command above.
+  if [[ "$need" == "engine" && "$engine" == "claude" \
+        && "${profile[0]}" != "--network=none" ]]; then
+    local secret; secret="$(container_claude_secret)" || return 1
+    CONTAINER_ARGV+=( --secret "${secret},type=env,target=${CONTAINER_CLAUDE_SECRET_ENV}" )
+  fi
   CONTAINER_ARGV+=( "${profile[@]}" "$image" "$@" )
 }
 

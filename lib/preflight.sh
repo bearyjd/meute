@@ -50,10 +50,11 @@ preflight() {
 # The same guarantee, asked of the credential the run will actually use.
 #
 # Under `runtime: container` the host's login is not what the engine reaches:
-# the container mounts a COPY in a volume, and that copy can be absent,
-# empty, or signed out while the host's is fine. So the probe runs inside the
-# image, on --network=none, with only that engine's volume mounted -- no
-# network, no scratch tree, no cost.
+# codex's container mounts a COPY in a volume, and that copy can be absent,
+# empty, or signed out while the host's is fine. So codex's probe runs inside
+# the image, on --network=none, with only its volume mounted -- no network,
+# no scratch tree, no cost. Claude's credential is a podman secret instead,
+# which only proxied runs carry, so its check is host-side (see below).
 #
 # It RETURNS rather than dies. A missing credential is a precondition the
 # operator can remediate (`just auth`, or a re-login), so bin/run.sh routes
@@ -73,33 +74,34 @@ preflight_container() {
   esac
 }
 
-# jq lives on the host, not in the image: the container's job is to produce
-# the status, and the host's is to judge it. That split also means the checks
-# below are the same ones the host path applies.
+# Claude's precondition is the token secret, asked of the HOST (PRP-004 §8).
+# There is deliberately no container here. The preflight runs on
+# --network=none, and the secret goes only to proxied runs, so an in-image
+# `claude auth status` could only read the volume's .credentials.json --
+# revoked, and not the credential the run uses. It would pass against a dead
+# file, and refuse a good secret if the volume were ever emptied.
+#
+# Absent is a REFUSAL, never a fallback. A proxied claude run without the
+# secret falls back to that volume file, and if it is ever valid its refresh
+# revokes the host's token -- the original race. podman itself also refuses
+# to start a container naming a missing secret; this is the check that says
+# so with a stage and a remedy, before anything starts. A podman that cannot
+# answer is not a podman that said yes: every non-zero status refuses.
+#
+# It proves presence, not validity: a revoked token still exists. That hole
+# is the one §8 already names for the in-container probe, not a new one.
 preflight_container_claude() {
-  local entry="$1" status key_source plan
-  # The probe declares its engine like any argv builder. Its command is
-  # fixed in this file, so the claim is trivially true -- the point is that
-  # it travels the same path as every other credential-bearing dispatch
-  # rather than around it, because the exception is what rots.
-  local ENGINE_ARGV_ENGINE="claude"
-  status="$(container_run "$entry" preflight claude "" "" -- claude auth status --json 2>/dev/null)" \
-    || { PREFLIGHT_DETAIL="claude auth status failed inside the container - the volume may be empty; run: just auth"; return 1; }
-  if [[ "$(jq -r '.loggedIn // false' <<< "$status" 2>/dev/null)" != "true" ]]; then
-    PREFLIGHT_DETAIL="claude is not logged in inside the container; run: just auth"
-    return 1
-  fi
-  key_source="$(jq -r '.apiKeySource // ""' <<< "$status")"
-  if [[ -n "$key_source" ]]; then
-    PREFLIGHT_DETAIL="claude resolved auth from ${key_source} inside the container; refusing metered billing"
-    return 1
-  fi
-  plan="$(jq -r '.subscriptionType // ""' <<< "$status")"
-  if [[ -z "$plan" || "$plan" == "null" ]]; then
-    PREFLIGHT_DETAIL="claude reports no subscription plan inside the container; run: just auth"
-    return 1
-  fi
-  AUTH_MODE="$(jq -r '.authMethod // "unknown"' <<< "$status")/${plan}"
+  local entry="$1" secret rc=0
+  secret="$(container_claude_secret 2>/dev/null)" \
+    || { PREFLIGHT_DETAIL="the claude secret name '${MEUTE_CLAUDE_SECRET:-}' is not a plain podman secret name"; return 1; }
+  container_claude_secret_exists || rc=$?
+  case "$rc" in
+    0) AUTH_MODE="oauth-token/secret:${secret}" ;;
+    1) PREFLIGHT_DETAIL="claude token secret ${secret} is not present on the host; in Atelier run: just auth-login claude"
+       return 1 ;;
+    *) PREFLIGHT_DETAIL="could not check the claude token secret ${secret} on the host (podman rc=${rc}); refusing rather than falling back to the volume; if it is missing, in Atelier run: just auth-login claude"
+       return 1 ;;
+  esac
 }
 
 preflight_container_codex() {
