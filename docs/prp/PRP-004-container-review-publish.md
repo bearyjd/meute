@@ -393,7 +393,16 @@ volumes itself. The third is a test result. Of the fourth, only the
    `contents: write` + `pull_requests: write`) mounted only by the publish
    stage, and `atelier-auth-gh-review` (`contents: read`, `pull_requests:
    write` for comments, `checks: read`) for scout and review. Neither is
-   the owner's token.
+   the owner's token. **Minted 2026-09-27** (owner, `just auth-login gh`),
+   expiring 2026-12-27 -- rotate before then. Measured from a proxied
+   `agent-base:g691e067` container with Meute's run flags, each volume
+   mounted `:ro,z` at `/home/agent/.config/gh`: `gh api user` returns
+   `bearyjd` and the rate limit reads 5000 (authenticated; 60 would be
+   anonymous). Without `--userns=keep-id:uid=1000,gid=1000` gh cannot read
+   its 0600 `config.yml` and exits before any request, so a probe of these
+   volumes must use the run's own flags. What a fine-grained token can
+   *write* is not visible to gh (`.permissions` on a repo reports the
+   user's role, not the token's grant); the first publish is the test.
 3. **The OAuth refresh race.** `state/log` 2026-09-18: `Failed to refresh
    OAuth token: another Claude Code process is refreshing it`. Atelier
    §4.1 copies credentials into a volume; if the provider rotates refresh

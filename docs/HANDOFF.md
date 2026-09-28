@@ -48,7 +48,7 @@ run. This file says only where things stand and what to do next.
 5. **Before Phase 3**: a Codex quota probe, and the credential fixed. A green
    codex run beside a 401'd claude run reads as a provider difference and is a
    credential one (§8).
-6. **Before Phase 5**: mint the two fine-grained PATs (§5 item 2).
+6. ~~Before Phase 5: mint the two fine-grained PATs~~ — done 2026-09-27, both authenticate from a proxied container; they expire **2026-12-27** (§5 item 2).
 7. First container repo: pick one low-stakes repo, not the fleet.
 
 ## How to resume
