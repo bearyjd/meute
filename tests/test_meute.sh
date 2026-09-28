@@ -3822,6 +3822,7 @@ STUB
     else
       is  "argv: a malformed secret name '${bogus}' is refused" "$rc" "1"
       has "argv: ...with a reason"                                "$out" "not a plain podman secret name"
+      hasnt "argv: ...that never echoes the rejected value"       "$out" "$bogus"
     fi
   done
 
