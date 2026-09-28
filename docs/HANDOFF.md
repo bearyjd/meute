@@ -1,6 +1,6 @@
 # Handoff — Meute
 
-**As of:** 2026-09-27. **Repo:** `https://github.com/bearyjd/meute` (public, `main`).
+**As of:** 2026-09-27 (updated after Atelier `317b951`). **Repo:** `https://github.com/bearyjd/meute` (public, `main`).
 **Read first:** `docs/prp/PRP-004-container-review-publish.md` — §5 is the Atelier
 contract, §8 the open items, §11 what each phase disclosed, §12 how reviews are
 run. This file says only where things stand and what to do next.
@@ -22,22 +22,23 @@ run. This file says only where things stand and what to do next.
 - **Worktree** `../meute-wt-prp004-phase1`, branch `feat/prp-004-phase-2b`, level
   with origin, clean. The live checkout stays on `main` — the timers run
   `bin/run.sh` from it.
-- **Pending contract change** (§5): Claude moves from a mounted
-  `.credentials.json` to a `claude setup-token` secret injected as
-  `CLAUDE_CODE_OAUTH_TOKEN`. Agreed with Atelier, **not built on either side**.
+- **Contract change, half built** (§5): Claude moves from a mounted
+  `.credentials.json` to the `atelier-claude-token` secret injected as
+  `CLAUDE_CODE_OAUTH_TOKEN`. **Atelier built it** (`317b951`, with the `:z`
+  fix in `e779ec0`); **Meute has not**, and the secret is not populated yet.
 
 ## Decisions the owner holds, in order
 
 1. **Merge `#28`.** Changes no fire until a repo opts into `runtime: container`.
-2. **Give Atelier its go** on its uncommitted `:z` commit and on building
-   `just auth-login` (Atelier `docs/HANDOFF.md`, items 1–2). A peer's relay is
-   not your authorisation; that session is waiting on you directly.
-3. **Run the logins** once built: `claude setup-token` and
-   `codex login --device-auth`, one browser step each. Do **not** re-run
-   `just auth` for claude or codex — re-copying lets the next container
-   refresh revoke *your* session.
-4. Then Meute: switch `lib/container.sh`'s claude branch from volume to
-   secret, re-verify claude-in-container, and `meute image bump` to `g9d76449`.
+2. ~~Give Atelier its go~~ — done; `:z` and `just auth-login` are pushed.
+3. **Run the logins**, in the Atelier repo: `just auth-login claude` and
+   `just auth-login codex` — one browser step each. Do **not** re-run
+   `just auth` for claude or codex; it now copies only gh, by design.
+4. Then Meute: add the secret to proxied claude runs in `lib/container.sh`
+   (not `--network=none` ones), make the claude precondition check the
+   secret host-side rather than the stale volume file (§8), re-verify
+   claude-in-container, and `meute image bump` to `g9d76449`. The secret
+   change touches the credential path, so it gets a Codex round.
    Treat the bump as a test of the command too: check the backup lands beside
    the resolved file and the digest written is what `podman image inspect`
    returns — both have only ever been asserted with stubs.
