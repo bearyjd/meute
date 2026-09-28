@@ -3785,7 +3785,7 @@ STUB
   has "argv: ...and CLAUDE_CODE_USE_BEDROCK"           "$want_unset" "--unsetenv=CLAUDE_CODE_USE_BEDROCK"
   has "argv: ...and OPENAI_API_KEY"                    "$want_unset" "--unsetenv=OPENAI_API_KEY"
   local f rc out
-  for f in argv-none argv-proxied argv-pre argv-codex argv-codex-proxied argv-ro; do
+  for f in argv-none argv-proxied argv-pre argv-codex argv-codex-proxied argv-override; do
     is "argv (${f#argv-}): every billing variable is unset in the container" \
        "$(grep -x -- '--unsetenv=.*' "$root/$f")" "$want_unset"
     # The proxy variables are the boundary's own, set by --env on a proxied
@@ -4617,13 +4617,15 @@ STUB
 # scrubbing nothing.
 test_billing_scrub_one_list() {
   local scrub
-  scrub="$( source "$REPO/lib/container.sh"; source "$REPO/lib/preflight.sh"
+  # The suite's own shell may have sourced container.sh already, and its
+  # readonly constants would complain on stderr; only the list matters here.
+  scrub="$( source "$REPO/lib/container.sh" 2>/dev/null; source "$REPO/lib/preflight.sh"
             printf '%s ' "${ENGINE_SCRUB_VARS[@]}" )"
   is "scrub: the host strips the same variables it always did" "$scrub" \
      "ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy "
   local out rc
   # Both callers run under `set -e`, so a failed source ends them.
-  out="$( set -e; source "$REPO/lib/preflight.sh" 2>&1; printf 'loaded:%s\n' "${ENGINE_SCRUB_VARS[*]:-}" )"; rc=$?
+  out="$( unset ENGINE_BILLING_VARS; set -e; source "$REPO/lib/preflight.sh" 2>&1; printf 'loaded:%s\n' "${ENGINE_SCRUB_VARS[*]:-}" )"; rc=$?
   is  "scrub: preflight.sh without the list refuses to load" "$rc" "1"
   has "scrub: ...saying what it needs"                      "$out" "lib/container.sh"
   hasnt "scrub: ...rather than loading with nothing to strip" "$out" "loaded:"

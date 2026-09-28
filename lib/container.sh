@@ -73,6 +73,20 @@ container_stage_credential() {
   return 1
 }
 
+# Variables that switch an engine from subscription to metered billing, or
+# route it to another endpoint or provider. THE list: lib/preflight.sh builds
+# the host path's scrub from it (adding the proxy variables, which the
+# container sets itself), and every container engine run --unsetenv's each
+# one, because an image ENV -- or a rebuilt image -- setting
+# ANTHROPIC_API_KEY would outrank the token secret. It lives here because this
+# file is self-contained and preflight.sh is not. Not `readonly`, as above.
+ENGINE_BILLING_VARS=(
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT
+  OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT
+  CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+)
+
 # Claude's credential is not the volume any more (PRP-004 §5, Atelier
 # 317b951): it is a podman secret holding a long-lived `claude setup-token`
 # token, injected as CLAUDE_CODE_OAUTH_TOKEN. That token has no refresh, so
@@ -356,6 +370,15 @@ container_argv() {
     auth="$(container_auth_mount "$engine")" \
       || { container_note "stage ${stage} runs an engine, and '${engine:-<none>}' has no credential volume"; return 1; }
     CONTAINER_ARGV+=( --volume "$auth" )
+    # The host path's metered-billing defence, carried across. An empty list
+    # is a refusal: a scrub with nothing in it looks exactly like one that
+    # worked.
+    if [[ -z "${ENGINE_BILLING_VARS[*]:-}" ]]; then
+      container_note "stage ${stage} runs an engine but the billing variable list is empty; refusing"
+      return 1
+    fi
+    local var
+    for var in "${ENGINE_BILLING_VARS[@]}"; do CONTAINER_ARGV+=( "--unsetenv=${var}" ); done
   fi
   local -a profile=()
   container_network_argv "$stage" "$network" || return 1
@@ -363,10 +386,12 @@ container_argv() {
   # Claude's token secret goes where the network does, and nowhere else: a
   # run on --network=none cannot use it (§5). Decided from the profile just
   # chosen rather than by re-asking "preflight, or not proxied?" -- one
-  # authority for which runs are networked. The engine is the parameter
-  # the credential volume was chosen by, already bound to the command above.
+  # authority for which runs are networked -- and matched positively, so a
+  # profile added later gets no credential until someone decides it should.
+  # The engine is the parameter the credential volume was chosen by, already
+  # bound to the command above.
   if [[ "$need" == "engine" && "$engine" == "claude" \
-        && "${profile[0]}" != "--network=none" ]]; then
+        && "${profile[0]}" == "--network=${CONTAINER_NETWORK}" ]]; then
     local secret; secret="$(container_claude_secret)" || return 1
     CONTAINER_ARGV+=( --secret "${secret},type=env,target=${CONTAINER_CLAUDE_SECRET_ENV}" )
   fi

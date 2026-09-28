@@ -10,11 +10,17 @@
 # third-party endpoint as well as switch it from subscription to API-key auth.
 # Keep this explicit rather than using `env -i`: the CLIs still need normal
 # login/config discovery, PATH, locale, and terminal behaviour.
+#
+# The billing half of the list is lib/container.sh's ENGINE_BILLING_VARS, which
+# the container path --unsetenv's too: one list, two consumers. Without it
+# this file refuses to load rather than scrub nothing, and both callers run
+# under `set -e`, so a failed source ends them.
+if [[ -z "${ENGINE_BILLING_VARS[*]:-}" ]]; then
+  printf 'meute: lib/preflight.sh needs ENGINE_BILLING_VARS; source lib/container.sh first\n' >&2
+  return 1
+fi
 readonly ENGINE_SCRUB_VARS=(
-  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-  ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT
-  OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT
-  CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+  "${ENGINE_BILLING_VARS[@]}"
   HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
   http_proxy https_proxy all_proxy no_proxy
 )
@@ -91,7 +97,15 @@ preflight_container() {
 # It proves presence, not validity: a revoked token still exists. That hole
 # is the one §8 already names for the in-container probe, not a new one.
 preflight_container_claude() {
-  local entry="$1" secret rc=0
+  local entry="$1" secret rc=0 network
+  # The secret reaches proxied runs only, so a claude container entry on any
+  # other network would run with no credential but the volume's file. The
+  # value itself, not `// "proxied"`: a default here would be a pass.
+  network="$(jq -r '.network // ""' <<< "$entry")"
+  if [[ "$network" != "proxied" ]]; then
+    PREFLIGHT_DETAIL="claude runs in a container need network: proxied to receive the token secret (this entry: '${network:-unset}')"
+    return 1
+  fi
   secret="$(container_claude_secret 2>/dev/null)" \
     || { PREFLIGHT_DETAIL="the claude secret name '${MEUTE_CLAUDE_SECRET:-}' is not a plain podman secret name"; return 1; }
   container_claude_secret_exists || rc=$?
@@ -108,7 +122,7 @@ preflight_container_codex() {
   local entry="$1" status
   local ENGINE_ARGV_ENGINE="codex"
   status="$(container_run "$entry" preflight codex "" "" -- codex login status 2>&1)" \
-    || { PREFLIGHT_DETAIL="codex login status failed inside the container - the volume may be empty; run: just auth"; return 1; }
+    || { PREFLIGHT_DETAIL="codex login status failed inside the container - the volume may be empty; in Atelier run: just auth-login codex"; return 1; }
   if ! grep -qi 'chatgpt' <<< "$status"; then
     PREFLIGHT_DETAIL="codex did not report a ChatGPT subscription inside the container (got: ${status})"
     return 1
