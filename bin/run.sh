@@ -689,6 +689,18 @@ run_entry() {
     ENGINE_STATUS="error"; ENGINE_DETAIL="engine exited ${rc}"
   fi
   [[ -n "$REPORT" ]] || { ENGINE_STATUS="error"; ENGINE_DETAIL="${ENGINE_DETAIL:-empty report}"; }
+  # The token secret was present at the preflight, but it can vanish before
+  # the build starts, and podman then refuses the container. Recorded as a
+  # build failure, that would count toward demoting the REPO (§7) for a
+  # credential it has nothing to do with. So a failed claude container run
+  # asks the preflight's own host-side question again, and an absent secret
+  # (podman's exit status 1 -- never its stderr) is logged as the preflight
+  # failure it is, with the preflight's detail.
+  if (( CONTAINER_MODE && rc != 0 )) && [[ "$engine" == "claude" ]]; then
+    if ! preflight_container "$entry" claude && [[ "$PREFLIGHT_SECRET_RC" == "1" ]]; then
+      LOG_STAGE="preflight"; ENGINE_STATUS="error"; ENGINE_DETAIL="preflight: ${PREFLIGHT_DETAIL}"
+    fi
+  fi
 
   # The self-budget gate only sees meute's own spend, never the subscription
   # it draws from -- a 429 here means the real pool is already gone and every

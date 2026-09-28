@@ -106,7 +106,8 @@ CONTAINER_CLAUDE_SECRET_ENV="CLAUDE_CODE_OAUTH_TOKEN"
 container_claude_secret() {
   local name="${MEUTE_CLAUDE_SECRET:-$CONTAINER_CLAUDE_SECRET_DEFAULT}"
   if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-    container_note "claude secret name '${name}' is not a plain podman secret name; refusing"
+    # Never echo the value: it is not a name, so it may be anything.
+    container_note "MEUTE_CLAUDE_SECRET is not a plain podman secret name (value not shown); refusing"
     return 1
   fi
   printf '%s\n' "$name"

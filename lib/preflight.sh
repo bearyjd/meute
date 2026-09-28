@@ -72,7 +72,7 @@ preflight() {
 # --------------------------------------------------------------------------
 preflight_container() {
   local entry="$1" engine="$2"
-  PREFLIGHT_DETAIL=""
+  PREFLIGHT_DETAIL=""; PREFLIGHT_SECRET_RC=""
   case "$engine" in
     claude) preflight_container_claude "$entry" ;;
     codex)  preflight_container_codex "$entry" ;;
@@ -106,9 +106,14 @@ preflight_container_claude() {
     PREFLIGHT_DETAIL="claude runs in a container need network: proxied to receive the token secret (this entry: '${network:-unset}')"
     return 1
   fi
+  # A rejected name is never echoed: it is not a secret name, so it may be
+  # anything -- a pasted token, or a tab or newline that splits the log line.
   secret="$(container_claude_secret 2>/dev/null)" \
-    || { PREFLIGHT_DETAIL="the claude secret name '${MEUTE_CLAUDE_SECRET:-}' is not a plain podman secret name"; return 1; }
+    || { PREFLIGHT_DETAIL="MEUTE_CLAUDE_SECRET is not a plain podman secret name (value not shown)"; return 1; }
   container_claude_secret_exists || rc=$?
+  # For the runner's post-failure re-check: which answer podman gave, by
+  # exit status, never by what it printed.
+  PREFLIGHT_SECRET_RC="$rc"
   case "$rc" in
     0) AUTH_MODE="oauth-token/secret:${secret}" ;;
     1) PREFLIGHT_DETAIL="claude token secret ${secret} is not present on the host; in Atelier run: just auth-login claude"
