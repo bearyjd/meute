@@ -3732,6 +3732,64 @@ STUB
   has "argv: a codex entry mounts the codex credential" "$argv" "atelier-auth-codex:/home/agent/.codex:z"
   hasnt "argv: ...and not claude's"                     "$argv" "atelier-auth-claude"
 
+  # PRP-004 §5: claude's credential is the atelier-claude-token secret,
+  # injected as CLAUDE_CODE_OAUTH_TOKEN -- on proxied runs only. A run with
+  # no network cannot use it, and Atelier's contract keeps it off them.
+  # Matched as whole argv elements, in order: `--secret` then its value.
+  is "argv (proxied): a claude run carries the token secret" \
+     "$(grep -x -A1 -- '--secret' "$root/argv-proxied")" \
+     "$(printf '%s\n%s' --secret 'atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN')"
+  is "argv (proxied): ...exactly once" "$(grep -cx -- '--secret' "$root/argv-proxied")" "1"
+  local noseq
+  for noseq in argv-none argv-pre; do
+    hasnt "argv (${noseq#argv-}): a claude run on no network gets no secret" \
+          "$(tr '\n' ' ' < "$root/${noseq}")" "--secret"
+  done
+  # The claude volume stays mounted beside the secret (§5): under a read-only
+  # root it is claude's only writable config directory.
+  has "argv (proxied): claude's volume stays mounted beside the secret" \
+      "$(tr '\n' ' ' < "$root/argv-proxied")" "atelier-auth-claude:/home/agent/.claude:z"
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    local e; e="$(jq -c '.engine = "codex" | .network = "proxied"' <<< "$entry")"
+    container_ready "$e" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=codex
+    container_argv "$e" build codex "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-codex-proxied"
+  argv="$(tr '\n' ' ' < "$root/argv-codex-proxied")"
+  has   "argv (proxied): a codex run is still proxied"      "$argv" "--network=atelier-internal"
+  hasnt "argv (proxied): ...and never carries claude's secret" "$argv" "--secret"
+  hasnt "argv (proxied): ...by any name"                    "$argv" "atelier-claude-token"
+  # The secret's name is overridable (MEUTE_CLAUDE_SECRET, for proving the
+  # refusal against a real host without deleting the real secret), and the
+  # override is validated: a comma would smuggle podman secret options --
+  # a second `target=` -- into the flag.
+  ( source "$REPO/lib/container.sh"
+    export MEUTE_PODMAN="$root/stub/podman"
+    container_ready "$entry" >/dev/null 2>&1
+    ENGINE_ARGV_ENGINE=claude
+    MEUTE_CLAUDE_SECRET=meute-other-token \
+      container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build claude "$root/work" "$root/out" -- true
+    printf '%s\n' "${CONTAINER_ARGV[@]}" ) > "$root/argv-override"
+  has "argv (proxied): an overridden secret name is the one injected" \
+      "$(tr '\n' ' ' < "$root/argv-override")" "--secret meute-other-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN"
+  local bogus rc out
+  for bogus in 'x,target=PATH' '' '-x' 'a b'; do
+    out="$( source "$REPO/lib/container.sh"
+            export MEUTE_PODMAN="$root/stub/podman"
+            container_ready "$entry" >/dev/null 2>&1
+            ENGINE_ARGV_ENGINE=claude
+            MEUTE_CLAUDE_SECRET="$bogus" \
+              container_argv "$(jq -c '.network = "proxied"' <<< "$entry")" build claude "$root/work" "$root/out" -- true 2>&1 )"; rc=$?
+    if [[ -z "$bogus" ]]; then
+      # Empty means unset: the default, not a refusal.
+      is "argv: an empty secret override falls back to the default" "$rc" "0"
+    else
+      is  "argv: a malformed secret name '${bogus}' is refused" "$rc" "1"
+      has "argv: ...with a reason"                                "$out" "secret"
+    fi
+  done
+
   # A tier that does not write code cannot write the branch it is reading.
   # git still works there: status, diff <base>...HEAD, log and show all
   # succeed on a read-only mount, provided it is still relabelled.
@@ -4357,6 +4415,7 @@ case "\$*" in
   *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
   *"{{.State.Running}}"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  "secret exists atelier-claude-token") exit 0 ;;
   *"claude auth status"*) printf '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}\n' ;;
   *" -p "*) printf '{"is_error":false,"result":"## Summary ran inside the container","total_cost_usd":0.01,"num_turns":1}\n' ;;
   *) exit 125 ;;
@@ -4377,15 +4436,18 @@ STUB
   has "dispatch: ...and the image that ran"  "$out" "image=${P2_ID:0:12}"
   has "dispatch: ...and the stage that ran"  "$out" "stage=build"
   has "dispatch: the pin was asserted first" "$(cat "$root/stub/podman-calls")" "{{.Digest}}"
-  # Two containers, in order: the credential probe with no network and no
-  # trees, then the engine with /work, /out and the proxied profile.
-  is  "dispatch: the preflight ran in a container of its own" \
-      "$(grep -c 'claude auth status' "$root/stub/podman-calls")" "1"
-  has "dispatch: ...on no network at all"   "$(grep 'claude auth status' "$root/stub/podman-calls")" "--network=none"
-  hasnt "dispatch: ...with no scratch tree" "$(grep 'claude auth status' "$root/stub/podman-calls")" "/work"
-  has "dispatch: ...and only its own credential" \
-      "$(grep 'claude auth status' "$root/stub/podman-calls")" "atelier-auth-claude:/home/agent/.claude:z"
+  # Claude's precondition is the token secret, checked on the host (§8). The
+  # in-container `claude auth status` probe of 2b is gone for claude: it ran
+  # on --network=none, which carries no secret, so it could only ever read
+  # the volume's revoked .credentials.json -- the wrong credential.
+  is  "dispatch: the claude precondition asks the host for the secret" \
+      "$(grep -cx 'secret exists atelier-claude-token' "$root/stub/podman-calls")" "1"
+  is  "dispatch: ...and no container probes the stale volume file" \
+      "$(grep -c 'claude auth status' "$root/stub/podman-calls")" "0"
   local engine_call; engine_call="$(grep -- '-p ' "$root/stub/podman-calls" | tail -1)"
+  has "dispatch: the engine carries the token secret" \
+      "$engine_call" "--secret atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN"
+  has "dispatch: ...on the proxied profile"                "$engine_call" "--network=atelier-internal"
   has "dispatch: the engine got the scratch tree at /work" "$engine_call" ":/work:"
   has "dispatch: ...and /out for its captures"             "$engine_call" ":/out:Z"
   has "dispatch: ...the image root read-only"              "$engine_call" "--read-only"
@@ -4393,48 +4455,84 @@ STUB
   hasnt "dispatch: ...and never the GitHub token"          "$(cat "$root/stub/podman-calls")" "atelier-auth-gh"
 }
 
-# The last precondition before an engine runs. The host may be logged in
-# while the volume the container reads is empty, signed out, or absent -- so
-# the probe runs inside, and a failure is remediable (`just auth`), which
-# makes it retryable under force rather than a discarded request.
+# The last precondition before an engine runs. For claude that is the token
+# secret (PRP-004 §5, §8), checked on the host: the in-container probe could
+# only ever read the volume's revoked file, because the preflight runs on
+# --network=none and no secret goes there. An absent secret is a REFUSAL,
+# never a fallback -- a proxied claude run without it falls back to the
+# volume's .credentials.json, and if that file is ever valid its refresh
+# revokes the host's token, which is the original race. Remediable (`just
+# auth-login claude`), so a forced refusal stays retryable.
 test_p2b_preflight() {
   local root="$FIXTURE/p2b-preflight"; p4_fixture "$root"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
   mkdir -p "$root/stub"
-  # A podman whose image verifies, but whose container reports a signed-out
-  # credential -- exactly the shape of an unpopulated auth volume.
-  cat > "$root/stub/podman" <<STUB
+  # A podman whose image verifies and whose proxy is up, but which holds no
+  # such secret (rc 1, podman's own answer), and whose container would even
+  # report a logged-in volume -- which must not be what lets the run go.
+  local secret_rc
+  for secret_rc in 1 125; do
+    rm -f "$root/stub/podman-calls"; : > "$root/state/cursor"
+    cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 echo "\$*" >> "$root/stub/podman-calls"
 case "\$*" in
   *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
   *"{{.State.Running}}"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
-  *"claude auth status"*) printf '{"loggedIn":false}\n' ;;
+  "secret exists"*) exit ${secret_rc} ;;
+  *"claude auth status"*) printf '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}\n' ;;
+  *" -p "*) printf '{"is_error":false,"result":"## Summary ran","total_cost_usd":0.01,"num_turns":1}\n' ;;
   *) exit 125 ;;
 esac
 STUB
-  chmod +x "$root/stub/podman"
-  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
-    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
-  local out
+    chmod +x "$root/stub/podman"
+    yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+      "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+    local out
+    out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+           "$root/bin/run.sh" daily --repo netlens 2>&1)"
+    has "preflight (rc ${secret_rc}): no token secret stops the run" "$out" "status=error"
+    has "preflight (rc ${secret_rc}): ...naming the secret"          "$out" "atelier-claude-token"
+    has "preflight (rc ${secret_rc}): ...and how to create it"       "$out" "just auth-login claude"
+    if (( secret_rc == 1 )); then
+      has "preflight (rc 1): ...saying it is absent"           "$out" "not present"
+    else
+      # A podman that cannot answer is not a podman that said yes.
+      has "preflight (rc 125): ...saying it could not be checked" "$out" "could not check"
+    fi
+    has   "preflight (rc ${secret_rc}): the host was asked" "$(cat "$root/stub/podman-calls")" "secret exists atelier-claude-token"
+    hasnt "preflight (rc ${secret_rc}): ...before any engine was invoked" "$(cat "$root/stub/podman-calls")" " -p "
+    hasnt "preflight (rc ${secret_rc}): ...and the volume was never consulted instead" \
+          "$(cat "$root/stub/podman-calls")" "claude auth status"
+    # Remediable, so forced it stays retryable -- the operator creates the
+    # secret and asks for the same repo again.
+    is  "preflight (rc ${secret_rc}): a forced refusal leaves the cursor alone" \
+        "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
+    # §4.4 wants the stage named, and §7's demotion rule excludes
+    # stage=preflight lines BY NAME: logged as `-`, a missing credential
+    # counts toward demoting a repo for a reason that has nothing to do with it.
+    local line; line="$(tail -1 "$root/state/log")"
+    has "preflight (rc ${secret_rc}): the line names the stage"       "$line" "stage=preflight"
+    has "preflight (rc ${secret_rc}): ...and the runtime it was in"   "$line" "runtime=container"
+    has "preflight (rc ${secret_rc}): ...and the image it would run"  "$line" "image=${P2_ID:0:12}"
+  done
+
+  # The override names the secret that is checked, so the refusal can be
+  # proven against a real host without touching the real secret.
+  rm -f "$root/stub/podman-calls"; : > "$root/state/cursor"
+  sed -i 's/^  "secret exists"\*) exit 125 ;;$/  "secret exists atelier-claude-token") exit 0 ;;\n  "secret exists"*) exit 1 ;;/' "$root/stub/podman"
+  out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         MEUTE_CLAUDE_SECRET=meute-no-such-token "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  has   "preflight: an overridden secret name is the one checked" "$(cat "$root/stub/podman-calls")" "secret exists meute-no-such-token"
+  has   "preflight: ...and its absence refuses"                   "$out" "meute-no-such-token"
+  hasnt "preflight: ...before any engine was invoked"             "$(cat "$root/stub/podman-calls")" " -p "
+  # And the stub really does say yes to the real name: without the override
+  # the same fixture runs, so the refusal above is the override's doing.
+  rm -f "$root/stub/podman-calls"; : > "$root/state/cursor"
   out="$(PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
          "$root/bin/run.sh" daily --repo netlens 2>&1)"
-  has "preflight: a signed-out volume stops the run"   "$out" "status=error"
-  has "preflight: ...saying what to do about it"       "$out" "not logged in inside the container"
-  has "preflight: ...and naming just auth"             "$out" "just auth"
-  hasnt "preflight: ...before any engine was invoked"  "$(cat "$root/stub/podman-calls")" "\-p "
-  # Remediable, so forced it stays retryable -- the operator runs `just auth`
-  # and asks for the same repo again.
-  is  "preflight: a forced refusal leaves the cursor alone" \
-      "$(kv_get_test "$root/state/cursor" cursor.daily)" ""
-  # §4.4 wants the stage named, and §7's demotion rule excludes
-  # stage=preflight lines BY NAME: logged as `-`, a signed-out credential
-  # counts toward demoting a repo for a reason that has nothing to do with it.
-  local line; line="$(tail -1 "$root/state/log")"
-  has "preflight: the line names the stage"       "$line" "stage=preflight"
-  has "preflight: ...and the runtime it was in"   "$line" "runtime=container"
-  has "preflight: ...and the image it would run"  "$line" "image=${P2_ID:0:12}"
+  has "preflight: with the secret present the same entry runs" "$out" "status=ok"
 }
 
 # The probe makes two scratch directories. If the second cannot be made, the
@@ -4689,6 +4787,7 @@ case "\$*" in
   *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
   *"{{.State.Running}}"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  "secret exists atelier-claude-token") exit 0 ;;
   *"claude auth status"*) printf '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}\n' ;;
   *"codex login status"*) printf 'Logged in using ChatGPT\n' ;;
   *" -p "*) printf '{"is_error":false,"result":"## Summary ran","total_cost_usd":0.01,"num_turns":1}\n' ;;
@@ -4718,6 +4817,9 @@ STUB
   hasnt "override: ...and never claude's"                      "$calls" "atelier-auth-claude"
   has   "override: ...and it is codex that is probed"          "$calls" "codex login status"
   hasnt "override: ...not the engine the entry named"          "$calls" "claude auth status"
+  # Claude's secret follows the engine that runs, exactly as its volume does.
+  hasnt "override: ...nor claude's secret checked"             "$calls" "secret exists"
+  hasnt "override: ...nor claude's secret injected"            "$calls" "--secret"
 
   # And the reverse, so the fix is not one-directional.
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" "d['repos'][0]['engine'] = 'codex'"
@@ -4725,6 +4827,9 @@ STUB
   calls="$(cat "$root/stub/podman-calls")"
   has   "override: --engine claude on a codex entry mounts claude's" "$calls" "atelier-auth-claude"
   hasnt "override: ...and never codex's"                             "$calls" "atelier-auth-codex"
+  has   "override: ...checks claude's secret on the host"            "$calls" "secret exists atelier-claude-token"
+  has   "override: ...and injects it into the engine run" \
+        "$(grep -- ' -p ' <<< "$calls")" "--secret atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN"
 
   # The invariant that keeps this fixed is these assertions, not a grep for
   # a spelling. There WAS such a grep here -- `jq -r '.engine` counted in
