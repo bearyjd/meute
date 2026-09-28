@@ -1074,10 +1074,14 @@ What running it disclosed:
 ### Claude token secret -- the credential the run uses, checked where it lives (2026-09-27)
 
 Branch `feat/claude-token-secret` off `7e24a49`. Baseline 932 assertions
--> 970, every new one red first; each new guard mutation-checked (secret on
-a no-network run, on a codex run, never injected, absent secret passing,
+-> 970. 35 of the new assertions were red first. The rest assert an
+absence (no `--secret` on a no-network or codex run, the volume still
+mounted), which cannot fail before the flag exists, so mutation proves
+them instead. Each new guard was mutated in turn, and every mutation
+turned the suite red: the secret on a no-network run, the secret on a
+codex run, the secret never injected, an absent secret passing, an
 unanswerable podman passing, the check skipped, the name unvalidated, the
-override ignored -- every mutation turned the suite red).
+override ignored.
 
 - **The claude preflight left the container.** It ran on
   `--network=none`, and the secret goes only to proxied runs, so the
@@ -1104,9 +1108,14 @@ override ignored -- every mutation turned the suite red).
   - A real `claude -p --model haiku` returned `is_error: false`, `result:
     ok`, $0.016. The volume's token is revoked, so the secret is what
     authenticated.
+  - The volume's `.credentials.json` still has its 2026-09-23 mtime after
+    the run (only `stat` was used, never the contents), so the env var won
+    and nothing wrote the file.
   - Podman itself refuses to start a container naming a missing secret
     (`rc=125`, `no such secret`), a second fail-closed layer under the
-    preflight.
+    preflight. One narrow gap remains: a secret deleted between the
+    preflight and the run fails at `stage=build`, not `stage=preflight`, so
+    §7's demotion exclusion does not cover it.
   - The control run was deliberately **not** made: a proxied claude run
     without the secret would fall back to the volume file and try to
     refresh it, which is the race this change exists to end.

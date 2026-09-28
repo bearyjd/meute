@@ -13,8 +13,8 @@ run. This file says only where things stand and what to do next.
 | PRP-004 Phase 2a (container boundary, no credential) | Merged, `#27` |
 | PRP-004 Phase 2b (engine runs inside the boundary) | Merged, `#28` as `7e24a49` |
 | Claude token secret (step 4) | **Built on `feat/claude-token-secret`** (worktree `../meute-wt-claude-secret`), 970 / 0. Proxied claude runs carry `atelier-claude-token` as `CLAUDE_CODE_OAUTH_TOKEN`, and the claude precondition is a host-side `podman secret exists` that refuses when the secret is missing. Real-container run green on `g691e067` (§11). Still to do: a Codex adversarial round, then a PR |
-| Live fleet | Healthy on `main` (`baa0137`). Timers armed; last run `status=ok` 2026-09-27. **No repo is `runtime: container`**, so nothing above changes what a fire does |
-| Atelier pin | `agent-base:g691e067` = `sha256:9ac5558d…`. `g9d76449` = `sha256:ba67b80e…` is built and its diff is read; bump waits on `#28` |
+| Live fleet | The live checkout is on `main` at `7e24a49` (read 2026-09-27). Its health has not been re-checked since `baa0137`. Timers armed; last run `status=ok` 2026-09-27. **No repo is `runtime: container`**, so nothing above changes what a fire does |
+| Atelier pin | `agent-base:g691e067` = `sha256:9ac5558d…`. `g9d76449` = `sha256:ba67b80e…` is built and its diff is read; the bump waits on step 4 |
 | `atelier-auth-claude` | **Revoked** and left that way on purpose (§5): the host refreshed and invalidated the copy (§11, Phase 2b). It is still mounted as claude's config directory. The credential is now the `atelier-claude-token` secret, which the owner populated 2026-09-27 |
 | `atelier-auth-codex` | Working; its own copy, not yet refreshed out from under it |
 
