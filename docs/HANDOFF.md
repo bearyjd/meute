@@ -1,6 +1,6 @@
 # Handoff — Meute
 
-**As of:** 2026-09-27 (updated after Atelier `317b951`). **Repo:** `https://github.com/bearyjd/meute` (public, `main`).
+**As of:** 2026-09-27 (updated after `#28` merged and the claude secret branch was built). **Repo:** `https://github.com/bearyjd/meute` (public, `main`).
 **Read first:** `docs/prp/PRP-004-container-review-publish.md` — §5 is the Atelier
 contract, §8 the open items, §11 what each phase disclosed, §12 how reviews are
 run. This file says only where things stand and what to do next.
@@ -11,33 +11,36 @@ run. This file says only where things stand and what to do next.
 |---|---|
 | PRP-004 Phase 1 (schema, plumbing, log columns) | Merged, `#23` |
 | PRP-004 Phase 2a (container boundary, no credential) | Merged, `#27` |
-| PRP-004 Phase 2b (engine runs inside the boundary) | **PR `#28` open**, 15 commits, head `665ddf6`, 932 / 0; Codex round five Approve |
+| PRP-004 Phase 2b (engine runs inside the boundary) | Merged, `#28` as `7e24a49` |
+| Claude token secret (step 4) | **Built on `feat/claude-token-secret`** (worktree `../meute-wt-claude-secret`), 970 / 0. Proxied claude runs carry `atelier-claude-token` as `CLAUDE_CODE_OAUTH_TOKEN`, and the claude precondition is a host-side `podman secret exists` that refuses when the secret is missing. Real-container run green on `g691e067` (§11). Still to do: a Codex adversarial round, then a PR |
 | Live fleet | Healthy on `main` (`baa0137`). Timers armed; last run `status=ok` 2026-09-27. **No repo is `runtime: container`**, so nothing above changes what a fire does |
 | Atelier pin | `agent-base:g691e067` = `sha256:9ac5558d…`. `g9d76449` = `sha256:ba67b80e…` is built and its diff is read; bump waits on `#28` |
-| `atelier-auth-claude` | **Revoked.** Host refreshed and invalidated the copy (§11, Phase 2b). Container claude runs 401 at cost 0 |
+| `atelier-auth-claude` | **Revoked** and left that way on purpose (§5): the host refreshed and invalidated the copy (§11, Phase 2b). It is still mounted as claude's config directory. The credential is now the `atelier-claude-token` secret, which the owner populated 2026-09-27 |
 | `atelier-auth-codex` | Working; its own copy, not yet refreshed out from under it |
 
 ## In flight
 
-- **Worktree** `../meute-wt-prp004-phase1`, branch `feat/prp-004-phase-2b`, level
-  with origin, clean. The live checkout stays on `main` — the timers run
-  `bin/run.sh` from it.
-- **Contract change, half built** (§5): Claude moves from a mounted
+- **Worktree** `../meute-wt-claude-secret`, branch `feat/claude-token-secret`
+  off `7e24a49`, not pushed. The live checkout stays on `main` — the timers
+  run `bin/run.sh` from it.
+- **Contract change, built on both sides** (§5): Claude moves from a mounted
   `.credentials.json` to the `atelier-claude-token` secret injected as
-  `CLAUDE_CODE_OAUTH_TOKEN`. **Atelier built it** (`317b951`, with the `:z`
-  fix in `e779ec0`); **Meute has not**, and the secret is not populated yet.
+  `CLAUDE_CODE_OAUTH_TOKEN`. Atelier built its side in `317b951` (the `:z`
+  fix is `e779ec0`). Meute's side is on the branch above and has not had
+  its review yet. The secret is populated.
 
 ## Decisions the owner holds, in order
 
-1. **Merge `#28`.** Changes no fire until a repo opts into `runtime: container`.
+1. ~~Merge `#28`~~ -- done, `7e24a49`.
 2. ~~Give Atelier its go~~ — done; `:z` and `just auth-login` are pushed.
 3. **Run the logins**, in the Atelier repo: `just auth-login claude` and
-   `just auth-login codex` — one browser step each. Do **not** re-run
+   `just auth-login codex` — one browser step each. Claude's is done:
+   `atelier-claude-token` exists as of 2026-09-27. Do **not** re-run
    `just auth` for claude or codex; it now copies only gh, by design.
-4. Then Meute: add the secret to proxied claude runs in `lib/container.sh`
-   (not `--network=none` ones), make the claude precondition check the
-   secret host-side rather than the stale volume file (§8), re-verify
-   claude-in-container, and `meute image bump` to `g9d76449`. The secret
+4. Then Meute. **Built on `feat/claude-token-secret` and verified in a real
+   container** (§11, "Claude token secret"): the secret goes on proxied
+   claude runs, and the claude precondition is host-side and fails closed.
+   Still open: the Codex round, the PR, and `meute image bump` to `g9d76449`. The secret
    change touches the credential path, so it gets a Codex round.
    Treat the bump as a test of the command too: check the backup lands beside
    the resolved file and the digest written is what `podman image inspect`

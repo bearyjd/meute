@@ -369,7 +369,7 @@ Fixed by Atelier's audit; Meute does not re-decide them:
 | Proxy name resolution | `atelier-internal` is created with `--disable-dns` (podman ordered the proxy's nameservers non-deterministically on two networks; ~1 start in 4 lost public DNS), so container names do not resolve there. Every `proxied` run passes `--add-host atelier-egress:<ip>`, `<ip>` read at run time: `podman inspect atelier-egress --format '{{(index .NetworkSettings.Networks "atelier-internal").IPAddress}}'`. `HTTPS_PROXY=http://atelier-egress:3128` unchanged; `none` unaffected | 4.2, Atelier Phase 2 finding 2026-09-21 |
 | Tag availability | `g<sha>` is emitted only from a clean committed tree. **Atelier's first commit is `691e067` (2026-09-22)**, so the tags exist: `agent-base:g691e067` = `sha256:9ac5558d3ffd…`, `agent-example:g691e067` = `sha256:10878437f596…`. `agent-example` is the reference overlay, not a fleet project; per-project images come from `containers/<project>/` as they are added | response below, verified on the host |
 | Credential import | **Superseded, 2026-09-23.** `just auth` copied the host's credentials into volumes; the refresh collision (§11, Phase 2b) proved that wrong for Claude and Codex, and Atelier now documents it as gh-only. The replacement, agreed but **not yet built**: `claude setup-token` mints a long-lived subscription token with no refresh to collide, held as a Podman secret and injected as `CLAUDE_CODE_OAUTH_TOKEN`; `codex login --device-auth` gives the codex volume its own refresh pair by logging in **inside** a container rather than by copying; `gh auth login --with-token` covers gh from a PAT on stdin | response below |
-| **Claude token secret** (built by Atelier `317b951`, 2026-09-27; Meute side **not yet built**) | Proxied runs that call claude add `--secret atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN`; **not** on `--network=none` runs. Populated by the owner with `just auth-login claude` (pastes `claude setup-token` output; long-lived, no refresh in the container, so the 401 race cannot recur). Resolved at container start: rotation is `secret create --replace` plus a restart, and a container naming a deleted secret fails to start. The token sits in plaintext in the container's `config.json` and `/proc/<pid>/environ` for its lifetime; revoke a leak at claude.ai. The `atelier-auth-claude` volume stays mounted rw with its revoked `.credentials.json` left in place — the env var takes precedence. Codex: `just auth-login codex` re-logs the volume with device-auth inside a container; never `codex logout` against it. gh: `just auth-login gh <volume>` from a PAT on stdin, **refused while any container, stopped ones included, mounts the target** — remove Meute's containers on that volume first. `just auth` now copies only the owner's gh `hosts.yml`. Image content unchanged; `g9d76449` still stands | Atelier AUDIT §4.1 "Built", README "Claude token secret" row |
+| **Claude token secret** (built by Atelier `317b951`, 2026-09-27; Meute side built on `feat/claude-token-secret`, 2026-09-27, pending review) | Proxied runs that call claude add `--secret atelier-claude-token,type=env,target=CLAUDE_CODE_OAUTH_TOKEN`; **not** on `--network=none` runs. Populated by the owner with `just auth-login claude` (pastes `claude setup-token` output; long-lived, no refresh in the container, so the 401 race cannot recur). Resolved at container start: rotation is `secret create --replace` plus a restart, and a container naming a deleted secret fails to start. The token sits in plaintext in the container's `config.json` and `/proc/<pid>/environ` for its lifetime; revoke a leak at claude.ai. The `atelier-auth-claude` volume stays mounted rw with its revoked `.credentials.json` left in place — the env var takes precedence. Codex: `just auth-login codex` re-logs the volume with device-auth inside a container; never `codex logout` against it. gh: `just auth-login gh <volume>` from a PAT on stdin, **refused while any container, stopped ones included, mounts the target** — remove Meute's containers on that volume first. `just auth` now copies only the owner's gh `hosts.yml`. Image content unchanged; `g9d76449` still stands | Atelier AUDIT §4.1 "Built", README "Claude token secret" row |
 | Smoke test | Atelier's `tests/smoke.sh` is Phase 2's precondition | 5 |
 
 Four things go **back** to Atelier, raised by this PRP's review (§12).
@@ -671,7 +671,7 @@ phase cannot quietly change them.
 | Item | Resolved by |
 |---|---|
 | A Codex quota probe, or an explicit stubbed reading for the observation week | owner, before Phase 3 |
-| **The claude preflight checks the wrong credential once the secret lands.** Atelier says not to inject the secret on `--network=none` runs, and the preflight is one; the volume keeps its revoked `.credentials.json`, so `claude auth status` there reads the stale file and reports `loggedIn: true` while the real run uses the secret. It already could not see revocation (Phase 2b); now it would not even look at the credential the run uses. Design input for the Meute change: check the secret's presence host-side (`podman secret inspect atelier-claude-token`) as the claude precondition, which is zero-cost and tests the right thing. Atelier agreed, and added the stronger reason: a proxied claude run *without* the secret falls back to the volume's `.credentials.json`, and if that file is ever valid its refresh revokes the host's token — the original race. So a missing secret must be a **refusal**, never a fallback; the host-side check has to fail closed, the same rule as the absent engine claim in Phase 2b | Meute, with the secret change |
+| **The claude preflight checks the wrong credential once the secret lands.** Atelier says not to inject the secret on `--network=none` runs, and the preflight is one; the volume keeps its revoked `.credentials.json`, so `claude auth status` there reads the stale file and reports `loggedIn: true` while the real run uses the secret. It already could not see revocation (Phase 2b); now it would not even look at the credential the run uses. Design input for the Meute change: check the secret's presence host-side (`podman secret inspect atelier-claude-token`) as the claude precondition, which is zero-cost and tests the right thing. Atelier agreed, and added the stronger reason: a proxied claude run *without* the secret falls back to the volume's `.credentials.json`, and if that file is ever valid its refresh revokes the host's token — the original race. So a missing secret must be a **refusal**, never a fallback; the host-side check has to fail closed, the same rule as the absent engine claim in Phase 2b. **Built** on `feat/claude-token-secret` (§11, "Claude token secret"): `podman secret exists` host-side replaces the in-container claude probe; absent and unanswerable both refuse. It proves presence, not validity -- the revocation hole in the row below is unchanged | Meute, with the secret change -- built, pending Codex round |
 | **Do not read Phase 3's first data as a provider difference.** `atelier-auth-claude` is revoked (§11, Phase 2b): until per-volume `just auth-login`, a container claude run 401s at cost 0 while codex runs green. Side by side in `state/log` that reads exactly like a codex-vs-claude finding and is a credential one. Fix the credential before the observation week, or the week measures the wrong thing | owner, before Phase 3 |
 | `just auth` — putting real credentials into the Atelier volumes, which is what verifies the OAuth-refresh hostnames and unblocks Phase 2's gate; held by Atelier because of the rotation risk (§5 item 3) | **owner** |
 | ~~Atelier's first commit — no `g<sha>` tag exists before it~~ — done: `691e067`, tags and digests verified on the host (§11). The pin is deliberately **not** Atelier HEAD, which has moved on; a pin follows a human reading the diff and running `meute image bump`, which is the whole point of pinning | resolved 2026-09-22 |
@@ -1070,6 +1070,47 @@ What running it disclosed:
   in both runtimes and changed nothing, reporting that the repository has
   adopted no linter and that introducing one is the owner's decision. Worth
   keeping in mind when reading `commit=none`.
+
+### Claude token secret -- the credential the run uses, checked where it lives (2026-09-27)
+
+Branch `feat/claude-token-secret` off `7e24a49`. Baseline 932 assertions
+-> 970, every new one red first; each new guard mutation-checked (secret on
+a no-network run, on a codex run, never injected, absent secret passing,
+unanswerable podman passing, the check skipped, the name unvalidated, the
+override ignored -- every mutation turned the suite red).
+
+- **The claude preflight left the container.** It ran on
+  `--network=none`, and the secret goes only to proxied runs, so the
+  in-image `claude auth status` could only read the volume's revoked
+  `.credentials.json`. It is now `podman secret exists` on the host. Absent
+  (rc 1) and unanswerable (any other rc) both refuse through
+  `abort_precondition` with `stage=preflight`. Codex keeps its in-container
+  probe.
+- **`--secret` follows the network profile, not the stage name.**
+  `container_argv` adds it when the stage runs an engine, the engine is
+  claude, and the profile `container_network_argv` chose is not
+  `--network=none`. There is one authority for which runs are networked.
+- **The claude volume stays mounted**, as §5 has it. Under `--read-only`
+  it is claude's only writable config directory, and the env var takes
+  precedence over the revoked file. Removing it would need a tmpfs for
+  `~/.claude`, which has not been measured.
+- **Measured on the host, 2026-09-27**, against `agent-base:g691e067` (the
+  current pin) on the live proxy. The value was never read. Results:
+  - The preflight passes against the real secret.
+  - `MEUTE_CLAUDE_SECRET=meute-no-such-token` refuses, naming the secret
+    and `just auth-login claude`.
+  - Inside the container, `CLAUDE_CODE_OAUTH_TOKEN` is present (tested with
+    `[ -n ]` only).
+  - A real `claude -p --model haiku` returned `is_error: false`, `result:
+    ok`, $0.016. The volume's token is revoked, so the secret is what
+    authenticated.
+  - Podman itself refuses to start a container naming a missing secret
+    (`rc=125`, `no such secret`), a second fail-closed layer under the
+    preflight.
+  - The control run was deliberately **not** made: a proxied claude run
+    without the secret would fall back to the volume file and try to
+    refresh it, which is the race this change exists to end.
+
 
 ## 12. Review record
 
