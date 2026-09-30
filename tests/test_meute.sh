@@ -2291,6 +2291,20 @@ end"
   out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main 2>/dev/null
           echo "$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_KEY_1"' _ "$lib" "$root/repo")"
   is  "no-lfs: a caller's own GIT_CONFIG_ entries are kept, not overwritten" "$out" "5 x.y filter.lfs.process"
+  # An inherited count the arithmetic would trip on. git reads it with
+  # strtol: " 1" is 1 and 08 is 8 to git, so the list is appended after the
+  # caller's entries, never over them. A count git itself rejects ("junk")
+  # fails the check first: no override, a note, and the run goes on.
+  local -a keys8=(); local k; for k in 0 1 2 3 4 5 6 7; do keys8+=( "GIT_CONFIG_KEY_$k=x.k$k" "GIT_CONFIG_VALUE_$k=v" ); done
+  local count_probe='set -Eeuo pipefail; source "$1"; scratch_git_env "$2" main 2>&1
+          echo "count=$GIT_CONFIG_COUNT ${GIT_CONFIG_KEY_0:-} ${GIT_CONFIG_KEY_1:-} ${GIT_CONFIG_KEY_8:-}"'
+  out="$(env "${keys8[@]}" GIT_CONFIG_COUNT=08 PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
+  has "no-lfs: an inherited GIT_CONFIG_COUNT of 08 is decimal, appended after" "$out" "count=12 x.k0 x.k1 filter.lfs.process"
+  out="$(GIT_CONFIG_COUNT=" 1" GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
+  has "no-lfs: an inherited count with a leading space keeps the caller's entry" "$out" "count=5 x.y filter.lfs.process"
+  out="$(GIT_CONFIG_COUNT=junk PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
+  has "no-lfs: a count git rejects applies no override, and the run goes on" "$out" "count=junk"
+  has "no-lfs: ...saying it could not tell"                                  "$out" "could not tell"
 
   # The tree being checked out decides, not the owner's index: the owner may
   # sit on a branch from before LFS arrived, or after it left.

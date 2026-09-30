@@ -64,6 +64,13 @@ scratch_git_env() {
        return 0 ;;
   esac
   local n="${GIT_CONFIG_COUNT:-0}" kv
+  # Appended after what the caller already set, read as git reads it
+  # (strtol): leading blanks skipped, 08 decimal rather than bad octal. A
+  # count that is no number at all failed the git grep above already; the
+  # fallback only keeps the arithmetic from ending the run.
+  n="${n#"${n%%[![:space:]]*}"}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  n=$(( 10#$n ))
   for kv in filter.lfs.process= filter.lfs.smudge= filter.lfs.clean= \
             filter.lfs.required=false; do
     export "GIT_CONFIG_KEY_${n}=${kv%%=*}" "GIT_CONFIG_VALUE_${n}=${kv#*=}"
