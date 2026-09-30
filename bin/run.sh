@@ -737,7 +737,8 @@ run_entry() {
   if (( WRITES_CODE )); then
     local commit_rc=0
     committed="$(commit_worktree "$repo" "$task" "$lens")" || commit_rc=$?
-    # 3: a refusal commit_worktree names on stdout; nothing was committed.
+    # 3: a refusal commit_worktree names on stdout (an LFS blob, or a commit
+    # git itself refused); nothing was committed.
     if (( commit_rc == 3 )); then abort_entry "$entry" "$committed"; fi
     (( commit_rc == 0 )) || exit "$commit_rc"
   fi
@@ -959,8 +960,12 @@ commit_worktree() {
       printf 'lfs-files-changed-without-git-lfs: %s\n' "${#lfs_paths[@]}"; return 3
     fi
   fi
+  # A commit git refused -- the owner's pre-commit, say -- is the run's
+  # failure; under $(...) set -e never sees it, and HEAD would still name
+  # the base as if it were this run's commit.
   git -C "$WORKTREE" "${ident[@]}" commit -q -m "$(printf 'chore: %s (%s)\n\nUnattended meute run on %s.\nTask: %s%s\nReview before merging; nothing here has been pushed.' \
-      "$task" "$repo" "$DATE" "$task" "$([[ "$lens" != "none" ]] && printf ' (lens: %s)' "$lens")")"
+      "$task" "$repo" "$DATE" "$task" "$([[ "$lens" != "none" ]] && printf ' (lens: %s)' "$lens")")" \
+    || { printf 'commit-failed\n'; return 3; }
   git -C "$WORKTREE" rev-parse --short HEAD
 }
 

@@ -2410,6 +2410,10 @@ PY2
   [[ -f "$root/pre-commit-ran" ]] && ok "lfs run: the owner's pre-commit still runs at the commit" \
     || bad "lfs run: the owner's pre-commit still runs at the commit" "no marker; hooks were off for the commit"
   is    "lfs run: ...and a failing one still stops the commit" "$(branches)" "0"
+  # ...and the run says so. A refused commit used to be logged status=ok with
+  # the base as its commit, since nothing checked git commit's own status.
+  has   "lfs run: ...a refused commit is an error"            "$(tail -1 "$root/state/log")" "status=error"
+  has   "lfs run: ...named as the commit's failure"           "$(tail -1 "$root/state/log")" "detail=commit-failed"
   rm -f "$repo/.git/hooks/pre-commit"
 
   # With the clean filter off, `git add -A` stores an edited LFS file as a
