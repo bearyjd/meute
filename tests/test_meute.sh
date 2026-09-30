@@ -2394,7 +2394,12 @@ if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max",
 here="$(dirname "${BASH_SOURCE[0]}")"
 : > "$here/engine-ran"
 edit="$(cat "$here/edit")"
-[[ -z "$edit" ]] || printf 'changed by the stub\n' >> "$edit"
+if [[ "$edit" == commit:* ]]; then
+  # An engine committing on its own, in the worktree it was started in.
+  printf 'full content, not a pointer\n' > "${edit#commit:}"
+  git add -- "${edit#commit:}" && git -c user.email=e@e -c user.name=e commit -qm "engine's own"
+  git rev-parse HEAD > "$here/engine-commit"
+elif [[ -n "$edit" ]]; then printf 'changed by the stub\n' >> "$edit"; fi
 jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
 STUB
   chmod +x "$root/stub/claude"
@@ -2450,6 +2455,23 @@ PY2
         "$(grep -F 'git grep' "$root/trace")" "$base_sha"
   has   "lfs run: ...and the worktree is added from that same SHA" \
         "$(grep -F 'worktree add' "$root/trace")" "$base_sha"
+
+  # writes_code:false is not a promise the engine cannot commit. A branch
+  # that moved off the base under the override carries full blobs, so the
+  # run is an error and the branch is deleted however it moved.
+  printf 'commit:big.bin\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task r 2>&1)"
+  line="$(tail -1 "$root/state/log")"
+  has   "lfs run: a read-only engine that commits under the override is an error" "$line" "status=error"
+  has   "lfs run: ...named as the branch having moved"        "$line" "detail=lfs-branch-moved-without-git-lfs"
+  local engine_commit; engine_commit="$(cat "$root/stub/engine-commit" 2>/dev/null)"
+  [[ -n "$engine_commit" ]] && ok "lfs run: ...the stub really committed" \
+    || bad "lfs run: ...the stub really committed" "no commit recorded"
+  is    "lfs run: ...and no meute branch is left"             "$(branches "$repo")" "0"
+  is    "lfs run: ...nor any ref that reaches its commit" \
+        "$(git -C "$repo" for-each-ref --contains "${engine_commit:-HEAD}" | wc -l)" "0"
+  is    "lfs run: ...nor any worktree"                        "$(git -C "$repo" worktree list | wc -l)" "1"
+  : > "$root/stub/edit"
 
   # A write tier on a repo without LFS is unaffected. The owner's pre-commit
   # runs, and a failing one stops the commit -- and the run says so: a
@@ -4904,6 +4926,57 @@ STUB
   hasnt "dispatch: ...and never the GitHub token"          "$(cat "$root/stub/podman-calls")" "atelier-auth-gh"
 }
 
+# The container side of lfs-branch-moved-without-git-lfs: an LFS repo on a
+# host without git-lfs, a read-only tier, and an engine that commits in the
+# scratch clone anyway. Nothing may be fetched back into the owner's repo.
+test_p2b_lfs_branch_moved() {
+  local root="$FIXTURE/p2b-lfs"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub" "$root/nolfs"
+  local f; for f in /usr/bin/*; do [[ "${f##*/}" == git-lfs ]] || ln -s "$f" "$root/nolfs/"; done
+  ( cd "$root/git-netlens" || exit 1
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes && git -c user.email=t@t -c user.name=t commit -qm lfs )
+  # The engine call commits in the host directory mounted at /work, as an
+  # engine given a writable tree could.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  "secret exists atelier-claude-token") exit 0 ;;
+  *" -p "*)
+    work="\$(printf '%s\n' "\$@" | sed -n 's|^\(.*\):/work:.*|\1|p' | head -1)"
+    printf 'full content\n' > "\$work/big.bin"
+    git -C "\$work" add big.bin && git -C "\$work" -c user.email=e@e -c user.name=e commit -qm "engine's own"
+    git -C "\$work" rev-parse HEAD > "$root/stub/engine-commit"
+    printf '{"is_error":false,"result":"## Summary ran inside the container","total_cost_usd":0.01,"num_turns":1}\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local out line sha
+  out="$(PATH="$root/stub:$root/nolfs" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  line="$(tail -1 "$root/state/log")"
+  sha="$(cat "$root/stub/engine-commit" 2>/dev/null)"
+  [[ -n "$sha" ]] && ok "lfs container: the engine really committed in the clone" \
+    || bad "lfs container: the engine really committed in the clone" "no commit recorded: $out"
+  has "lfs container: the run is an error"            "$line" "status=error"
+  has "lfs container: ...named as the branch having moved" "$line" "detail=lfs-branch-moved-without-git-lfs"
+  is  "lfs container: ...no meute branch in the owner's repo" \
+      "$(git -C "$root/git-netlens" branch --list 'meute/*' | wc -l)" "0"
+  is  "lfs container: ...no import aside either" \
+      "$(git -C "$root/git-netlens" for-each-ref refs/meute | wc -l)" "0"
+  git -C "$root/git-netlens" cat-file -e "${sha:-0000000}" 2>/dev/null \
+    && bad "lfs container: ...and the commit was never fetched" "it is in the owner's object store" \
+    || ok "lfs container: ...and the commit was never fetched"
+}
+
 # The last precondition before an engine runs. For claude that is the token
 # secret (PRP-004 §5, §8), checked on the host: the in-container probe could
 # only ever read the volume's revoked file, because the preflight runs on
@@ -5709,6 +5782,7 @@ test_p2_isolation
 test_p2_proxied_egress
 test_p2_container_probe
 test_p2b_container_dispatch
+test_p2b_lfs_branch_moved
 test_p2b_preflight
 test_p2b_secret_vanishes
 test_p2b_pidfile_signal_cleanup

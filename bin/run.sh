@@ -102,6 +102,7 @@ REPO_PATH=""
 WORKTREE=""
 CONTAINER_MODE=0
 SCRATCH_LFS_OVERRIDE=0
+DISCARD_BRANCH=0
 OUT_DIR=""
 BRANCH=""
 BASE_SHA=""
@@ -167,7 +168,9 @@ cleanup() {
   fi
   if [[ -n "$BRANCH" && -n "$REPO_PATH" && -n "$BASE_SHA" ]] \
      && git -C "$REPO_PATH" rev-parse --verify -q "$BRANCH" >/dev/null 2>&1; then
-    if [[ "$(git -C "$REPO_PATH" rev-parse "$BRANCH")" == "$BASE_SHA" ]]; then
+    # A branch still at the base holds nothing; one marked for discard holds
+    # what must not survive (lfs-branch-moved-without-git-lfs).
+    if (( DISCARD_BRANCH )) || [[ "$(git -C "$REPO_PATH" rev-parse "$BRANCH")" == "$BASE_SHA" ]]; then
       git -C "$REPO_PATH" branch -q -D "$BRANCH" >/dev/null 2>&1 || true
     fi
   fi
@@ -734,6 +737,21 @@ run_entry() {
   if (( CONTAINER_MODE && ! ${CONTAINER_STARTED:-1} && rc == 125 )) && [[ "$engine" == "claude" ]]; then
     if ! preflight_container "$entry" claude && [[ "$PREFLIGHT_SECRET_RC" == "1" ]]; then
       LOG_STAGE="preflight"; ENGINE_STATUS="error"; ENGINE_DETAIL="preflight: ${PREFLIGHT_DETAIL}"
+    fi
+  fi
+
+  # Under the LFS override any `git add` stores full blobs, and a tier's
+  # writes_code:false does not stop its engine committing. Before meute
+  # commits anything, the branch and HEAD must still be at the base; if
+  # anything moved them the run is an error and cleanup deletes the branch,
+  # so nothing reaches the owner's refs (host) or is fetched back (container).
+  if (( SCRATCH_LFS_OVERRIDE )); then
+    local branch_at head_at
+    branch_at="$(git -C "$WORKTREE" rev-parse --verify -q "refs/heads/${BRANCH}^{commit}" 2>/dev/null)" || branch_at=""
+    head_at="$(git -C "$WORKTREE" rev-parse --verify -q "HEAD^{commit}" 2>/dev/null)" || head_at=""
+    if [[ "$branch_at" != "$BASE_SHA" || "$head_at" != "$BASE_SHA" ]]; then
+      DISCARD_BRANCH=1
+      abort_entry "$entry" "lfs-branch-moved-without-git-lfs"
     fi
   fi
 
