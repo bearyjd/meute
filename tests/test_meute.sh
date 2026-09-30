@@ -2612,6 +2612,16 @@ test_engines() {
     mb_chars="$(printf '%s' "$mb" | LC_ALL=C.UTF-8 wc -m)"
     is "engines: ...and exactly 300 characters, not bytes" "$mb_chars" "300"
   done
+  # Without the UTF-8 locale (a host that lacks C.UTF-8), the cut is by
+  # bytes; iconv then drops the split sequence it leaves, so the line is
+  # still valid UTF-8, just shorter.
+  for lead in "" a; do
+    mb="$(LC_ALL=C; ENGINE_DETAIL_LOCALE=xx_NO.UTF-8; engine_detail_clean "api 500: ${lead}$(printf '\xc3\xa9%.0s' {1..1024})" 2>/dev/null)"
+    printf '%s' "$mb" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 \
+      && ok "engines: under a locale that does not exist (lead [${lead}]), still valid UTF-8" \
+      || bad "engines: under a locale that does not exist (lead [${lead}]), still valid UTF-8" "iconv rejected it"
+    has "engines: ...and still capped with an ellipsis" "${mb: -3}" "..."
+  done
 }
 
 

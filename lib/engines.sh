@@ -64,10 +64,18 @@ engine_argv_claude() {
 # terminal line) becomes a space. Counted in characters under a UTF-8
 # locale set here: the timer runs under C, where ${#s} counts bytes and the
 # cut split a multibyte character, leaving invalid UTF-8 on the line.
+# ENGINE_DETAIL_LOCALE exists so a test can name a locale that is missing.
+# Where it is missing the cut is by bytes, and iconv -c drops the split
+# sequence it leaves; without iconv the byte cut stands, still one clean line.
 engine_detail_clean() {
-  local LC_ALL=C.UTF-8
-  local s="${1//[[:cntrl:]]/ }"
+  local LC_ALL="${ENGINE_DETAIL_LOCALE:-C.UTF-8}"
+  local s="${1//[[:cntrl:]]/ }" v
   (( ${#s} <= 300 )) || s="${s:0:297}..."
+  if command -v iconv >/dev/null 2>&1; then
+    # -c exits 1 when it dropped anything, which is the case it is here for.
+    v="$(printf '%s' "$s" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null)" || true
+    [[ -z "$v" ]] || s="$v"
+  fi
   printf '%s' "$s"
 }
 
