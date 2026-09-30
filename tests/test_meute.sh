@@ -2263,7 +2263,7 @@ test_scratch_without_lfs() {
 
   # What run.sh does: the env first, then the checkout, then more git.
   out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main
-          git -C "$2" worktree add -q -b fixed "$3" main && git -C "$3" status --porcelain && echo "rc=$?"' _ \
+          git -C "$2" -c core.hooksPath=/dev/null worktree add -q -b fixed "$3" main && git -C "$3" status --porcelain && echo "rc=$?"' _ \
           "$lib" "$root/repo" "$root/wt-fixed" 2>&1)"
   has "no-lfs: with the run's env the worktree add succeeds"  "$out" "rc=0"
   has "no-lfs: ...and says why the tree holds pointers"        "$out" "uses Git LFS and git-lfs is absent"
@@ -2275,6 +2275,12 @@ test_scratch_without_lfs() {
   has "no-lfs: the container path's clone succeeds too"        "$out" "rc=0"
   is  "no-lfs: nothing was written into the owner's config" \
       "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" config --get core.hooksPath; echo end)" "end"
+  # Hooks go off for the checkout alone (run.sh's worktree add), never for
+  # the run: the environment every later git call inherits leaves them on.
+  out="$(PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main 2>/dev/null
+          echo "key0=${GIT_CONFIG_KEY_0:-unset}"; git -C "$2" config --get core.hooksPath; echo end' _ "$lib" "$root/repo")"
+  is  "no-lfs: the run's environment leaves the repo's hooks on" "$out" "key0=filter.lfs.process
+end"
 
   out="$(PATH="$root/lfs-bin:$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/repo")"
   is  "no-lfs: with git-lfs present, git runs unchanged"       "$out" "count=unset"
@@ -2284,7 +2290,7 @@ test_scratch_without_lfs() {
   is  "no-lfs: a repo without LFS keeps its hooks, even without git-lfs" "$out" "count=unset"
   out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main 2>/dev/null
           echo "$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_KEY_1"' _ "$lib" "$root/repo")"
-  is  "no-lfs: a caller's own GIT_CONFIG_ entries are kept, not overwritten" "$out" "6 x.y filter.lfs.process"
+  is  "no-lfs: a caller's own GIT_CONFIG_ entries are kept, not overwritten" "$out" "5 x.y filter.lfs.process"
 
   # The tree being checked out decides, not the owner's index: the owner may
   # sit on a branch from before LFS arrived, or after it left.
@@ -2319,6 +2325,65 @@ test_scratch_without_lfs() {
       "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$root/big" ls-files -- ':(attr:filter=lfs)' | wc -l)" "5000"
   out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe" _ "$lib" "$root/big" main 2>/dev/null)"
   is  "no-lfs: 5000 LFS paths under set -Eeuo pipefail are still detected" "$out" "key0=filter.lfs.process"
+}
+
+# The same repository through run.sh itself, as a write tier on the timer's
+# PATH (no git-lfs). The owner's post-checkout exits 2 without git-lfs, so
+# the checkout runs hooks off; the commit must not: the owner's pre-commit
+# still runs, and a failing one still stops the commit.
+test_scratch_lfs_run() {
+  local root="$FIXTURE/lfs-run" repo="$FIXTURE/lfs-run/git-lfsrepo" out
+  mkdir -p "$root"/{state,tasks,stub,nolfs} "$repo"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  printf 'Task {{REPO_NAME}} {{REPO_PATH}} {{FILE_BUDGET}} {{LENS}} {{REPORT_PATH}} {{DATE}} {{BRANCH}} {{TASK}} {{TIER}} {{REPO_SPEC}} {{ALLOWED_COMMANDS}} {{DEFAULT_BRANCH}} {{UPSTREAM}} {{ETIQUETTE}} {{ETIQUETTE_CONTENT}} {{TICKET_ID}} {{TICKET_TITLE}} {{TICKET_NOTES}}\n' > "$root/tasks/t.md"
+  # Everything in /usr/bin but git-lfs: run.sh needs far more than git.
+  local f; for f in /usr/bin/*; do [[ "${f##*/}" == git-lfs ]] || ln -s "$f" "$root/nolfs/"; done
+  printf '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\trequired = true\n' > "$root/gitconfig-lfs"
+  local -a env_run=( GIT_CONFIG_GLOBAL="$root/gitconfig-lfs" GIT_CONFIG_NOSYSTEM=1
+                     PATH="$root/stub:$root/nolfs" MEUTE_QUOTA_STUB=100 )
+  (
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$repo"; cd "$repo" || exit 1
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    printf 'version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n' > asset.bin
+    echo x > f.txt
+    git add -A; git -c user.email=t@t -c user.name=t commit -qm init
+    printf '#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || exit 2\n' > .git/hooks/post-checkout
+    printf '#!/bin/sh\necho ran > "%s/pre-commit-ran"\nexit 1\n' "$root" > .git/hooks/pre-commit
+    chmod +x .git/hooks/post-checkout .git/hooks/pre-commit
+  )
+  # The stub engine edits the file named in $root/stub/edit, then reports.
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+edit="$(cat "$(dirname "${BASH_SOURCE[0]}")/edit")"
+printf 'changed by the stub\n' >> "$edit"
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+  python3 - "$root" "$repo" <<'PY2'
+import sys, pathlib, yaml
+root, repo = sys.argv[1], sys.argv[2]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"}},
+    "tasks": {"t": {"tier": "tier1", "template": "tasks/t.md", "slots": ["daily"]}},
+    "repos": [{"name": "lfsrepo", "path": repo, "spec": "lfs fixture", "tasks": ["t"]}],
+    "community": [],
+}, open(pathlib.Path(root) / "repos.yaml", "w"), sort_keys=False)
+PY2
+  branches() { git -C "$repo" branch --list 'meute/*' | wc -l; }
+
+  printf 'f.txt\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  hasnt "lfs run: a post-checkout that exits 2 no longer breaks the checkout" "$out" "worktree-add-failed"
+  has   "lfs run: ...the base was seen to use LFS"        "$out" "uses Git LFS and git-lfs is absent"
+  [[ -f "$root/pre-commit-ran" ]] && ok "lfs run: the owner's pre-commit still runs at the commit" \
+    || bad "lfs run: the owner's pre-commit still runs at the commit" "no marker; hooks were off for the commit"
+  is    "lfs run: ...and a failing one still stops the commit" "$(branches)" "0"
 }
 
 test_engines() {
@@ -5431,6 +5496,7 @@ test_pause
 test_hold_extend
 test_engines
 test_scratch_without_lfs
+test_scratch_lfs_run
 test_self_budget
 test_manifest_ceiling
 test_subscription_gate

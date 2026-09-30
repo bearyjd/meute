@@ -28,25 +28,32 @@ scratch_note() { printf 'meute: %s\n' "$*" >&2; }
 # checked out at all: the smudge filter cannot start, and the post-checkout
 # hook `git lfs install` writes exits 2 (plan-UnrealClaude, 2026-09-27,
 # worktree-add-failed). Every task reads source and none needs the binaries,
-# so for such a repo the run keeps the pointer files: filter off, hooks off.
+# so for such a repo the run keeps the pointer files: the filter is off, and
+# SCRATCH_LFS_OVERRIDE=1 tells the caller so.
 #
 # Through the environment (GIT_CONFIG_COUNT), not -c on one command: every
 # later git call in the run -- status, diff, the commit -- would otherwise hit
 # the same missing filter. Never written into the owner's .git/config, which a
-# linked worktree shares. Hooks go off only for an LFS repository; anywhere
-# else they are left alone, so a repo's own pre-commit still runs.
+# linked worktree shares. The engine a host run starts inherits it too, which
+# is wanted: the agent's own `git status` works on the pointers. A container
+# run does not; nothing in the container's environment comes from here.
+#
+# Hooks are not in it. Only bin/run.sh's host `git worktree add` runs with
+# them off, and only under the override: that is where the post-checkout
+# fails. The owner's pre-commit still runs at the commit.
 #
 # Whether the repo uses LFS is asked of <commit>, the tree about to be checked
 # out, not of the owner's index: the owner may sit on a branch from before LFS
 # arrived. Its .gitattributes are grepped for filter=lfs, which needs no
 # git-lfs. git's own exit status answers, never a pipe into a reader that
 # stops early: under the runner's pipefail the writer's SIGPIPE read as "no
-# LFS" once the path list outgrew the pipe. A check that
-# cannot be answered applies no override and says so; the checkout then fails
-# loudly rather than being altered on a guess.
+# LFS" once the path list outgrew the pipe. A check that cannot be answered
+# applies no override and says so; the checkout then fails loudly rather than
+# being altered on a guess.
 # --------------------------------------------------------------------------
 scratch_git_env() {
   local repo="$1" commit="$2" rc
+  SCRATCH_LFS_OVERRIDE=0
   command -v git-lfs >/dev/null 2>&1 && return 0
   git -C "$repo" grep -q -e 'filter=lfs' "${commit:-}" -- .gitattributes '**/.gitattributes' 2>/dev/null \
     && rc=0 || rc=$?
@@ -58,12 +65,13 @@ scratch_git_env() {
   esac
   local n="${GIT_CONFIG_COUNT:-0}" kv
   for kv in filter.lfs.process= filter.lfs.smudge= filter.lfs.clean= \
-            filter.lfs.required=false core.hooksPath=/dev/null; do
+            filter.lfs.required=false; do
     export "GIT_CONFIG_KEY_${n}=${kv%%=*}" "GIT_CONFIG_VALUE_${n}=${kv#*=}"
     n=$(( n + 1 ))
   done
   export GIT_CONFIG_COUNT="$n"
-  scratch_note "${repo##*/} uses Git LFS and git-lfs is absent: pointer files, no hooks"
+  SCRATCH_LFS_OVERRIDE=1
+  scratch_note "${repo##*/} uses Git LFS and git-lfs is absent: pointer files kept"
 }
 
 # --------------------------------------------------------------------------

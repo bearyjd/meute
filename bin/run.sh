@@ -101,6 +101,7 @@ PLAN_MODE=0
 REPO_PATH=""
 WORKTREE=""
 CONTAINER_MODE=0
+SCRATCH_LFS_OVERRIDE=0
 OUT_DIR=""
 BRANCH=""
 BASE_SHA=""
@@ -645,7 +646,11 @@ run_entry() {
     scratch_clone "$REPO_PATH" "$WORKTREE" "$base_ref" "$BRANCH" "$BASE_SHA" \
       || abort_entry "$entry" "scratch-clone-failed"
   else
-    git -C "$REPO_PATH" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
+    # An LFS repo's post-checkout exits 2 without git-lfs; off for this one
+    # command, never the run, so the owner's pre-commit still runs later.
+    local -a checkout_c=()
+    if (( SCRATCH_LFS_OVERRIDE )); then checkout_c=( -c core.hooksPath=/dev/null ); fi
+    git -C "$REPO_PATH" "${checkout_c[@]}" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
       || abort_entry "$entry" "worktree-add-failed"
   fi
   copy_worktree_files "$entry"
