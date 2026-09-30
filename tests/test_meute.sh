@@ -4426,6 +4426,47 @@ test_p2_outer_bound() {
      "$(grep -c 'timeout --kill-after="\$CONTAINER_STOP_TIMEOUT" "\$(container_outer_bound' "$REPO/lib/container.sh")" "1"
 }
 
+# Whether the container process ever existed is podman's --pidfile, which
+# survives --rm (the cidfile does not: podman deletes it with the container)
+# and is never written when podman refuses before starting one. Measured on
+# the host, podman 5.8.7. container_run reports it as CONTAINER_STARTED, and
+# the flag is reset on every call, so a refusal before podman even runs can
+# never inherit the previous run's "started".
+test_p2b_container_started() {
+  local root="$FIXTURE/p2b-started"; mkdir -p "$root/stub" "$root/out"
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+pidfile=""; prev=""
+for a in "\$@"; do [[ "\$prev" == --pidfile ]] && pidfile="\$a"; prev="\$a"; done
+echo "\${pidfile:-none}" > "$root/stub/pidfile"
+[[ -n "\${STARTED:-}" && -n "\$pidfile" ]] && echo 4242 > "\$pidfile"
+exit \${RC:-0}
+STUB
+  chmod +x "$root/stub/podman"
+  local entry got
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:60}')"
+  got="$( source "$REPO/lib/container.sh" 2>/dev/null
+          export MEUTE_PODMAN="$root/stub/podman"
+          CONTAINER_IMAGE_ID="$P2_ID"; CONTAINER_IMAGE_FOR="$P2_IMAGE $P2_DIGEST"
+          rc=0; STARTED=1 RC=125 container_run "$entry" probe "" "" "$root/out" -- true || rc=$?
+          pf="$(cat "$root/stub/pidfile")"
+          printf 'a=%s:%s ' "$rc" "$CONTAINER_STARTED"
+          [[ -e "$pf" ]] && printf 'left ' || printf 'gone '
+          [[ "$pf" == "$root/out"* ]] && printf 'inout ' || printf 'apart '
+          rc=0; RC=125 container_run "$entry" probe "" "" "$root/out" -- true || rc=$?
+          printf 'b=%s:%s ' "$rc" "$CONTAINER_STARTED"
+          CONTAINER_STARTED=1; CONTAINER_IMAGE_ID=""
+          rc=0; container_run "$entry" probe "" "" "$root/out" -- true 2>/dev/null || rc=$?
+          printf 'c=%s:%s' "$rc" "$CONTAINER_STARTED" )"
+  has "started: a container that wrote its pidfile is reported started" "$got" "a=125:1 "
+  has "started: ...with claude's own status passed through"            "$got" "a=125:"
+  has "started: ...and the pidfile is removed afterwards"              "$got" " gone "
+  has "started: ...and was never under the /out directory"             "$got" " apart "
+  has "started: podman refusing before a start is reported not started" "$got" "b=125:0 "
+  has "started: a refusal before podman runs resets a stale flag"      "$got" "c=1:0"
+}
+
 # Phase 2b removes the abort that kept a timer fire from dispatching a
 # container, so what has to be asserted now is the opposite: that a verified
 # entry IS dispatched, into a container carrying the flags 2a settled, and
@@ -4632,19 +4673,27 @@ STUB
 # The secret is checked at the preflight and used at the build, and it can
 # vanish between the two. podman then refuses to start the build -- fail
 # closed -- but the line would say stage=build, and §7's demotion counts
-# build errors against the REPO. So a failed claude container run re-asks
-# the same host-side question, and an absent secret is recorded as the
-# preflight failure it is. Decided by podman's exit status, never by
-# parsing its stderr.
+# build errors against the REPO. So a claude container that never started
+# re-asks the same host-side question, and an absent secret is recorded as
+# the preflight failure it is. "Never started" is podman's --pidfile, which
+# it writes only once the container process exists -- not the exit status,
+# which podman forwards from claude, so 125 alone proves nothing -- and
+# never its stderr.
 test_p2b_secret_vanishes() {
   local root="$FIXTURE/p2b-vanish"; p4_fixture "$root"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
   mkdir -p "$root/stub"
   # Present for the first `secret exists`, gone for every later one; and the
-  # engine run fails the way podman fails on a missing secret.
+  # engine run fails the way podman fails on a missing secret -- 125, no
+  # pidfile -- unless STARTED is set, when the container process existed
+  # (podman wrote the pidfile it was given) and ENGINE_RC is claude's own.
   cat > "$root/stub/podman" <<STUB
 #!/usr/bin/env bash
 echo "\$*" >> "$root/stub/podman-calls"
+pidfile=""; prev=""
+for a in "\$@"; do [[ "\$prev" == --pidfile ]] && pidfile="\$a"; prev="\$a"; done
+[[ -n "\$pidfile" ]] && { echo "\$pidfile" >> "$root/stub/pidfiles"
+  [[ -e "\$pidfile" ]] && echo "pre-existing \$pidfile" >> "$root/stub/pidfiles"; }
 case "\$*" in
   *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
   *"{{.State.Running}}"*) printf 'true\n' ;;
@@ -4652,14 +4701,15 @@ case "\$*" in
   "secret exists atelier-claude-token")
     [[ -e "$root/stub/secret-gone" ]] && exit 1
     touch "$root/stub/secret-gone"; exit 0 ;;
-  *" -p "*) echo 'Error: an unrelated message the runner must not parse' >&2; exit \${ENGINE_RC:-125} ;;
+  *" -p "*) [[ -n "\${STARTED:-}" && -n "\$pidfile" ]] && echo 4242 > "\$pidfile"
+    echo 'Error: an unrelated message the runner must not parse' >&2; exit \${ENGINE_RC:-125} ;;
   *) exit 125 ;;
 esac
 STUB
   chmod +x "$root/stub/podman"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
     "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
-  local fire; fire() { rm -f "$root/stub/podman-calls" "$root/stub/secret-gone"; : > "$root/state/cursor"
+  local fire; fire() { rm -f "$root/stub/podman-calls" "$root/stub/secret-gone" "$root/stub/pidfiles"; : > "$root/state/cursor"
     PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
       "$root/bin/run.sh" daily --repo netlens 2>&1; }
   local out line
@@ -4675,11 +4725,29 @@ STUB
   # §7's demotion keys on stage=: no build-stage error was recorded at all.
   is  "vanish: nothing here can count toward demotion" \
       "$(grep -c $'\tstage=build\t' "$root/state/log")" "0"
+  # The pidfile podman is handed is fresh -- podman overwrites one that
+  # exists, which would read as "started" -- and is not under /out's host
+  # directory, where a started container could delete it and pass for one
+  # that never ran.
+  is    "vanish: podman was handed exactly one pidfile" "$(wc -l < "$root/stub/pidfiles")" "1"
+  hasnt "vanish: ...that did not already exist"         "$(cat "$root/stub/pidfiles")" "pre-existing"
+  hasnt "vanish: ...outside the directory mounted at /out" "$(cat "$root/stub/pidfiles")" "meute-out-"
 
-  # The secret deleted while claude runs: the container already holds its
-  # token, so a failure claude reports itself (any status but podman's own
-  # 125) is the build's, whatever the secret's state now. No re-check.
-  out="$(ENGINE_RC=1 fire)"; line="$(tail -1 "$root/state/log")"
+  # The secret deleted while claude runs, and claude itself exits 125 -- the
+  # status podman uses for its own failures, forwarded from the container.
+  # The container started (the pidfile exists), so it already held its token
+  # and this failure is claude's: the build's, and not re-checked.
+  out="$(STARTED=1 ENGINE_RC=125 fire)"; line="$(tail -1 "$root/state/log")"
+  is  "vanish: claude's own 125 from a started container is not re-checked" \
+      "$(grep -cx 'secret exists atelier-claude-token' "$root/stub/podman-calls")" "1"
+  has "vanish: ...its failure stays the build's"         "$line" "stage=build"
+  hasnt "vanish: ...and is not relabelled the preflight's" "$line" "stage=preflight"
+  local pf; pf="$(head -1 "$root/stub/pidfiles")"
+  [[ -n "$pf" && ! -e "$pf" ]] && ok "vanish: ...and the pidfile is removed afterwards" \
+    || bad "vanish: ...and the pidfile is removed afterwards" "left behind: ${pf:-<none recorded>}"
+
+  # The same with any other status claude reports: still the build's.
+  out="$(STARTED=1 ENGINE_RC=1 fire)"; line="$(tail -1 "$root/state/log")"
   is  "vanish: a container that started is not re-checked" \
       "$(grep -cx 'secret exists atelier-claude-token' "$root/stub/podman-calls")" "1"
   has "vanish: ...its failure stays the build's"         "$line" "stage=build"
@@ -5203,6 +5271,7 @@ test_p2_step_over
 test_p2_forced_refusal_is_retryable
 test_p2_engine_cwd
 test_p2_outer_bound
+test_p2b_container_started
 test_p2_pin_is_one_snapshot
 test_p2_isolation
 test_p2_proxied_egress
