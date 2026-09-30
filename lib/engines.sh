@@ -57,6 +57,16 @@ engine_argv_claude() {
   return 0
 }
 
+# A CLI's message on one line of at most 300 characters, "..." included:
+# state/log is tab-separated, one record per fire, and what the CLI says is
+# neither clean nor bounded. Every control character -- tab, newline, the
+# carriage return that redraws a terminal line -- becomes a space.
+engine_detail_clean() {
+  local s="${1//[[:cntrl:]]/ }"
+  (( ${#s} <= 300 )) || s="${s:0:297}..."
+  printf '%s' "$s"
+}
+
 extract_claude() {
   local out="$1"
   if ! jq -e . "$out" > /dev/null 2>&1; then
@@ -77,10 +87,7 @@ extract_claude() {
     local status_code msg
     status_code="$(jq -r '.api_error_status // empty' "$out")"
     if [[ -n "$status_code" ]]; then
-      msg="$(jq -r '.result // "no message"' "$out")"
-      # state/log is tab-separated, one line per fire; a detail carrying
-      # either would split the record it is part of.
-      msg="${msg//$'\t'/ }"; msg="${msg//$'\n'/ }"
+      msg="$(engine_detail_clean "$(jq -r '.result // "no message"' "$out")")"
       if [[ "$status_code" == "429" ]]; then
         RATE_LIMITED=1
         ENGINE_DETAIL="rate-limited: ${msg}"
@@ -102,8 +109,7 @@ extract_claude() {
       # on a failure's line.
       local subtype
       subtype="$(jq -r '.subtype // "unknown"' "$out")"
-      msg="$(jq -r '.result // ""' "$out")"
-      msg="${msg//$'\t'/ }"; msg="${msg//$'\n'/ }"
+      msg="$(engine_detail_clean "$(jq -r '.result // ""' "$out")")"
       [[ "$subtype" == "success" ]] && subtype="cli error"
       if [[ -n "$msg" ]]; then
         ENGINE_DETAIL="${subtype}: ${msg}"

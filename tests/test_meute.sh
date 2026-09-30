@@ -2509,6 +2509,28 @@ test_engines() {
   printf '%s' '{"result":"","is_error":true,"subtype":"success"}' > "$out"
   extract_claude "$out" || true
   is "engines: a failure with no message and a meaningless subtype says so" "$ENGINE_DETAIL" "cli error: no message"
+
+  # A CLI message is neither clean nor bounded. A carriage return would
+  # redraw a terminal line over the record; a stack trace would swamp it.
+  # Every control character becomes a space and the message stops at 300
+  # characters, "..." included, on both branches.
+  out="$root/carriage-return.json"
+  printf '%s' '{"result":"refresh failed\rOK\u0007done","is_error":true,"subtype":"success"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a status-less message's control characters become spaces" "$ENGINE_DETAIL" "cli error: refresh failed OK done"
+  out="$root/huge.json"
+  jq -n --arg r "$(printf 'x%.0s' {1..2048})" '{result:$r,is_error:true,subtype:"success",api_error_status:500}' > "$out"
+  extract_claude "$out" || true
+  is  "engines: a 2 KB provider message is capped at 300 characters, ellipsis included" \
+      "$ENGINE_DETAIL" "api 500: $(printf 'x%.0s' {1..297})..."
+  out="$root/cr-status.json"
+  printf '%s' '{"result":"bad\rgateway","is_error":true,"subtype":"success","api_error_status":502}' > "$out"
+  extract_claude "$out" || true
+  is "engines: ...and a provider message's carriage return is a space too" "$ENGINE_DETAIL" "api 502: bad gateway"
+  out="$root/huge-no-status.json"
+  jq -n --arg r "$(printf 'y%.0s' {1..2048})" '{result:$r,is_error:true,subtype:"success"}' > "$out"
+  extract_claude "$out" || true
+  is  "engines: a 2 KB status-less message is capped too" "$ENGINE_DETAIL" "cli error: $(printf 'y%.0s' {1..297})..."
 }
 
 
