@@ -116,13 +116,15 @@ scratch_clone() {
 
   # Already on the branch this stage continues: nothing to cut.
   [[ "$(git -C "$scratch" rev-parse --abbrev-ref HEAD)" != "$branch" ]] || return 0
-  local at="$base_sha"
   # The base must be in the clone to be checked out. It is for a build (the
   # default branch's tip came across) and for a later stage (an ancestor of
-  # the branch that did). If it is not -- a base from a branch that never
-  # arrived -- the clone's own HEAD is the honest answer, as on the host.
-  git -C "$scratch" rev-parse --verify -q "${at}^{commit}" >/dev/null 2>&1 || at="HEAD"
-  git -C "$scratch" checkout -q -b "$branch" "$at" \
+  # the branch that did). If it is not -- a base from a ref that never
+  # arrived -- the clone is refused: the run resolved that base once, asked
+  # it about LFS, and the host path checks out exactly it, so the clone's
+  # own HEAD would be a different tree under the same name.
+  git -C "$scratch" rev-parse --verify -q "${base_sha}^{commit}" >/dev/null 2>&1 \
+    || { scratch_note "base ${base_sha:0:12} did not arrive in the scratch clone"; return 1; }
+  git -C "$scratch" checkout -q -b "$branch" "$base_sha" \
     || { scratch_note "could not cut ${branch} in the scratch tree"; return 1; }
 }
 

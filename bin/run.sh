@@ -632,10 +632,13 @@ run_entry() {
   fi
 
   trap cleanup EXIT
-  # Asked of the tree about to be checked out: the branch a later stage
-  # continues if it exists (as scratch_clone decides), else the base.
+  # Asked of the commit about to be checked out, by SHA: the branch a later
+  # stage continues if it exists (as scratch_clone decides), else the base
+  # both checkouts below are cut from. The suffix loop above makes BRANCH
+  # fresh today, so the first case is Phase 4's.
   local lfs_at="$BASE_SHA"
-  git -C "$REPO_PATH" rev-parse --verify -q "refs/heads/${BRANCH}" >/dev/null 2>&1 && lfs_at="$BRANCH"
+  lfs_at="$(git -C "$REPO_PATH" rev-parse --verify -q "refs/heads/${BRANCH}^{commit}" 2>/dev/null)" \
+    || lfs_at="$BASE_SHA"
   scratch_git_env "$REPO_PATH" "$lfs_at"
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
@@ -650,7 +653,9 @@ run_entry() {
     # command, never the run, so the owner's pre-commit still runs later.
     local -a checkout_c=()
     if (( SCRATCH_LFS_OVERRIDE )); then checkout_c=( -c core.hooksPath=/dev/null ); fi
-    git -C "$REPO_PATH" "${checkout_c[@]}" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
+    # From BASE_SHA, not $base_ref: the ref can move after it was resolved,
+    # and the tree checked out must be the one LFS detection was asked of.
+    git -C "$REPO_PATH" "${checkout_c[@]}" worktree add -q -b "$BRANCH" "$WORKTREE" "$BASE_SHA" \
       || abort_entry "$entry" "worktree-add-failed"
   fi
   copy_worktree_files "$entry"

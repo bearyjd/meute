@@ -2383,7 +2383,7 @@ test_scratch_lfs_run() {
 #!/usr/bin/env bash
 if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
 edit="$(cat "$(dirname "${BASH_SOURCE[0]}")/edit")"
-if [[ "$edit" == rm:* ]]; then rm -f -- "${edit#rm:}"; else printf 'changed by the stub\n' >> "$edit"; fi
+if [[ "$edit" == rm:* ]]; then rm -f -- "${edit#rm:}"; elif [[ -n "$edit" ]]; then printf 'changed by the stub\n' >> "$edit"; fi
 jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
 STUB
   chmod +x "$root/stub/claude"
@@ -2395,16 +2395,18 @@ yaml.safe_dump({
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
     "policy": {"quota_floor_percent": 30, "community_share": 0.20,
                "tier3_max_in_flight": 3, "branch_prefix": "meute"},
-    "tiers": {"tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"}},
-    "tasks": {"t": {"tier": "tier1", "template": "tasks/t.md", "slots": ["daily"]}},
-    "repos": [{"name": "lfsrepo", "path": repo, "spec": "lfs fixture", "tasks": ["t"]}],
+    "tiers": {"tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"},
+              "tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
+    "tasks": {"t": {"tier": "tier1", "template": "tasks/t.md", "slots": ["daily"]},
+              "r": {"tier": "tier2", "template": "tasks/t.md", "slots": ["daily"]}},
+    "repos": [{"name": "lfsrepo", "path": repo, "spec": "lfs fixture", "tasks": ["t", "r"]}],
     "community": [],
 }, open(pathlib.Path(root) / "repos.yaml", "w"), sort_keys=False)
 PY2
   branches() { git -C "$repo" branch --list 'meute/*' | wc -l; }
 
   printf 'f.txt\n' > "$root/stub/edit"
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
   hasnt "lfs run: a post-checkout that exits 2 no longer breaks the checkout" "$out" "worktree-add-failed"
   has   "lfs run: ...the base was seen to use LFS"        "$out" "uses Git LFS and git-lfs is absent"
   [[ -f "$root/pre-commit-ran" ]] && ok "lfs run: the owner's pre-commit still runs at the commit" \
@@ -2418,20 +2420,33 @@ PY2
 
   # With the clean filter off, `git add -A` stores an edited LFS file as a
   # full blob. Such a commit is refused; anything else still commits.
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
   has   "lfs run: an edit to an ordinary file still commits, past a post-commit that exits 2" "$out" "status=ok"
   is    "lfs run: ...onto a scratch branch"                   "$(branches)" "1"
   printf 'asset.bin\n' > "$root/stub/edit"
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
   has   "lfs run: an edited LFS file refuses the commit"      "$out" "detail=lfs-files-changed-without-git-lfs: 1"
   has   "lfs run: ...as an error"                             "$out" "status=error"
   is    "lfs run: ...and leaves nothing committed"            "$(branches)" "1"
   is    "lfs run: ...nor any worktree behind"                 "$(git -C "$repo" worktree list | wc -l)" "1"
   # A deletion stages no blob: nothing to bloat, so it commits.
   printf 'rm:asset.bin\n' > "$root/stub/edit"
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
   has   "lfs run: deleting an LFS file still commits"         "$out" "status=ok"
   is    "lfs run: ...onto its own branch"                     "$(branches)" "2"
+
+  # Detection and checkout name one commit. The base is resolved once; a
+  # checkout from the ref instead reads it again, and the ref can move in
+  # between (the owner commits, a fetch lands). Traced, not inferred: git
+  # grep and worktree add must both be handed the recorded SHA.
+  : > "$root/stub/edit"
+  local base_sha; base_sha="$(git -C "$repo" rev-parse main)"
+  out="$(env "${env_run[@]}" GIT_TRACE="$root/trace" "$root/bin/run.sh" daily --repo lfsrepo --task r 2>&1)"
+  has   "lfs run: a read-only tier on the LFS repo runs, on pointer files" "$out" "status=ok"
+  has   "lfs run: LFS is detected at the recorded base SHA" \
+        "$(grep -F 'git grep' "$root/trace")" "$base_sha"
+  has   "lfs run: ...and the worktree is added from that same SHA" \
+        "$(grep -F 'worktree add' "$root/trace")" "$base_sha"
 }
 
 test_engines() {
@@ -4264,6 +4279,16 @@ test_p2_scratch_clone() {
   scratch_clone "$root/src" "$root/work2" "" "meute/lint-2026-09-22" "$base" >/dev/null 2>&1
   is  "clone: no default branch falls back to HEAD" \
       "$(git -C "$root/work2" rev-parse HEAD)" "$base"
+
+  # A base the clone did not bring is refused, not swapped for the clone's
+  # HEAD: LFS detection was asked of the base, so the tree checked out has
+  # to be that one.
+  local absent; absent="$(git -C "$root/src" rev-parse secret)"
+  if scratch_clone "$root/src" "$root/work5" main "meute/lint-2026-09-24" "$absent" >/dev/null 2>&1; then
+    bad "clone: a base the clone lacks is refused" "checked out $(git -C "$root/work5" rev-parse HEAD) instead"
+  else
+    ok "clone: a base the clone lacks is refused"
+  fi
 
   # A later stage clones the branch it is continuing, not the default one.
   git -C "$root/src" branch meute/draft-2026-09-01 main
