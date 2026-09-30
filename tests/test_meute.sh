@@ -2418,7 +2418,7 @@ PY2
 
   # A write tier on the LFS repo: refused by name, before the checkout.
   printf 'f.txt\n' > "$root/stub/edit"
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
+  out="$(env "${env_run[@]}" GIT_TRACE="$root/trace-refused" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
   local line; line="$(tail -1 "$root/state/log")"
   has   "lfs run: a write tier on an LFS repo without git-lfs is refused" "$line" "detail=lfs-repo-needs-git-lfs-for-write-tiers"
   has   "lfs run: ...as an error"                             "$line" "status=error"
@@ -2430,6 +2430,9 @@ PY2
   is    "lfs run: ...nor a scratch directory"                 "$(find "$root/.worktrees" -mindepth 1 -maxdepth 1 -name 'lfsrepo-*' 2>/dev/null | wc -l)" "0"
   [[ -e "$root/stub/engine-ran" ]] && bad "lfs run: ...and no engine is invoked" "the stub ran" \
     || ok "lfs run: ...and no engine is invoked"
+  # Cleanup would remove a worktree and a branch still at the base, so their
+  # absence afterwards proves nothing about order: the trace does.
+  hasnt "lfs run: ...the refusal comes before any worktree add" "$(cat "$root/trace-refused")" "worktree add"
 
   # A read-only tier on the same repo runs, on pointer files, past a
   # post-checkout that exits 2. Detection and checkout name one commit: the
