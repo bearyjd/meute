@@ -57,6 +57,32 @@ engine_argv_claude() {
   return 0
 }
 
+# An engine's detail on one line of at most 300 characters, prefix and
+# "..." included: state/log is tab-separated, one record per fire, and
+# nothing the CLI says -- message, subtype or status -- is clean or bounded.
+# Every control character (tab, newline, the carriage return that redraws a
+# terminal line) becomes a space. Counted in characters under a UTF-8
+# locale set here: the timer runs under C, where ${#s} counts bytes and the
+# cut split a multibyte character, leaving invalid UTF-8 on the line.
+# ENGINE_DETAIL_LOCALE exists so a test can name a locale that is missing.
+# Where it is missing the cut is by bytes, and iconv -c drops the split
+# sequence it leaves -- or python3, which meute already requires, where
+# iconv is absent.
+engine_detail_clean() {
+  local LC_ALL="${ENGINE_DETAIL_LOCALE:-C.UTF-8}"
+  local s="${1//[[:cntrl:]]/ }" v
+  (( ${#s} <= 300 )) || s="${s:0:297}..."
+  if command -v iconv >/dev/null 2>&1; then
+    # -c exits 1 when it dropped anything, which is the case it is here for.
+    v="$(printf '%s' "$s" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null)" || true
+    [[ -z "$v" ]] || s="$v"
+  elif command -v python3 >/dev/null 2>&1; then
+    v="$(printf '%s' "$s" | python3 -c 'import sys; sys.stdout.write(sys.stdin.buffer.read().decode("utf-8", "ignore"))' 2>/dev/null)" || true
+    [[ -z "$v" ]] || s="$v"
+  fi
+  printf '%s' "$s"
+}
+
 extract_claude() {
   local out="$1"
   if ! jq -e . "$out" > /dev/null 2>&1; then
@@ -78,9 +104,6 @@ extract_claude() {
     status_code="$(jq -r '.api_error_status // empty' "$out")"
     if [[ -n "$status_code" ]]; then
       msg="$(jq -r '.result // "no message"' "$out")"
-      # state/log is tab-separated, one line per fire; a detail carrying
-      # either would split the record it is part of.
-      msg="${msg//$'\t'/ }"; msg="${msg//$'\n'/ }"
       if [[ "$status_code" == "429" ]]; then
         RATE_LIMITED=1
         ENGINE_DETAIL="rate-limited: ${msg}"
@@ -95,8 +118,25 @@ extract_claude() {
         ENGINE_DETAIL="api ${status_code}: ${msg}"
       fi
     else
-      ENGINE_DETAIL="$(jq -r '.subtype // "unknown"' "$out")"
+      # No status: the CLI failed before or around the API call (a token
+      # refresh colliding with an interactive session, 2026-09-29), and
+      # .result is the only true thing it said. A specific subtype leads;
+      # "success" is dropped, since it is the one word that must not appear
+      # on a failure's line.
+      local subtype
+      subtype="$(jq -r '.subtype // "unknown"' "$out")"
+      msg="$(jq -r '.result // ""' "$out")"
+      [[ "$subtype" == "success" ]] && subtype="cli error"
+      if [[ -n "$msg" ]]; then
+        ENGINE_DETAIL="${subtype}: ${msg}"
+      elif [[ "$subtype" == "cli error" ]]; then
+        ENGINE_DETAIL="cli error: no message"
+      else
+        ENGINE_DETAIL="$subtype"
+      fi
     fi
+    # Cleaned once, whole: every field above is the CLI's, not only .result.
+    ENGINE_DETAIL="$(engine_detail_clean "$ENGINE_DETAIL")"
     return 1
   fi
   ENGINE_STATUS="ok"; ENGINE_DETAIL=""

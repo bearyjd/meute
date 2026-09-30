@@ -101,6 +101,8 @@ PLAN_MODE=0
 REPO_PATH=""
 WORKTREE=""
 CONTAINER_MODE=0
+SCRATCH_LFS_OVERRIDE=0
+DISCARD_BRANCH=0
 OUT_DIR=""
 BRANCH=""
 BASE_SHA=""
@@ -166,7 +168,9 @@ cleanup() {
   fi
   if [[ -n "$BRANCH" && -n "$REPO_PATH" && -n "$BASE_SHA" ]] \
      && git -C "$REPO_PATH" rev-parse --verify -q "$BRANCH" >/dev/null 2>&1; then
-    if [[ "$(git -C "$REPO_PATH" rev-parse "$BRANCH")" == "$BASE_SHA" ]]; then
+    # A branch still at the base holds nothing; one marked for discard holds
+    # what must not survive (lfs-branch-moved-without-git-lfs).
+    if (( DISCARD_BRANCH )) || [[ "$(git -C "$REPO_PATH" rev-parse "$BRANCH")" == "$BASE_SHA" ]]; then
       git -C "$REPO_PATH" branch -q -D "$BRANCH" >/dev/null 2>&1 || true
     fi
   fi
@@ -630,6 +634,31 @@ run_entry() {
     exit 0
   fi
 
+  # Asked of the commit about to be checked out, by SHA: the branch a later
+  # stage continues if it exists (as scratch_clone decides), else the base
+  # both checkouts below are cut from. The suffix loop above makes BRANCH
+  # fresh today, so the first case is Phase 4's.
+  local lfs_at="$BASE_SHA"
+  lfs_at="$(git -C "$REPO_PATH" rev-parse --verify -q "refs/heads/${BRANCH}^{commit}" 2>/dev/null)" \
+    || lfs_at="$BASE_SHA"
+  scratch_git_env "$REPO_PATH" "$lfs_at"
+  # With the LFS filter off, `git add` stores an LFS file as its full
+  # content -- the runner's add and an engine's own alike -- and a check of
+  # what was staged would read .gitattributes from the tree the engine just
+  # edited. So a tier that writes is refused before anything is checked out:
+  # a precondition the operator remedies by installing git-lfs, logged at
+  # stage=preflight so §7's demotion counter does not hold it against the
+  # repo. Read-only tiers run on the pointer files.
+  if (( SCRATCH_LFS_OVERRIDE && WRITES_CODE )); then
+    LOG_STAGE="preflight"
+    abort_precondition "$entry" "lfs-repo-needs-git-lfs-for-write-tiers"
+  fi
+  # Every run that gets here under the override is read-only, so its branch
+  # never holds anything meute keeps: cleanup deletes it whatever it points
+  # at. The check after the engine names a move; this closes the window
+  # after that check, where a child the engine left running could still
+  # commit before cleanup.
+  (( SCRATCH_LFS_OVERRIDE )) && DISCARD_BRANCH=1
   trap cleanup EXIT
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
@@ -640,7 +669,13 @@ run_entry() {
     scratch_clone "$REPO_PATH" "$WORKTREE" "$base_ref" "$BRANCH" "$BASE_SHA" \
       || abort_entry "$entry" "scratch-clone-failed"
   else
-    git -C "$REPO_PATH" worktree add -q -b "$BRANCH" "$WORKTREE" "$base_ref" \
+    # An LFS repo's post-checkout exits 2 without git-lfs; off for this one
+    # command, never the run.
+    local -a checkout_c=()
+    if (( SCRATCH_LFS_OVERRIDE )); then checkout_c=( -c core.hooksPath=/dev/null ); fi
+    # From BASE_SHA, not $base_ref: the ref can move after it was resolved,
+    # and the tree checked out must be the one LFS detection was asked of.
+    git -C "$REPO_PATH" "${checkout_c[@]}" worktree add -q -b "$BRANCH" "$WORKTREE" "$BASE_SHA" \
       || abort_entry "$entry" "worktree-add-failed"
   fi
   copy_worktree_files "$entry"
@@ -711,6 +746,21 @@ run_entry() {
     fi
   fi
 
+  # Under the LFS override any `git add` stores full blobs, and a tier's
+  # writes_code:false does not stop its engine committing. Before meute
+  # commits anything, the branch and HEAD must still be at the base; if
+  # anything moved them the run is an error and cleanup deletes the branch,
+  # so nothing reaches the owner's refs (host) or is fetched back (container).
+  if (( SCRATCH_LFS_OVERRIDE )); then
+    local branch_at head_at
+    branch_at="$(git -C "$WORKTREE" rev-parse --verify -q "refs/heads/${BRANCH}^{commit}" 2>/dev/null)" || branch_at=""
+    head_at="$(git -C "$WORKTREE" rev-parse --verify -q "HEAD^{commit}" 2>/dev/null)" || head_at=""
+    if [[ "$branch_at" != "$BASE_SHA" || "$head_at" != "$BASE_SHA" ]]; then
+      DISCARD_BRANCH=1
+      abort_entry "$entry" "lfs-branch-moved-without-git-lfs"
+    fi
+  fi
+
   # The self-budget gate only sees meute's own spend, never the subscription
   # it draws from -- a 429 here means the real pool is already gone and every
   # slot until the hold lifts would fail the same way for nothing.
@@ -724,7 +774,14 @@ run_entry() {
   write_report "$report_rel" "$entry" "$engine" "$lens" "$base_ref" "$err"
 
   local committed="-" imported=""
-  if (( WRITES_CODE )); then committed="$(commit_worktree "$repo" "$task" "$lens")"; fi
+  if (( WRITES_CODE )); then
+    local commit_rc=0
+    committed="$(commit_worktree "$repo" "$task" "$lens")" || commit_rc=$?
+    # 3: a refusal commit_worktree names on stdout (a commit git itself
+    # refused); nothing was committed.
+    if (( commit_rc == 3 )); then abort_entry "$entry" "$committed"; fi
+    (( commit_rc == 0 )) || exit "$commit_rc"
+  fi
   # cleanup removes the clone, so anything committed in it has to reach the
   # owner's repository first (PRP-004 §4.2). A fetch git refuses -- the
   # branch moved on, or is checked out -- lands on a dated aside ref rather
@@ -928,8 +985,12 @@ commit_worktree() {
   # Layer meute's artifact excludes under the repo's own .gitignore so a green
   # test run does not commit its own __pycache__ / node_modules to the branch.
   git -C "$WORKTREE" -c "core.excludesFile=${MEUTE_ROOT}/lib/artifacts.gitignore" add -A
+  # A commit git refused -- the owner's pre-commit, say -- is the run's
+  # failure; under $(...) set -e never sees it, and HEAD would still name
+  # the base as if it were this run's commit.
   git -C "$WORKTREE" "${ident[@]}" commit -q -m "$(printf 'chore: %s (%s)\n\nUnattended meute run on %s.\nTask: %s%s\nReview before merging; nothing here has been pushed.' \
-      "$task" "$repo" "$DATE" "$task" "$([[ "$lens" != "none" ]] && printf ' (lens: %s)' "$lens")")"
+      "$task" "$repo" "$DATE" "$task" "$([[ "$lens" != "none" ]] && printf ' (lens: %s)' "$lens")")" \
+    || { printf 'commit-failed\n'; return 3; }
   git -C "$WORKTREE" rev-parse --short HEAD
 }
 

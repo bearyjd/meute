@@ -2225,6 +2225,271 @@ test_hold_extend() {
 # is_error is true and the real cause was an HTTP 429 -- the fix was to check
 # api_error_status instead of trusting subtype, discovered from a real
 # unattended run that hit the account's weekly limit.
+# A repository that uses Git LFS on a machine without git-lfs: the host the
+# timers run on has none, and on 2026-09-27 plan-UnrealClaude's audit died as
+# worktree-add-failed -- the smudge filter could not start, and the repo's own
+# post-checkout hook exits 2 when git-lfs is missing. A read-only analysis
+# needs the pointer files, not the binaries, so without git-lfs the scratch
+# checkout runs with the filter and hooks off; with it, nothing changes.
+test_scratch_without_lfs() {
+  local root="$FIXTURE/no-lfs" out
+  mkdir -p "$root/nolfs-bin" "$root/lfs-bin"
+  printf '#!/bin/sh\nexit 0\n' > "$root/lfs-bin/git-lfs"; chmod +x "$root/lfs-bin/git-lfs"
+  (
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$root/repo"; cd "$root/repo" || exit 1
+    git config user.email t@t; git config user.name t
+    printf 'version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n' > asset.bin
+    git add asset.bin; git commit -qm init
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes; git commit -qm attrs
+    git config filter.lfs.process "git-lfs filter-process"
+    git config filter.lfs.required true
+    printf '#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || exit 2\n' > .git/hooks/post-checkout
+    chmod +x .git/hooks/post-checkout
+  )
+  # A PATH holding only what the checkout needs. /usr/bin is not one: the
+  # distrobox the suite runs in has git-lfs there, the host does not.
+  local t; for t in git bash cat grep; do ln -sfn "$(command -v "$t")" "$root/nolfs-bin/$t"; done
+  local nolfs_path="$root/nolfs-bin"
+  # The filter reaches a fresh clone from the global config `git lfs install`
+  # writes, as on the host.
+  printf '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\trequired = true\n' > "$root/gitconfig-lfs"
+  local -a env_lfs=( GIT_CONFIG_GLOBAL="$root/gitconfig-lfs" GIT_CONFIG_NOSYSTEM=1 )
+  local lib="$REPO/lib/scratch.sh"
+
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" git -C "$root/repo" worktree add -q -b plain "$root/wt-plain" main 2>&1; echo "rc=$?")"
+  hasnt "no-lfs: a plain worktree add fails without git-lfs (the bug)" "$out" "rc=0"
+
+  # What run.sh does: the env first, then the checkout, then more git.
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main
+          git -C "$2" -c core.hooksPath=/dev/null worktree add -q -b fixed "$3" main && git -C "$3" status --porcelain && echo "rc=$?"' _ \
+          "$lib" "$root/repo" "$root/wt-fixed" 2>&1)"
+  has "no-lfs: with the run's env the worktree add succeeds"  "$out" "rc=0"
+  has "no-lfs: ...and says why the tree holds pointers"        "$out" "uses Git LFS and git-lfs is absent"
+  has "no-lfs: ...leaving the pointer file in place"           "$(cat "$root/wt-fixed/asset.bin" 2>/dev/null)" "git-lfs.github.com/spec"
+  hasnt "no-lfs: ...and a later git status still works"        "$out" "filter"
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main
+          git clone -q --no-local -- "$2" "$3" && git -C "$3" status --porcelain && echo "rc=$?"' _ \
+          "$lib" "$root/repo" "$root/clone-fixed" 2>&1)"
+  has "no-lfs: the container path's clone succeeds too"        "$out" "rc=0"
+  is  "no-lfs: nothing was written into the owner's config" \
+      "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" config --get core.hooksPath; echo end)" "end"
+  # Hooks go off for the checkout alone (run.sh's worktree add), never for
+  # the run: the environment every later git call inherits leaves them on.
+  out="$(PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main 2>/dev/null
+          echo "key0=${GIT_CONFIG_KEY_0:-unset}"; git -C "$2" config --get core.hooksPath; echo end' _ "$lib" "$root/repo")"
+  is  "no-lfs: the run's environment leaves the repo's hooks on" "$out" "key0=filter.lfs.process
+end"
+
+  out="$(PATH="$root/lfs-bin:$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/repo")"
+  is  "no-lfs: with git-lfs present, git runs unchanged"       "$out" "count=unset"
+  ( export GIT_CONFIG_GLOBAL=/dev/null; git init -q -b main "$root/plainrepo" && cd "$root/plainrepo" && printf x > f \
+      && git -c user.email=t@t -c user.name=t add f && git -c user.email=t@t -c user.name=t commit -qm x )
+  out="$(PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/plainrepo")"
+  is  "no-lfs: a repo without LFS keeps its hooks, even without git-lfs" "$out" "count=unset"
+  out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main 2>/dev/null
+          echo "$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_KEY_1"' _ "$lib" "$root/repo")"
+  is  "no-lfs: a caller's own GIT_CONFIG_ entries are kept, not overwritten" "$out" "5 x.y filter.lfs.process"
+  # An inherited count the arithmetic would trip on. git reads it with
+  # strtol: " 1" is 1 and 08 is 8 to git, so the list is appended after the
+  # caller's entries, never over them. A count git itself rejects ("junk")
+  # fails the check first: no override, a note, and the run goes on.
+  local -a keys8=(); local k; for k in 0 1 2 3 4 5 6 7; do keys8+=( "GIT_CONFIG_KEY_$k=x.k$k" "GIT_CONFIG_VALUE_$k=v" ); done
+  local count_probe='set -Eeuo pipefail; source "$1"; scratch_git_env "$2" main 2>&1
+          echo "count=$GIT_CONFIG_COUNT ${GIT_CONFIG_KEY_0:-} ${GIT_CONFIG_KEY_1:-} ${GIT_CONFIG_KEY_8:-}"'
+  out="$(env "${keys8[@]}" GIT_CONFIG_COUNT=08 PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
+  has "no-lfs: an inherited GIT_CONFIG_COUNT of 08 is decimal, appended after" "$out" "count=12 x.k0 x.k1 filter.lfs.process"
+  out="$(GIT_CONFIG_COUNT=" 1" GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
+  has "no-lfs: an inherited count with a leading space keeps the caller's entry" "$out" "count=5 x.y filter.lfs.process"
+  out="$(GIT_CONFIG_COUNT=+1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
+  has "no-lfs: an inherited count with a plus sign keeps the caller's entry" "$out" "count=5 x.y filter.lfs.process"
+  out="$(GIT_CONFIG_COUNT=junk PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
+  has "no-lfs: a count git rejects is read as LFS present, and the run goes on" "$out" "count=4 filter.lfs.process"
+  has "no-lfs: ...saying it could not tell"                                  "$out" "could not tell"
+
+  # The tree being checked out decides, not the owner's index: the owner may
+  # sit on a branch from before LFS arrived, or after it left.
+  local probe='source "$1"; scratch_git_env "$2" "$3"; echo "key0=${GIT_CONFIG_KEY_0:-unset}"'
+  local pre_lfs; pre_lfs="$(git -C "$root/repo" rev-parse main~1)"
+  out="$(PATH="$nolfs_path" bash -c "$probe" _ "$lib" "$root/repo" "$pre_lfs" 2>/dev/null)"
+  is  "no-lfs: a base without LFS is not overridden, though the owner's tree has it" "$out" "key0=unset"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" -c core.hooksPath=/dev/null checkout -q -b pre-lfs "$pre_lfs"
+  out="$(PATH="$nolfs_path" bash -c "$probe" _ "$lib" "$root/repo" main 2>/dev/null)"
+  is  "no-lfs: a base with LFS is overridden, though the owner's tree has none" "$out" "key0=filter.lfs.process"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" -c core.hooksPath=/dev/null checkout -q main
+  # A check that cannot be answered fails closed: read as LFS present, so a
+  # write tier is refused rather than let through on a guess, and says so.
+  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "override=$SCRATCH_LFS_OVERRIDE"; echo "survived"' _ "$lib" "$root/repo" no-such-ref 2>&1)"
+  has "no-lfs: an unreadable base is read as LFS present..." "$out" "override=1"
+  has "no-lfs: ...notes why, naming git grep's exit status" "$out" "git grep exited 128"
+  has "no-lfs: ...and does not end the run"               "$out" "survived"
+  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "survived"' _ "$lib" "$root/plainrepo" main 2>&1)"
+  is  "no-lfs: no match under set -e does not end the run" "$(tr "\n" " " <<< "$out")" "key0=unset survived "
+
+  # LFS declared only below the top level, as UnrealClaude does it
+  # (UnrealClaude/.gitattributes): a root-only check would miss it.
+  ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$root/nested" && cd "$root/nested" || exit 1
+    mkdir -p sub; printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > sub/.gitattributes
+    : > sub/a.bin; git add -A && git -c user.email=t@t -c user.name=t commit -qm nested )
+  out="$(PATH="$nolfs_path" bash -c "$probe" _ "$lib" "$root/nested" main 2>/dev/null)"
+  is  "no-lfs: LFS declared in a nested .gitattributes is detected" "$out" "key0=filter.lfs.process"
+
+  # Under run.sh's own options, with far more LFS paths than a pipe holds: a
+  # reader that stops at the first line SIGPIPEs the writer, and pipefail
+  # turned that into "no LFS" (the review of 67e8bab).
+  ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$root/big" && cd "$root/big" || exit 1
+    mkdir -p assets/a-directory-name-long-enough-to-fill-the-pipe
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    local i; for (( i = 0; i < 5000; i++ )); do
+      : > "assets/a-directory-name-long-enough-to-fill-the-pipe/asset-${i}.bin"
+    done
+    git add -A && git -c user.email=t@t -c user.name=t commit -qm big )
+  is  "no-lfs: the fixture really has 5000 LFS paths" \
+      "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$root/big" ls-files -- ':(attr:filter=lfs)' | wc -l)" "5000"
+  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe" _ "$lib" "$root/big" main 2>/dev/null)"
+  is  "no-lfs: 5000 LFS paths under set -Eeuo pipefail are still detected" "$out" "key0=filter.lfs.process"
+}
+
+# The same repository through run.sh itself, on the timer's PATH (no
+# git-lfs). With the clean filter off, `git add` -- the runner's or an
+# engine's own -- stores an LFS file as its full content, and a guard on
+# what was staged reads .gitattributes from the tree the engine edited. So a
+# write tier on such a repo is refused before anything is checked out; a
+# read-only tier runs on the pointer files; a repo without LFS is unaffected,
+# and there the owner's pre-commit still runs and still stops a commit.
+test_scratch_lfs_run() {
+  local root="$FIXTURE/lfs-run" repo="$FIXTURE/lfs-run/git-lfsrepo" plain="$FIXTURE/lfs-run/git-plainrepo" out
+  mkdir -p "$root"/{state,tasks,stub,nolfs} "$repo" "$plain"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  printf 'Task {{REPO_NAME}} {{REPO_PATH}} {{FILE_BUDGET}} {{LENS}} {{REPORT_PATH}} {{DATE}} {{BRANCH}} {{TASK}} {{TIER}} {{REPO_SPEC}} {{ALLOWED_COMMANDS}} {{DEFAULT_BRANCH}} {{UPSTREAM}} {{ETIQUETTE}} {{ETIQUETTE_CONTENT}} {{TICKET_ID}} {{TICKET_TITLE}} {{TICKET_NOTES}}\n' > "$root/tasks/t.md"
+  # Everything in /usr/bin but git-lfs: run.sh needs far more than git.
+  local f; for f in /usr/bin/*; do [[ "${f##*/}" == git-lfs ]] || ln -s "$f" "$root/nolfs/"; done
+  printf '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\trequired = true\n' > "$root/gitconfig-lfs"
+  local -a env_run=( GIT_CONFIG_GLOBAL="$root/gitconfig-lfs" GIT_CONFIG_NOSYSTEM=1
+                     PATH="$root/stub:$root/nolfs" MEUTE_QUOTA_STUB=100 )
+  (
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$repo"; cd "$repo" || exit 1
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    printf 'version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n' > asset.bin
+    echo x > f.txt
+    git add -A; git -c user.email=t@t -c user.name=t commit -qm init
+    printf '#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || exit 2\n' > .git/hooks/post-checkout
+    cp .git/hooks/post-checkout .git/hooks/post-commit   # as `git lfs install` writes both
+    chmod +x .git/hooks/post-checkout .git/hooks/post-commit
+    git init -q -b main "$plain"; cd "$plain" || exit 1
+    echo x > f.txt
+    git add -A; git -c user.email=t@t -c user.name=t commit -qm init
+    printf '#!/bin/sh\necho ran > "%s/pre-commit-ran"\nexit 1\n' "$root" > .git/hooks/pre-commit
+    chmod +x .git/hooks/pre-commit
+  )
+  # The stub engine marks that it ran (auth is preflight, not a run), edits
+  # the file named in $root/stub/edit, then reports.
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+here="$(dirname "${BASH_SOURCE[0]}")"
+: > "$here/engine-ran"
+edit="$(cat "$here/edit")"
+if [[ "$edit" == commit:* ]]; then
+  # An engine committing on its own, in the worktree it was started in.
+  printf 'full content, not a pointer\n' > "${edit#commit:}"
+  git add -- "${edit#commit:}" && git -c user.email=e@e -c user.name=e commit -qm "engine's own"
+  git rev-parse HEAD > "$here/engine-commit"
+elif [[ -n "$edit" ]]; then printf 'changed by the stub\n' >> "$edit"; fi
+jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
+STUB
+  chmod +x "$root/stub/claude"
+  python3 - "$root" "$repo" "$plain" <<'PY2'
+import sys, pathlib, yaml
+root, repo, plain = sys.argv[1], sys.argv[2], sys.argv[3]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.20,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier1": {"tools": "Read", "permission_mode": "acceptEdits", "writes_code": True, "network": "proxied"},
+              "tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
+    "tasks": {"t": {"tier": "tier1", "template": "tasks/t.md", "slots": ["daily"]},
+              "r": {"tier": "tier2", "template": "tasks/t.md", "slots": ["daily"]}},
+    "repos": [{"name": "lfsrepo", "path": repo, "spec": "lfs fixture", "tasks": ["t", "r"]},
+              {"name": "plainrepo", "path": plain, "spec": "plain fixture", "tasks": ["t"]}],
+    "community": [],
+}, open(pathlib.Path(root) / "repos.yaml", "w"), sort_keys=False)
+PY2
+  branches() { git -C "$1" branch --list 'meute/*' | wc -l; }
+
+  # A write tier on the LFS repo: refused by name, before the checkout.
+  printf 'f.txt\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" GIT_TRACE="$root/trace-refused" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
+  local line; line="$(tail -1 "$root/state/log")"
+  has   "lfs run: a write tier on an LFS repo without git-lfs is refused" "$line" "detail=lfs-repo-needs-git-lfs-for-write-tiers"
+  has   "lfs run: ...as an error"                             "$line" "status=error"
+  # §7's demotion counter excludes stage=preflight by name; a host that
+  # lacks git-lfs is no fault of the repo's.
+  has   "lfs run: ...logged at stage=preflight, outside demotion" "$line" "stage=preflight"
+  is    "lfs run: ...no branch is created"                    "$(branches "$repo")" "0"
+  is    "lfs run: ...nor any worktree"                        "$(git -C "$repo" worktree list | wc -l)" "1"
+  is    "lfs run: ...nor a scratch directory"                 "$(find "$root/.worktrees" -mindepth 1 -maxdepth 1 -name 'lfsrepo-*' 2>/dev/null | wc -l)" "0"
+  [[ -e "$root/stub/engine-ran" ]] && bad "lfs run: ...and no engine is invoked" "the stub ran" \
+    || ok "lfs run: ...and no engine is invoked"
+  # Cleanup would remove a worktree and a branch still at the base, so their
+  # absence afterwards proves nothing about order: the trace does.
+  hasnt "lfs run: ...the refusal comes before any worktree add" "$(cat "$root/trace-refused")" "worktree add"
+
+  # A read-only tier on the same repo runs, on pointer files, past a
+  # post-checkout that exits 2. Detection and checkout name one commit: the
+  # base is resolved once, and a checkout from the ref would read it again
+  # after it could have moved. Traced, not inferred.
+  : > "$root/stub/edit"
+  local base_sha; base_sha="$(git -C "$repo" rev-parse main)"
+  out="$(env "${env_run[@]}" GIT_TRACE="$root/trace" "$root/bin/run.sh" daily --repo lfsrepo --task r 2>&1)"
+  has   "lfs run: a read-only tier on the LFS repo runs, on pointer files" "$out" "status=ok"
+  has   "lfs run: ...the base was seen to use LFS"            "$out" "uses Git LFS and git-lfs is absent"
+  [[ -e "$root/stub/engine-ran" ]] && ok "lfs run: ...and its engine is invoked" \
+    || bad "lfs run: ...and its engine is invoked" "the stub never ran"
+  has   "lfs run: LFS is detected at the recorded base SHA" \
+        "$(grep -F 'git grep' "$root/trace")" "$base_sha"
+  has   "lfs run: ...and the worktree is added from that same SHA" \
+        "$(grep -F 'worktree add' "$root/trace")" "$base_sha"
+
+  # writes_code:false is not a promise the engine cannot commit. A branch
+  # that moved off the base under the override carries full blobs, so the
+  # run is an error and the branch is deleted however it moved.
+  printf 'commit:big.bin\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task r 2>&1)"
+  line="$(tail -1 "$root/state/log")"
+  has   "lfs run: a read-only engine that commits under the override is an error" "$line" "status=error"
+  has   "lfs run: ...named as the branch having moved"        "$line" "detail=lfs-branch-moved-without-git-lfs"
+  local engine_commit; engine_commit="$(cat "$root/stub/engine-commit" 2>/dev/null)"
+  [[ -n "$engine_commit" ]] && ok "lfs run: ...the stub really committed" \
+    || bad "lfs run: ...the stub really committed" "no commit recorded"
+  is    "lfs run: ...and no meute branch is left"             "$(branches "$repo")" "0"
+  is    "lfs run: ...nor any ref that reaches its commit" \
+        "$(git -C "$repo" for-each-ref --contains "${engine_commit:-HEAD}" | wc -l)" "0"
+  is    "lfs run: ...nor any worktree"                        "$(git -C "$repo" worktree list | wc -l)" "1"
+  : > "$root/stub/edit"
+
+  # A write tier on a repo without LFS is unaffected. The owner's pre-commit
+  # runs, and a failing one stops the commit -- and the run says so: a
+  # refused commit used to be logged status=ok with the base as its commit.
+  printf 'f.txt\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo plainrepo --task t 2>&1)"
+  hasnt "lfs run: a write tier on a repo without LFS is not refused" "$out" "lfs-repo-needs-git-lfs"
+  [[ -f "$root/pre-commit-ran" ]] && ok "lfs run: ...the owner's pre-commit runs at the commit" \
+    || bad "lfs run: ...the owner's pre-commit runs at the commit" "no marker"
+  is    "lfs run: ...and a failing one stops the commit"      "$(branches "$plain")" "0"
+  has   "lfs run: ...a refused commit is an error"            "$(tail -1 "$root/state/log")" "status=error"
+  has   "lfs run: ...named as the commit's failure"           "$(tail -1 "$root/state/log")" "detail=commit-failed"
+  rm -f "$plain/.git/hooks/pre-commit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo plainrepo --task t 2>&1)"
+  has   "lfs run: ...and with the hook gone it commits"       "$out" "status=ok"
+  is    "lfs run: ...onto a scratch branch"                   "$(branches "$plain")" "1"
+}
+
 test_engines() {
   local root="$FIXTURE/engines" out
   mkdir -p "$root"
@@ -2293,6 +2558,104 @@ test_engines() {
   printf '%s' '{"result":"","is_error":true,"subtype":"error_during_execution"}' > "$out"
   extract_claude "$out" || true
   is "engines: without a status, the subtype is still the detail" "$ENGINE_DETAIL" "error_during_execution"
+
+  # No status AND subtype "success": the CLI failed before any API call (seen
+  # 2026-09-29/30 on the host, a token refresh colliding with an interactive
+  # session) and the only true thing it said is in .result. The log used to
+  # read `status=error detail=success`.
+  out="$root/no-status-success.json"
+  printf '%s' '{"result":"Failed to refresh OAuth token: another Claude Code process\nis refreshing it","is_error":true,"subtype":"success","num_turns":1}' > "$out"
+  extract_claude "$out" || true
+  is    "engines: a status-less failure is an error"          "$ENGINE_STATUS" "error"
+  has   "engines: ...whose detail carries the CLI's message"  "$ENGINE_DETAIL" "Failed to refresh OAuth token"
+  hasnt "engines: ...and never reads as success"            "$ENGINE_DETAIL" "success"
+  is    "engines: ...on one line"  "$(printf '%s' "$ENGINE_DETAIL" | wc -l)" "0"
+  is    "engines: ...and is not a rate limit"                 "$RATE_LIMITED" "0"
+  # A specific subtype that also carries a message keeps both.
+  out="$root/subtype-and-message.json"
+  printf '%s' '{"result":"tool loop aborted","is_error":true,"subtype":"error_during_execution"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a subtype with a message keeps both" "$ENGINE_DETAIL" "error_during_execution: tool loop aborted"
+  # Nothing at all to say is still named, not blank.
+  out="$root/no-status-no-message.json"
+  printf '%s' '{"result":"","is_error":true,"subtype":"success"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a failure with no message and a meaningless subtype says so" "$ENGINE_DETAIL" "cli error: no message"
+
+  # A CLI message is neither clean nor bounded. A carriage return would
+  # redraw a terminal line over the record; a stack trace would swamp it.
+  # Every control character becomes a space and the message stops at 300
+  # characters, "..." included, on both branches.
+  out="$root/carriage-return.json"
+  printf '%s' '{"result":"refresh failed\rOK\u0007done","is_error":true,"subtype":"success"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a status-less message's control characters become spaces" "$ENGINE_DETAIL" "cli error: refresh failed OK done"
+  out="$root/huge.json"
+  jq -n --arg r "$(printf 'x%.0s' {1..2048})" '{result:$r,is_error:true,subtype:"success",api_error_status:500}' > "$out"
+  extract_claude "$out" || true
+  is  "engines: a 2 KB provider message is capped at 300 characters, prefix and ellipsis included" \
+      "$ENGINE_DETAIL" "api 500: $(printf 'x%.0s' {1..288})..."
+  out="$root/cr-status.json"
+  printf '%s' '{"result":"bad\rgateway","is_error":true,"subtype":"success","api_error_status":502}' > "$out"
+  extract_claude "$out" || true
+  is "engines: ...and a provider message's carriage return is a space too" "$ENGINE_DETAIL" "api 502: bad gateway"
+  out="$root/huge-no-status.json"
+  jq -n --arg r "$(printf 'y%.0s' {1..2048})" '{result:$r,is_error:true,subtype:"success"}' > "$out"
+  extract_claude "$out" || true
+  is  "engines: a 2 KB status-less message is capped too" "$ENGINE_DETAIL" "cli error: $(printf 'y%.0s' {1..286})..."
+
+  # The final detail is cleaned, not only the message: the subtype and the
+  # status are the CLI's too, and go through the same cleaner.
+  out="$root/cr-subtype.json"
+  printf '%s' '{"result":"m","is_error":true,"subtype":"err\r\tx"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a subtype's carriage return and tab become spaces" "$ENGINE_DETAIL" "err  x: m"
+  out="$root/cr-status-field.json"
+  printf '%s' '{"result":"m","is_error":true,"subtype":"success","api_error_status":"5\r0\t2"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: ...and so do a status's" "$ENGINE_DETAIL" "api 5 0 2: m"
+  out="$root/huge-subtype.json"
+  jq -n --arg s "$(printf 's%.0s' {1..2048})" '{result:"m",is_error:true,subtype:$s}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a 2 KB subtype still caps the whole detail at 300" "${#ENGINE_DETAIL}" "300"
+  # Counted in characters, under the timer's C locale: a byte cut splits
+  # a multibyte character and leaves invalid UTF-8 on the log line. Where a
+  # byte cut lands depends on what precedes the é run, so both parities: a
+  # cut of the message alone at 297 bytes splits the first, a cut of the
+  # whole detail at 297 bytes splits the second.
+  local lead mb mb_chars
+  for lead in "" a; do
+    out="$root/huge-multibyte${lead}.json"
+    jq -n --arg r "${lead}$(printf '\xc3\xa9%.0s' {1..1024})" '{result:$r,is_error:true,subtype:"success",api_error_status:500}' > "$out"
+    mb="$(LC_ALL=C; extract_claude "$out" || true; printf '%s' "$ENGINE_DETAIL")"
+    printf '%s' "$mb" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 \
+      && ok "engines: a 2 KB multibyte message (lead [${lead}]) cut under LC_ALL=C is valid UTF-8" \
+      || bad "engines: a 2 KB multibyte message (lead [${lead}]) cut under LC_ALL=C is valid UTF-8" "iconv rejected it"
+    mb_chars="$(printf '%s' "$mb" | LC_ALL=C.UTF-8 wc -m)"
+    is "engines: ...and exactly 300 characters, not bytes" "$mb_chars" "300"
+  done
+  # Without the UTF-8 locale (a host that lacks C.UTF-8), the cut is by
+  # bytes; iconv then drops the split sequence it leaves, so the line is
+  # still valid UTF-8, just shorter.
+  for lead in "" a; do
+    mb="$(LC_ALL=C; ENGINE_DETAIL_LOCALE=xx_NO.UTF-8; engine_detail_clean "api 500: ${lead}$(printf '\xc3\xa9%.0s' {1..1024})" 2>/dev/null)"
+    printf '%s' "$mb" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 \
+      && ok "engines: under a locale that does not exist (lead [${lead}]), still valid UTF-8" \
+      || bad "engines: under a locale that does not exist (lead [${lead}]), still valid UTF-8" "iconv rejected it"
+    has "engines: ...and still capped with an ellipsis" "${mb: -3}" "..."
+  done
+  # Without the locale AND without iconv, python3 -- which meute already
+  # requires -- is the last repair; the line is still valid UTF-8.
+  local pyonly="$FIXTURE/engines-pyonly"; mkdir -p "$pyonly"
+  ln -sfn "$(command -v python3)" "$pyonly/python3"
+  local iconv_bin; iconv_bin="$(command -v iconv)"
+  for lead in "" a; do
+    mb="$(LC_ALL=C; PATH="$pyonly"; ENGINE_DETAIL_LOCALE=xx_NO.UTF-8; engine_detail_clean "api 500: ${lead}$(printf '\xc3\xa9%.0s' {1..1024})" 2>/dev/null)"
+    printf '%s' "$mb" | "$iconv_bin" -f UTF-8 -t UTF-8 >/dev/null 2>&1 \
+      && ok "engines: with neither the locale nor iconv (lead [${lead}]), still valid UTF-8" \
+      || bad "engines: with neither the locale nor iconv (lead [${lead}]), still valid UTF-8" "iconv rejected it"
+    has "engines: ...and still capped with an ellipsis" "${mb: -3}" "..."
+  done
 }
 
 
@@ -3980,6 +4343,16 @@ test_p2_scratch_clone() {
   is  "clone: no default branch falls back to HEAD" \
       "$(git -C "$root/work2" rev-parse HEAD)" "$base"
 
+  # A base the clone did not bring is refused, not swapped for the clone's
+  # HEAD: LFS detection was asked of the base, so the tree checked out has
+  # to be that one.
+  local absent; absent="$(git -C "$root/src" rev-parse secret)"
+  if scratch_clone "$root/src" "$root/work5" main "meute/lint-2026-09-24" "$absent" >/dev/null 2>&1; then
+    bad "clone: a base the clone lacks is refused" "checked out $(git -C "$root/work5" rev-parse HEAD) instead"
+  else
+    ok "clone: a base the clone lacks is refused"
+  fi
+
   # A later stage clones the branch it is continuing, not the default one.
   git -C "$root/src" branch meute/draft-2026-09-01 main
   scratch_clone "$root/src" "$root/work3" "" "meute/draft-2026-09-01" "$base" >/dev/null 2>&1
@@ -4563,6 +4936,57 @@ STUB
   has "dispatch: ...the image root read-only"              "$engine_call" "--read-only"
   has "dispatch: ...its own credential volume"             "$engine_call" "atelier-auth-claude"
   hasnt "dispatch: ...and never the GitHub token"          "$(cat "$root/stub/podman-calls")" "atelier-auth-gh"
+}
+
+# The container side of lfs-branch-moved-without-git-lfs: an LFS repo on a
+# host without git-lfs, a read-only tier, and an engine that commits in the
+# scratch clone anyway. Nothing may be fetched back into the owner's repo.
+test_p2b_lfs_branch_moved() {
+  local root="$FIXTURE/p2b-lfs"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub" "$root/nolfs"
+  local f; for f in /usr/bin/*; do [[ "${f##*/}" == git-lfs ]] || ln -s "$f" "$root/nolfs/"; done
+  ( cd "$root/git-netlens" || exit 1
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes && git -c user.email=t@t -c user.name=t commit -qm lfs )
+  # The engine call commits in the host directory mounted at /work, as an
+  # engine given a writable tree could.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$root/stub/podman-calls"
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  "secret exists atelier-claude-token") exit 0 ;;
+  *" -p "*)
+    work="\$(printf '%s\n' "\$@" | sed -n 's|^\(.*\):/work:.*|\1|p' | head -1)"
+    printf 'full content\n' > "\$work/big.bin"
+    git -C "\$work" add big.bin && git -C "\$work" -c user.email=e@e -c user.name=e commit -qm "engine's own"
+    git -C "\$work" rev-parse HEAD > "$root/stub/engine-commit"
+    printf '{"is_error":false,"result":"## Summary ran inside the container","total_cost_usd":0.01,"num_turns":1}\n' ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  local out line sha
+  out="$(PATH="$root/stub:$root/nolfs" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+         "$root/bin/run.sh" daily --repo netlens 2>&1)"
+  line="$(tail -1 "$root/state/log")"
+  sha="$(cat "$root/stub/engine-commit" 2>/dev/null)"
+  [[ -n "$sha" ]] && ok "lfs container: the engine really committed in the clone" \
+    || bad "lfs container: the engine really committed in the clone" "no commit recorded: $out"
+  has "lfs container: the run is an error"            "$line" "status=error"
+  has "lfs container: ...named as the branch having moved" "$line" "detail=lfs-branch-moved-without-git-lfs"
+  is  "lfs container: ...no meute branch in the owner's repo" \
+      "$(git -C "$root/git-netlens" branch --list 'meute/*' | wc -l)" "0"
+  is  "lfs container: ...no import aside either" \
+      "$(git -C "$root/git-netlens" for-each-ref refs/meute | wc -l)" "0"
+  git -C "$root/git-netlens" cat-file -e "${sha:-0000000}" 2>/dev/null \
+    && bad "lfs container: ...and the commit was never fetched" "it is in the owner's object store" \
+    || ok "lfs container: ...and the commit was never fetched"
 }
 
 # The last precondition before an engine runs. For claude that is the token
@@ -5311,6 +5735,8 @@ test_install_timers
 test_pause
 test_hold_extend
 test_engines
+test_scratch_without_lfs
+test_scratch_lfs_run
 test_self_budget
 test_manifest_ceiling
 test_subscription_gate
@@ -5368,6 +5794,7 @@ test_p2_isolation
 test_p2_proxied_egress
 test_p2_container_probe
 test_p2b_container_dispatch
+test_p2b_lfs_branch_moved
 test_p2b_preflight
 test_p2b_secret_vanishes
 test_p2b_pidfile_signal_cleanup
