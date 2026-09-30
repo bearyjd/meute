@@ -1344,3 +1344,11 @@ than advancing onto an empty branch (§4.3).
   suite's own session. GNU `timeout` moves itself into its own process
   group, which is why a group signal could not reproduce this and the test
   signals the session.
+- **Codex round seven: Warning (1 LOW), accepted.** Everything else
+  clean; full suite 1050 / 0 in Codex's harness, which the suite no longer
+  endangers. The LOW: a unit-wide SIGTERM landing between `mktemp -d` and
+  the trap going up can leave one empty `meute-pid-*` directory. No bash
+  ordering closes it -- `mktemp` creates the directory before its name can
+  be assigned to anything a trap reads -- and the cost is an empty
+  directory in `$TMPDIR`. Recorded, not chased: seven rounds, and the
+  findings had narrowed from credential fallback to this.
