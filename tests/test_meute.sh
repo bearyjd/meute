@@ -2262,29 +2262,63 @@ test_scratch_without_lfs() {
   hasnt "no-lfs: a plain worktree add fails without git-lfs (the bug)" "$out" "rc=0"
 
   # What run.sh does: the env first, then the checkout, then more git.
-  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main
           git -C "$2" worktree add -q -b fixed "$3" main && git -C "$3" status --porcelain && echo "rc=$?"' _ \
           "$lib" "$root/repo" "$root/wt-fixed" 2>&1)"
   has "no-lfs: with the run's env the worktree add succeeds"  "$out" "rc=0"
   has "no-lfs: ...and says why the tree holds pointers"        "$out" "uses Git LFS and git-lfs is absent"
   has "no-lfs: ...leaving the pointer file in place"           "$(cat "$root/wt-fixed/asset.bin" 2>/dev/null)" "git-lfs.github.com/spec"
   hasnt "no-lfs: ...and a later git status still works"        "$out" "filter"
-  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main
           git clone -q --no-local -- "$2" "$3" && git -C "$3" status --porcelain && echo "rc=$?"' _ \
           "$lib" "$root/repo" "$root/clone-fixed" 2>&1)"
   has "no-lfs: the container path's clone succeeds too"        "$out" "rc=0"
   is  "no-lfs: nothing was written into the owner's config" \
       "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" config --get core.hooksPath; echo end)" "end"
 
-  out="$(PATH="$root/lfs-bin:$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/repo")"
+  out="$(PATH="$root/lfs-bin:$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/repo")"
   is  "no-lfs: with git-lfs present, git runs unchanged"       "$out" "count=unset"
   ( export GIT_CONFIG_GLOBAL=/dev/null; git init -q -b main "$root/plainrepo" && cd "$root/plainrepo" && printf x > f \
       && git -c user.email=t@t -c user.name=t add f && git -c user.email=t@t -c user.name=t commit -qm x )
-  out="$(PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/plainrepo")"
+  out="$(PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/plainrepo")"
   is  "no-lfs: a repo without LFS keeps its hooks, even without git-lfs" "$out" "count=unset"
-  out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" 2>/dev/null
+  out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" main 2>/dev/null
           echo "$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_KEY_1"' _ "$lib" "$root/repo")"
   is  "no-lfs: a caller's own GIT_CONFIG_ entries are kept, not overwritten" "$out" "6 x.y filter.lfs.process"
+
+  # The tree being checked out decides, not the owner's index: the owner may
+  # sit on a branch from before LFS arrived, or after it left.
+  local probe='source "$1"; scratch_git_env "$2" "$3"; echo "key0=${GIT_CONFIG_KEY_0:-unset}"'
+  local pre_lfs; pre_lfs="$(git -C "$root/repo" rev-parse main~1)"
+  out="$(PATH="$nolfs_path" bash -c "$probe" _ "$lib" "$root/repo" "$pre_lfs" 2>/dev/null)"
+  is  "no-lfs: a base without LFS is not overridden, though the owner's tree has it" "$out" "key0=unset"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" -c core.hooksPath=/dev/null checkout -q -b pre-lfs "$pre_lfs"
+  out="$(PATH="$nolfs_path" bash -c "$probe" _ "$lib" "$root/repo" main 2>/dev/null)"
+  is  "no-lfs: a base with LFS is overridden, though the owner's tree has none" "$out" "key0=filter.lfs.process"
+  GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" -c core.hooksPath=/dev/null checkout -q main
+  # A check that cannot be answered is not "no LFS" by accident, and says so.
+  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "survived"' _ "$lib" "$root/repo" no-such-ref 2>&1)"
+  is  "no-lfs: an unreadable base applies no override..." "$(grep -c 'key0=unset' <<< "$out")" "1"
+  has "no-lfs: ...notes why"                              "$out" "could not tell"
+  has "no-lfs: ...and does not end the run"               "$out" "survived"
+  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "survived"' _ "$lib" "$root/plainrepo" main 2>&1)"
+  is  "no-lfs: no match under set -e does not end the run" "$(tr "\n" " " <<< "$out")" "key0=unset survived "
+
+  # Under run.sh's own options, with far more LFS paths than a pipe holds: a
+  # reader that stops at the first line SIGPIPEs the writer, and pipefail
+  # turned that into "no LFS" (the review of 67e8bab).
+  ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$root/big" && cd "$root/big" || exit 1
+    mkdir -p assets/a-directory-name-long-enough-to-fill-the-pipe
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    local i; for (( i = 0; i < 5000; i++ )); do
+      : > "assets/a-directory-name-long-enough-to-fill-the-pipe/asset-${i}.bin"
+    done
+    git add -A && git -c user.email=t@t -c user.name=t commit -qm big )
+  is  "no-lfs: the fixture really has 5000 LFS paths" \
+      "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$root/big" ls-files -- ':(attr:filter=lfs)' | wc -l)" "5000"
+  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe" _ "$lib" "$root/big" main 2>/dev/null)"
+  is  "no-lfs: 5000 LFS paths under set -Eeuo pipefail are still detected" "$out" "key0=filter.lfs.process"
 }
 
 test_engines() {

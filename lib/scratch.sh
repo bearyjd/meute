@@ -22,7 +22,7 @@ scratch_note() { printf 'meute: %s\n' "$*" >&2; }
 # --------------------------------------------------------------------------
 # A repository that uses Git LFS, on a machine without git-lfs.
 #
-#   scratch_git_env <repo>
+#   scratch_git_env <repo> <commit>
 #
 # The host the timers run on has no git-lfs. An LFS repository then cannot be
 # checked out at all: the smudge filter cannot start, and the post-checkout
@@ -34,13 +34,28 @@ scratch_note() { printf 'meute: %s\n' "$*" >&2; }
 # later git call in the run -- status, diff, the commit -- would otherwise hit
 # the same missing filter. Never written into the owner's .git/config, which a
 # linked worktree shares. Hooks go off only for an LFS repository; anywhere
-# else they are left alone, so a repo's own pre-commit still runs. Whether the
-# repo uses LFS is asked through attribute pathspecs, which need no git-lfs.
+# else they are left alone, so a repo's own pre-commit still runs.
+#
+# Whether the repo uses LFS is asked of <commit>, the tree about to be checked
+# out, not of the owner's index: the owner may sit on a branch from before LFS
+# arrived. Its .gitattributes are grepped for filter=lfs, which needs no
+# git-lfs. git's own exit status answers, never a pipe into a reader that
+# stops early: under the runner's pipefail the writer's SIGPIPE read as "no
+# LFS" once the path list outgrew the pipe. A check that
+# cannot be answered applies no override and says so; the checkout then fails
+# loudly rather than being altered on a guess.
 # --------------------------------------------------------------------------
 scratch_git_env() {
-  local repo="$1"
+  local repo="$1" commit="$2" rc
   command -v git-lfs >/dev/null 2>&1 && return 0
-  git -C "$repo" ls-files -- ':(attr:filter=lfs)' 2>/dev/null | grep -q . || return 0
+  git -C "$repo" grep -q -e 'filter=lfs' "${commit:-}" -- .gitattributes '**/.gitattributes' 2>/dev/null \
+    && rc=0 || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) scratch_note "could not tell whether ${repo##*/} uses Git LFS at ${commit:-<none>} (git grep exited ${rc}); no override"
+       return 0 ;;
+  esac
   local n="${GIT_CONFIG_COUNT:-0}" kv
   for kv in filter.lfs.process= filter.lfs.smudge= filter.lfs.clean= \
             filter.lfs.required=false core.hooksPath=/dev/null; do

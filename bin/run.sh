@@ -631,7 +631,11 @@ run_entry() {
   fi
 
   trap cleanup EXIT
-  scratch_git_env "$REPO_PATH"
+  # Asked of the tree about to be checked out: the branch a later stage
+  # continues if it exists (as scratch_clone decides), else the base.
+  local lfs_at="$BASE_SHA"
+  git -C "$REPO_PATH" rev-parse --verify -q "refs/heads/${BRANCH}" >/dev/null 2>&1 && lfs_at="$BRANCH"
+  scratch_git_env "$REPO_PATH" "$lfs_at"
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
     # other side of the mount, so the container gets a self-contained clone
