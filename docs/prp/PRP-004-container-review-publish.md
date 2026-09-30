@@ -1321,3 +1321,9 @@ than advancing onto an empty branch (§4.3).
     red.
     A ninth, the fail-closed default for an unset flag, is equivalent,
     because `container_run` always sets the flag.
+- **Codex round four: Warning (1 LOW), fixed.** The pidfile logic held;
+  the pidfile directory leaked when a signal ended the run inside
+  `timeout`, since only `container_run`'s normal return removed it. It is
+  now published as `CONTAINER_PIDDIR` and the runner's EXIT trap removes
+  it (bash runs the EXIT trap on SIGTERM, checked). Tested with a stub that
+  SIGTERMs the runner mid-engine.

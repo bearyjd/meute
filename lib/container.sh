@@ -476,6 +476,9 @@ container_run() {
   local piddir rc=0
   piddir="$(mktemp -d "${TMPDIR:-/tmp}/meute-pid-XXXXXX")" \
     || { container_note "could not create a directory for the container's pidfile"; return 1; }
+  # Published so the runner's EXIT trap can remove it when a signal ends the
+  # run inside `timeout`, before the removal below is reached.
+  CONTAINER_PIDDIR="$piddir"
   local -a podman; read -ra podman <<< "$(podman_cmd)"
   local seconds; seconds="$(jq -r '.timeout_seconds // ""' <<< "$entry")"
   timeout --kill-after="$CONTAINER_STOP_TIMEOUT" "$(container_outer_bound "$seconds")" \
@@ -483,5 +486,6 @@ container_run() {
   [[ -s "${piddir}/pid" ]] && CONTAINER_STARTED=1
   rm -f "${piddir}/pid"; rmdir "$piddir" 2>/dev/null \
     || container_note "could not remove the pidfile directory ${piddir}"
+  CONTAINER_PIDDIR=""
   return "$rc"
 }

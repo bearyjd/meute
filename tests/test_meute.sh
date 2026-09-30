@@ -4679,6 +4679,35 @@ STUB
 # it writes only once the container process exists -- not the exit status,
 # which podman forwards from claude, so 125 alone proves nothing -- and
 # never its stderr.
+# A run stopped mid-flight (systemd's SIGTERM, a Ctrl-C) must not strand the
+# pidfile directory container_run made: the EXIT trap's cleanup removes it
+# too, since container_run's own removal is only on its normal return.
+test_p2b_pidfile_signal_cleanup() {
+  local root="$FIXTURE/p2b-pidsig"; p4_fixture "$root"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
+  mkdir -p "$root/stub" "$root/tmp"
+  # The engine run signals run.sh (timeout's parent) the way systemd would.
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+case "\$*" in
+  *"image inspect"*) printf '%s %s\n' "$P4_DIGEST" "$P2_ID" ;;
+  *"{{.State.Running}}"*) printf 'true\n' ;;
+  *"NetworkSettings"*) printf '10.89.14.10\n' ;;
+  "secret exists atelier-claude-token") exit 0 ;;
+  *" -p "*) kill -TERM "\$(ps -o ppid= -p "\$PPID" | tr -d ' ')"; sleep 5; exit 0 ;;
+  *) exit 125 ;;
+esac
+STUB
+  chmod +x "$root/stub/podman"
+  yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
+    "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
+  : > "$root/state/cursor"
+  TMPDIR="$root/tmp" PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
+    "$root/bin/run.sh" daily --repo netlens > /dev/null 2>&1
+  is "pidsig: a signalled run leaves no pidfile directory behind" \
+     "$(find "$root/tmp" -maxdepth 1 -name 'meute-pid-*' | wc -l)" "0"
+}
+
 test_p2b_secret_vanishes() {
   local root="$FIXTURE/p2b-vanish"; p4_fixture "$root"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
@@ -5286,6 +5315,7 @@ test_p2_container_probe
 test_p2b_container_dispatch
 test_p2b_preflight
 test_p2b_secret_vanishes
+test_p2b_pidfile_signal_cleanup
 test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential

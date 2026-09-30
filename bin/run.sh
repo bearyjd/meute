@@ -153,6 +153,7 @@ usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^#( |$)/, ""); print }' "$
 cleanup() {
   local rc=$?
   [[ -z "$OUT_DIR" ]] || rm -rf "$OUT_DIR"
+  [[ -z "${CONTAINER_PIDDIR:-}" ]] || rm -rf "$CONTAINER_PIDDIR"
   if [[ -n "$WORKTREE" && -d "$WORKTREE" ]]; then
     if (( CONTAINER_MODE )); then
       # A clone is a directory of its own: the owner's repository never
