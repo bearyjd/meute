@@ -1084,7 +1084,8 @@ What running it disclosed:
 ### Claude token secret -- the credential the run uses, checked where it lives (2026-09-27)
 
 Branch `feat/claude-token-secret` off `7e24a49`. Baseline 932 assertions
--> 970, then 1004 after review, then 1026 after Codex round one. 35 of the new assertions were red first. The rest assert an
+-> 970, then 1004 after review, then 1026 after Codex round one, 1029
+after round two, and 1044 after round three. 35 of the new assertions were red first. The rest assert an
 absence (no `--secret` on a no-network or codex run, the volume still
 mounted), which cannot fail before the flag exists, so mutation proves
 them instead. Each new guard was mutated in turn, and every mutation
@@ -1141,7 +1142,37 @@ override ignored.
     the image's own environment.
   - **One narrow gap remained, and is now closed.** A secret deleted
     between the preflight and the run used to fail as `stage=build`. After
-    Codex round one it is logged `stage=preflight` (§12).
+    Codex round one it is logged `stage=preflight` (§12). Since round
+    three, the relabel requires that the container process never existed.
+    That is read from podman's `--pidfile`, not from the exit status: podman
+    forwards the contained process's status, so claude can exit 125 too.
+  - **Measured on the host, 2026-09-30**, podman 5.8.7, `agent-base:g691e067`,
+    `--rm --network=none`, using a secret name that does not exist and no
+    real secret:
+    - `--cidfile F --secret no-such-secret,...  true`: rc 125
+      (`no such secret`), F absent.
+    - A normal run writes F, but podman deletes F with the container at
+      `--rm`. F exists while the container runs and is gone afterwards.
+      That makes the cidfile useless as an after-the-fact signal, because
+      every run would read as never-started. It was the planned signal and
+      is not used.
+    - `--pidfile P` survives `--rm`: P is present (7 bytes) after a
+      successful run, and after `sh -c 'exit 125'` under `--init
+      --read-only`, which returned rc 125.
+    - P is absent after the missing-secret refusal (rc 125).
+    - P is written when the image's pid 1 fails to exec (rc 1): the process
+      existed.
+    - A P that already exists is overwritten without complaint (rc 0).
+      That is why the runner always hands podman a fresh path in a new
+      `mktemp -d`, outside `/out`'s host directory.
+  - **Residual, accepted.** The relabel still fires on any podman failure
+    before a container process exists (rc 125, no pidfile) when the secret
+    happens to be absent at the re-check, even if the secret's absence did
+    not cause it. For example, podman fails at create for another reason
+    while the secret is deleted at the same moment. claude never ran in
+    that case, so no genuine claude failure is mislabelled. The only effect
+    is that a coincident podman failure is not counted toward demotion. An
+    unset `CONTAINER_STARTED` reads as started, the fail-closed side.
   - The env-over-file precedence is proven by this recorded live check,
     not by the suite, whose podman is a stub. It is re-checked on any image
     bump that moves claude (§5).
@@ -1257,3 +1288,30 @@ than advancing onto an empty branch (§4.3).
   `stage=build`. Tested both ways: gone-after with rc 1 stays `build` with
   no re-check; gone-after with 125 is `preflight`; present with 125 is
   `build`.
+- **Codex round three: Block (1 MEDIUM), fixed.** podman forwards the
+  contained process's exit status, so claude's own 125 was
+  indistinguishable from podman refusing a missing secret. A secret deleted
+  while claude ran still relabelled claude's genuine failure, and the exit
+  status alone cannot prove that a container never started.
+  - The plan was `--cidfile`. The host measurement ruled it out: `--rm`
+    deletes the cidfile with the container, so every run would have read
+    as never-started (§11).
+  - The fix uses `--pidfile` instead. `container_run` hands podman a fresh
+    path outside `/out`'s host directory, because a started container
+    could delete a file under `/out`. It sets `CONTAINER_STARTED` from
+    that file, resets the flag on every call, and removes the file
+    afterwards.
+  - The relabel now requires never-started, rc 125, and the re-check's
+    rc 1. The 125 conjunct keeps out a `container_argv` refusal (1) and
+    the outer wall clock (124).
+  - Tested with a stub that writes the pidfile only when it simulates a
+    started container:
+    - gone, never started, 125: `preflight`.
+    - gone, started, claude's own 125: `build`, not re-checked.
+    - gone, started, 1: `build`, not re-checked.
+    - gone, never started, 124: `build`.
+    - present, never started, 125: `build`.
+  - A unit test pins the flag's reset, the pidfile's cleanup, and its
+    location. All eight mutations of the new guards turned the suite red.
+    A ninth, the fail-closed default for an unset flag, is equivalent,
+    because `container_run` always sets the flag.
