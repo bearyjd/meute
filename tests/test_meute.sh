@@ -2644,6 +2644,18 @@ test_engines() {
       || bad "engines: under a locale that does not exist (lead [${lead}]), still valid UTF-8" "iconv rejected it"
     has "engines: ...and still capped with an ellipsis" "${mb: -3}" "..."
   done
+  # Without the locale AND without iconv, python3 -- which meute already
+  # requires -- is the last repair; the line is still valid UTF-8.
+  local pyonly="$FIXTURE/engines-pyonly"; mkdir -p "$pyonly"
+  ln -sfn "$(command -v python3)" "$pyonly/python3"
+  local iconv_bin; iconv_bin="$(command -v iconv)"
+  for lead in "" a; do
+    mb="$(LC_ALL=C; PATH="$pyonly"; ENGINE_DETAIL_LOCALE=xx_NO.UTF-8; engine_detail_clean "api 500: ${lead}$(printf '\xc3\xa9%.0s' {1..1024})" 2>/dev/null)"
+    printf '%s' "$mb" | "$iconv_bin" -f UTF-8 -t UTF-8 >/dev/null 2>&1 \
+      && ok "engines: with neither the locale nor iconv (lead [${lead}]), still valid UTF-8" \
+      || bad "engines: with neither the locale nor iconv (lead [${lead}]), still valid UTF-8" "iconv rejected it"
+    has "engines: ...and still capped with an ellipsis" "${mb: -3}" "..."
+  done
 }
 
 

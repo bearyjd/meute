@@ -66,7 +66,8 @@ engine_argv_claude() {
 # cut split a multibyte character, leaving invalid UTF-8 on the line.
 # ENGINE_DETAIL_LOCALE exists so a test can name a locale that is missing.
 # Where it is missing the cut is by bytes, and iconv -c drops the split
-# sequence it leaves; without iconv the byte cut stands, still one clean line.
+# sequence it leaves -- or python3, which meute already requires, where
+# iconv is absent.
 engine_detail_clean() {
   local LC_ALL="${ENGINE_DETAIL_LOCALE:-C.UTF-8}"
   local s="${1//[[:cntrl:]]/ }" v
@@ -74,6 +75,9 @@ engine_detail_clean() {
   if command -v iconv >/dev/null 2>&1; then
     # -c exits 1 when it dropped anything, which is the case it is here for.
     v="$(printf '%s' "$s" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null)" || true
+    [[ -z "$v" ]] || s="$v"
+  elif command -v python3 >/dev/null 2>&1; then
+    v="$(printf '%s' "$s" | python3 -c 'import sys; sys.stdout.write(sys.stdin.buffer.read().decode("utf-8", "ignore"))' 2>/dev/null)" || true
     [[ -z "$v" ]] || s="$v"
   fi
   printf '%s' "$s"
