@@ -53,8 +53,9 @@ scratch_note() { printf 'meute: %s\n' "$*" >&2; }
 # git-lfs. git's own exit status answers, never a pipe into a reader that
 # stops early: under the runner's pipefail the writer's SIGPIPE read as "no
 # LFS" once the path list outgrew the pipe. A check that cannot be answered
-# applies no override and says so; the checkout then fails loudly rather than
-# being altered on a guess.
+# fails closed and says so: it is read as LFS present, so the override is on
+# and bin/run.sh refuses a writing tier rather than letting one through on a
+# guess.
 # --------------------------------------------------------------------------
 scratch_git_env() {
   local repo="$1" commit="$2" rc
@@ -65,14 +66,13 @@ scratch_git_env() {
   case "$rc" in
     0) ;;
     1) return 0 ;;
-    *) scratch_note "could not tell whether ${repo##*/} uses Git LFS at ${commit:-<none>} (git grep exited ${rc}); no override"
-       return 0 ;;
+    *) scratch_note "could not tell whether ${repo##*/} uses Git LFS at ${commit:-<none>} (git grep exited ${rc}); treated as LFS present" ;;
   esac
   local n="${GIT_CONFIG_COUNT:-0}" kv
   # Appended after what the caller already set, read as git reads it
   # (strtoul): leading blanks and a plus sign skipped, 08 decimal rather than
-  # bad octal. A count git rejects failed the git grep above already; the
-  # fallback is a backstop that keeps the arithmetic from ending the run.
+  # bad octal. A count git rejects failed the git grep above already, and
+  # is replaced: the list then starts at 0, a count git accepts.
   n="${n#"${n%%[![:space:]]*}"}"; n="${n#+}"
   [[ "$n" =~ ^[0-9]+$ ]] || n=0
   n=$(( 10#$n ))

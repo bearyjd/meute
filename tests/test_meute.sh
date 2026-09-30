@@ -2305,7 +2305,7 @@ end"
   out="$(GIT_CONFIG_COUNT=+1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
   has "no-lfs: an inherited count with a plus sign keeps the caller's entry" "$out" "count=5 x.y filter.lfs.process"
   out="$(GIT_CONFIG_COUNT=junk PATH="$nolfs_path" bash -c "$count_probe" _ "$lib" "$root/repo" 2>&1)"
-  has "no-lfs: a count git rejects applies no override, and the run goes on" "$out" "count=junk"
+  has "no-lfs: a count git rejects is read as LFS present, and the run goes on" "$out" "count=4 filter.lfs.process"
   has "no-lfs: ...saying it could not tell"                                  "$out" "could not tell"
 
   # The tree being checked out decides, not the owner's index: the owner may
@@ -2318,10 +2318,11 @@ end"
   out="$(PATH="$nolfs_path" bash -c "$probe" _ "$lib" "$root/repo" main 2>/dev/null)"
   is  "no-lfs: a base with LFS is overridden, though the owner's tree has none" "$out" "key0=filter.lfs.process"
   GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" -c core.hooksPath=/dev/null checkout -q main
-  # A check that cannot be answered is not "no LFS" by accident, and says so.
-  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "survived"' _ "$lib" "$root/repo" no-such-ref 2>&1)"
-  is  "no-lfs: an unreadable base applies no override..." "$(grep -c 'key0=unset' <<< "$out")" "1"
-  has "no-lfs: ...notes why"                              "$out" "could not tell"
+  # A check that cannot be answered fails closed: read as LFS present, so a
+  # write tier is refused rather than let through on a guess, and says so.
+  out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "override=$SCRATCH_LFS_OVERRIDE"; echo "survived"' _ "$lib" "$root/repo" no-such-ref 2>&1)"
+  has "no-lfs: an unreadable base is read as LFS present..." "$out" "override=1"
+  has "no-lfs: ...notes why, naming git grep's exit status" "$out" "git grep exited 128"
   has "no-lfs: ...and does not end the run"               "$out" "survived"
   out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "survived"' _ "$lib" "$root/plainrepo" main 2>&1)"
   is  "no-lfs: no match under set -e does not end the run" "$(tr "\n" " " <<< "$out")" "key0=unset survived "
