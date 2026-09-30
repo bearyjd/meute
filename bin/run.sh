@@ -734,7 +734,13 @@ run_entry() {
   write_report "$report_rel" "$entry" "$engine" "$lens" "$base_ref" "$err"
 
   local committed="-" imported=""
-  if (( WRITES_CODE )); then committed="$(commit_worktree "$repo" "$task" "$lens")"; fi
+  if (( WRITES_CODE )); then
+    local commit_rc=0
+    committed="$(commit_worktree "$repo" "$task" "$lens")" || commit_rc=$?
+    # 3: a refusal commit_worktree names on stdout; nothing was committed.
+    if (( commit_rc == 3 )); then abort_entry "$entry" "$committed"; fi
+    (( commit_rc == 0 )) || exit "$commit_rc"
+  fi
   # cleanup removes the clone, so anything committed in it has to reach the
   # owner's repository first (PRP-004 §4.2). A fetch git refuses -- the
   # branch moved on, or is checked out -- lands on a dated aside ref rather
@@ -938,6 +944,21 @@ commit_worktree() {
   # Layer meute's artifact excludes under the repo's own .gitignore so a green
   # test run does not commit its own __pycache__ / node_modules to the branch.
   git -C "$WORKTREE" -c "core.excludesFile=${MEUTE_ROOT}/lib/artifacts.gitignore" add -A
+  # With the LFS clean filter off (scratch_git_env), `add -A` stores an
+  # edited or new LFS file as its full content, not a pointer: a branch that
+  # would bloat the owner's history once merged. Refused, not committed; a
+  # deletion stages no blob and is left alone. A diff that cannot be read
+  # refuses too, rather than reading as "nothing staged".
+  if (( SCRATCH_LFS_OVERRIDE )); then
+    local lfs_staged
+    if ! lfs_staged="$(git -C "$WORKTREE" diff --cached --name-only --diff-filter=d -- ':(attr:filter=lfs)')"; then
+      printf 'lfs-staged-check-failed\n'; return 3
+    fi
+    if [[ -n "$lfs_staged" ]]; then
+      local -a lfs_paths; mapfile -t lfs_paths <<< "$lfs_staged"
+      printf 'lfs-files-changed-without-git-lfs: %s\n' "${#lfs_paths[@]}"; return 3
+    fi
+  fi
   git -C "$WORKTREE" "${ident[@]}" commit -q -m "$(printf 'chore: %s (%s)\n\nUnattended meute run on %s.\nTask: %s%s\nReview before merging; nothing here has been pushed.' \
       "$task" "$repo" "$DATE" "$task" "$([[ "$lens" != "none" ]] && printf ' (lens: %s)' "$lens")")"
   git -C "$WORKTREE" rev-parse --short HEAD

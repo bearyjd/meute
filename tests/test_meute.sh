@@ -2357,7 +2357,7 @@ test_scratch_lfs_run() {
 #!/usr/bin/env bash
 if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
 edit="$(cat "$(dirname "${BASH_SOURCE[0]}")/edit")"
-printf 'changed by the stub\n' >> "$edit"
+if [[ "$edit" == rm:* ]]; then rm -f -- "${edit#rm:}"; else printf 'changed by the stub\n' >> "$edit"; fi
 jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
 STUB
   chmod +x "$root/stub/claude"
@@ -2384,6 +2384,24 @@ PY2
   [[ -f "$root/pre-commit-ran" ]] && ok "lfs run: the owner's pre-commit still runs at the commit" \
     || bad "lfs run: the owner's pre-commit still runs at the commit" "no marker; hooks were off for the commit"
   is    "lfs run: ...and a failing one still stops the commit" "$(branches)" "0"
+  rm -f "$repo/.git/hooks/pre-commit"
+
+  # With the clean filter off, `git add -A` stores an edited LFS file as a
+  # full blob. Such a commit is refused; anything else still commits.
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  has   "lfs run: an edit to an ordinary file still commits" "$out" "status=ok"
+  is    "lfs run: ...onto a scratch branch"                   "$(branches)" "1"
+  printf 'asset.bin\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  has   "lfs run: an edited LFS file refuses the commit"      "$out" "detail=lfs-files-changed-without-git-lfs: 1"
+  has   "lfs run: ...as an error"                             "$out" "status=error"
+  is    "lfs run: ...and leaves nothing committed"            "$(branches)" "1"
+  is    "lfs run: ...nor any worktree behind"                 "$(git -C "$repo" worktree list | wc -l)" "1"
+  # A deletion stages no blob: nothing to bloat, so it commits.
+  printf 'rm:asset.bin\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
+  has   "lfs run: deleting an LFS file still commits"         "$out" "status=ok"
+  is    "lfs run: ...onto its own branch"                     "$(branches)" "2"
 }
 
 test_engines() {
