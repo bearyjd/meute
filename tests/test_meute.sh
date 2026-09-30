@@ -2352,13 +2352,16 @@ end"
   is  "no-lfs: 5000 LFS paths under set -Eeuo pipefail are still detected" "$out" "key0=filter.lfs.process"
 }
 
-# The same repository through run.sh itself, as a write tier on the timer's
-# PATH (no git-lfs). The owner's post-checkout exits 2 without git-lfs, so
-# the checkout runs hooks off; the commit must not: the owner's pre-commit
-# still runs, and a failing one still stops the commit.
+# The same repository through run.sh itself, on the timer's PATH (no
+# git-lfs). With the clean filter off, `git add` -- the runner's or an
+# engine's own -- stores an LFS file as its full content, and a guard on
+# what was staged reads .gitattributes from the tree the engine edited. So a
+# write tier on such a repo is refused before anything is checked out; a
+# read-only tier runs on the pointer files; a repo without LFS is unaffected,
+# and there the owner's pre-commit still runs and still stops a commit.
 test_scratch_lfs_run() {
-  local root="$FIXTURE/lfs-run" repo="$FIXTURE/lfs-run/git-lfsrepo" out
-  mkdir -p "$root"/{state,tasks,stub,nolfs} "$repo"
+  local root="$FIXTURE/lfs-run" repo="$FIXTURE/lfs-run/git-lfsrepo" plain="$FIXTURE/lfs-run/git-plainrepo" out
+  mkdir -p "$root"/{state,tasks,stub,nolfs} "$repo" "$plain"
   ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/contrib" "$root/contrib"
   printf 'Task {{REPO_NAME}} {{REPO_PATH}} {{FILE_BUDGET}} {{LENS}} {{REPORT_PATH}} {{DATE}} {{BRANCH}} {{TASK}} {{TIER}} {{REPO_SPEC}} {{ALLOWED_COMMANDS}} {{DEFAULT_BRANCH}} {{UPSTREAM}} {{ETIQUETTE}} {{ETIQUETTE_CONTENT}} {{TICKET_ID}} {{TICKET_TITLE}} {{TICKET_NOTES}}\n' > "$root/tasks/t.md"
   # Everything in /usr/bin but git-lfs: run.sh needs far more than git.
@@ -2375,21 +2378,28 @@ test_scratch_lfs_run() {
     git add -A; git -c user.email=t@t -c user.name=t commit -qm init
     printf '#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || exit 2\n' > .git/hooks/post-checkout
     cp .git/hooks/post-checkout .git/hooks/post-commit   # as `git lfs install` writes both
+    chmod +x .git/hooks/post-checkout .git/hooks/post-commit
+    git init -q -b main "$plain"; cd "$plain" || exit 1
+    echo x > f.txt
+    git add -A; git -c user.email=t@t -c user.name=t commit -qm init
     printf '#!/bin/sh\necho ran > "%s/pre-commit-ran"\nexit 1\n' "$root" > .git/hooks/pre-commit
-    chmod +x .git/hooks/post-checkout .git/hooks/post-commit .git/hooks/pre-commit
+    chmod +x .git/hooks/pre-commit
   )
-  # The stub engine edits the file named in $root/stub/edit, then reports.
+  # The stub engine marks that it ran (auth is preflight, not a run), edits
+  # the file named in $root/stub/edit, then reports.
   cat > "$root/stub/claude" <<'STUB'
 #!/usr/bin/env bash
 if [[ "$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
-edit="$(cat "$(dirname "${BASH_SOURCE[0]}")/edit")"
-if [[ "$edit" == rm:* ]]; then rm -f -- "${edit#rm:}"; elif [[ -n "$edit" ]]; then printf 'changed by the stub\n' >> "$edit"; fi
+here="$(dirname "${BASH_SOURCE[0]}")"
+: > "$here/engine-ran"
+edit="$(cat "$here/edit")"
+[[ -z "$edit" ]] || printf 'changed by the stub\n' >> "$edit"
 jq -n '{is_error:false,result:"## Summary\nstub ran",total_cost_usd:0.01,num_turns:1}'
 STUB
   chmod +x "$root/stub/claude"
-  python3 - "$root" "$repo" <<'PY2'
+  python3 - "$root" "$repo" "$plain" <<'PY2'
 import sys, pathlib, yaml
-root, repo = sys.argv[1], sys.argv[2]
+root, repo, plain = sys.argv[1], sys.argv[2], sys.argv[3]
 yaml.safe_dump({
     "version": 1,
     "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
@@ -2399,54 +2409,59 @@ yaml.safe_dump({
               "tier2": {"tools": "Read", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
     "tasks": {"t": {"tier": "tier1", "template": "tasks/t.md", "slots": ["daily"]},
               "r": {"tier": "tier2", "template": "tasks/t.md", "slots": ["daily"]}},
-    "repos": [{"name": "lfsrepo", "path": repo, "spec": "lfs fixture", "tasks": ["t", "r"]}],
+    "repos": [{"name": "lfsrepo", "path": repo, "spec": "lfs fixture", "tasks": ["t", "r"]},
+              {"name": "plainrepo", "path": plain, "spec": "plain fixture", "tasks": ["t"]}],
     "community": [],
 }, open(pathlib.Path(root) / "repos.yaml", "w"), sort_keys=False)
 PY2
-  branches() { git -C "$repo" branch --list 'meute/*' | wc -l; }
+  branches() { git -C "$1" branch --list 'meute/*' | wc -l; }
 
+  # A write tier on the LFS repo: refused by name, before the checkout.
   printf 'f.txt\n' > "$root/stub/edit"
   out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
-  hasnt "lfs run: a post-checkout that exits 2 no longer breaks the checkout" "$out" "worktree-add-failed"
-  has   "lfs run: ...the base was seen to use LFS"        "$out" "uses Git LFS and git-lfs is absent"
-  [[ -f "$root/pre-commit-ran" ]] && ok "lfs run: the owner's pre-commit still runs at the commit" \
-    || bad "lfs run: the owner's pre-commit still runs at the commit" "no marker; hooks were off for the commit"
-  is    "lfs run: ...and a failing one still stops the commit" "$(branches)" "0"
-  # ...and the run says so. A refused commit used to be logged status=ok with
-  # the base as its commit, since nothing checked git commit's own status.
-  has   "lfs run: ...a refused commit is an error"            "$(tail -1 "$root/state/log")" "status=error"
-  has   "lfs run: ...named as the commit's failure"           "$(tail -1 "$root/state/log")" "detail=commit-failed"
-  rm -f "$repo/.git/hooks/pre-commit"
+  local line; line="$(tail -1 "$root/state/log")"
+  has   "lfs run: a write tier on an LFS repo without git-lfs is refused" "$line" "detail=lfs-repo-needs-git-lfs-for-write-tiers"
+  has   "lfs run: ...as an error"                             "$line" "status=error"
+  # §7's demotion counter excludes stage=preflight by name; a host that
+  # lacks git-lfs is no fault of the repo's.
+  has   "lfs run: ...logged at stage=preflight, outside demotion" "$line" "stage=preflight"
+  is    "lfs run: ...no branch is created"                    "$(branches "$repo")" "0"
+  is    "lfs run: ...nor any worktree"                        "$(git -C "$repo" worktree list | wc -l)" "1"
+  is    "lfs run: ...nor a scratch directory"                 "$(find "$root/.worktrees" -mindepth 1 -maxdepth 1 -name 'lfsrepo-*' 2>/dev/null | wc -l)" "0"
+  [[ -e "$root/stub/engine-ran" ]] && bad "lfs run: ...and no engine is invoked" "the stub ran" \
+    || ok "lfs run: ...and no engine is invoked"
 
-  # With the clean filter off, `git add -A` stores an edited LFS file as a
-  # full blob. Such a commit is refused; anything else still commits.
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
-  has   "lfs run: an edit to an ordinary file still commits, past a post-commit that exits 2" "$out" "status=ok"
-  is    "lfs run: ...onto a scratch branch"                   "$(branches)" "1"
-  printf 'asset.bin\n' > "$root/stub/edit"
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
-  has   "lfs run: an edited LFS file refuses the commit"      "$out" "detail=lfs-files-changed-without-git-lfs: 1"
-  has   "lfs run: ...as an error"                             "$out" "status=error"
-  is    "lfs run: ...and leaves nothing committed"            "$(branches)" "1"
-  is    "lfs run: ...nor any worktree behind"                 "$(git -C "$repo" worktree list | wc -l)" "1"
-  # A deletion stages no blob: nothing to bloat, so it commits.
-  printf 'rm:asset.bin\n' > "$root/stub/edit"
-  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo lfsrepo --task t 2>&1)"
-  has   "lfs run: deleting an LFS file still commits"         "$out" "status=ok"
-  is    "lfs run: ...onto its own branch"                     "$(branches)" "2"
-
-  # Detection and checkout name one commit. The base is resolved once; a
-  # checkout from the ref instead reads it again, and the ref can move in
-  # between (the owner commits, a fetch lands). Traced, not inferred: git
-  # grep and worktree add must both be handed the recorded SHA.
+  # A read-only tier on the same repo runs, on pointer files, past a
+  # post-checkout that exits 2. Detection and checkout name one commit: the
+  # base is resolved once, and a checkout from the ref would read it again
+  # after it could have moved. Traced, not inferred.
   : > "$root/stub/edit"
   local base_sha; base_sha="$(git -C "$repo" rev-parse main)"
   out="$(env "${env_run[@]}" GIT_TRACE="$root/trace" "$root/bin/run.sh" daily --repo lfsrepo --task r 2>&1)"
   has   "lfs run: a read-only tier on the LFS repo runs, on pointer files" "$out" "status=ok"
+  has   "lfs run: ...the base was seen to use LFS"            "$out" "uses Git LFS and git-lfs is absent"
+  [[ -e "$root/stub/engine-ran" ]] && ok "lfs run: ...and its engine is invoked" \
+    || bad "lfs run: ...and its engine is invoked" "the stub never ran"
   has   "lfs run: LFS is detected at the recorded base SHA" \
         "$(grep -F 'git grep' "$root/trace")" "$base_sha"
   has   "lfs run: ...and the worktree is added from that same SHA" \
         "$(grep -F 'worktree add' "$root/trace")" "$base_sha"
+
+  # A write tier on a repo without LFS is unaffected. The owner's pre-commit
+  # runs, and a failing one stops the commit -- and the run says so: a
+  # refused commit used to be logged status=ok with the base as its commit.
+  printf 'f.txt\n' > "$root/stub/edit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo plainrepo --task t 2>&1)"
+  hasnt "lfs run: a write tier on a repo without LFS is not refused" "$out" "lfs-repo-needs-git-lfs"
+  [[ -f "$root/pre-commit-ran" ]] && ok "lfs run: ...the owner's pre-commit runs at the commit" \
+    || bad "lfs run: ...the owner's pre-commit runs at the commit" "no marker"
+  is    "lfs run: ...and a failing one stops the commit"      "$(branches "$plain")" "0"
+  has   "lfs run: ...a refused commit is an error"            "$(tail -1 "$root/state/log")" "status=error"
+  has   "lfs run: ...named as the commit's failure"           "$(tail -1 "$root/state/log")" "detail=commit-failed"
+  rm -f "$plain/.git/hooks/pre-commit"
+  out="$(env "${env_run[@]}" "$root/bin/run.sh" daily --repo plainrepo --task t 2>&1)"
+  has   "lfs run: ...and with the hook gone it commits"       "$out" "status=ok"
+  is    "lfs run: ...onto a scratch branch"                   "$(branches "$plain")" "1"
 }
 
 test_engines() {

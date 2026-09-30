@@ -32,15 +32,20 @@ scratch_note() { printf 'meute: %s\n' "$*" >&2; }
 # SCRATCH_LFS_OVERRIDE=1 tells the caller so.
 #
 # Through the environment (GIT_CONFIG_COUNT), not -c on one command: every
-# later git call in the run -- status, diff, the commit -- would otherwise hit
-# the same missing filter. Never written into the owner's .git/config, which a
-# linked worktree shares. The engine a host run starts inherits it too, which
-# is wanted: the agent's own `git status` works on the pointers. A container
-# run does not; nothing in the container's environment comes from here.
+# later git call in the run -- status, diff -- would otherwise hit the same
+# missing filter. Never written into the owner's .git/config, which a linked
+# worktree shares. The engine a host run starts inherits it too, so the
+# agent's own `git status` works on the pointers. A container run does not;
+# nothing in the container's environment comes from here.
+#
+# Only a read-only tier ever runs under it. With the clean filter off, any
+# `git add` -- the runner's or the engine's -- stores an LFS file as its full
+# content, so bin/run.sh refuses a writing tier whenever this sets the
+# override (lfs-repo-needs-git-lfs-for-write-tiers), before any checkout.
 #
 # Hooks are not in it. Only bin/run.sh's host `git worktree add` runs with
 # them off, and only under the override: that is where the post-checkout
-# fails. The owner's pre-commit still runs at the commit.
+# fails. Every other hook the run meets stays on.
 #
 # Whether the repo uses LFS is asked of <commit>, the tree about to be checked
 # out, not of the owner's index: the owner may sit on a branch from before LFS

@@ -631,7 +631,6 @@ run_entry() {
     exit 0
   fi
 
-  trap cleanup EXIT
   # Asked of the commit about to be checked out, by SHA: the branch a later
   # stage continues if it exists (as scratch_clone decides), else the base
   # both checkouts below are cut from. The suffix loop above makes BRANCH
@@ -640,6 +639,18 @@ run_entry() {
   lfs_at="$(git -C "$REPO_PATH" rev-parse --verify -q "refs/heads/${BRANCH}^{commit}" 2>/dev/null)" \
     || lfs_at="$BASE_SHA"
   scratch_git_env "$REPO_PATH" "$lfs_at"
+  # With the LFS filter off, `git add` stores an LFS file as its full
+  # content -- the runner's add and an engine's own alike -- and a check of
+  # what was staged would read .gitattributes from the tree the engine just
+  # edited. So a tier that writes is refused before anything is checked out:
+  # a precondition the operator remedies by installing git-lfs, logged at
+  # stage=preflight so §7's demotion counter does not hold it against the
+  # repo. Read-only tiers run on the pointer files.
+  if (( SCRATCH_LFS_OVERRIDE && WRITES_CODE )); then
+    LOG_STAGE="preflight"
+    abort_precondition "$entry" "lfs-repo-needs-git-lfs-for-write-tiers"
+  fi
+  trap cleanup EXIT
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
     # other side of the mount, so the container gets a self-contained clone
@@ -650,7 +661,7 @@ run_entry() {
       || abort_entry "$entry" "scratch-clone-failed"
   else
     # An LFS repo's post-checkout exits 2 without git-lfs; off for this one
-    # command, never the run, so the owner's pre-commit still runs later.
+    # command, never the run.
     local -a checkout_c=()
     if (( SCRATCH_LFS_OVERRIDE )); then checkout_c=( -c core.hooksPath=/dev/null ); fi
     # From BASE_SHA, not $base_ref: the ref can move after it was resolved,
@@ -742,8 +753,8 @@ run_entry() {
   if (( WRITES_CODE )); then
     local commit_rc=0
     committed="$(commit_worktree "$repo" "$task" "$lens")" || commit_rc=$?
-    # 3: a refusal commit_worktree names on stdout (an LFS blob, or a commit
-    # git itself refused); nothing was committed.
+    # 3: a refusal commit_worktree names on stdout (a commit git itself
+    # refused); nothing was committed.
     if (( commit_rc == 3 )); then abort_entry "$entry" "$committed"; fi
     (( commit_rc == 0 )) || exit "$commit_rc"
   fi
@@ -950,21 +961,6 @@ commit_worktree() {
   # Layer meute's artifact excludes under the repo's own .gitignore so a green
   # test run does not commit its own __pycache__ / node_modules to the branch.
   git -C "$WORKTREE" -c "core.excludesFile=${MEUTE_ROOT}/lib/artifacts.gitignore" add -A
-  # With the LFS clean filter off (scratch_git_env), `add -A` stores an
-  # edited or new LFS file as its full content, not a pointer: a branch that
-  # would bloat the owner's history once merged. Refused, not committed; a
-  # deletion stages no blob and is left alone. A diff that cannot be read
-  # refuses too, rather than reading as "nothing staged".
-  if (( SCRATCH_LFS_OVERRIDE )); then
-    local lfs_staged
-    if ! lfs_staged="$(git -C "$WORKTREE" diff --cached --name-only --diff-filter=d -- ':(attr:filter=lfs)')"; then
-      printf 'lfs-staged-check-failed\n'; return 3
-    fi
-    if [[ -n "$lfs_staged" ]]; then
-      local -a lfs_paths; mapfile -t lfs_paths <<< "$lfs_staged"
-      printf 'lfs-files-changed-without-git-lfs: %s\n' "${#lfs_paths[@]}"; return 3
-    fi
-  fi
   # A commit git refused -- the owner's pre-commit, say -- is the run's
   # failure; under $(...) set -e never sees it, and HEAD would still name
   # the base as if it were this run's commit.
