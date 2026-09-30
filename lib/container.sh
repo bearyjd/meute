@@ -452,11 +452,36 @@ container_outer_bound() {
 # Assemble and execute. Writes nothing to stdout of its own -- the command's
 # output is the caller's to redirect, exactly as the host path's is -- and
 # returns the command's exit status.
+#
+# Sets CONTAINER_STARTED to 1 only if the container process existed. The exit
+# status cannot say so: podman forwards the contained process's own, so a
+# claude that exits 125 looks exactly like podman refusing a missing secret.
+# podman's --pidfile can. Measured on the host (podman 5.8.7): it is written
+# once the process exists and survives --rm, including a container exiting
+# 125, and is never written when podman refuses at create. The cidfile, the
+# obvious candidate, is deleted with the container at --rm, so every run
+# would look never-started. The path is fresh (podman silently overwrites
+# one that exists, which would read as started), and never under /out's host
+# directory, where a started container could delete it and pass for one
+# that never ran. The flag is reset first, so a refusal before podman runs
+# cannot inherit the previous run's.
 container_run() {
   local entry="$1"
+  CONTAINER_STARTED=0
   container_argv "$@" || return 1
+  if [[ "${CONTAINER_ARGV[0]}" != "run" ]]; then
+    container_note "the argv is not a podman run; refusing to guess where --pidfile goes"
+    return 1
+  fi
+  local piddir rc=0
+  piddir="$(mktemp -d "${TMPDIR:-/tmp}/meute-pid-XXXXXX")" \
+    || { container_note "could not create a directory for the container's pidfile"; return 1; }
   local -a podman; read -ra podman <<< "$(podman_cmd)"
   local seconds; seconds="$(jq -r '.timeout_seconds // ""' <<< "$entry")"
   timeout --kill-after="$CONTAINER_STOP_TIMEOUT" "$(container_outer_bound "$seconds")" \
-    "${podman[@]}" "${CONTAINER_ARGV[@]}"
+    "${podman[@]}" run --pidfile "${piddir}/pid" "${CONTAINER_ARGV[@]:1}" || rc=$?
+  [[ -s "${piddir}/pid" ]] && CONTAINER_STARTED=1
+  rm -f "${piddir}/pid"; rmdir "$piddir" 2>/dev/null \
+    || container_note "could not remove the pidfile directory ${piddir}"
+  return "$rc"
 }
