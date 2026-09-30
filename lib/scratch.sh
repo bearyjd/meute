@@ -20,6 +20,38 @@
 scratch_note() { printf 'meute: %s\n' "$*" >&2; }
 
 # --------------------------------------------------------------------------
+# A repository that uses Git LFS, on a machine without git-lfs.
+#
+#   scratch_git_env <repo>
+#
+# The host the timers run on has no git-lfs. An LFS repository then cannot be
+# checked out at all: the smudge filter cannot start, and the post-checkout
+# hook `git lfs install` writes exits 2 (plan-UnrealClaude, 2026-09-27,
+# worktree-add-failed). Every task reads source and none needs the binaries,
+# so for such a repo the run keeps the pointer files: filter off, hooks off.
+#
+# Through the environment (GIT_CONFIG_COUNT), not -c on one command: every
+# later git call in the run -- status, diff, the commit -- would otherwise hit
+# the same missing filter. Never written into the owner's .git/config, which a
+# linked worktree shares. Hooks go off only for an LFS repository; anywhere
+# else they are left alone, so a repo's own pre-commit still runs. Whether the
+# repo uses LFS is asked through attribute pathspecs, which need no git-lfs.
+# --------------------------------------------------------------------------
+scratch_git_env() {
+  local repo="$1"
+  command -v git-lfs >/dev/null 2>&1 && return 0
+  git -C "$repo" ls-files -- ':(attr:filter=lfs)' 2>/dev/null | grep -q . || return 0
+  local n="${GIT_CONFIG_COUNT:-0}" kv
+  for kv in filter.lfs.process= filter.lfs.smudge= filter.lfs.clean= \
+            filter.lfs.required=false core.hooksPath=/dev/null; do
+    export "GIT_CONFIG_KEY_${n}=${kv%%=*}" "GIT_CONFIG_VALUE_${n}=${kv#*=}"
+    n=$(( n + 1 ))
+  done
+  export GIT_CONFIG_COUNT="$n"
+  scratch_note "${repo##*/} uses Git LFS and git-lfs is absent: pointer files, no hooks"
+}
+
+# --------------------------------------------------------------------------
 # The clone.
 #
 #   scratch_clone <repo> <scratch> <default_branch> <branch> <base_sha>

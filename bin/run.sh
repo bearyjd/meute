@@ -631,6 +631,7 @@ run_entry() {
   fi
 
   trap cleanup EXIT
+  scratch_git_env "$REPO_PATH"
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
     # other side of the mount, so the container gets a self-contained clone

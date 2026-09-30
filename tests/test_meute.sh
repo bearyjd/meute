@@ -2225,6 +2225,68 @@ test_hold_extend() {
 # is_error is true and the real cause was an HTTP 429 -- the fix was to check
 # api_error_status instead of trusting subtype, discovered from a real
 # unattended run that hit the account's weekly limit.
+# A repository that uses Git LFS on a machine without git-lfs: the host the
+# timers run on has none, and on 2026-09-27 plan-UnrealClaude's audit died as
+# worktree-add-failed -- the smudge filter could not start, and the repo's own
+# post-checkout hook exits 2 when git-lfs is missing. A read-only analysis
+# needs the pointer files, not the binaries, so without git-lfs the scratch
+# checkout runs with the filter and hooks off; with it, nothing changes.
+test_scratch_without_lfs() {
+  local root="$FIXTURE/no-lfs" out
+  mkdir -p "$root/nolfs-bin" "$root/lfs-bin"
+  printf '#!/bin/sh\nexit 0\n' > "$root/lfs-bin/git-lfs"; chmod +x "$root/lfs-bin/git-lfs"
+  (
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$root/repo"; cd "$root/repo" || exit 1
+    git config user.email t@t; git config user.name t
+    printf 'version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n' > asset.bin
+    git add asset.bin; git commit -qm init
+    printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+    git add .gitattributes; git commit -qm attrs
+    git config filter.lfs.process "git-lfs filter-process"
+    git config filter.lfs.required true
+    printf '#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || exit 2\n' > .git/hooks/post-checkout
+    chmod +x .git/hooks/post-checkout
+  )
+  # A PATH holding only what the checkout needs. /usr/bin is not one: the
+  # distrobox the suite runs in has git-lfs there, the host does not.
+  local t; for t in git bash cat grep; do ln -sfn "$(command -v "$t")" "$root/nolfs-bin/$t"; done
+  local nolfs_path="$root/nolfs-bin"
+  # The filter reaches a fresh clone from the global config `git lfs install`
+  # writes, as on the host.
+  printf '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\trequired = true\n' > "$root/gitconfig-lfs"
+  local -a env_lfs=( GIT_CONFIG_GLOBAL="$root/gitconfig-lfs" GIT_CONFIG_NOSYSTEM=1 )
+  local lib="$REPO/lib/scratch.sh"
+
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" git -C "$root/repo" worktree add -q -b plain "$root/wt-plain" main 2>&1; echo "rc=$?")"
+  hasnt "no-lfs: a plain worktree add fails without git-lfs (the bug)" "$out" "rc=0"
+
+  # What run.sh does: the env first, then the checkout, then more git.
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"
+          git -C "$2" worktree add -q -b fixed "$3" main && git -C "$3" status --porcelain && echo "rc=$?"' _ \
+          "$lib" "$root/repo" "$root/wt-fixed" 2>&1)"
+  has "no-lfs: with the run's env the worktree add succeeds"  "$out" "rc=0"
+  has "no-lfs: ...and says why the tree holds pointers"        "$out" "uses Git LFS and git-lfs is absent"
+  has "no-lfs: ...leaving the pointer file in place"           "$(cat "$root/wt-fixed/asset.bin" 2>/dev/null)" "git-lfs.github.com/spec"
+  hasnt "no-lfs: ...and a later git status still works"        "$out" "filter"
+  out="$(env "${env_lfs[@]}" PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"
+          git clone -q --no-local -- "$2" "$3" && git -C "$3" status --porcelain && echo "rc=$?"' _ \
+          "$lib" "$root/repo" "$root/clone-fixed" 2>&1)"
+  has "no-lfs: the container path's clone succeeds too"        "$out" "rc=0"
+  is  "no-lfs: nothing was written into the owner's config" \
+      "$(GIT_CONFIG_GLOBAL=/dev/null git -C "$root/repo" config --get core.hooksPath; echo end)" "end"
+
+  out="$(PATH="$root/lfs-bin:$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/repo")"
+  is  "no-lfs: with git-lfs present, git runs unchanged"       "$out" "count=unset"
+  ( export GIT_CONFIG_GLOBAL=/dev/null; git init -q -b main "$root/plainrepo" && cd "$root/plainrepo" && printf x > f \
+      && git -c user.email=t@t -c user.name=t add f && git -c user.email=t@t -c user.name=t commit -qm x )
+  out="$(PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2"; echo "count=${GIT_CONFIG_COUNT:-unset}"' _ "$lib" "$root/plainrepo")"
+  is  "no-lfs: a repo without LFS keeps its hooks, even without git-lfs" "$out" "count=unset"
+  out="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=x.y GIT_CONFIG_VALUE_0=z PATH="$nolfs_path" bash -c 'source "$1"; scratch_git_env "$2" 2>/dev/null
+          echo "$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_KEY_1"' _ "$lib" "$root/repo")"
+  is  "no-lfs: a caller's own GIT_CONFIG_ entries are kept, not overwritten" "$out" "6 x.y filter.lfs.process"
+}
+
 test_engines() {
   local root="$FIXTURE/engines" out
   mkdir -p "$root"
@@ -5334,6 +5396,7 @@ test_install_timers
 test_pause
 test_hold_extend
 test_engines
+test_scratch_without_lfs
 test_self_budget
 test_manifest_ceiling
 test_subscription_gate
