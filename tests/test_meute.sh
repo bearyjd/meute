@@ -4746,6 +4746,13 @@ STUB
   [[ -n "$pf" && ! -e "$pf" ]] && ok "vanish: ...and the pidfile is removed afterwards" \
     || bad "vanish: ...and the pidfile is removed afterwards" "left behind: ${pf:-<none recorded>}"
 
+  # Never started, but not podman's own 125 either -- the outer wall clock
+  # (124) killed a stalled podman. A secret gone at the same moment did not
+  # cause that, so it stays the build's.
+  out="$(ENGINE_RC=124 fire)"; line="$(tail -1 "$root/state/log")"
+  has   "vanish: a never-started run that is not podman's 125 stays the build's" "$line" "stage=build"
+  hasnt "vanish: ...and is not relabelled the preflight's" "$line" "stage=preflight"
+
   # The same with any other status claude reports: still the build's.
   out="$(STARTED=1 ENGINE_RC=1 fire)"; line="$(tail -1 "$root/state/log")"
   is  "vanish: a container that started is not re-checked" \
