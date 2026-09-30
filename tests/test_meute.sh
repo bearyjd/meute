@@ -2326,6 +2326,15 @@ end"
   out="$(PATH="$nolfs_path" bash -c 'set -Eeuo pipefail; '"$probe"'; echo "survived"' _ "$lib" "$root/plainrepo" main 2>&1)"
   is  "no-lfs: no match under set -e does not end the run" "$(tr "\n" " " <<< "$out")" "key0=unset survived "
 
+  # LFS declared only below the top level, as UnrealClaude does it
+  # (UnrealClaude/.gitattributes): a root-only check would miss it.
+  ( export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+    git init -q -b main "$root/nested" && cd "$root/nested" || exit 1
+    mkdir -p sub; printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > sub/.gitattributes
+    : > sub/a.bin; git add -A && git -c user.email=t@t -c user.name=t commit -qm nested )
+  out="$(PATH="$nolfs_path" bash -c "$probe" _ "$lib" "$root/nested" main 2>/dev/null)"
+  is  "no-lfs: LFS declared in a nested .gitattributes is detected" "$out" "key0=filter.lfs.process"
+
   # Under run.sh's own options, with far more LFS paths than a pipe holds: a
   # reader that stops at the first line SIGPIPEs the writer, and pipefail
   # turned that into "no LFS" (the review of 67e8bab).
@@ -2365,8 +2374,9 @@ test_scratch_lfs_run() {
     echo x > f.txt
     git add -A; git -c user.email=t@t -c user.name=t commit -qm init
     printf '#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || exit 2\n' > .git/hooks/post-checkout
+    cp .git/hooks/post-checkout .git/hooks/post-commit   # as `git lfs install` writes both
     printf '#!/bin/sh\necho ran > "%s/pre-commit-ran"\nexit 1\n' "$root" > .git/hooks/pre-commit
-    chmod +x .git/hooks/post-checkout .git/hooks/pre-commit
+    chmod +x .git/hooks/post-checkout .git/hooks/post-commit .git/hooks/pre-commit
   )
   # The stub engine edits the file named in $root/stub/edit, then reports.
   cat > "$root/stub/claude" <<'STUB'
@@ -2405,7 +2415,7 @@ PY2
   # With the clean filter off, `git add -A` stores an edited LFS file as a
   # full blob. Such a commit is refused; anything else still commits.
   out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
-  has   "lfs run: an edit to an ordinary file still commits" "$out" "status=ok"
+  has   "lfs run: an edit to an ordinary file still commits, past a post-commit that exits 2" "$out" "status=ok"
   is    "lfs run: ...onto a scratch branch"                   "$(branches)" "1"
   printf 'asset.bin\n' > "$root/stub/edit"
   out="$(env "${env_run[@]}" "$root/bin/run.sh" daily 2>&1)"
