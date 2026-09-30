@@ -1084,7 +1084,7 @@ What running it disclosed:
 ### Claude token secret -- the credential the run uses, checked where it lives (2026-09-27)
 
 Branch `feat/claude-token-secret` off `7e24a49`. Baseline 932 assertions
--> 970, then 1004 after review. 35 of the new assertions were red first. The rest assert an
+-> 970, then 1004 after review, then 1026 after Codex round one. 35 of the new assertions were red first. The rest assert an
 absence (no `--secret` on a no-network or codex run, the volume still
 mounted), which cannot fail before the flag exists, so mutation proves
 them instead. Each new guard was mutated in turn, and every mutation
@@ -1132,15 +1132,19 @@ override ignored.
     and nothing wrote the file.
   - Podman itself refuses to start a container naming a missing secret
     (`rc=125`, `no such secret`), a second fail-closed layer under the
-    preflight. One narrow gap remains: a secret deleted between the
-    preflight and the run fails at `stage=build`, not `stage=preflight`, so
-    §7's demotion exclusion does not cover it.
+    preflight.
   - After review, rerun with `--unsetenv` on all 13 billing variables:
     still green (`result: ok`, $0.003). The volume file's mtime is still
     2026-09-23, and a `network: none` claude entry is refused at the
-    preflight. Measured separately: `--unsetenv=CLAUDE_CONFIG_DIR`
-    clears that image ENV variable inside `g691e067`, so `--unsetenv` does
-    reach the image's own environment.
+    preflight. Measured separately: `--unsetenv=CLAUDE_CONFIG_DIR` clears
+    that image ENV variable inside `g691e067`, so `--unsetenv` does reach
+    the image's own environment.
+  - **One narrow gap remained, and is now closed.** A secret deleted
+    between the preflight and the run used to fail as `stage=build`. After
+    Codex round one it is logged `stage=preflight` (§12).
+  - The env-over-file precedence is proven by this recorded live check,
+    not by the suite, whose podman is a stub. It is re-checked on any image
+    bump that moves claude (§5).
   - The control run was deliberately **not** made: a proxied claude run
     without the secret would fall back to the volume file and try to
     refresh it, which is the race this change exists to end.
@@ -1224,3 +1228,23 @@ one-liners folded in before commit: a second refused fetch on the same
 branch needs a forced, dated aside ref and terminates the ticket (§4.2);
 a build with `commit=none` goes to `done` as *nothing to review* rather
 than advancing onto an empty branch (§4.3).
+
+**2026-09-27, claude token secret (`feat/claude-token-secret`).**
+
+- **`code-reviewer` round one: 0 CRITICAL/HIGH, 2 MEDIUM, 5 LOW, all
+  fixed** (§11, "Claude token secret").
+  - The two MEDIUMs: the container path had lost its metered-billing
+    defence, now `--unsetenv` on the host scrub's own list; and a claude
+    entry off the proxied network is now refused at the preflight.
+- **Codex round one: Warning (1 MEDIUM, 2 LOW).**
+  - MEDIUM, fixed: a secret deleted between the preflight and the build
+    was logged `stage=build` and could feed demotion. A failed claude
+    container run now re-asks `podman secret exists`, and an exit status
+    of 1 is logged `stage=preflight` with the preflight's detail. It
+    never parses podman's stderr. Tested with a stub that holds the
+    secret at the preflight and not after.
+  - LOW, fixed: a rejected `MEUTE_CLAUDE_SECRET` was written raw to
+    `state/log`. A tab or newline in it split the record, and the test
+    showed that happening. It is now reported as "(value not shown)".
+  - LOW, accepted: there is no real-podman regression test for the
+    env-over-file precedence; see §11.
