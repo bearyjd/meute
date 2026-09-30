@@ -100,6 +100,11 @@ ENGINE_BILLING_VARS=(
 # into podman's `--secret name,opt=...` syntax: a comma in it would carry a
 # second `target=` into the flag. Not `readonly`, for the reason the stage
 # arrays above give.
+# The pidfile directory container_run has made and not yet removed, for an
+# EXIT trap to clean up after a signal. Cleared at source time: a value
+# inherited from the environment is not this process's to delete.
+CONTAINER_PIDDIR=""
+
 CONTAINER_CLAUDE_SECRET_DEFAULT="atelier-claude-token"
 CONTAINER_CLAUDE_SECRET_ENV="CLAUDE_CODE_OAUTH_TOKEN"
 

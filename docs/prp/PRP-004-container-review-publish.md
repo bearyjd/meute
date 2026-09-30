@@ -1327,3 +1327,8 @@ than advancing onto an empty branch (§4.3).
   now published as `CONTAINER_PIDDIR` and the runner's EXIT trap removes
   it (bash runs the EXIT trap on SIGTERM, checked). Tested with a stub that
   SIGTERMs the runner mid-engine.
+- **Codex round five: Warning (2 LOW), fixed.** An inherited
+  `CONTAINER_PIDDIR` would have been deleted by the runner's EXIT trap on a
+  run that never called `container_run`; `lib/container.sh` now clears it
+  at source time. `meute container probe`'s EXIT trap now removes the
+  published directory too.

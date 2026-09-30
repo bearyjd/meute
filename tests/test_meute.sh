@@ -4706,6 +4706,17 @@ STUB
     "$root/bin/run.sh" daily --repo netlens > /dev/null 2>&1
   is "pidsig: a signalled run leaves no pidfile directory behind" \
      "$(find "$root/tmp" -maxdepth 1 -name 'meute-pid-*' | wc -l)" "0"
+  # The trap removes only a directory this process made: a CONTAINER_PIDDIR
+  # inherited from the environment is not the runner's to delete, on any
+  # entrypoint that sources container.sh.
+  mkdir -p "$root/victim"; : > "$root/victim/keep"; : > "$root/state/cursor"
+  CONTAINER_PIDDIR="$root/victim" TMPDIR="$root/tmp" PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" \
+    MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo netlens > /dev/null 2>&1
+  is "pidsig: an inherited CONTAINER_PIDDIR survives the runner's trap" "$([[ -e "$root/victim/keep" ]] && echo kept)" "kept"
+  CONTAINER_PIDDIR="$root/victim" bash -c 'source "$1"; printf "%s" "${CONTAINER_PIDDIR:-empty}"' _ "$REPO/lib/container.sh" > "$root/pd" 2>/dev/null
+  is "pidsig: sourcing container.sh clears an inherited CONTAINER_PIDDIR" "$(cat "$root/pd")" "empty"
+  has "pidsig: meute's probe trap removes a published pidfile directory too" \
+      "$(grep -n "trap '" "$REPO/bin/meute")" 'CONTAINER_PIDDIR'
 }
 
 test_p2b_secret_vanishes() {

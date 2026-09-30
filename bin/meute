@@ -544,7 +544,7 @@ cmd_container_probe() {
   # The trap goes up with the FIRST directory, not after the second: a failed
   # second mktemp would otherwise leak the first.
   PROBE_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/meute-probe-XXXXXX")"
-  trap 'rm -rf "${PROBE_SCRATCH:-}" "${PROBE_OUT:-}"' EXIT
+  trap 'rm -rf "${PROBE_SCRATCH:-}" "${PROBE_OUT:-}" "${CONTAINER_PIDDIR:-}"' EXIT
   PROBE_OUT="$(mktemp -d "${TMPDIR:-/tmp}/meute-probe-out-XXXXXX")"
   # The clone is the point: what the agent sees is a repository of its own,
   # holding one branch, and never the owner's checkout.
