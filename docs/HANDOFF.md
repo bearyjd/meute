@@ -78,3 +78,6 @@ run. This file says only where things stand and what to do next.
   a revoked token. The preflight cannot see revocation (§8, named, not fixed).
 - A command that silently does nothing and reports success has bitten this
   project twice; check the artefact, not the exit status.
+- A host "read-only" tier is advisory: `git log/diff/show --output=` writes
+  files from an allowlisted subcommand. Only the container's read-only
+  `/work` is a boundary (PRP-004 §8, open).
