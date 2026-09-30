@@ -484,6 +484,14 @@ container_run() {
   # Published so the runner's EXIT trap can remove it when a signal ends the
   # run inside `timeout`, before the removal below is reached.
   CONTAINER_PIDDIR="$piddir"
+  # In a subshell -- the codex preflight's command substitution -- no parent
+  # trap can see that variable, and systemd's stop signals every process in
+  # the unit. A subshell starts with no traps of its own, so this one
+  # overwrites nothing; it is lifted again on the normal return.
+  local own_trap=0
+  if (( BASH_SUBSHELL > 0 )); then
+    trap 'rm -rf "${CONTAINER_PIDDIR:-}"' EXIT; own_trap=1
+  fi
   local -a podman; read -ra podman <<< "$(podman_cmd)"
   local seconds; seconds="$(jq -r '.timeout_seconds // ""' <<< "$entry")"
   timeout --kill-after="$CONTAINER_STOP_TIMEOUT" "$(container_outer_bound "$seconds")" \
@@ -492,5 +500,6 @@ container_run() {
   rm -f "${piddir}/pid"; rmdir "$piddir" 2>/dev/null \
     || container_note "could not remove the pidfile directory ${piddir}"
   CONTAINER_PIDDIR=""
+  (( own_trap )) && trap - EXIT
   return "$rc"
 }

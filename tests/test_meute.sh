@@ -4432,6 +4432,39 @@ test_p2_outer_bound() {
 # the host, podman 5.8.7. container_run reports it as CONTAINER_STARTED, and
 # the flag is reset on every call, so a refusal before podman even runs can
 # never inherit the previous run's "started".
+# container_run inside a command substitution (the codex preflight) runs in a
+# subshell whose CONTAINER_PIDDIR no parent trap can see. systemd stops a unit
+# by signalling its whole cgroup, so the subshell dies too; it must clean up
+# after itself. Run in a session of its own (setsid) so the group signal can
+# only ever reach this fixture, and the stub refuses if it would reach the
+# suite's own session.
+test_p2b_pidfile_subshell_signal() {
+  local root="$FIXTURE/p2b-subsig"; mkdir -p "$root/stub" "$root/tmp"
+  command -v setsid >/dev/null 2>&1 || { is "subsig: setsid is available" "no" "yes"; return; }
+  cat > "$root/stub/podman" <<STUB
+#!/usr/bin/env bash
+# Every process in the session, as systemd signals every process in the
+# unit's cgroup: GNU timeout moves itself into a process group of its own, so
+# a group signal would never reach the subshell. Refuses if the session would
+# be the suite's.
+sid="\$(ps -o sid= -p \$\$ | tr -d ' ')"
+[[ -n "\$sid" && "\$sid" != "$(ps -o sid= -p $$ | tr -d ' ')" ]] || exit 99
+echo signalled > "$root/stub/fired"
+pkill -TERM -s "\$sid"; sleep 5; exit 0
+STUB
+  chmod +x "$root/stub/podman"
+  local entry
+  entry="$(jq -cn --arg tag "$P2_IMAGE" --arg digest "$P2_DIGEST" \
+    '{repo:"alpha", image:{tag:$tag, digest:$digest}, network:"none", timeout_seconds:60}')"
+  TMPDIR="$root/tmp" MEUTE_PODMAN="$root/stub/podman" ENTRY="$entry" T_ID="$P2_ID" T_PIN="$P2_IMAGE $P2_DIGEST" \
+    setsid -w bash -c 'source "$1" 2>/dev/null
+      CONTAINER_IMAGE_ID="$T_ID"; CONTAINER_IMAGE_FOR="$T_PIN"
+      x="$(container_run "$ENTRY" probe "" "" "" -- true)"' _ "$REPO/lib/container.sh" > /dev/null 2>&1 || true
+  is "subsig: the stub reached podman and signalled the session" "$(cat "$root/stub/fired" 2>/dev/null)" "signalled"
+  is "subsig: a signal to the whole session leaves no pidfile directory from a subshell" \
+     "$(find "$root/tmp" -maxdepth 1 -name 'meute-pid-*' | wc -l)" "0"
+}
+
 test_p2b_container_started() {
   local root="$FIXTURE/p2b-started"; mkdir -p "$root/stub" "$root/out"
   cat > "$root/stub/podman" <<STUB
@@ -4694,16 +4727,26 @@ case "\$*" in
   *"{{.State.Running}}"*) printf 'true\n' ;;
   *"NetworkSettings"*) printf '10.89.14.10\n' ;;
   "secret exists atelier-claude-token") exit 0 ;;
-  *" -p "*) kill -TERM "\$(ps -o ppid= -p "\$PPID" | tr -d ' ')"; sleep 5; exit 0 ;;
+  *" -p "*)
+    # Signal exactly the runner the test launched, by the PID it recorded --
+    # never one worked out from the process tree, which in another harness
+    # can be the suite itself.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$root/stub/runner-pid" ]] && break; sleep 0.2; done
+    [[ -s "$root/stub/runner-pid" ]] && kill -TERM "\$(cat "$root/stub/runner-pid")"
+    sleep 5; exit 0 ;;
   *) exit 125 ;;
 esac
 STUB
   chmod +x "$root/stub/podman"
   yaml_edit "$root/repos.yaml" "$root/repos.yaml" \
     "d['repos'][0]['tasks'] = ['audit-security']; d['repos'][0]['tickets'] = []; d['community'] = []"
-  : > "$root/state/cursor"
+  : > "$root/state/cursor"; rm -f "$root/stub/runner-pid"
+  local runner
   TMPDIR="$root/tmp" PATH="$root/stub:$PATH" MEUTE_PODMAN="$root/stub/podman" MEUTE_QUOTA_STUB=100 \
-    "$root/bin/run.sh" daily --repo netlens > /dev/null 2>&1
+    "$root/bin/run.sh" daily --repo netlens > /dev/null 2>&1 &
+  runner=$!; printf '%s\n' "$runner" > "$root/stub/runner-pid"
+  wait "$runner" || true
+  rm -f "$root/stub/runner-pid"
   is "pidsig: a signalled run leaves no pidfile directory behind" \
      "$(find "$root/tmp" -maxdepth 1 -name 'meute-pid-*' | wc -l)" "0"
   # The trap removes only a directory this process made: a CONTAINER_PIDDIR
@@ -5319,6 +5362,7 @@ test_p2_forced_refusal_is_retryable
 test_p2_engine_cwd
 test_p2_outer_bound
 test_p2b_container_started
+test_p2b_pidfile_subshell_signal
 test_p2_pin_is_one_snapshot
 test_p2_isolation
 test_p2_proxied_egress

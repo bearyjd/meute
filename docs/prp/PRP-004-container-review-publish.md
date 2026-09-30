@@ -1332,3 +1332,15 @@ than advancing onto an empty branch (§4.3).
   run that never called `container_run`; `lib/container.sh` now clears it
   at source time. `meute container probe`'s EXIT trap now removes the
   published directory too.
+- **Codex round six: Warning (1 LOW), fixed.** `container_run` inside the
+  codex preflight's command substitution runs in a subshell whose
+  `CONTAINER_PIDDIR` no parent trap sees; systemd's stop signals every
+  process in the unit, so the subshell could die holding its directory.
+  In a subshell `container_run` now sets its own EXIT trap for the
+  directory and lifts it on return. Round six's run also showed the SIGTERM
+  test found its target from the process tree, which in Codex's harness
+  was the suite itself; it now signals only the PID it launched, and the
+  new session-wide test runs under `setsid -w` and refuses to fire in the
+  suite's own session. GNU `timeout` moves itself into its own process
+  group, which is why a group signal could not reproduce this and the test
+  signals the session.
