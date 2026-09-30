@@ -2537,8 +2537,8 @@ test_engines() {
   out="$root/huge.json"
   jq -n --arg r "$(printf 'x%.0s' {1..2048})" '{result:$r,is_error:true,subtype:"success",api_error_status:500}' > "$out"
   extract_claude "$out" || true
-  is  "engines: a 2 KB provider message is capped at 300 characters, ellipsis included" \
-      "$ENGINE_DETAIL" "api 500: $(printf 'x%.0s' {1..297})..."
+  is  "engines: a 2 KB provider message is capped at 300 characters, prefix and ellipsis included" \
+      "$ENGINE_DETAIL" "api 500: $(printf 'x%.0s' {1..288})..."
   out="$root/cr-status.json"
   printf '%s' '{"result":"bad\rgateway","is_error":true,"subtype":"success","api_error_status":502}' > "$out"
   extract_claude "$out" || true
@@ -2546,7 +2546,38 @@ test_engines() {
   out="$root/huge-no-status.json"
   jq -n --arg r "$(printf 'y%.0s' {1..2048})" '{result:$r,is_error:true,subtype:"success"}' > "$out"
   extract_claude "$out" || true
-  is  "engines: a 2 KB status-less message is capped too" "$ENGINE_DETAIL" "cli error: $(printf 'y%.0s' {1..297})..."
+  is  "engines: a 2 KB status-less message is capped too" "$ENGINE_DETAIL" "cli error: $(printf 'y%.0s' {1..286})..."
+
+  # The final detail is cleaned, not only the message: the subtype and the
+  # status are the CLI's too, and go through the same cleaner.
+  out="$root/cr-subtype.json"
+  printf '%s' '{"result":"m","is_error":true,"subtype":"err\r\tx"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a subtype's carriage return and tab become spaces" "$ENGINE_DETAIL" "err  x: m"
+  out="$root/cr-status-field.json"
+  printf '%s' '{"result":"m","is_error":true,"subtype":"success","api_error_status":"5\r0\t2"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: ...and so do a status's" "$ENGINE_DETAIL" "api 5 0 2: m"
+  out="$root/huge-subtype.json"
+  jq -n --arg s "$(printf 's%.0s' {1..2048})" '{result:"m",is_error:true,subtype:$s}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a 2 KB subtype still caps the whole detail at 300" "${#ENGINE_DETAIL}" "300"
+  # Counted in characters, under the timer's C locale: a byte cut splits
+  # a multibyte character and leaves invalid UTF-8 on the log line. Where a
+  # byte cut lands depends on what precedes the é run, so both parities: a
+  # cut of the message alone at 297 bytes splits the first, a cut of the
+  # whole detail at 297 bytes splits the second.
+  local lead mb mb_chars
+  for lead in "" a; do
+    out="$root/huge-multibyte${lead}.json"
+    jq -n --arg r "${lead}$(printf '\xc3\xa9%.0s' {1..1024})" '{result:$r,is_error:true,subtype:"success",api_error_status:500}' > "$out"
+    mb="$(LC_ALL=C; extract_claude "$out" || true; printf '%s' "$ENGINE_DETAIL")"
+    printf '%s' "$mb" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 \
+      && ok "engines: a 2 KB multibyte message (lead [${lead}]) cut under LC_ALL=C is valid UTF-8" \
+      || bad "engines: a 2 KB multibyte message (lead [${lead}]) cut under LC_ALL=C is valid UTF-8" "iconv rejected it"
+    mb_chars="$(printf '%s' "$mb" | LC_ALL=C.UTF-8 wc -m)"
+    is "engines: ...and exactly 300 characters, not bytes" "$mb_chars" "300"
+  done
 }
 
 

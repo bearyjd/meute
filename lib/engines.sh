@@ -57,11 +57,15 @@ engine_argv_claude() {
   return 0
 }
 
-# A CLI's message on one line of at most 300 characters, "..." included:
-# state/log is tab-separated, one record per fire, and what the CLI says is
-# neither clean nor bounded. Every control character -- tab, newline, the
-# carriage return that redraws a terminal line -- becomes a space.
+# An engine's detail on one line of at most 300 characters, prefix and
+# "..." included: state/log is tab-separated, one record per fire, and
+# nothing the CLI says -- message, subtype or status -- is clean or bounded.
+# Every control character (tab, newline, the carriage return that redraws a
+# terminal line) becomes a space. Counted in characters under a UTF-8
+# locale set here: the timer runs under C, where ${#s} counts bytes and the
+# cut split a multibyte character, leaving invalid UTF-8 on the line.
 engine_detail_clean() {
+  local LC_ALL=C.UTF-8
   local s="${1//[[:cntrl:]]/ }"
   (( ${#s} <= 300 )) || s="${s:0:297}..."
   printf '%s' "$s"
@@ -87,7 +91,7 @@ extract_claude() {
     local status_code msg
     status_code="$(jq -r '.api_error_status // empty' "$out")"
     if [[ -n "$status_code" ]]; then
-      msg="$(engine_detail_clean "$(jq -r '.result // "no message"' "$out")")"
+      msg="$(jq -r '.result // "no message"' "$out")"
       if [[ "$status_code" == "429" ]]; then
         RATE_LIMITED=1
         ENGINE_DETAIL="rate-limited: ${msg}"
@@ -109,7 +113,7 @@ extract_claude() {
       # on a failure's line.
       local subtype
       subtype="$(jq -r '.subtype // "unknown"' "$out")"
-      msg="$(engine_detail_clean "$(jq -r '.result // ""' "$out")")"
+      msg="$(jq -r '.result // ""' "$out")"
       [[ "$subtype" == "success" ]] && subtype="cli error"
       if [[ -n "$msg" ]]; then
         ENGINE_DETAIL="${subtype}: ${msg}"
@@ -119,6 +123,8 @@ extract_claude() {
         ENGINE_DETAIL="$subtype"
       fi
     fi
+    # Cleaned once, whole: every field above is the CLI's, not only .result.
+    ENGINE_DETAIL="$(engine_detail_clean "$ENGINE_DETAIL")"
     return 1
   fi
   ENGINE_STATUS="ok"; ENGINE_DETAIL=""
