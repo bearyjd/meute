@@ -1165,6 +1165,11 @@ override ignored.
     - A P that already exists is overwritten without complaint (rc 0).
       That is why the runner always hands podman a fresh path in a new
       `mktemp -d`, outside `/out`'s host directory.
+    - The runner's own `container_run`, through `distrobox-host-exec
+      podman`, reported rc:CONTAINER_STARTED as `125:1` for a container
+      that ran `sh -c 'exit 125'`, `0:1` for `true`, and `125:0` for an
+      image ID that `--pull=never` refused. It left no `meute-pid-`
+      directory behind.
   - **Residual, accepted.** The relabel still fires on any podman failure
     before a container process exists (rc 125, no pidfile) when the secret
     happens to be absent at the re-check, even if the secret's absence did
@@ -1312,6 +1317,7 @@ than advancing onto an empty branch (§4.3).
     - gone, never started, 124: `build`.
     - present, never started, 125: `build`.
   - A unit test pins the flag's reset, the pidfile's cleanup, and its
-    location. All eight mutations of the new guards turned the suite red.
+    location. All eight mutations of the new guards turned the two tests
+    red.
     A ninth, the fail-closed default for an unset flag, is equivalent,
     because `container_run` always sets the flag.
