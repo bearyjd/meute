@@ -10,11 +10,17 @@
 # third-party endpoint as well as switch it from subscription to API-key auth.
 # Keep this explicit rather than using `env -i`: the CLIs still need normal
 # login/config discovery, PATH, locale, and terminal behaviour.
+#
+# The billing half of the list is lib/container.sh's ENGINE_BILLING_VARS, which
+# the container path --unsetenv's too: one list, two consumers. Without it
+# this file refuses to load rather than scrub nothing, and both callers run
+# under `set -e`, so a failed source ends them.
+if [[ -z "${ENGINE_BILLING_VARS[*]:-}" ]]; then
+  printf 'meute: lib/preflight.sh needs ENGINE_BILLING_VARS; source lib/container.sh first\n' >&2
+  return 1
+fi
 readonly ENGINE_SCRUB_VARS=(
-  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-  ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT
-  OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT
-  CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+  "${ENGINE_BILLING_VARS[@]}"
   HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
   http_proxy https_proxy all_proxy no_proxy
 )
@@ -50,10 +56,11 @@ preflight() {
 # The same guarantee, asked of the credential the run will actually use.
 #
 # Under `runtime: container` the host's login is not what the engine reaches:
-# the container mounts a COPY in a volume, and that copy can be absent,
-# empty, or signed out while the host's is fine. So the probe runs inside the
-# image, on --network=none, with only that engine's volume mounted -- no
-# network, no scratch tree, no cost.
+# codex's container mounts a COPY in a volume, and that copy can be absent,
+# empty, or signed out while the host's is fine. So codex's probe runs inside
+# the image, on --network=none, with only its volume mounted -- no network,
+# no scratch tree, no cost. Claude's credential is a podman secret instead,
+# which only proxied runs carry, so its check is host-side (see below).
 #
 # It RETURNS rather than dies. A missing credential is a precondition the
 # operator can remediate (`just auth`, or a re-login), so bin/run.sh routes
@@ -65,7 +72,7 @@ preflight() {
 # --------------------------------------------------------------------------
 preflight_container() {
   local entry="$1" engine="$2"
-  PREFLIGHT_DETAIL=""
+  PREFLIGHT_DETAIL=""; PREFLIGHT_SECRET_RC=""
   case "$engine" in
     claude) preflight_container_claude "$entry" ;;
     codex)  preflight_container_codex "$entry" ;;
@@ -73,40 +80,54 @@ preflight_container() {
   esac
 }
 
-# jq lives on the host, not in the image: the container's job is to produce
-# the status, and the host's is to judge it. That split also means the checks
-# below are the same ones the host path applies.
+# Claude's precondition is the token secret, asked of the HOST (PRP-004 §8).
+# There is deliberately no container here. The preflight runs on
+# --network=none, and the secret goes only to proxied runs, so an in-image
+# `claude auth status` could only read the volume's .credentials.json --
+# revoked, and not the credential the run uses. It would pass against a dead
+# file, and refuse a good secret if the volume were ever emptied.
+#
+# Absent is a REFUSAL, never a fallback. A proxied claude run without the
+# secret falls back to that volume file, and if it is ever valid its refresh
+# revokes the host's token -- the original race. podman itself also refuses
+# to start a container naming a missing secret; this is the check that says
+# so with a stage and a remedy, before anything starts. A podman that cannot
+# answer is not a podman that said yes: every non-zero status refuses.
+#
+# It proves presence, not validity: a revoked token still exists. That hole
+# is the one §8 already names for the in-container probe, not a new one.
 preflight_container_claude() {
-  local entry="$1" status key_source plan
-  # The probe declares its engine like any argv builder. Its command is
-  # fixed in this file, so the claim is trivially true -- the point is that
-  # it travels the same path as every other credential-bearing dispatch
-  # rather than around it, because the exception is what rots.
-  local ENGINE_ARGV_ENGINE="claude"
-  status="$(container_run "$entry" preflight claude "" "" -- claude auth status --json 2>/dev/null)" \
-    || { PREFLIGHT_DETAIL="claude auth status failed inside the container - the volume may be empty; run: just auth"; return 1; }
-  if [[ "$(jq -r '.loggedIn // false' <<< "$status" 2>/dev/null)" != "true" ]]; then
-    PREFLIGHT_DETAIL="claude is not logged in inside the container; run: just auth"
+  local entry="$1" secret rc=0 network
+  # The secret reaches proxied runs only, so a claude container entry on any
+  # other network would run with no credential but the volume's file. The
+  # value itself, not `// "proxied"`: a default here would be a pass.
+  network="$(jq -r '.network // ""' <<< "$entry")"
+  if [[ "$network" != "proxied" ]]; then
+    PREFLIGHT_DETAIL="claude runs in a container need network: proxied to receive the token secret (this entry: '${network:-unset}')"
     return 1
   fi
-  key_source="$(jq -r '.apiKeySource // ""' <<< "$status")"
-  if [[ -n "$key_source" ]]; then
-    PREFLIGHT_DETAIL="claude resolved auth from ${key_source} inside the container; refusing metered billing"
-    return 1
-  fi
-  plan="$(jq -r '.subscriptionType // ""' <<< "$status")"
-  if [[ -z "$plan" || "$plan" == "null" ]]; then
-    PREFLIGHT_DETAIL="claude reports no subscription plan inside the container; run: just auth"
-    return 1
-  fi
-  AUTH_MODE="$(jq -r '.authMethod // "unknown"' <<< "$status")/${plan}"
+  # A rejected name is never echoed: it is not a secret name, so it may be
+  # anything -- a pasted token, or a tab or newline that splits the log line.
+  secret="$(container_claude_secret 2>/dev/null)" \
+    || { PREFLIGHT_DETAIL="MEUTE_CLAUDE_SECRET is not a plain podman secret name (value not shown)"; return 1; }
+  container_claude_secret_exists || rc=$?
+  # For the runner's post-failure re-check: which answer podman gave, by
+  # exit status, never by what it printed.
+  PREFLIGHT_SECRET_RC="$rc"
+  case "$rc" in
+    0) AUTH_MODE="oauth-token/secret:${secret}" ;;
+    1) PREFLIGHT_DETAIL="claude token secret ${secret} is not present on the host; in Atelier run: just auth-login claude"
+       return 1 ;;
+    *) PREFLIGHT_DETAIL="could not check the claude token secret ${secret} on the host (podman rc=${rc}); refusing rather than falling back to the volume; if it is missing, in Atelier run: just auth-login claude"
+       return 1 ;;
+  esac
 }
 
 preflight_container_codex() {
   local entry="$1" status
   local ENGINE_ARGV_ENGINE="codex"
   status="$(container_run "$entry" preflight codex "" "" -- codex login status 2>&1)" \
-    || { PREFLIGHT_DETAIL="codex login status failed inside the container - the volume may be empty; run: just auth"; return 1; }
+    || { PREFLIGHT_DETAIL="codex login status failed inside the container - the volume may be empty; in Atelier run: just auth-login codex"; return 1; }
   if ! grep -qi 'chatgpt' <<< "$status"; then
     PREFLIGHT_DETAIL="codex did not report a ChatGPT subscription inside the container (got: ${status})"
     return 1

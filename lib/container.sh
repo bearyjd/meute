@@ -73,6 +73,60 @@ container_stage_credential() {
   return 1
 }
 
+# Variables that switch an engine from subscription to metered billing, or
+# route it to another endpoint or provider. THE list: lib/preflight.sh builds
+# the host path's scrub from it (adding the proxy variables, which the
+# container sets itself), and every container engine run --unsetenv's each
+# one, because an image ENV -- or a rebuilt image -- setting
+# ANTHROPIC_API_KEY would outrank the token secret. It lives here because this
+# file is self-contained and preflight.sh is not. Not `readonly`, as above.
+ENGINE_BILLING_VARS=(
+  ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_ENDPOINT
+  OPENAI_API_KEY OPENAI_BASE_URL OPENAI_API_BASE OPENAI_ORG_ID OPENAI_PROJECT
+  CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+)
+
+# Claude's credential is not the volume any more (PRP-004 §5, Atelier
+# 317b951): it is a podman secret holding a long-lived `claude setup-token`
+# token, injected as CLAUDE_CODE_OAUTH_TOKEN. That token has no refresh, so
+# the refresh race that revoked the volume's copy (§11, Phase 2b) cannot
+# recur. The volume stays mounted beside it, as the contract says: under a
+# read-only root it is claude's only writable config directory, and the
+# env var takes precedence over the revoked .credentials.json left there.
+#
+# The name is overridable so the refusal can be proven on a real host
+# without deleting the real secret. It is validated, because it is spliced
+# into podman's `--secret name,opt=...` syntax: a comma in it would carry a
+# second `target=` into the flag. Not `readonly`, for the reason the stage
+# arrays above give.
+# The pidfile directory container_run has made and not yet removed, for an
+# EXIT trap to clean up after a signal. Cleared at source time: a value
+# inherited from the environment is not this process's to delete.
+CONTAINER_PIDDIR=""
+
+CONTAINER_CLAUDE_SECRET_DEFAULT="atelier-claude-token"
+CONTAINER_CLAUDE_SECRET_ENV="CLAUDE_CODE_OAUTH_TOKEN"
+
+container_claude_secret() {
+  local name="${MEUTE_CLAUDE_SECRET:-$CONTAINER_CLAUDE_SECRET_DEFAULT}"
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    # Never echo the value: it is not a name, so it may be anything.
+    container_note "MEUTE_CLAUDE_SECRET is not a plain podman secret name (value not shown); refusing"
+    return 1
+  fi
+  printf '%s\n' "$name"
+}
+
+# Host-side, and only whether it exists: nothing here reads the value.
+# Returns podman's own status -- 0 present, 1 absent, anything else means
+# podman could not answer -- so the caller can say which, and refuse on all
+# but 0.
+container_claude_secret_exists() {
+  local name; name="$(container_claude_secret)" || return 2
+  podman_run secret exists "$name" >/dev/null 2>&1
+}
+
 container_auth_mount() {
   case "$1" in
     claude) printf 'atelier-auth-claude:/home/agent/.claude:z\n' ;;
@@ -322,10 +376,31 @@ container_argv() {
     auth="$(container_auth_mount "$engine")" \
       || { container_note "stage ${stage} runs an engine, and '${engine:-<none>}' has no credential volume"; return 1; }
     CONTAINER_ARGV+=( --volume "$auth" )
+    # The host path's metered-billing defence, carried across. An empty list
+    # is a refusal: a scrub with nothing in it looks exactly like one that
+    # worked.
+    if [[ -z "${ENGINE_BILLING_VARS[*]:-}" ]]; then
+      container_note "stage ${stage} runs an engine but the billing variable list is empty; refusing"
+      return 1
+    fi
+    local var
+    for var in "${ENGINE_BILLING_VARS[@]}"; do CONTAINER_ARGV+=( "--unsetenv=${var}" ); done
   fi
   local -a profile=()
   container_network_argv "$stage" "$network" || return 1
   profile=( "${CONTAINER_NETWORK_ARGV[@]}" )
+  # Claude's token secret goes where the network does, and nowhere else: a
+  # run on --network=none cannot use it (§5). Decided from the profile just
+  # chosen rather than by re-asking "preflight, or not proxied?" -- one
+  # authority for which runs are networked -- and matched positively, so a
+  # profile added later gets no credential until someone decides it should.
+  # The engine is the parameter the credential volume was chosen by, already
+  # bound to the command above.
+  if [[ "$need" == "engine" && "$engine" == "claude" \
+        && "${profile[0]}" == "--network=${CONTAINER_NETWORK}" ]]; then
+    local secret; secret="$(container_claude_secret)" || return 1
+    CONTAINER_ARGV+=( --secret "${secret},type=env,target=${CONTAINER_CLAUDE_SECRET_ENV}" )
+  fi
   CONTAINER_ARGV+=( "${profile[@]}" "$image" "$@" )
 }
 
@@ -382,11 +457,49 @@ container_outer_bound() {
 # Assemble and execute. Writes nothing to stdout of its own -- the command's
 # output is the caller's to redirect, exactly as the host path's is -- and
 # returns the command's exit status.
+#
+# Sets CONTAINER_STARTED to 1 only if the container process existed. The exit
+# status cannot say so: podman forwards the contained process's own, so a
+# claude that exits 125 looks exactly like podman refusing a missing secret.
+# podman's --pidfile can. Measured on the host (podman 5.8.7): it is written
+# once the process exists and survives --rm, including a container exiting
+# 125, and is never written when podman refuses at create. The cidfile, the
+# obvious candidate, is deleted with the container at --rm, so every run
+# would look never-started. The path is fresh (podman silently overwrites
+# one that exists, which would read as started), and never under /out's host
+# directory, where a started container could delete it and pass for one
+# that never ran. The flag is reset first, so a refusal before podman runs
+# cannot inherit the previous run's.
 container_run() {
   local entry="$1"
+  CONTAINER_STARTED=0
   container_argv "$@" || return 1
+  if [[ "${CONTAINER_ARGV[0]}" != "run" ]]; then
+    container_note "the argv is not a podman run; refusing to guess where --pidfile goes"
+    return 1
+  fi
+  local piddir rc=0
+  piddir="$(mktemp -d "${TMPDIR:-/tmp}/meute-pid-XXXXXX")" \
+    || { container_note "could not create a directory for the container's pidfile"; return 1; }
+  # Published so the runner's EXIT trap can remove it when a signal ends the
+  # run inside `timeout`, before the removal below is reached.
+  CONTAINER_PIDDIR="$piddir"
+  # In a subshell -- the codex preflight's command substitution -- no parent
+  # trap can see that variable, and systemd's stop signals every process in
+  # the unit. A subshell starts with no traps of its own, so this one
+  # overwrites nothing; it is lifted again on the normal return.
+  local own_trap=0
+  if (( BASH_SUBSHELL > 0 )); then
+    trap 'rm -rf "${CONTAINER_PIDDIR:-}"' EXIT; own_trap=1
+  fi
   local -a podman; read -ra podman <<< "$(podman_cmd)"
   local seconds; seconds="$(jq -r '.timeout_seconds // ""' <<< "$entry")"
   timeout --kill-after="$CONTAINER_STOP_TIMEOUT" "$(container_outer_bound "$seconds")" \
-    "${podman[@]}" "${CONTAINER_ARGV[@]}"
+    "${podman[@]}" run --pidfile "${piddir}/pid" "${CONTAINER_ARGV[@]:1}" || rc=$?
+  [[ -s "${piddir}/pid" ]] && CONTAINER_STARTED=1
+  rm -f "${piddir}/pid"; rmdir "$piddir" 2>/dev/null \
+    || container_note "could not remove the pidfile directory ${piddir}"
+  CONTAINER_PIDDIR=""
+  (( own_trap )) && trap - EXIT
+  return "$rc"
 }
