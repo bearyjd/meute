@@ -2293,6 +2293,29 @@ test_engines() {
   printf '%s' '{"result":"","is_error":true,"subtype":"error_during_execution"}' > "$out"
   extract_claude "$out" || true
   is "engines: without a status, the subtype is still the detail" "$ENGINE_DETAIL" "error_during_execution"
+
+  # No status AND subtype "success": the CLI failed before any API call (seen
+  # 2026-09-29/30 on the host, a token refresh colliding with an interactive
+  # session) and the only true thing it said is in .result. The log used to
+  # read `status=error detail=success`.
+  out="$root/no-status-success.json"
+  printf '%s' '{"result":"Failed to refresh OAuth token: another Claude Code process\nis refreshing it","is_error":true,"subtype":"success","num_turns":1}' > "$out"
+  extract_claude "$out" || true
+  is    "engines: a status-less failure is an error"          "$ENGINE_STATUS" "error"
+  has   "engines: ...whose detail carries the CLI's message"  "$ENGINE_DETAIL" "Failed to refresh OAuth token"
+  hasnt "engines: ...and never reads as success"            "$ENGINE_DETAIL" "success"
+  is    "engines: ...on one line"  "$(printf '%s' "$ENGINE_DETAIL" | wc -l)" "0"
+  is    "engines: ...and is not a rate limit"                 "$RATE_LIMITED" "0"
+  # A specific subtype that also carries a message keeps both.
+  out="$root/subtype-and-message.json"
+  printf '%s' '{"result":"tool loop aborted","is_error":true,"subtype":"error_during_execution"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a subtype with a message keeps both" "$ENGINE_DETAIL" "error_during_execution: tool loop aborted"
+  # Nothing at all to say is still named, not blank.
+  out="$root/no-status-no-message.json"
+  printf '%s' '{"result":"","is_error":true,"subtype":"success"}' > "$out"
+  extract_claude "$out" || true
+  is "engines: a failure with no message and a meaningless subtype says so" "$ENGINE_DETAIL" "cli error: no message"
 }
 
 

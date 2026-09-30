@@ -95,7 +95,23 @@ extract_claude() {
         ENGINE_DETAIL="api ${status_code}: ${msg}"
       fi
     else
-      ENGINE_DETAIL="$(jq -r '.subtype // "unknown"' "$out")"
+      # No status: the CLI failed before or around the API call (a token
+      # refresh colliding with an interactive session, 2026-09-29), and
+      # .result is the only true thing it said. A specific subtype leads;
+      # "success" is dropped, since it is the one word that must not appear
+      # on a failure's line.
+      local subtype
+      subtype="$(jq -r '.subtype // "unknown"' "$out")"
+      msg="$(jq -r '.result // ""' "$out")"
+      msg="${msg//$'\t'/ }"; msg="${msg//$'\n'/ }"
+      [[ "$subtype" == "success" ]] && subtype="cli error"
+      if [[ -n "$msg" ]]; then
+        ENGINE_DETAIL="${subtype}: ${msg}"
+      elif [[ "$subtype" == "cli error" ]]; then
+        ENGINE_DETAIL="cli error: no message"
+      else
+        ENGINE_DETAIL="$subtype"
+      fi
     fi
     return 1
   fi
