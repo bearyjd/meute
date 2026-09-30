@@ -695,8 +695,11 @@ run_entry() {
   # credential it has nothing to do with. So a failed claude container run
   # asks the preflight's own host-side question again, and an absent secret
   # (podman's exit status 1 -- never its stderr) is logged as the preflight
-  # failure it is, with the preflight's detail.
-  if (( CONTAINER_MODE && rc != 0 )) && [[ "$engine" == "claude" ]]; then
+  # failure it is, with the preflight's detail. Only when podman itself
+  # failed (its own exit status 125, so the container never started): a
+  # container that started already holds its token, and a secret deleted
+  # while claude runs does not make claude's own failure the preflight's.
+  if (( CONTAINER_MODE && rc == 125 )) && [[ "$engine" == "claude" ]]; then
     if ! preflight_container "$entry" claude && [[ "$PREFLIGHT_SECRET_RC" == "1" ]]; then
       LOG_STAGE="preflight"; ENGINE_STATUS="error"; ENGINE_DETAIL="preflight: ${PREFLIGHT_DETAIL}"
     fi

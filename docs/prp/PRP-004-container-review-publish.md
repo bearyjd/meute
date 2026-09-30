@@ -1248,3 +1248,12 @@ than advancing onto an empty branch (§4.3).
     showed that happening. It is now reported as "(value not shown)".
   - LOW, accepted: there is no real-podman regression test for the
     env-over-file precedence; see §11.
+- **Codex round two: Warning (1 MEDIUM), fixed.** The re-check ran on any
+  failed claude container run, so a secret deleted *while claude ran*
+  would relabel claude's own failure as the preflight's -- though the
+  container already held its token. It now runs only when podman itself
+  failed (exit status 125: the container never started; measured for a
+  missing secret on podman 5.8.7). A failure claude reports stays
+  `stage=build`. Tested both ways: gone-after with rc 1 stays `build` with
+  no re-check; gone-after with 125 is `preflight`; present with 125 is
+  `build`.

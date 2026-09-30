@@ -4676,11 +4676,20 @@ STUB
   is  "vanish: nothing here can count toward demotion" \
       "$(grep -c $'\tstage=build\t' "$root/state/log")" "0"
 
+  # The secret deleted while claude runs: the container already holds its
+  # token, so a failure claude reports itself (any status but podman's own
+  # 125) is the build's, whatever the secret's state now. No re-check.
+  out="$(ENGINE_RC=1 fire)"; line="$(tail -1 "$root/state/log")"
+  is  "vanish: a container that started is not re-checked" \
+      "$(grep -cx 'secret exists atelier-claude-token' "$root/stub/podman-calls")" "1"
+  has "vanish: ...its failure stays the build's"         "$line" "stage=build"
+  hasnt "vanish: ...and is not relabelled the preflight's" "$line" "stage=preflight"
+
   # The converse: a build that fails with the secret still present is the
   # build's own failure, and stays stage=build.
   sed -i "s|    \[\[ -e \"$root/stub/secret-gone\" \]\] \&\& exit 1|    :|" "$root/stub/podman"
-  out="$(ENGINE_RC=1 fire)"; line="$(tail -1 "$root/state/log")"
-  is  "vanish: a build failure with the secret present re-checks once more" \
+  out="$(ENGINE_RC=125 fire)"; line="$(tail -1 "$root/state/log")"
+  is  "vanish: podman failing with the secret present re-checks once more" \
       "$(grep -cx 'secret exists atelier-claude-token' "$root/stub/podman-calls")" "2"
   has "vanish: ...and stays the build's failure"         "$line" "stage=build"
   has "vanish: ...an error"                              "$line" "status=error"
