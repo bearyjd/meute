@@ -653,6 +653,12 @@ run_entry() {
     LOG_STAGE="preflight"
     abort_precondition "$entry" "lfs-repo-needs-git-lfs-for-write-tiers"
   fi
+  # Every run that gets here under the override is read-only, so its branch
+  # never holds anything meute keeps: cleanup deletes it whatever it points
+  # at. The check after the engine names a move; this closes the window
+  # after that check, where a child the engine left running could still
+  # commit before cleanup.
+  (( SCRATCH_LFS_OVERRIDE )) && DISCARD_BRANCH=1
   trap cleanup EXIT
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
