@@ -65,10 +65,10 @@ scratch_git_env() {
   esac
   local n="${GIT_CONFIG_COUNT:-0}" kv
   # Appended after what the caller already set, read as git reads it
-  # (strtol): leading blanks skipped, 08 decimal rather than bad octal. A
-  # count that is no number at all failed the git grep above already; the
-  # fallback only keeps the arithmetic from ending the run.
-  n="${n#"${n%%[![:space:]]*}"}"
+  # (strtoul): leading blanks and a plus sign skipped, 08 decimal rather than
+  # bad octal. A count git rejects failed the git grep above already; the
+  # fallback is a backstop that keeps the arithmetic from ending the run.
+  n="${n#"${n%%[![:space:]]*}"}"; n="${n#+}"
   [[ "$n" =~ ^[0-9]+$ ]] || n=0
   n=$(( 10#$n ))
   for kv in filter.lfs.process= filter.lfs.smudge= filter.lfs.clean= \
