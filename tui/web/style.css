@@ -50,3 +50,7 @@ tr.decided { opacity: 0.55; }
 #run-notice.ok { color: #6fcf8e; }
 #run-notice.err { color: #ff7b72; }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
+progress { appearance: none; -webkit-appearance: none; border: 0; background: #2c3038; border-radius: 3px; overflow: hidden; }
+progress::-webkit-progress-bar { background: #2c3038; }
+progress::-webkit-progress-value { background: #3b82f6; }
+progress::-moz-progress-bar { background: #3b82f6; }

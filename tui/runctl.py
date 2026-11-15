@@ -321,6 +321,10 @@ class RunController:
             state, current = self._state, self._current
             reason, enqueued_at = self._stopped_reason, self._enqueued_at
         entries, archived, mtime = rp.load_queue(self.state_dir)
+        if archived and enqueued_at is None:
+            # An old finished plan from before this page was opened: not progress
+            # worth showing (it would read "0 / N" with nothing done by us).
+            entries, archived = [], False
         since = enqueued_at if enqueued_at is not None else (int(mtime) if mtime else None)
         done, recent = rp.progress(entries, rp.read_log(self.log_path), since)
         total = len(entries)

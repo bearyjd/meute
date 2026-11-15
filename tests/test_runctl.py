@@ -236,6 +236,13 @@ class StatusTests(RunCtlCase):
         status = self.ctl.status()
         self.assertEqual((status["total"], status["remaining"]), (2, 0))
 
+    def test_status_ignores_archive_from_before_this_page(self):
+        self.fleet.write_queue([ALPHA, BETA])
+        os.rename(self.path("plan-queue.json"), self.path("plan-queue.completed-20261001T060549.json"))
+        fresh = runctl.RunController(self.root, runner=self.fleet)
+        status = fresh.status()
+        self.assertEqual((status["total"], status["done"], status["remaining"]), (0, 0, 0))
+
     def test_status_with_nothing_staged(self):
         status = self.ctl.status()
         self.assertEqual((status["total"], status["done"], status["remaining"]), (0, 0, 0))
