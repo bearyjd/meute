@@ -49,7 +49,7 @@ Added 2026-11-15 at the user's request: a button that launches the fleet's work,
 
 ### Flow
 1. **Plan** (read-only): the page calls `GET /api/plan`, which runs `meute plan --json` and lists proposed repos/tasks.
-2. **Review**: the user ticks the repos to stage. Nothing is ticked by default, and Enqueue is disabled until at least one is ticked, so a stray click cannot stage e.g. `private-docs` or vendored code.
+2. **Review**: the user ticks the repos to stage. Nothing is ticked by default, and Enqueue is disabled until at least one is ticked, so a stray click cannot stage e.g. a private-documents repo or vendored code.
 3. **Enqueue**: `POST /api/enqueue {paths: [...]}` runs `meute plan --enqueue --only <path> ...`. The server re-runs the plan and rejects any path not in the fresh result (never an arbitrary path).
 4. **Execute**: `POST /api/run/start` starts one background loop that runs the daily slot, then the weekly slot, for the staged items only (staged read-only tasks are mostly weekly-only; repos.yaml lists at least one read-only task for both slots). Each item is forced individually via `--repo/--task` (quota floor, pause, lock and budget still apply), one item per call, strictly one loop at a time. It stops when nothing is eligible, the quota gate or a pause says skip, 3 consecutive errors occur, or the user presses Stop (`POST /api/run/stop`, lets the current item finish). A confirm click is required before Start.
 5. **Track**: `GET /api/run/status` returns state (idle/running/stopping), the current item, counts (total, done, remaining) from the staged queue plus `state/log`, and the last results with outcome. The page polls every 2s.
