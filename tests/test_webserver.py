@@ -1,77 +1,17 @@
-"""Tests for tui/webserver.py. The inbox module is faked; real act() never runs."""
-import http.client
+"""Tests for tui/webserver.py: inbox endpoints, guards and the inbox page.
+
+Run-endpoint and Run-tab tests live in test_webserver_run.py.
+"""
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
-import threading
 import unittest
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "tui"))
-import webserver  # noqa: E402
-
-REASONS = ["false-positive", "wont-fix"]
-
-
-class FakeInbox:
-    DISMISS_REASONS = tuple(REASONS)
-
-    def __init__(self):
-        self.calls = []
-        self.dump_calls = 0
-        self.result = {"ok": True, "message": "done"}
-
-    def dump(self):
-        self.dump_calls += 1
-        return {"findings": [{"id": "r1"}], "dismiss_reasons": REASONS}
-
-    def finding_body(self, rid, n):
-        return f"body of {rid}#{n}"
-
-    def act(self, verb, rid, n, *rest):
-        self.calls.append((verb, rid, n, *rest))
-        return self.result
-
-
-class WebTestCase(unittest.TestCase):
-    def setUp(self):
-        self.inbox = FakeInbox()
-        self.server, self.token = webserver.make_server("127.0.0.1", 0, self.inbox)
-        self.port = self.server.server_port
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
-        self.thread.start()
-        self.addCleanup(self._stop)
-
-    def _stop(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(5)
-
-    def request(self, method, path, body=None, headers=None, host="default", token=True):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        hdrs = dict(headers or {})
-        if token and method == "POST":
-            hdrs.setdefault("X-Meute-Token", self.token)
-        conn.putrequest(method, path, skip_host=True)
-        conn.putheader("Host", f"127.0.0.1:{self.port}" if host == "default" else host)
-        data = None
-        if body is not None:
-            data = body if isinstance(body, bytes) else json.dumps(body).encode()
-            hdrs["Content-Type"] = "application/json"
-            hdrs["Content-Length"] = str(len(data))
-        for k, v in hdrs.items():
-            conn.putheader(k, v)
-        conn.endheaders(data)
-        resp = conn.getresponse()
-        raw = resp.read()
-        conn.close()
-        return resp, raw
-
-    def post_act(self, payload, **kw):
-        return self.request("POST", "/api/act", payload, **kw)
-
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from webtest_helpers import ROOT, WebTestCase, web_file  # noqa: E402
 
 class ReadTests(WebTestCase):
     def test_get_inbox_returns_dump(self):
@@ -220,8 +160,7 @@ class ActTests(WebTestCase):
 
 class PageTests(WebTestCase):
     def web(self, name):
-        with open(os.path.join(ROOT, "tui", "web", name), encoding="utf-8") as f:
-            return f.read()
+        return web_file(name)
 
     def test_index_has_token_meta_and_no_inline_script(self):
         resp, raw = self.request("GET", "/")
@@ -264,182 +203,49 @@ process.stdout.write(JSON.stringify(r));"""
         out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
         self.assertEqual(json.loads(out), [True, True, True, False, False])
 
-    def test_run_js_never_uses_innerhtml(self):
-        js = self.web("run.js")
-        for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write", "style="):
-            self.assertNotIn(banned, js)
 
-    def test_run_js_sends_token_header(self):
-        self.assertIn("X-Meute-Token", self.web("run.js"))
+class FetchSiteTests(WebTestCase):
+    """Sec-Fetch-Site: a page on another site can send the exact bound Host
+    (an <img> or no-cors fetch), so cross-site and same-site requests are
+    refused before any handler runs; curl and the address bar send none/absent."""
 
-    def test_index_loads_run_js(self):
-        resp, raw = self.request("GET", "/")
-        self.assertIn('<script src="/static/run.js" defer>', raw.decode())
-        resp, raw = self.request("GET", "/static/run.js")
+    GOOD = {"verb": "promote", "id": "r1", "n": 1}
+
+    def test_cross_and_same_site_get_is_403_and_handler_not_called(self):
+        for site in ("cross-site", "same-site"):
+            for path in ("/api/inbox", "/api/finding?id=r1&n=1", "/"):
+                resp, _ = self.request("GET", path, headers={"Sec-Fetch-Site": site})
+                self.assertEqual(resp.status, 403, (site, path))
+        self.assertEqual(self.inbox.dump_calls, 0)
+
+    def test_cross_and_same_site_post_is_403_and_act_not_called(self):
+        for site in ("cross-site", "same-site"):
+            resp, _ = self.post_act(self.GOOD, headers={"Sec-Fetch-Site": site})
+            self.assertEqual(resp.status, 403, site)
+        self.assertEqual(self.inbox.calls, [])
+
+    def test_same_origin_none_and_absent_are_allowed(self):
+        for hdrs in ({"Sec-Fetch-Site": "same-origin"}, {"Sec-Fetch-Site": "none"}, {}):
+            resp, _ = self.request("GET", "/api/inbox", headers=hdrs)
+            self.assertEqual(resp.status, 200, hdrs)
+        resp, _ = self.post_act(self.GOOD, headers={"Sec-Fetch-Site": "same-origin"})
         self.assertEqual(resp.status, 200)
-
-    @unittest.skipUnless(shutil.which("node"), "node not installed")
-    def test_run_js_pure_helpers_under_node(self):
-        js = self.web("run.js")
-        start = js.index("// PURE-BEGIN")
-        end = js.index("// PURE-END")
-        script = js[start:end] + """
-const r = [
-  groupByRepo([{repo: "a", path: "/p/a", task: "t1", reason: "r"}, {repo: "b", path: "/p/b", task: "t2"},
-               {repo: "a", path: "/p/a", task: "t3"}]).map((g) => [g.path, g.tasks.length]),
-  enqueuePayload([{path: "/p/a", checked: true}, {path: "/p/b", checked: false}, {path: "/p/a", checked: true}]),
-  progressValues({total: 4, done: 1}), progressValues({total: 0, done: 0}), progressValues(null),
-];
-process.stdout.write(JSON.stringify(r));"""
-        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
-        self.assertEqual(json.loads(out), [
-            [["/p/a", 2], ["/p/b", 1]], {"paths": ["/p/a"]},
-            {"max": 4, "value": 1}, {"max": 1, "value": 0}, {"max": 1, "value": 0}])
-
-    def _node_pure(self, body):
-        js = self.web("run.js")
-        script = js[js.index("// PURE-BEGIN"):js.index("// PURE-END")] + body
-        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
-        return json.loads(out)
-
-    @unittest.skipUnless(shutil.which("node"), "node not installed")
-    def test_run_js_stale_poll_response_dropped(self):
-        r = self._node_pure("process.stdout.write(JSON.stringify([shouldApply(2, 3), shouldApply(3, 3), shouldApply(4, 3)]));")
-        self.assertEqual(r, [False, False, True])
-
-    @unittest.skipUnless(shutil.which("node"), "node not installed")
-    def test_run_js_stop_not_blocked_by_busy(self):
-        r = self._node_pure("""const b = (o) => buttonFlags(Object.assign({state: "running", pollFailed: false,
-  busy: false, stopBusy: false, anyChecked: true}, o)).stop;
-process.stdout.write(JSON.stringify([b({busy: true}), b({stopBusy: true}), b({pollFailed: true, busy: true}),
-  b({pollFailed: true, stopBusy: true})]));""")
-        self.assertEqual(r, [True, False, True, False])
-
-    @unittest.skipUnless(shutil.which("node"), "node not installed")
-    def test_run_js_button_flags_unknown_state_disables_start_enqueue(self):
-        r = self._node_pure("""const f = (o) => buttonFlags(Object.assign({state: "idle", pollFailed: false,
-  busy: false, stopBusy: false, anyChecked: true}, o));
-const pick = (x) => [x.start, x.enqueue, x.stop];
-process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), pick(f({state: "running"})),
-  pick(f({busy: true})), pick(f({anyChecked: false}))]));""")
-        self.assertEqual(r, [[True, True, False], [False, False, True], [False, False, True],
-                             [False, False, False], [True, False, False]])
-
-    def test_run_js_poll_error_has_own_element(self):
-        js = self.web("run.js")
-        self.assertIn("run-status-error", js)
-        self.assertNotIn('"status failed', js)
-        self.assertLess(len(js.splitlines()), 400)
+        self.assertEqual(len(self.inbox.calls), 1)
 
 
-class FakeRun:
-    def __init__(self):
-        self.calls = []
-        self.start_error = None
-
-    def plan(self):
-        self.calls.append(("plan",))
-        return {"scan": "/s", "items": []}
-
-    def enqueue(self, paths):
-        self.calls.append(("enqueue", paths))
-        if not paths:
-            raise ValueError("select at least one repository")
-        return {"ok": True, "message": "staged", "staged": len(paths)}
-
-    def start(self):
-        self.calls.append(("start",))
-        if self.start_error:
-            raise self.start_error
-        return {"state": "running"}
-
-    def stop(self):
-        self.calls.append(("stop",))
-
-    def status(self):
-        self.calls.append(("status",))
-        return {"state": "idle", "total": 0}
-
-
-class RunEndpointTests(WebTestCase):
-    def setUp(self):
-        self.run = FakeRun()
-        self.inbox = FakeInbox()
-        self.server, self.token = webserver.make_server("127.0.0.1", 0, self.inbox, self.run)
-        self.port = self.server.server_port
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
-        self.thread.start()
-        self.addCleanup(self._stop)
-
-    def test_run_endpoints_require_token(self):
-        for path, body in (("/api/enqueue", {"paths": ["/a"]}), ("/api/run/start", {}),
-                           ("/api/run/stop", {})):
-            resp, _ = self.request("POST", path, body, token=False)
-            self.assertEqual(resp.status, 403, path)
-            resp, _ = self.request("POST", path, body, headers={"X-Meute-Token": "nope"})
-            self.assertEqual(resp.status, 403, path)
-            resp, _ = self.request("POST", path, body, headers={"Origin": "http://evil.example"})
-            self.assertEqual(resp.status, 403, path)
-        self.assertEqual(self.run.calls, [])
-
-    def test_run_gets_require_host(self):
-        for path in ("/api/plan", "/api/run/status"):
-            resp, _ = self.request("GET", path, host="evil.example:80")
-            self.assertEqual(resp.status, 403, path)
-        self.assertEqual(self.run.calls, [])
-
-    def test_enqueue_empty_is_400(self):
-        resp, raw = self.request("POST", "/api/enqueue", {"paths": []})
-        self.assertEqual(resp.status, 400)
-        self.assertFalse(json.loads(raw)["ok"])
-
-    def test_enqueue_bad_body_is_400(self):
-        for body in ([1], {"paths": "x"}, {}):
-            resp, _ = self.request("POST", "/api/enqueue", body)
-            self.assertEqual(resp.status, 400, body)
-        self.assertEqual(self.run.calls, [])
-
-    def test_enqueue_passes_paths(self):
-        resp, raw = self.request("POST", "/api/enqueue", {"paths": ["/a b", "/c"]})
-        self.assertEqual(resp.status, 200)
-        self.assertEqual(self.run.calls, [("enqueue", ["/a b", "/c"])])
-        self.assertEqual(json.loads(raw)["staged"], 2)
-
-    def test_start_conflict_is_409(self):
-        self.run.start_error = webserver.runctl.RunConflict("the fleet is paused")
-        resp, raw = self.request("POST", "/api/run/start", {})
-        self.assertEqual(resp.status, 409)
-        self.assertEqual(json.loads(raw), {"ok": False, "message": "the fleet is paused"})
-
-    def test_start_value_error_is_400(self):
-        self.run.start_error = ValueError("nothing is staged")
-        resp, _ = self.request("POST", "/api/run/start", {})
-        self.assertEqual(resp.status, 400)
-
-    def test_start_stop_status_plan(self):
-        resp, raw = self.request("POST", "/api/run/start", {})
-        self.assertEqual((resp.status, json.loads(raw)), (200, {"state": "running"}))
-        resp, raw = self.request("POST", "/api/run/stop", {})
-        self.assertEqual(resp.status, 200)
-        resp, raw = self.request("GET", "/api/run/status")
-        self.assertEqual(json.loads(raw), {"state": "idle", "total": 0})
-        resp, raw = self.request("GET", "/api/plan")
-        self.assertEqual(json.loads(raw)["scan"], "/s")
-        self.assertEqual([c[0] for c in self.run.calls], ["start", "stop", "status", "plan"])
-
-    def test_runner_failure_is_502(self):
-        def boom():
-            raise webserver.runctl.RunnerFailed("meute plan --json failed (exit 1)")
-        self.run.plan = boom
-        resp, raw = self.request("GET", "/api/plan")
-        self.assertEqual(resp.status, 502)
-        self.assertIn("exit 1", json.loads(raw)["message"])
-
-    def test_default_run_mod_is_a_run_controller(self):
-        server, _ = webserver.make_server("127.0.0.1", 0, self.inbox)
-        self.addCleanup(server.server_close)
-        self.assertIsInstance(server.run_mod, webserver.runctl.RunController)
-        self.assertEqual(server.run_mod.root, webserver.ROOT)
+class PortInUseTests(unittest.TestCase):
+    def test_busy_port_prints_one_line_and_exits_1(self):
+        busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(busy.close)
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        port = busy.getsockname()[1]
+        proc = subprocess.run([sys.executable, os.path.join(ROOT, "tui", "webserver.py"),
+                               "--host", "127.0.0.1", "--port", str(port)],
+                              capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stderr.strip(), f"meute web: port {port} is already in use")
+        self.assertNotIn("Traceback", proc.stderr)
 
 
 if __name__ == "__main__":

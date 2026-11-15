@@ -1,6 +1,6 @@
 # Web inbox: a real web page for the meute triage inbox
 
-Status: v1 approved 2026-11-15; v2 addendum (Run tab) awaiting approval
+Status: v1 + v2 approved 2026-11-15; implemented on branch feat/web-inbox
 
 ## Intent
 `meute web` currently shows the Textual TUI in a browser via textual-serve. The user wants a real web page instead: ordinary HTML, not a terminal in a browser. Same inbox, same decisions, no new screens.
@@ -21,7 +21,8 @@ Status: v1 approved 2026-11-15; v2 addendum (Run tab) awaiting approval
 
 ## Constraints
 - Python standard library only (`http.server`), run from `tui/` next to `serve.py`.
-- Binds 127.0.0.1 by default; off-loopback keeps the existing `--host` + `--insecure-public` acknowledgement.
+- Binds 127.0.0.1 by default; off-loopback keeps the existing `--host` + `--insecure-public` acknowledgement; wildcard hosts (`0.0.0.0`, `0`, `*`) are rejected because the Host check would refuse every request.
+- Every request (GET included) is refused with 403 when `Sec-Fetch-Site` is `cross-site` or `same-site` (`same-origin`, `none` and absent pass), so another site's `<img>`/no-cors fetch cannot trigger a `meute plan` scan; `plan()` is single-flight (a concurrent scan gets 409).
 - State-changing endpoints (POST) require a per-process random token (embedded in the served page, sent as a header) and reject requests whose `Host` is not the bound address (blocks DNS rebinding) or whose `Origin` mismatches.
 - Evidence text is untrusted report content: render with `textContent`, never `innerHTML`.
 - Files stay small (<400 lines each); no mutation of shared state in handlers beyond calling `act`.
@@ -50,7 +51,7 @@ Added 2026-11-15 at the user's request: a button that launches the fleet's work,
 1. **Plan** (read-only): the page calls `GET /api/plan`, which runs `meute plan --json` and lists proposed repos/tasks.
 2. **Review**: the user ticks the repos to stage. Nothing is ticked by default, and Enqueue is disabled until at least one is ticked, so a stray click cannot stage e.g. `private-docs` or vendored code.
 3. **Enqueue**: `POST /api/enqueue {paths: [...]}` runs `meute plan --enqueue --only <path> ...`. The server re-runs the plan and rejects any path not in the fresh result (never an arbitrary path).
-4. **Execute**: `POST /api/run/start` starts one background loop that runs the daily slot, then the weekly slot, for the staged items only (staged read-only tasks are weekly-only). Each item is forced individually via `--repo/--task` (quota floor, pause, lock and budget still apply), one item per call, strictly one loop at a time. It stops when nothing is eligible, the quota gate or a pause says skip, 3 consecutive errors occur, or the user presses Stop (`POST /api/run/stop`, lets the current item finish). A confirm click is required before Start.
+4. **Execute**: `POST /api/run/start` starts one background loop that runs the daily slot, then the weekly slot, for the staged items only (staged read-only tasks are mostly weekly-only; repos.yaml lists at least one read-only task for both slots). Each item is forced individually via `--repo/--task` (quota floor, pause, lock and budget still apply), one item per call, strictly one loop at a time. It stops when nothing is eligible, the quota gate or a pause says skip, 3 consecutive errors occur, or the user presses Stop (`POST /api/run/stop`, lets the current item finish). A confirm click is required before Start.
 5. **Track**: `GET /api/run/status` returns state (idle/running/stopping), the current item, counts (total, done, remaining) from the staged queue plus `state/log`, and the last results with outcome. The page polls every 2s.
 
 ### Changes to meute itself

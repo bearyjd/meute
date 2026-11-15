@@ -1,8 +1,12 @@
 """Tests for tui/runprogress.py: crediting a run.sh call with its own log line."""
+import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +38,29 @@ class ClassifyTests(unittest.TestCase):
     def test_only_foreign_lines_is_error(self):
         out = runprogress.classify([self.rec("weekly", "ok")], 0, "daily", time.time() - 5)
         self.assertEqual(out["status"], "error")
+
+
+class LoadQueueTests(unittest.TestCase):
+    def test_queue_archived_between_isfile_and_getmtime_reads_the_archive(self):
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state)
+        with open(os.path.join(state, "plan-queue.completed-20261115T120000.json"), "w") as f:
+            json.dump({"entries": [{"name": "r", "task": "t"}]}, f)
+        live = os.path.join(state, "plan-queue.json")
+        real_isfile = os.path.isfile
+        # run.sh renames the live queue right after isfile() said it was there
+        with mock.patch.object(runprogress.os.path, "isfile",
+                               side_effect=lambda p: p == live or real_isfile(p)):
+            entries, archived, mtime = runprogress.load_queue(state)
+        self.assertEqual((entries, archived), ([("r", "t")], True))
+        self.assertIsNotNone(mtime)
+
+    def test_everything_vanishing_is_an_empty_queue(self):
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state)
+        live = os.path.join(state, "plan-queue.json")
+        with mock.patch.object(runprogress.os.path, "isfile", side_effect=lambda p: p == live):
+            self.assertEqual(runprogress.load_queue(state), ([], False, None))
 
 
 if __name__ == "__main__":

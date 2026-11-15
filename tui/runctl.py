@@ -24,14 +24,22 @@ finds nothing to run. As defence in depth the loop still stops if a call logged
 something that was not staged. It stops with "staged plan finished" when both
 slots have nothing pending.
 
-Subprocesses start in their own session and are never signalled: Stop and a
-server exit both let the in-flight item finish.
+Start pins the staged queue: the set of (name, task) pairs it saw. A CLI
+`meute plan --enqueue` (or another `meute web`) restaging mid-run would make
+the loop drive repos this page never showed, so the loop re-reads the queue
+before each item and stops if the set changed.
+
+Subprocesses start in their own session. The run.sh item calls have no timeout
+and are never signalled: Stop and a server exit both let the in-flight item
+finish. The scans (meute plan, the manifest.py pending check) do time out; a
+hung scan's process group is killed and the call fails with a clear message.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -40,6 +48,9 @@ import time
 import runprogress as rp
 
 MAX_ERRORS = 3
+PLAN_TIMEOUT = 120    # seconds for `meute plan --json` and `meute plan --enqueue`
+PENDING_TIMEOUT = 30  # seconds for the lib/manifest.py plan-queue check
+QUEUE_CHANGED = "staged queue changed outside this page"
 RUN_OUTPUT = ".plan-web-run.log"  # under state/; matches the .gitignore'd state/.plan-*
 
 
@@ -51,17 +62,29 @@ class RunnerFailed(Exception):
     """A meute command failed; the message is safe to show."""
 
 
-def subprocess_runner(argv: list[str], cwd: str, out_path: str | None = None) -> tuple[int, str]:
+def subprocess_runner(argv: list[str], cwd: str, out_path: str | None = None,
+                      timeout: float | None = None) -> tuple[int, str]:
     """Run argv to completion. Returns (returncode, stdout).
 
-    With out_path, stdout and stderr go to that file and "" is returned: the
-    child never writes into a pipe this process could close under it.
+    With timeout, a child still running after `timeout` seconds has its whole
+    process group killed (find/jq grandchildren would hold the pipe open) and
+    subprocess.TimeoutExpired is raised. With out_path, stdout and stderr go to
+    that file and "" is returned: the child never writes into a pipe this
+    process could close under it. out_path calls (run.sh items) never time out.
     """
     if out_path is None:
-        proc = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, text=True,
-                              start_new_session=True, check=False)
-        return proc.returncode, proc.stdout
+        proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # start_new_session: pgid == pid
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise
+        return proc.returncode, out
     with open(out_path, "ab") as out:
         child = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
                                  stderr=out, start_new_session=True)
@@ -98,14 +121,35 @@ class RunController:
         self._thread: threading.Thread | None = None
         self._state = "idle"
         self._enqueuing = False
+        self._planning = False
+        self._pinned: frozenset | None = None
         self._current: dict | None = None
         self._stopped_reason: str | None = None
         self._enqueued_at: int | None = None
 
     # ------------------------------------------------------------ plan ---
+    def _call(self, argv: list[str], timeout: float, what: str) -> tuple[int, str]:
+        """Run a scan with a timeout; a hang becomes a RunnerFailed (-> 502)."""
+        try:
+            return self.runner(argv, self.root, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RunnerFailed(f"{what} timed out after {timeout}s") from None
+
     def plan(self) -> dict:
+        """One scan at a time: a second caller gets RunConflict (-> 409)."""
+        with self._lock:
+            if self._planning:
+                raise RunConflict("a plan scan is already running; try again when it finishes")
+            self._planning = True
+        try:
+            return self._plan()
+        finally:
+            with self._lock:
+                self._planning = False
+
+    def _plan(self) -> dict:
         argv = [self.meute, "plan", "--json"] + (["--", self.scan_dir] if self.scan_dir else [])
-        rc, out = self.runner(argv, self.root)
+        rc, out = self._call(argv, PLAN_TIMEOUT, "meute plan --json")
         if rc != 0:
             raise RunnerFailed(f"meute plan --json failed (exit {rc})")
         try:
@@ -140,7 +184,7 @@ class RunController:
             argv += ["--only", path]
         argv += ["--", fresh["scan"]]
         started = int(self.clock())
-        rc, _ = self.runner(argv, self.root)
+        rc, _ = self._call(argv, PLAN_TIMEOUT, "meute plan --enqueue")
         if rc != 0:
             return {"ok": False, "message": f"meute plan --enqueue failed (exit {rc})",
                     "staged": 0}
@@ -162,6 +206,7 @@ class RunController:
                 raise RunConflict(paused)
             if not os.path.isfile(self.queue_path):
                 raise ValueError("nothing is staged: enqueue repositories first")
+            self._pinned = self._queue_identity()
             self._state, self._current, self._stopped_reason = "running", None, None
             self._stopping.clear()
             self._thread = threading.Thread(target=self._loop, name="meute-run", daemon=True)
@@ -201,6 +246,15 @@ class RunController:
                 slot, pending = "weekly", self._pending("weekly")
             if not pending:
                 return "staged plan finished"
+            if self._queue_identity() != self._pinned:
+                return QUEUE_CHANGED
+            # Accepted trade-off: from the pending check above (a manifest.py
+            # subprocess) through run.sh's startup up to its flock -- tens to
+            # hundreds of milliseconds -- a scheduled timer can finish this same
+            # item, and run.sh then runs it a second time (one duplicate,
+            # read-only run). Closing the window needs run.sh to re-check
+            # plan-complete under its lock for forced items; this module only
+            # drives run.sh and cannot do that from outside.
             repo, task = pending[0]
             with self._lock:
                 if self._stopping.is_set():
@@ -209,7 +263,9 @@ class RunController:
             outcome = self._run_once(slot, repo, task)
             if outcome["status"] == "skipped":
                 return f"skipped: {outcome['reason'] or 'no reason given'}"
-            staged = set(rp.load_queue(self.state_dir)[0])
+            staged = self._queue_identity()
+            if staged != self._pinned:
+                return QUEUE_CHANGED
             if outcome["repo"] and (outcome["repo"], outcome["task"]) not in staged:
                 return ("stopped: the runner moved on to the manifest queue "
                         f"({outcome['repo']}/{outcome['task']})")
@@ -225,6 +281,10 @@ class RunController:
         rc, _ = self.runner(argv, self.root, out_path=out)
         return rp.classify(rp.read_log(self.log_path, offset), rc, slot, started)
 
+    def _queue_identity(self) -> frozenset:
+        """The staged queue as a set of (name, task), read like status() reads it."""
+        return frozenset(rp.load_queue(self.state_dir)[0])
+
     def _manifest(self) -> str:
         override = os.environ.get("MEUTE_MANIFEST")
         if override:
@@ -238,7 +298,7 @@ class RunController:
             return []
         argv = [sys.executable, os.path.join(self.root, "lib", "manifest.py"), "plan-queue",
                 self._manifest(), self.queue_path, slot]
-        rc, out = self.runner(argv, self.root)
+        rc, out = self._call(argv, PENDING_TIMEOUT, "stopped: the staged plan queue check")
         if rc != 0:
             raise RunnerFailed("stopped: the staged plan queue failed validation")
         done = rp.completed_keys(self.state_dir)

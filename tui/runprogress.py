@@ -130,14 +130,27 @@ def load_queue(state_dir: str) -> tuple[list[tuple[str, str]], bool, float | Non
     """(entries as (name, task), archived?, file mtime) of the current plan.
 
     The live queue if there is one, else the newest archive run.sh left.
+    run.sh can archive (rename) the live queue at any moment, so a file that
+    vanishes between the existence check and the stat is treated as archived.
     """
     live = os.path.join(state_dir, "plan-queue.json")
     if os.path.isfile(live):
-        return _entries(live), False, os.path.getmtime(live)
+        try:
+            mtime = os.path.getmtime(live)
+        except OSError:
+            pass  # archived just now: fall through to the archives
+        else:
+            return _entries(live), False, mtime
     pattern = os.path.join(glob.escape(state_dir), "plan-queue.completed-*.json*")
-    archives = sorted(glob.glob(pattern), key=os.path.getmtime)
-    if archives:
-        return _entries(archives[-1]), True, os.path.getmtime(archives[-1])
+    stamped = []
+    for path in glob.glob(pattern):
+        try:
+            stamped.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    if stamped:
+        mtime, newest = max(stamped)
+        return _entries(newest), True, mtime
     return [], False, None
 
 

@@ -176,7 +176,8 @@ work:
 3. **Enqueue** -- stages only the ticked repos. Re-enqueueing *replaces* the
    staged queue rather than adding to it.
 4. **Start** (after a confirm click) -- Go runs the daily slot, then the weekly
-   slot, for the staged items only (staged read-only tasks are weekly-only), one
+   slot, for the staged items only (staged read-only tasks are mostly
+   weekly-only; repos.yaml lists at least one read-only task for both slots), one
    item at a time. Each item is forced via `--repo/--task`; the quota floor,
    pause, lock and budget still apply. Stop lets the current item finish.
 5. **Progress** -- the page polls the run status (current item, done/remaining,
@@ -186,7 +187,10 @@ Safety model: it binds `127.0.0.1` by default (loopback only). Every POST needs
 a per-process token plus Host/Origin checks. Start refuses while the fleet is
 paused or a run is already going, and the runner's own quota floor still
 applies. To bind off loopback, pass both `--host <addr>` and `--insecure-public`
-(IPv4 only; IPv6 hosts are rejected); the latter acknowledges that anyone who can
+(IPv4 only; IPv6 hosts are rejected). `<addr>` must be the specific address the
+browser will use, such as a LAN or tailnet IP: wildcard binds (`0.0.0.0`, `0`,
+`*`) are rejected, because the Host check would refuse every request. The
+`--insecure-public` flag acknowledges that anyone who can
 reach the listener can triage findings **and start fleet runs that spend your
 Claude/Codex quota**. A tailnet address is the sensible way to use it from a
 phone.
@@ -196,8 +200,15 @@ header. With the default bind, browse to `127.0.0.1:<port>`; with
 `--host localhost` the browser must use `localhost:<port>` (`127.0.0.1:<port>`
 then returns 403); a non-loopback bind must be browsed at the same address.
 
-Known limitation: if a scheduled timer finishes the same staged item inside a
-millisecond-wide window, one duplicate read-only run can occur.
+Known limitation: if a scheduled timer finishes the same staged item between
+the page's pending check (a `lib/manifest.py` subprocess) and `run.sh` taking
+its lock -- a window of tens to hundreds of milliseconds -- one duplicate
+read-only run can occur. Closing it needs a `run.sh` change, so it is accepted.
+
+Browsers mark requests another site starts (an `<img>`, a no-cors fetch) with
+`Sec-Fetch-Site: cross-site` or `same-site`; the server refuses those with 403
+on every route, so a web page cannot make it run `meute plan` scans. A second
+`meute web` on a busy port exits with `meute web: port <p> is already in use`.
 
 ## Quota gates
 

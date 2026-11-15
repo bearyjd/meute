@@ -46,6 +46,25 @@ function buttonFlags(f) {
     plan: !f.busy,
   };
 }
+// Excluded counts for the scan note; the names go in a tooltip.
+function excludedSummary(ex) {
+  const e = ex || {};
+  const count = (v) => (Array.isArray(v) ? v.length : (typeof v === "number" ? v : 0));
+  const names = (label, v) => (Array.isArray(v) && v.length ? [label + ": " + v.join(", ")] : []);
+  return {
+    text: "excluded web " + count(e.web) + " / other " + count(e.other),
+    title: names("web", e.web).concat(names("other", e.other)).join("\n"),
+  };
+}
+
+// The consent text for Enqueue: one full path per ticked repo (two repos can
+// share a name), then what enqueueing means.
+function enqueueConfirmText(entries) {
+  const paths = enqueuePayload(entries).paths;
+  return "Enqueue " + paths.length + " repo(s):\n" + paths.join("\n")
+    + "\n\nThey will be analysed by an AI model: their code leaves this machine's disk "
+    + "and is sent to the model provider.\nThis replaces the currently staged queue.";
+}
 // PURE-END
 
 async function runCall(method, url, body) {
@@ -117,11 +136,11 @@ function renderPlan(plan) {
     row.append(lab, ul);
     list.appendChild(row);
   });
-  const ex = plan.excluded || {};
-  const note = "scan " + (plan.scan || "?") + ": discovered " + plan.discovered + ", configured "
-    + plan.configured + ", unconfigured " + plan.unconfigured + ", excluded web "
-    + (ex.web === undefined ? 0 : ex.web) + " / other " + (ex.other === undefined ? 0 : ex.other);
-  list.appendChild(el("p", note, "muted"));
+  const ex = excludedSummary(plan.excluded);
+  const note = el("p", "scan " + (plan.scan || "?") + ": discovered " + plan.discovered + ", configured "
+    + plan.configured + ", unconfigured " + plan.unconfigured + ", " + ex.text, "muted");
+  if (ex.title) note.setAttribute("title", ex.title);
+  list.appendChild(note);
   syncButtons();
 }
 
@@ -221,12 +240,8 @@ function doPlan() {
 
 function doEnqueue() {
   const entries = checkedEntries();
-  const names = entries.filter((e) => e.checked).map((e) => e.repo);
-  if (!names.length) return Promise.resolve();
-  const ok = window.confirm("Enqueue " + names.length + " repo(s):\n" + names.join("\n")
-    + "\n\nThey will be analysed by an AI model: their code leaves this machine's disk "
-    + "and is sent to the model provider.\nThis replaces the currently staged queue.");
-  if (!ok) return Promise.resolve();
+  if (!enqueuePayload(entries).paths.length) return Promise.resolve();
+  if (!window.confirm(enqueueConfirmText(entries))) return Promise.resolve();
   return guarded(async () => {
     const res = await runCall("POST", "/api/enqueue", enqueuePayload(entries));
     runNotice(res.message || "enqueued", true);

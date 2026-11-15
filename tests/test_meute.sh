@@ -3097,14 +3097,23 @@ test_web_bind_guard() {
   local out rc stub="$FIXTURE/webstub"; mkdir -p "$stub"
   printf '#!/bin/sh\necho "python3-stub $*"\n' > "$stub/python3"; chmod +x "$stub/python3"
   web() { PATH="$stub:$PATH" bash -c 'source "$1/bin/meute"; shift; cmd_web "$@"' _ "$REPO" "$@" 2>&1; }
-  out="$(web --host 0.0.0.0)"; rc=$?
+  out="$(web --host 192.0.2.10)"; rc=$?
   is "web: refuses non-loopback without explicit acknowledgement" "$rc" "1"
   has "web: names the required public-bind flag" "$out" "--insecure-public"
   out="$(web --host 127.0.0.1 --port 8123)"
   has "web: loopback remains available without acknowledgement" "$out" "webserver.py --host 127.0.0.1 --port 8123"
-  out="$(web --host 0.0.0.0 --insecure-public)"
-  has "web: explicit insecure opt-in permits non-loopback" "$out" "--host 0.0.0.0"
+  out="$(web --host 192.0.2.10 --insecure-public)"
+  has "web: explicit insecure opt-in permits non-loopback" "$out" "webserver.py --host 192.0.2.10"
   has "web: warning says fleet runs spend quota" "$out" "start fleet runs"
+  # The Host check accepts only the bound host:port, and no browser sends
+  # Host 0.0.0.0, so a wildcard bind could only ever answer 403.
+  local wild
+  for wild in 0.0.0.0 0 '*' ''; do
+    out="$(web --host "$wild" --insecure-public)"; rc=$?
+    is  "web: wildcard host '${wild}' rejected even with --insecure-public" "$rc" "1"
+    has "web: wildcard host '${wild}' message says to bind a specific address" "$out" "specific address"
+    hasnt "web: wildcard host '${wild}' never starts the server" "$out" "python3-stub"
+  done
   out="$(web --host ::1)"; rc=$?
   is  "web: IPv6 host is rejected" "$rc" "1"
   has "web: IPv6 rejection explains itself" "$out" "IPv6"

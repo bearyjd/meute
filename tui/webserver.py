@@ -3,14 +3,18 @@
     python3 tui/webserver.py --host 127.0.0.1 --port 8642
 
 Every state change goes through inbox.act (-> bin/meute), so the page cannot
-drift from the CLI. POSTs are guarded by a per-process token, an exact Host
-match and (when sent) an exact Origin match. Report text is untrusted: this
-module only ever serves it as text/plain or inside JSON.
+drift from the CLI. Every request needs an exact Host match and is refused
+when the browser marks it cross-site or same-site (Sec-Fetch-Site): another
+site's <img> or no-cors fetch sends the right Host, and GET /api/plan runs a
+full scan. POSTs also need a per-process token and (when sent) an exact Origin
+match. Report text is untrusted: this module only ever serves it as text/plain
+or inside JSON.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import hmac
 import json
 import os
@@ -42,6 +46,10 @@ PLACEHOLDER = (
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 VERBS = ("promote", "dismiss", "resolve")
 MAX_BODY = 64 * 1024
+# Sec-Fetch-Site values a browser sends for requests another site started.
+# same-origin (this page), none (address bar, bookmark) and absent (curl,
+# older browsers) pass.
+FOREIGN_FETCH_SITES = ("cross-site", "same-site")
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
@@ -236,6 +244,8 @@ class Handler(BaseHTTPRequestHandler):
         expect = f"{self.server.bound_host}:{self.server.server_port}"
         if self.headers.get("Host") != expect:
             return False
+        if (self.headers.get("Sec-Fetch-Site") or "").strip().lower() in FOREIGN_FETCH_SITES:
+            return False
         if method != "POST":
             return True
         origin = self.headers.get("Origin")
@@ -286,7 +296,13 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8642)
     args = ap.parse_args()
-    server, _ = make_server(args.host, args.port)
+    try:
+        server, _ = make_server(args.host, args.port)
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        sys.stderr.write(f"meute web: port {args.port} is already in use\n")
+        sys.exit(1)
     print(f"meute web inbox on http://{args.host}:{server.server_port}/", flush=True)
     try:
         server.serve_forever()
