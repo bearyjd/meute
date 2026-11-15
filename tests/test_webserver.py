@@ -216,5 +216,31 @@ class ActTests(WebTestCase):
         self.assertEqual(json.loads(raw), {"ok": False, "message": "nope"})
 
 
+class PageTests(WebTestCase):
+    def web(self, name):
+        with open(os.path.join(ROOT, "tui", "web", name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_index_has_token_meta_and_no_inline_script(self):
+        resp, raw = self.request("GET", "/")
+        page = raw.decode()
+        self.assertIn(f'<meta name="meute-token" content="{self.token}">', page)
+        self.assertIn('<section id="run"', page)
+        self.assertIn('<script src="/static/run.js" defer>', page)
+        import re
+        for m in re.finditer(r"<script\b([^>]*)>", page):
+            self.assertIn("src=", m.group(1))
+        self.assertNotRegex(page, r"\son[a-z]+\s*=")
+        self.assertNotIn("style=", page)
+
+    def test_app_js_never_uses_innerhtml(self):
+        js = self.web("app.js")
+        for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write"):
+            self.assertNotIn(banned, js)
+
+    def test_app_js_sends_token_header(self):
+        self.assertIn("X-Meute-Token", self.web("app.js"))
+
+
 if __name__ == "__main__":
     unittest.main()
