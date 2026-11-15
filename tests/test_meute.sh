@@ -3108,6 +3108,18 @@ test_web_bind_guard() {
   out="$(web --host ::1)"; rc=$?
   is  "web: IPv6 host is rejected" "$rc" "1"
   has "web: IPv6 rejection explains itself" "$out" "IPv6"
+  out="$(web --port --insecure-public)"; rc=$?
+  is  "web: --port swallowing a flag is rejected" "$rc" "1"
+  has "web: --port flag-value message is clear" "$out" "--port needs a value"
+  out="$(web --port abc)"; rc=$?
+  is  "web: non-numeric port rejected" "$rc" "1"
+  has "web: bad port message names the range" "$out" "1-65535"
+  out="$(web --port 70000)"; rc=$?
+  is  "web: out-of-range port rejected" "$rc" "1"
+  out="$(web --port 0)"; rc=$?
+  is  "web: port 0 rejected" "$rc" "1"
+  out="$(web --host --insecure-public)"; rc=$?
+  is  "web: --host swallowing a flag is rejected" "$rc" "1"
   local body; body="$(sed -n '/^cmd_web()/,/^}/p' "$REPO/bin/meute")"
   has   "web: cmd_web execs webserver.py" "$body" "tui/webserver.py"
   hasnt "web: cmd_web no longer execs serve.py" "$body" "serve.py"
@@ -3116,26 +3128,27 @@ test_web_bind_guard() {
 # The web inbox is stdlib-only (plain python3, no venv), and the runner
 # still never reaches into tui/. Every unittest file must pass.
 test_web_invariants() {
-  local f bad out rc
-  for f in webserver runctl runprogress; do
-    bad="$(python3 - "$REPO/tui/$f.py" "$REPO/tui" "$REPO/lib" <<'PY2'
-import ast, os, sys
+  local f bad rc out
+  for f in "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" \
+           "$REPO/lib/inbox.py" "$REPO/lib/report.py"; do
+    bad="$(python3 - "$f" <<'PY2'
+import ast, sys
 std = sys.stdlib_module_names
-local = {n[:-3] for d in sys.argv[2:] for n in os.listdir(d) if n.endswith(".py")}
+# the only sibling modules the web files may import (never serve/app/model)
+siblings = {"inbox", "report", "runctl", "runprogress"}
 tree = ast.parse(open(sys.argv[1]).read())
 bad = []
 for n in ast.walk(tree):
     mods = [a.name for a in n.names] if isinstance(n, ast.Import) else \
            [n.module or ""] if isinstance(n, ast.ImportFrom) and n.level == 0 else []
-    bad += [m for m in mods if m.split(".")[0] not in std and m.split(".")[0] not in local]
+    bad += [m for m in mods if m.split(".")[0] not in std and m.split(".")[0] not in siblings]
 print(" ".join(bad))
 PY2
-)"
-    is "invariant: tui/$f.py imports only stdlib/local modules" "$bad" ""
+)"; rc=$?
+    is "invariant: $(basename "$f") AST check ran" "$rc" "0"
+    is "invariant: $(basename "$f") imports only stdlib and its web siblings" "$bad" ""
   done
-  is "invariant: web files never import textual or flask" \
-     "$(grep -lE '^\s*(import|from) (textual|flask)' "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" | wc -l)" "0"
-  is "invariant: run.sh still never references tui/" "$(grep -c 'tui/' "$REPO/bin/run.sh")" "0"
+  [[ -f "$REPO/bin/run.sh" ]]; is "invariant: bin/run.sh exists" "$?" "0"
   for f in "$REPO"/tests/test_*.py; do
     out="$(cd "$REPO/tests" && python3 -m unittest "$(basename "$f" .py)" 2>&1)"; rc=$?
     is "unittest: $(basename "$f") exits 0" "$rc" "0"
@@ -3315,7 +3328,7 @@ PY2
   has "model: a stub reads UNMEASURED, never ok" "$hdr" "UNMEASURED (stub)"
 
   # PRP-003's hard invariant: the runner never depends on the UI.
-  is  "invariant: run.sh never references tui/" "$(grep -c 'tui/' "$REPO/bin/run.sh")" "0"
+  is  "invariant: run.sh never references tui/" "$(grep -c 'tui/' "$REPO/bin/run.sh" 2>&1; true)" "0"
   is  "invariant: lib/ never imports textual"   "$(grep -rlc 'textual' "$REPO/lib" | wc -l)" "0"
   is  "invariant: tui/model.py imports no textual" "$(grep -c 'textual' "$REPO/tui/model.py")" "0"
 }

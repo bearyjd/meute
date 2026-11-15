@@ -150,23 +150,54 @@ the inbox is the same thing with a cursor:
 ./bin/meute resolve <id> -f <n> -m "fixed in PR #12"
 
 ./bin/meute tui                      # the inbox in the terminal
-./bin/meute web                      # the identical inbox in a browser, loopback only
+./bin/meute web                      # the web inbox + Run tab in a browser, loopback only
 ```
 
-`tui` and `web` are one Textual app (PRP-003): `j`/`k` move, `Enter` shows the
+`tui` is a Textual app (PRP-003): `j`/`k` move, `Enter` shows the
 finding with its evidence, `p` promotes, `d` dismisses (a reason is required —
 it is the sole promoted-vs-dismissed signal per lens), `r` resolves, `/`
 filters on any column, `g` jumps to the next repo, `a` shows decided findings
 too. Every action goes through the CLI commands above, so the two can never
 disagree. Tabs for the tier-3 drafts awaiting merge and for every report.
 
-The UI lives in its own uv venv under `tui/`, created on first use. **The
-runner has no dependency on it**: `bin/run.sh` succeeds on a machine where
-that venv was never created, and the suite pins that. `web` is textual-serve
-and has no authentication — it binds `127.0.0.1` by default. To bind off loopback,
-pass both `--host <addr>` and `--insecure-public`. The latter is an explicit
-acknowledgement that anyone who can reach the listener can triage findings; a
-tailnet address is the sensible way to use it from a phone.
+The Textual UI lives in its own uv venv under `tui/`, created on first use.
+**The runner has no dependency on it**: `bin/run.sh` succeeds on a machine where
+that venv was never created, and the suite pins that.
+
+`meute web` is a separate, real web page (design:
+`docs/superpowers/specs/2026-11-15-web-inbox-design.md`) served by the
+stdlib-only `tui/webserver.py` under plain `python3` -- no venv, no Textual. It
+has an inbox tab (triage findings) and a **Run tab** that launches the fleet's
+work:
+
+1. **Plan** -- read-only; lists the repos/tasks `meute plan` proposes.
+2. **Tick repos** -- nothing is ticked by default, and Enqueue stays disabled
+   until at least one is.
+3. **Enqueue** -- stages only the ticked repos. Re-enqueueing *replaces* the
+   staged queue rather than adding to it.
+4. **Start** (after a confirm click) -- Go runs the daily slot, then the weekly
+   slot, for the staged items only (staged read-only tasks are weekly-only), one
+   item at a time. Each item is forced via `--repo/--task`; the quota floor,
+   pause, lock and budget still apply. Stop lets the current item finish.
+5. **Progress** -- the page polls the run status (current item, done/remaining,
+   recent outcomes).
+
+Safety model: it binds `127.0.0.1` by default (loopback only). Every POST needs
+a per-process token plus Host/Origin checks. Start refuses while the fleet is
+paused or a run is already going, and the runner's own quota floor still
+applies. To bind off loopback, pass both `--host <addr>` and `--insecure-public`
+(IPv4 only; IPv6 hosts are rejected); the latter acknowledges that anyone who can
+reach the listener can triage findings **and start fleet runs that spend your
+Claude/Codex quota**. A tailnet address is the sensible way to use it from a
+phone.
+
+Host rule: the server accepts only the exact bound `host:port` as the Host
+header. With the default bind, browse to `127.0.0.1:<port>`; with
+`--host localhost` the browser must use `localhost:<port>` (`127.0.0.1:<port>`
+then returns 403); a non-loopback bind must be browsed at the same address.
+
+Known limitation: if a scheduled timer finishes the same staged item inside a
+millisecond-wide window, one duplicate read-only run can occur.
 
 ## Quota gates
 

@@ -688,13 +688,15 @@ cmd_web() {
   local host="127.0.0.1" port="8642" insecure_public=0
   while (( $# )); do
     case "$1" in
-      --host) host="${2:?--host needs a value}"; shift ;;
-      --port) port="${2:?--port needs a value}"; shift ;;
+      --host) host="${2:?--host needs a value}"; [[ "$host" != --* ]] || die "web: --host needs a value, got '${host}'"; shift ;;
+      --port) port="${2:?--port needs a value}"; [[ "$port" != --* ]] || die "web: --port needs a value, got '${port}'"; shift ;;
       --insecure-public) insecure_public=1 ;;
       *) die "web: unknown argument $1" ;;
     esac
     shift
   done
+  [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
+    || die "web: --port must be an integer 1-65535, got '${port}'"
   # The server binds an IPv4 socket; an IPv6 literal (::1, ::) cannot work.
   [[ "$host" != *:* ]] || die "web: IPv6 host ${host} is not supported; use an IPv4 address (127.0.0.1 is the default)"
   if [[ "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
