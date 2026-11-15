@@ -84,6 +84,7 @@ source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/container.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 source "${MEUTE_ROOT}/lib/plan.sh"
+source "${MEUTE_ROOT}/lib/plan_dedup.sh"
 source "${MEUTE_ROOT}/lib/status.sh"
 source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
@@ -647,6 +648,8 @@ cmd_plan() {
 
   plan_collect_tasks "$allow_web"
   plan_scan_repos "$scan_dir" "$max_depth"
+  # One canonical copy per repository; copies are listed, never staged.
+  plan_dedup "$scan_dir"
   if (( json )); then
     plan_print_json "$scan_dir"
     return 0

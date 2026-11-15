@@ -65,6 +65,27 @@ function enqueueConfirmText(entries) {
     + "\n\nThey will be analysed by an AI model: their code leaves this machine's disk "
     + "and is sent to the model provider.\nThis replaces the currently staged queue.";
 }
+
+// meute plan stages one copy per repository; the copies it collapsed and the
+// repos it could not read are summarised above the list.
+function planDedupSummary(plan) {
+  const n = (v) => (Array.isArray(v) ? v.length : 0);
+  return n(plan.duplicates) + " duplicate copies collapsed, " + n(plan.skipped) + " skipped";
+}
+
+// Collapsed copies keyed by the path they are a copy of, in plan order.
+function copiesByCanonical(dups) {
+  const by = {};
+  (dups || []).forEach((d) => {
+    if (!d || typeof d.path !== "string" || typeof d.of !== "string") return;
+    (by[d.of] = by[d.of] || []).push(d.path);
+  });
+  return by;
+}
+
+function hiddenCopiesText(n) {
+  return n + (n === 1 ? " duplicate copy hidden" : " duplicate copies hidden");
+}
 // PURE-END
 
 async function runCall(method, url, body) {
@@ -121,7 +142,9 @@ function renderPlan(plan) {
   runUi.planned = true;
   const list = $("run-plan-list");
   list.replaceChildren();
+  list.appendChild(el("p", planDedupSummary(plan), "muted"));
   if (!runUi.groups.length) { list.appendChild(el("p", "Nothing proposed.", "muted")); }
+  const copies = copiesByCanonical(plan.duplicates);
   runUi.groups.forEach((g, i) => {
     const box = el("input");
     box.type = "checkbox";
@@ -134,6 +157,14 @@ function renderPlan(plan) {
     g.tasks.forEach((t) => ul.appendChild(el("li", t.task + (t.reason ? " - " + t.reason : ""))));
     const row = el("div", null, "plan-group");
     row.append(lab, ul);
+    const hidden = Object.prototype.hasOwnProperty.call(copies, g.path) ? copies[g.path] : [];
+    if (hidden.length) {
+      // Text only: the paths go in the tooltip; no checkbox, so select all
+      // and select none never reach a copy.
+      const more = el("div", hiddenCopiesText(hidden.length), "muted plan-copies");
+      more.setAttribute("title", hidden.join("\n"));
+      row.appendChild(more);
+    }
     list.appendChild(row);
   });
   const ex = excludedSummary(plan.excluded);

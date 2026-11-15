@@ -4,10 +4,14 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from webtest_helpers import FakeRun, WebTestCase, node_pure, web_file, webserver  # noqa: E402
+from runctl_helpers import ALPHA, FakeFleet  # noqa: E402
+
+DUP = "/scan root/projects/output/alpha copy"
 
 HAS_NODE = shutil.which("node") is not None
 
@@ -109,6 +113,30 @@ class RunEndpointTests(WebTestCase):
         self.assertEqual(server.run_mod.root, webserver.ROOT)
 
 
+class DuplicateEnqueueTests(WebTestCase):
+    """The real controller behind the endpoint, over a fake fleet whose plan
+    lists a collapsed copy: enqueueing the copy is a 400 and stages nothing."""
+
+    def run_factory(self):
+        root = tempfile.mkdtemp(prefix="meute web dup ")
+        self.addCleanup(shutil.rmtree, root)
+        os.makedirs(os.path.join(root, "state"))
+        self.fleet = FakeFleet(root)
+        self.fleet.duplicates = [{"path": DUP, "of": ALPHA, "reason": "duplicate of " + ALPHA}]
+        return webserver.runctl.RunController(root, runner=self.fleet)
+
+    def test_enqueue_duplicate_is_400(self):
+        resp, raw = self.request("POST", "/api/enqueue", {"paths": [DUP]})
+        self.assertEqual(resp.status, 400)
+        self.assertIn(DUP, json.loads(raw)["message"])
+        self.assertFalse(any("--enqueue" in c for c in self.fleet.calls))
+
+    def test_enqueue_canonical_still_stages(self):
+        resp, raw = self.request("POST", "/api/enqueue", {"paths": [ALPHA]})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(raw)["staged"], 1)
+
+
 class RunPageTests(WebTestCase):
     run_factory = FakeRun
 
@@ -206,6 +234,28 @@ process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), p
         self.assertEqual(r[1], {"text": "excluded web 0 / other 0", "title": ""})
         self.assertEqual(r[2], {"text": "excluded web 0 / other 0", "title": ""})
         self.assertEqual(r[3]["text"], "excluded web 3 / other 0")
+
+    @unittest.skipUnless(HAS_NODE, "node not installed")
+    def test_duplicate_summary_and_hidden_copies(self):
+        r = node_pure("""process.stdout.write(JSON.stringify([
+  planDedupSummary({duplicates: [{path: "/o/a", of: "/p/a"}, {path: "/o/b", of: "/p/a"},
+                                 {path: "/c", of: "/enrolled"}], skipped: [{path: "/s"}]}),
+  planDedupSummary({}),
+  copiesByCanonical([{path: "/o/b", of: "/p/a"}, {path: "/o/a", of: "/p/a"}, {path: "/c", of: "/e"}, null]),
+  copiesByCanonical(undefined),
+  hiddenCopiesText(1), hiddenCopiesText(3)]));""")
+        self.assertEqual(r[0], "3 duplicate copies collapsed, 1 skipped")
+        self.assertEqual(r[1], "0 duplicate copies collapsed, 0 skipped")
+        self.assertEqual(r[2], {"/p/a": ["/o/b", "/o/a"], "/e": ["/c"]})
+        self.assertEqual(r[3], {})
+        self.assertEqual(r[4], "1 duplicate copy hidden")
+        self.assertEqual(r[5], "3 duplicate copies hidden")
+
+    def test_run_js_hidden_copies_use_text_and_title_only(self):
+        js = web_file("run.js")
+        self.assertIn("hiddenCopiesText(", js)
+        self.assertIn('setAttribute("title"', js)
+        self.assertIn("planDedupSummary(plan)", js)
 
     def test_run_js_poll_error_has_own_element(self):
         js = web_file("run.js")

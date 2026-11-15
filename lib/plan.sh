@@ -25,6 +25,8 @@
 # plan_collect_tasks sets PLAN_TASKS / PLAN_WEB_TASKS / PLAN_OTHER_TASKS.
 # plan_scan_repos    sets PLAN_REPOS / PLAN_CONFIGURED / PLAN_UNCONFIGURED /
 #                    PLAN_KNOWN_NAME.
+# plan_dedup (lib/plan_dedup.sh) then narrows PLAN_UNCONFIGURED to one
+# canonical copy per root commit; everything below plans only those.
 
 declare -A PLAN_KNOWN_NAME=()
 
@@ -199,23 +201,30 @@ plan_print_json() {
     done
   fi
   items="$( (( ${#lines[@]} )) && printf '%s\n' "${lines[@]}" | jq -s . || echo '[]' )"
+  # `unconfigured` counts canonical copies (lib/plan_dedup.sh); `discovered`
+  # stays the raw count, so it is the sum of the four classes.
+  local -a dedup=()
+  mapfile -t dedup < <(plan_dedup_json)
   jq -n --arg scan "$scan_dir" --argjson items "$items" \
     --argjson discovered "${#PLAN_REPOS[@]}" --argjson configured "${#PLAN_CONFIGURED[@]}" \
     --argjson unconfigured "${#PLAN_UNCONFIGURED[@]}" \
+    --argjson duplicates "${dedup[0]}" --argjson skipped "${dedup[1]}" \
     --argjson web "$(jq -cn '$ARGS.positional' --args "${PLAN_WEB_TASKS[@]}")" \
     --argjson other "$(jq -cn '$ARGS.positional' --args "${PLAN_OTHER_TASKS[@]}")" \
     '{scan:$scan, discovered:$discovered, configured:$configured, unconfigured:$unconfigured,
-      items:$items, excluded:{web:$web, other:$other}}'
+      items:$items, excluded:{web:$web, other:$other}, duplicates:$duplicates, skipped:$skipped}'
 }
 
 # Narrow PLAN_UNCONFIGURED to the paths named with --only. Compared by
 # identity (dir_id), like the scan. A path that is not an unconfigured
-# repository the scan found refuses the whole request before anything is staged.
+# repository the scan found -- or one dedup set aside -- refuses the whole
+# request before anything is staged.
 plan_restrict_to() {
   local -A want=()
   local -a kept=()
   local path real id
   for path in "$@"; do
+    plan_refuse_collapsed "$path"
     id="$(dir_id "$path")"
     for real in "${PLAN_UNCONFIGURED[@]}"; do
       [[ "$(dir_id "$real")" == "$id" ]] && { want["$id"]=1; break; }
@@ -233,9 +242,11 @@ plan_print() {
   local scan_dir="$1" max_depth="$2" real task reason rank=1
   printf 'Portfolio inventory (read-only)\n'
   printf '  scan: %s (max depth: %s)\n' "$scan_dir" "$max_depth"
-  printf '  discovered: %d  configured: %d  unconfigured: %d\n' \
+  printf '  discovered: %d  configured: %d  unconfigured: %d' \
     "${#PLAN_REPOS[@]}" "${#PLAN_CONFIGURED[@]}" "${#PLAN_UNCONFIGURED[@]}"
-  printf '\nComparison\n'
+  (( ${#PLAN_DUPLICATES[@]} + ${#PLAN_SKIPPED[@]} == 0 )) \
+    || printf '  duplicates: %d  skipped: %d' "${#PLAN_DUPLICATES[@]}" "${#PLAN_SKIPPED[@]}"
+  printf '\n\nComparison\n'
   for real in "${PLAN_CONFIGURED[@]}"; do
     printf '  configured    %-24s %s\n' "${PLAN_KNOWN_NAME[$(dir_id "$real")]:-<unnamed>}" "$real"
   done
@@ -243,6 +254,7 @@ plan_print() {
     printf '  unconfigured  %-24s %s\n' "$(basename "$real")" "$real"
   done
   (( ${#PLAN_REPOS[@]} )) || printf '  (no Git repositories found)\n'
+  plan_print_dedup
 
   printf '\nProposed read-only analysis plan\n'
   printf '  Ranking: unconfigured repositories first; then security, architecture, features, market; path breaks ties.\n'

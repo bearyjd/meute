@@ -44,6 +44,7 @@ class FakeFleet:
         self.last_argv = ["run.sh", "daily"]
         self.on_pending = None
         self.timeouts = []  # (basename of argv[0] or "manifest.py", timeout) per call
+        self.duplicates = []  # plan --json's collapsed copies: [{path, of, reason}]
 
     # -- what the runner sees --
     def __call__(self, argv, cwd, out_path=None, timeout=None):
@@ -72,8 +73,9 @@ class FakeFleet:
     def plan_json(self):
         items = [{"rank": i + 1, "repo": os.path.basename(p), "path": p, "task": t,
                   "reason": "r"} for i, (p, t) in enumerate((p, t) for p in self.paths for t in self.tasks)]
-        return {"scan": SCAN, "discovered": 2, "configured": 0, "unconfigured": 2,
-                "items": items, "excluded": {"web": [], "other": []}}
+        return {"scan": SCAN, "discovered": 2 + len(self.duplicates), "configured": 0,
+                "unconfigured": 2, "items": items, "excluded": {"web": [], "other": []},
+                "duplicates": self.duplicates, "skipped": []}
 
     def write_queue(self, paths):
         entries = [{"name": name_for(p), "path": p, "task": t, "spec": "s"}

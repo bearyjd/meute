@@ -655,7 +655,7 @@ test_discover() {
   for r in repo-alpha repo-beta already-configured; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -867,7 +867,7 @@ test_plan_identity() {
   for r in meute-stand-in already-configured repo-alpha; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -961,7 +961,7 @@ test_plan_worktrees() {
   for r in meute-stand-in repo-alpha repo-beta; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -1024,7 +1024,7 @@ test_plan() {
   for r in repo-alpha repo-beta already-configured nested/repo-gamma; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -1245,7 +1245,7 @@ test_plan_json() {
   for r in repo-alpha "repo with space" repo-gamma already-configured; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"; git -C "$universe/$r" add -A
+    echo "$r" > "$universe/$r/f.txt"; git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
   python3 - "$root" "$universe" <<'PY'
@@ -1333,6 +1333,179 @@ PY
   is  "plan only: a refused --only creates no queue" "$(test -e "$queue"; echo $?)" "1"
 }
 
+# A plan fixture universe: meute-stand-in (pruned) with one read-only task and
+# a manifest enrolling the repos named as name=relative-path arguments.
+dedup_universe() {
+  local universe="$1" root="$1/meute-stand-in" spec; shift
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  python3 - "$root" "$universe" "$@" <<'PY'
+import sys, pathlib, yaml
+root, universe = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+repos = [{"name": n, "path": str(universe / p), "spec": "enrolled", "tasks": ["audit-security"]}
+         for n, p in (a.split("=", 1) for a in sys.argv[3:])]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
+    "repos": repos, "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+}
+
+# A repository with one commit whose content is unique to it, so its root
+# commit is its own: two `git init`s with identical content, author and
+# second share a root commit, which is exactly what dedup keys on.
+dedup_repo() {
+  mkdir -p "$1"
+  git -C "$1" init -q -b main
+  printf '%s\n' "$2" > "$1/f.txt"; git -C "$1" add -A
+  git -C "$1" -c user.email=t@t -c user.name=t commit -qm "init $2"
+}
+
+# Copies of one repository (scratch clones under output/, build/, vendored
+# checkouts, a --separate-git-dir checkout) are one repository: one canonical
+# copy is planned, the rest are listed as collapsed. Identity is the root
+# commit, never the remote URL.
+test_plan_dedup() {
+  local universe="$FIXTURE/plan-dedup" golden="$FIXTURE/plan-dedup-golden"
+  local root="$universe/meute-stand-in" out err rc json before
+  local queue="$root/state/plan-queue.json"
+
+  # (j) A tree without copies prints exactly what it printed before dedup.
+  dedup_universe "$golden" "enrolled-g=enrolled-g"
+  dedup_repo "$golden/repo-one" one; dedup_repo "$golden/nest/repo-two" two
+  dedup_repo "$golden/enrolled-g" g
+  out="$("$golden/meute-stand-in/bin/meute" plan "$golden" 2>/dev/null)"
+  is "dedup: a tree without copies prints the same output as before" "$out" "$(sed "s|@U@|$golden|g" <<'GOLD'
+Portfolio inventory (read-only)
+  scan: @U@ (max depth: 4)
+  discovered: 3  configured: 1  unconfigured: 2
+
+Comparison
+  configured    enrolled-g               @U@/enrolled-g
+  unconfigured  repo-two                 @U@/nest/repo-two
+  unconfigured  repo-one                 @U@/repo-one
+
+Proposed read-only analysis plan
+  Ranking: unconfigured repositories first; then security, architecture, features, market; path breaks ties.
+    1. repo-two                 audit-security         security baseline
+    2. repo-one                 audit-security         security baseline
+
+No manifest, repository, or state files were changed. Stage this exact plan for the runner with: meute plan --enqueue @U@ (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).
+GOLD
+)"
+  hasnt "dedup: ...with no duplicates section" "$out" "Duplicates collapsed"
+
+  dedup_universe "$universe" "enrolled-c=configured-c"
+  # (a) The original sits deeper than its scratch clones: only the
+  # not-scratch rule can pick it. Its origin embeds a credential (i).
+  dedup_repo "$universe/a/b/orig" group-a
+  git -C "$universe/a/b/orig" remote add origin "https://user:SECRET@example.com/x.git"
+  git clone -q "$universe/a/b/orig" "$universe/output/x"
+  git clone -q "$universe/a/b/orig" "$universe/build/y"
+  git -C "$universe/build/y" remote set-url origin "https://user:SECRET@example.com/y.git"
+  # (b) Every copy scratch-looking: fewest components wins over the shorter path.
+  dedup_repo "$universe/tmp/x/b" group-b
+  git clone -q "$universe/tmp/x/b" "$universe/vendor/bbbbbbbb"
+  git clone -q "$universe/tmp/x/b" "$universe/dist/bbbbbbbbbbbbbb"
+  # (c) A copy of an enrolled repository is never staged.
+  dedup_repo "$universe/configured-c" group-c
+  git clone -q "$universe/configured-c" "$universe/copies/c-clone"
+  # (d) A .git-file checkout loses to a plain one even with the shorter,
+  # shallower path; a `git worktree add` checkout is not a repository at all;
+  # a lone .git-file checkout is kept.
+  dedup_repo "$universe/dd/main-checkout" group-d; mkdir -p "$universe/gitstore"
+  git clone -q --separate-git-dir="$universe/gitstore/d.git" "$universe/dd/main-checkout" "$universe/d"
+  git -C "$universe/dd/main-checkout" worktree add -q "$universe/dd/wt" -b wt-branch
+  dedup_repo "$FIXTURE/plan-dedup-solo-src" solo
+  git clone -q --separate-git-dir="$universe/gitstore/solo.git" "$FIXTURE/plan-dedup-solo-src" "$universe/solo-gitfile"
+  # (e) Unreadable history (the root commit's object is gone): skipped, and
+  # its intact clone is not collapsed into it.
+  dedup_repo "$universe/broken" group-e
+  echo more >> "$universe/broken/f.txt"
+  git -C "$universe/broken" -c user.email=t@t -c user.name=t commit -qam second
+  git clone -q --no-hardlinks "$universe/broken" "$universe/broken-copy"
+  local rootc; rootc="$(git -C "$universe/broken" rev-list --max-parents=0 HEAD)"
+  rm -f "$universe/broken/.git/objects/${rootc:0:2}/${rootc:2}"
+  # (f) Unrelated repositories, one of them scratch-looking but alone.
+  dedup_repo "$universe/lone-x" lone-x
+  dedup_repo "$universe/output/lone-scratch" lone-scratch
+
+  out="$("$root/bin/meute" plan "$universe" 2>/dev/null)"
+  has "dedup: counts name every class" "$out" \
+    "discovered: 15  configured: 1  unconfigured: 7  duplicates: 6  skipped: 1"
+  has "dedup: the duplicates section is counted" "$out" "Duplicates collapsed (6)"
+  has "dedup: (a) a scratch clone collapses into the original" "$out" "  $universe/output/x -> $universe/a/b/orig"
+  has "dedup: (a) ...and so does the other" "$out" "  $universe/build/y -> $universe/a/b/orig"
+  has "dedup: (a) the original is the one proposed" "$out" "unconfigured  orig "
+  has "dedup: (b) all-scratch group: fewest components wins" "$out" "  $universe/tmp/x/b -> $universe/vendor/bbbbbbbb"
+  has "dedup: (b) ...then the shorter path" "$out" "  $universe/dist/bbbbbbbbbbbbbb -> $universe/vendor/bbbbbbbb"
+  has "dedup: (c) a copy of an enrolled repo names it" "$out" "  $universe/copies/c-clone -> enrolled-c"
+  has "dedup: (d) a .git-file copy collapses into the plain checkout" "$out" "  $universe/d -> $universe/dd/main-checkout"
+  hasnt "dedup: (d) a linked worktree is not a repository" "$out" "dd/wt"
+  has "dedup: (d) a lone .git-file checkout is kept" "$out" "unconfigured  solo-gitfile"
+  has "dedup: (e) unreadable history is listed as skipped" "$out" $'Skipped (no readable history)\n  '"$universe/broken"
+  has "dedup: (e) its intact clone is still proposed" "$out" "unconfigured  broken-copy"
+  has "dedup: (f) an unrelated repo is untouched" "$out" "unconfigured  lone-x"
+  has "dedup: (f) a lone scratch-looking repo is kept" "$out" "unconfigured  lone-scratch"
+  is  "dedup: only canonical repos are ranked" "$(grep -cE '^ +[0-9]+\. ' <<< "$out")" "7"
+  hasnt "dedup: (i) no credential in the human output" "$out" "SECRET"
+  hasnt "dedup: (i) no remote URL in the human output" "$out" "example.com"
+
+  # (h) JSON: one object, the new lists, and every discovered repo in exactly
+  # one class: discovered == configured + unconfigured + duplicates + skipped.
+  json="$("$root/bin/meute" plan --json "$universe" 2>"$FIXTURE/plan-dedup.err")"; rc=$?
+  is  "dedup json: exits 0" "$rc" "0"
+  is  "dedup json: a single JSON object" "$(jq -s 'length == 1 and (.[0] | type) == "object"' <<< "$json")" "true"
+  is  "dedup json: counts" "$(jq -c '[.discovered,.configured,.unconfigured,(.duplicates|length),(.skipped|length)]' <<< "$json")" "[15,1,7,6,1]"
+  is  "dedup json: every discovered repo is in exactly one class" \
+    "$(jq -e '.discovered == .configured + .unconfigured + (.duplicates|length) + (.skipped|length)' <<< "$json" >/dev/null; echo $?)" "0"
+  is  "dedup json: items cover canonical repos only" "$(jq '[.items[].path] | unique | length' <<< "$json")" "7"
+  is  "dedup json: a duplicate names its canonical path" \
+    "$(jq -c --arg p "$universe/output/x" '.duplicates[] | select(.path == $p) | [.of, .reason]' <<< "$json")" \
+    "[\"$universe/a/b/orig\",\"duplicate of $universe/a/b/orig\"]"
+  is  "dedup json: a copy of an enrolled repo says so" \
+    "$(jq -r --arg p "$universe/copies/c-clone" '.duplicates[] | select(.path == $p) | .reason' <<< "$json")" \
+    "already enrolled as enrolled-c"
+  is  "dedup json: skipped carries its reason" "$(jq -c '.skipped' <<< "$json")" \
+    "[{\"path\":\"$universe/broken\",\"reason\":\"no readable history\"}]"
+  is  "dedup json: no duplicate path is an item" \
+    "$(jq '[.duplicates[].path] as $d | [.items[] | select(.path as $p | $d | index($p))] | length' <<< "$json")" "0"
+  hasnt "dedup json: (i) no credential in the JSON" "$json" "SECRET"
+  hasnt "dedup json: (i) no credential on stderr" "$(cat "$FIXTURE/plan-dedup.err")" "SECRET"
+  # (b) Determinism: the same tree, the same choice.
+  is  "dedup json: (b) a second run picks the same copies" \
+    "$("$root/bin/meute" plan --json "$universe" 2>/dev/null | jq -c '[.duplicates, .items]')" \
+    "$(jq -c '[.duplicates, .items]' <<< "$json")"
+
+  # The queue itself: one set of entries per canonical copy, none for a copy.
+  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  is  "dedup stage: entries cover the canonical copies only" "$(jq '[.entries[].path] | unique | length' "$queue")" "7"
+  is  "dedup stage: no duplicate or skipped path is staged" \
+    "$(jq --argjson j "$json" '[$j.duplicates[].path, $j.skipped[].path] as $d | [.entries[] | select(.path as $p | $d | index($p))] | length' "$queue")" "0"
+
+  # (g) --only: a duplicate is refused and names the copy to pass instead.
+  "$root/bin/meute" plan --enqueue --only "$universe/a/b/orig" "$universe" >/dev/null 2>&1
+  is  "dedup only: the canonical copy stages only itself" "$(jq -r '[.entries[].path] | unique | join("|")' "$queue")" "$universe/a/b/orig"
+  before="$(md5sum "$queue" | cut -d' ' -f1)"
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/output/x" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "dedup only: a duplicate is refused" "$out" "rc=0"
+  has   "dedup only: ...naming the canonical path" "$out" \
+    "$universe/output/x is a duplicate of $universe/a/b/orig; pass $universe/a/b/orig instead"
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/lone-x" --only "$universe/copies/c-clone" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "dedup only: a copy of an enrolled repo is refused" "$out" "rc=0"
+  has   "dedup only: ...naming the enrolled repo" "$out" "already enrolled as enrolled-c"
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/broken" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "dedup only: a skipped repo is refused" "$out" "rc=0"
+  has   "dedup only: ...saying why" "$out" "no readable history"
+  is  "dedup only: refusals leave the queue byte-identical" "$(md5sum "$queue" | cut -d' ' -f1)" "$before"
+}
+
 # A staged plan end to end: the runner cuts a worktree in an unenrolled
 # repository, the stub engine runs in it, the report lands under the synthetic
 # name, and nothing is left behind -- no worktree, no branch, no commit in
@@ -1355,7 +1528,7 @@ test_plan_run() {
   for r in repo-alpha alpha-cfg beta-cfg; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -1402,7 +1575,7 @@ STUB
     "$(grep -cE '^plan-repo-alpha-[0-9a-f]{6}$' <<< "$alpha_name")" "1"
   mkdir -p "$universe/repo-aaa"
   git -C "$universe/repo-aaa" init -q -b main
-  echo x > "$universe/repo-aaa/f.txt"; git -C "$universe/repo-aaa" add -A
+  echo repo-aaa > "$universe/repo-aaa/f.txt"; git -C "$universe/repo-aaa" add -A
   git -C "$universe/repo-aaa" -c user.email=t@t -c user.name=t commit -qm init
   "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
   alpha_again="$(jq -r '.entries[] | select(.path | endswith("/repo-alpha")) | .name' "$root/state/plan-queue.json" | sort -u)"
@@ -5927,6 +6100,7 @@ test_plan_identity
 test_plan_worktrees
 test_plan
 test_plan_json
+test_plan_dedup
 test_plan_run
 test_repo_default_branch
 test_inbox

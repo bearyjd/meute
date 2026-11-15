@@ -23,6 +23,17 @@ class EnqueueTests(RunCtlCase):
         self.assertFalse(any("--enqueue" in c for c in self.fleet.calls))
         self.assertFalse(os.path.exists(self.path("plan-queue.json")))
 
+    def test_enqueue_rejects_a_collapsed_duplicate(self):
+        """meute plan lists a copy of a repository under `duplicates`, never under
+        `items`: the fresh-plan check alone must refuse it."""
+        dup = "/scan root/projects/output/alpha copy"
+        self.fleet.duplicates = [{"path": dup, "of": ALPHA, "reason": "duplicate of " + ALPHA}]
+        with self.assertRaises(ValueError) as cm:
+            self.ctl.enqueue([ALPHA, dup])
+        self.assertIn(dup, str(cm.exception))
+        self.assertFalse(any("--enqueue" in c for c in self.fleet.calls))
+        self.assertFalse(os.path.exists(self.path("plan-queue.json")))
+
     def test_enqueue_rejects_non_string_and_relative_paths(self):
         for bad in ([3], ["relative/path"], "not-a-list", [ALPHA + "\n"]):
             with self.assertRaises(ValueError):
