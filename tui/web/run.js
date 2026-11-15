@@ -163,7 +163,7 @@ function syncButtons() {
   $("run-plan").disabled = !fl.plan;
 }
 
-function renderStatus(st) {
+function renderRunStatus(st) {
   runUi.status = st;
   const badge = $("run-badge");
   badge.textContent = st.state;
@@ -199,7 +199,7 @@ async function pollStatus(fromTimer) {
     runUi.applied = mine;
     runUi.pollFailed = false;
     $("run-status-error").textContent = "";
-    renderStatus(st);
+    renderRunStatus(st);
   } catch (e) {
     if (!shouldApply(mine, runUi.applied)) return;
     runUi.applied = mine;

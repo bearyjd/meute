@@ -117,6 +117,18 @@ class RunPageTests(WebTestCase):
         for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write", "style="):
             self.assertNotIn(banned, js)
 
+    def test_page_scripts_share_no_top_level_names(self):
+        """Classic scripts share one global scope: a function in run.js with the
+        name of one in app.js silently replaces it (found live: run.js's
+        renderStatus broke the inbox load)."""
+        import re
+        decl = re.compile(r"^(?:async\s+)?(?:function\s+|(?:const|let|var)\s+)([A-Za-z_$][\w$]*)", re.M)
+        seen = {}
+        for name in ("app.js", "run.js"):
+            for ident in set(decl.findall(web_file(name))):
+                self.assertNotIn(ident, seen, f"{ident!r} declared in both {seen.get(ident)} and {name}")
+                seen[ident] = name
+
     def test_run_js_sends_token_header(self):
         self.assertIn("X-Meute-Token", web_file("run.js"))
 
