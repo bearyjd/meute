@@ -129,6 +129,14 @@ class RunPageTests(WebTestCase):
                 self.assertNotIn(ident, seen, f"{ident!r} declared in both {seen.get(ident)} and {name}")
                 seen[ident] = name
 
+    def test_run_tab_has_select_all_and_select_none(self):
+        js = web_file("run.js")
+        for needle in ('"run-all", "select all"', '"run-none", "select none"',
+                       'setAllChecked(true)', 'setAllChecked(false)'):
+            self.assertIn(needle, js)
+        # still nothing ticked by default: the plan list never pre-checks a box
+        self.assertNotIn("checked = true", js.split("function setAllChecked")[0])
+
     def test_run_js_sends_token_header(self):
         self.assertIn("X-Meute-Token", web_file("run.js"))
 

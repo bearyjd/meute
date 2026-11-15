@@ -93,7 +93,7 @@ function buildRunSection() {
   const root = $("run");
   const bar = el("div", null, "toolbar");
   const mk = (id, label) => { const b = el("button", label); b.type = "button"; b.id = id; return b; };
-  bar.append(mk("run-plan", "Plan"), mk("run-none", "select none"),
+  bar.append(mk("run-plan", "Plan"), mk("run-all", "select all"), mk("run-none", "select none"),
     mk("run-enqueue", "Enqueue selected"), mk("run-start", "Start"), mk("run-stop", "Stop"));
   const help = el("p", "Tick the repos to analyse, then Enqueue selected. Enqueueing again replaces the "
     + "staged queue (it does not add to it). Nothing is ticked by default.", "muted");
@@ -276,14 +276,15 @@ async function doStop() {
   await pollStatus();
 }
 
-function selectNone() {
-  document.querySelectorAll("#run-plan-list input[type=checkbox]").forEach((b) => { b.checked = false; });
+function setAllChecked(on) {
+  document.querySelectorAll("#run-plan-list input[type=checkbox]").forEach((b) => { b.checked = on; });
   syncButtons();
 }
 
 buildRunSection();
 $("run-plan").addEventListener("click", doPlan);
-$("run-none").addEventListener("click", selectNone);
+$("run-all").addEventListener("click", () => setAllChecked(true));
+$("run-none").addEventListener("click", () => setAllChecked(false));
 $("run-enqueue").addEventListener("click", doEnqueue);
 $("run-start").addEventListener("click", doStart);
 $("run-stop").addEventListener("click", doStop);
