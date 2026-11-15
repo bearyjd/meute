@@ -42,7 +42,8 @@ MAX_BODY = 64 * 1024
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "default-src 'self'",
+    "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
 }
 
 
@@ -119,7 +120,7 @@ def get_finding(h: "Handler", query: dict) -> None:
 
 def post_act(h: "Handler", query: dict) -> None:
     mod = h.server.inbox_mod
-    args = parse_act(h.read_json(), mod.dump().get("dismiss_reasons", []))
+    args = parse_act(h.read_json(), list(mod.DISMISS_REASONS))
     h.send_json(200, mod.act(*args))
 
 

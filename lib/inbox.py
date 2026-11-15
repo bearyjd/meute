@@ -32,6 +32,8 @@ sys.path.insert(0, HERE)
 import report as report_lib  # noqa: E402
 
 SEVERITY_RANK = {s: i for i, s in enumerate(report_lib.SEVERITIES)}
+DISMISS_REASONS = ("false-positive", "wont-fix", "out-of-scope",
+                   "duplicate", "too-large", "other")
 _LOG_FIELD = re.compile(r"(\w+)=([^\t]*)")
 
 
@@ -224,8 +226,7 @@ def dump() -> dict:
         "reports": reports,
         "findings": findings,
         "branches": load_branches(),
-        "dismiss_reasons": ["false-positive", "wont-fix", "out-of-scope",
-                            "duplicate", "too-large", "other"],
+        "dismiss_reasons": list(DISMISS_REASONS),
     }
 
 

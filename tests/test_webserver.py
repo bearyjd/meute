@@ -14,11 +14,15 @@ REASONS = ["false-positive", "wont-fix"]
 
 
 class FakeInbox:
+    DISMISS_REASONS = tuple(REASONS)
+
     def __init__(self):
         self.calls = []
+        self.dump_calls = 0
         self.result = {"ok": True, "message": "done"}
 
     def dump(self):
+        self.dump_calls += 1
         return {"findings": [{"id": "r1"}], "dismiss_reasons": REASONS}
 
     def finding_body(self, rid, n):
@@ -75,6 +79,13 @@ class ReadTests(WebTestCase):
         self.assertEqual(resp.getheader("Cache-Control"), "no-store")
         self.assertEqual(resp.getheader("X-Content-Type-Options"), "nosniff")
         self.assertIn("default-src 'self'", resp.getheader("Content-Security-Policy"))
+
+    def test_clickjacking_headers_on_every_response(self):
+        for path in ("/", "/api/inbox", "/nope", "/static/app.js"):
+            resp, _ = self.request("GET", path)
+            self.assertIn("frame-ancestors 'none'",
+                          resp.getheader("Content-Security-Policy"), path)
+            self.assertEqual(resp.getheader("X-Frame-Options"), "DENY", path)
 
     def test_finding_returns_body_text(self):
         resp, raw = self.request("GET", "/api/finding?id=r1&n=2")
@@ -151,6 +162,11 @@ class ActTests(WebTestCase):
 
     def test_dismiss_reason_not_in_dismiss_reasons_is_400(self):
         self.assert400({"verb": "dismiss", "id": "r1", "n": 1, "reason": "because"})
+
+    def test_dismiss_post_never_calls_dump(self):
+        resp, _ = self.post_act({"verb": "dismiss", "id": "r1", "n": 1, "reason": "wont-fix"})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.inbox.dump_calls, 0)
 
     def test_resolve_empty_message_is_400(self):
         self.assert400({"verb": "resolve", "id": "r1", "n": 1, "message": "  "})
