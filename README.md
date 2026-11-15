@@ -173,7 +173,8 @@ work:
 1. **Plan** -- read-only; lists the repos/tasks `meute plan` proposes. Copies
    of a repository are not offered: a line under each repo says how many
    duplicate copies were hidden (the paths are in its tooltip), and a summary
-   above the list counts the copies collapsed and the repos skipped.
+   above the list counts the copies collapsed and the repos skipped; the
+   skipped paths are listed under it.
 2. **Tick repos** -- nothing is ticked by default, and Enqueue stays disabled
    until at least one is.
 3. **Enqueue** -- stages only the ticked repos. Re-enqueueing *replaces* the
@@ -383,16 +384,20 @@ Enrollment in `repos.local.yaml` is never a side effect.
 
 A scan usually finds the same repository more than once — scratch clones under
 `output/` or `build/`, vendored upstream checkouts, a `--separate-git-dir`
-checkout. `plan` keys each repository by its root commit (never its remote URL,
-which can embed a credential) and plans one copy per key. A copy of an enrolled
+checkout. `plan` keys each repository by its set of root commits (never its remote URL,
+which can embed a credential; the whole set, so a repo that merged another
+project's history is not mistaken for that project) and plans one copy per key. A copy of an enrolled
 repository is not planned at all. Otherwise the canonical copy is the first by:
 not scratch-looking (a path component such as `output`, `build`, `vendor`,
 `upstream`, `tmp` or `.local-research`; the list is in `lib/plan_dedup.sh`), not
 a `.git`-file checkout, fewest path components, shortest path, then byte order —
 so the same tree always picks the same copy. The other copies are listed under
 "Duplicates collapsed" and in `--json`'s `duplicates`, and never staged;
-`--only` on one is refused with the canonical path to pass instead. A repository
-whose history cannot be read is listed as skipped. A repository with no copies
+`--only` on one is refused with the canonical path to pass instead (or enroll
+the copy to audit it separately). A copy whose HEAD commit the kept copy lacks
+is *diverged*: it is kept and planned too, and listed under "Diverged copies
+(kept)" and in `diverged`. A repository whose history cannot be read is listed
+as skipped, with a hint (`git fsck`, a dangling alternates entry). A repository with no copies
 is always kept, whatever its path looks like.
 
 A staged plan only includes tasks whose tier tools are a subset of `Read,Grep,Glob`.

@@ -238,14 +238,23 @@ process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), p
     @unittest.skipUnless(HAS_NODE, "node not installed")
     def test_duplicate_summary_and_hidden_copies(self):
         r = node_pure("""process.stdout.write(JSON.stringify([
-  planDedupSummary({duplicates: [{path: "/o/a", of: "/p/a"}, {path: "/o/b", of: "/p/a"},
-                                 {path: "/c", of: "/enrolled"}], skipped: [{path: "/s"}]}),
+  planDedupSummary({items: [{path: "/p/a"}],
+                    duplicates: [{path: "/o/a", of: "/p/a"}, {path: "/o/b", of: "/p/a"},
+                                 {path: "/c", of: "/enrolled", reason: "already enrolled as e"}],
+                    skipped: [{path: "/s one"}, {path: "/s2"}], diverged: [{path: "/d", of: "/p/a"}]}),
   planDedupSummary({}),
   copiesByCanonical([{path: "/o/b", of: "/p/a"}, {path: "/o/a", of: "/p/a"}, {path: "/c", of: "/e"}, null]),
   copiesByCanonical(undefined),
   hiddenCopiesText(1), hiddenCopiesText(3)]));""")
-        self.assertEqual(r[0], "3 duplicate copies collapsed, 1 skipped")
-        self.assertEqual(r[1], "0 duplicate copies collapsed, 0 skipped")
+        self.assertEqual(r[0]["text"], "3 duplicate copies collapsed, 2 skipped, 1 diverged copy kept")
+        self.assertEqual(r[0]["skipped"], ["/s one", "/s2"])
+        title = r[0]["title"].split("\n")
+        self.assertIn("skipped (no readable history): /s one", title)
+        self.assertIn("skipped (no readable history): /s2", title)
+        self.assertIn("/c -> already enrolled as e", title)   # its `of` has no row
+        self.assertIn("/d diverged from /p/a (kept)", title)
+        self.assertFalse(any(t.startswith("/o/") for t in title))  # shown under their row
+        self.assertEqual(r[1], {"text": "0 duplicate copies collapsed, 0 skipped", "title": "", "skipped": []})
         self.assertEqual(r[2], {"/p/a": ["/o/b", "/o/a"], "/e": ["/c"]})
         self.assertEqual(r[3], {})
         self.assertEqual(r[4], "1 duplicate copy hidden")
@@ -256,6 +265,7 @@ process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), p
         self.assertIn("hiddenCopiesText(", js)
         self.assertIn('setAttribute("title"', js)
         self.assertIn("planDedupSummary(plan)", js)
+        self.assertIn("run-skipped", js)  # the skipped paths, listed as text
 
     def test_run_js_poll_error_has_own_element(self):
         js = web_file("run.js")

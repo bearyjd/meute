@@ -201,18 +201,18 @@ plan_print_json() {
     done
   fi
   items="$( (( ${#lines[@]} )) && printf '%s\n' "${lines[@]}" | jq -s . || echo '[]' )"
-  # `unconfigured` counts canonical copies (lib/plan_dedup.sh); `discovered`
-  # stays the raw count, so it is the sum of the four classes.
+  # `unconfigured` counts canonical and diverged copies (lib/plan_dedup.sh);
+  # `discovered` stays the raw count, so it is the sum of the four classes.
   local -a dedup=()
   mapfile -t dedup < <(plan_dedup_json)
   jq -n --arg scan "$scan_dir" --argjson items "$items" \
     --argjson discovered "${#PLAN_REPOS[@]}" --argjson configured "${#PLAN_CONFIGURED[@]}" \
     --argjson unconfigured "${#PLAN_UNCONFIGURED[@]}" \
-    --argjson duplicates "${dedup[0]}" --argjson skipped "${dedup[1]}" \
+    --argjson duplicates "${dedup[0]}" --argjson skipped "${dedup[1]}" --argjson diverged "${dedup[2]}" \
     --argjson web "$(jq -cn '$ARGS.positional' --args "${PLAN_WEB_TASKS[@]}")" \
     --argjson other "$(jq -cn '$ARGS.positional' --args "${PLAN_OTHER_TASKS[@]}")" \
     '{scan:$scan, discovered:$discovered, configured:$configured, unconfigured:$unconfigured,
-      items:$items, excluded:{web:$web, other:$other}, duplicates:$duplicates, skipped:$skipped}'
+      items:$items, excluded:{web:$web, other:$other}, duplicates:$duplicates, skipped:$skipped, diverged:$diverged}'
 }
 
 # Narrow PLAN_UNCONFIGURED to the paths named with --only. Compared by
@@ -244,8 +244,9 @@ plan_print() {
   printf '  scan: %s (max depth: %s)\n' "$scan_dir" "$max_depth"
   printf '  discovered: %d  configured: %d  unconfigured: %d' \
     "${#PLAN_REPOS[@]}" "${#PLAN_CONFIGURED[@]}" "${#PLAN_UNCONFIGURED[@]}"
-  (( ${#PLAN_DUPLICATES[@]} + ${#PLAN_SKIPPED[@]} == 0 )) \
-    || printf '  duplicates: %d  skipped: %d' "${#PLAN_DUPLICATES[@]}" "${#PLAN_SKIPPED[@]}"
+  (( ${#PLAN_DUPLICATES[@]} + ${#PLAN_SKIPPED[@]} + ${#PLAN_DIVERGED[@]} == 0 )) \
+    || printf '  duplicates: %d  skipped: %d  diverged: %d' \
+         "${#PLAN_DUPLICATES[@]}" "${#PLAN_SKIPPED[@]}" "${#PLAN_DIVERGED[@]}"
   printf '\n\nComparison\n'
   for real in "${PLAN_CONFIGURED[@]}"; do
     printf '  configured    %-24s %s\n' "${PLAN_KNOWN_NAME[$(dir_id "$real")]:-<unnamed>}" "$real"

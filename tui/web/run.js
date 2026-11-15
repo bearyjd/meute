@@ -66,11 +66,23 @@ function enqueueConfirmText(entries) {
     + "and is sent to the model provider.\nThis replaces the currently staged queue.";
 }
 
-// meute plan stages one copy per repository; the copies it collapsed and the
-// repos it could not read are summarised above the list.
+// meute plan stages one copy per repository; the copies it collapsed, the
+// diverged copies it kept and the repos it could not read are summarised
+// above the list. The tooltip names what no row shows: skipped repos, copies
+// of an enrolled repo (their `of` has no row) and diverged copies.
 function planDedupSummary(plan) {
-  const n = (v) => (Array.isArray(v) ? v.length : 0);
-  return n(plan.duplicates) + " duplicate copies collapsed, " + n(plan.skipped) + " skipped";
+  const arr = (v) => (Array.isArray(v) ? v.filter((x) => x && typeof x.path === "string") : []);
+  const dups = arr(plan.duplicates), skipped = arr(plan.skipped), diverged = arr(plan.diverged);
+  const rows = {};
+  (plan.items || []).forEach((it) => { if (it) rows[it.path] = true; });
+  let text = dups.length + " duplicate copies collapsed, " + skipped.length + " skipped";
+  if (diverged.length) {
+    text += ", " + diverged.length + (diverged.length === 1 ? " diverged copy kept" : " diverged copies kept");
+  }
+  const title = skipped.map((d) => "skipped (no readable history): " + d.path)
+    .concat(dups.filter((d) => !rows[d.of]).map((d) => d.path + " -> " + (d.reason || d.of)))
+    .concat(diverged.map((d) => d.path + " diverged from " + d.of + " (kept)"));
+  return { text: text, title: title.join("\n"), skipped: skipped.map((d) => d.path) };
 }
 
 // Collapsed copies keyed by the path they are a copy of, in plan order.
@@ -142,7 +154,15 @@ function renderPlan(plan) {
   runUi.planned = true;
   const list = $("run-plan-list");
   list.replaceChildren();
-  list.appendChild(el("p", planDedupSummary(plan), "muted"));
+  const sum = planDedupSummary(plan);
+  const sumLine = el("p", sum.text, "muted");
+  if (sum.title) sumLine.setAttribute("title", sum.title);
+  list.appendChild(sumLine);
+  if (sum.skipped.length) {
+    const skippedList = el("ul", null, "muted run-skipped");
+    sum.skipped.forEach((path) => skippedList.appendChild(el("li", "skipped: " + path)));
+    list.appendChild(skippedList);
+  }
   if (!runUi.groups.length) { list.appendChild(el("p", "Nothing proposed.", "muted")); }
   const copies = copiesByCanonical(plan.duplicates);
   runUi.groups.forEach((g, i) => {

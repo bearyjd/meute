@@ -1435,25 +1435,53 @@ GOLD
   # (f) Unrelated repositories, one of them scratch-looking but alone.
   dedup_repo "$universe/lone-x" lone-x
   dedup_repo "$universe/output/lone-scratch" lone-scratch
+  # I1: m merges q's unrelated history into a clone of p, so it has two roots.
+  # Keyed by its smallest root it would collapse into p or q (whichever root
+  # sorts first); keyed by the set of roots it is its own repository, and only
+  # its clone collapses into it.
+  dedup_repo "$universe/merge/p" group-p
+  mkdir -p "$universe/merge/q"; git -C "$universe/merge/q" init -q -b main
+  echo q > "$universe/merge/q/g.txt"; git -C "$universe/merge/q" add -A
+  git -C "$universe/merge/q" -c user.email=t@t -c user.name=t commit -qm "init q"
+  git clone -q "$universe/merge/p" "$universe/merge/m"
+  git -C "$universe/merge/m" -c user.email=t@t -c user.name=t pull -q --no-rebase \
+    --allow-unrelated-histories "$universe/merge/q" main
+  git clone -q "$universe/merge/m" "$universe/output/m-clone"
+  # I2: a copy with a commit the canonical lacks is diverged, not a duplicate;
+  # a copy with only uncommitted edits is still a duplicate.
+  git clone -q "$universe/a/b/orig" "$universe/output/ahead"
+  echo ahead >> "$universe/output/ahead/f.txt"
+  git -C "$universe/output/ahead" -c user.email=t@t -c user.name=t commit -qam ahead
+  echo dirty >> "$universe/build/y/f.txt"
 
   out="$("$root/bin/meute" plan "$universe" 2>/dev/null)"
   has "dedup: counts name every class" "$out" \
-    "discovered: 15  configured: 1  unconfigured: 7  duplicates: 6  skipped: 1"
-  has "dedup: the duplicates section is counted" "$out" "Duplicates collapsed (6)"
+    "discovered: 20  configured: 1  unconfigured: 11  duplicates: 7  skipped: 1  diverged: 1"
+  has "dedup: the duplicates section is counted" "$out" "Duplicates collapsed (7)"
+  has "dedup: I1 a clone of a two-root repo collapses into it" "$out" "  $universe/output/m-clone -> $universe/merge/m"
+  has "dedup: I1 the two-root repo is its own repository" "$out" "unconfigured  m "
+  has "dedup: I1 ...and so is each single-root ancestor (p)" "$out" "unconfigured  p "
+  has "dedup: I1 ...(q)" "$out" "unconfigured  q "
+  has "dedup: I2 a diverged copy is reported as kept" "$out" \
+    $'Diverged copies (kept)\n  '"$universe/output/ahead has commits $universe/a/b/orig lacks"
+  has "dedup: I2 ...and proposed" "$out" "unconfigured  ahead "
+  has "dedup: I2 uncommitted edits alone are still a duplicate" "$out" "  $universe/build/y -> $universe/a/b/orig"
   has "dedup: (a) a scratch clone collapses into the original" "$out" "  $universe/output/x -> $universe/a/b/orig"
   has "dedup: (a) ...and so does the other" "$out" "  $universe/build/y -> $universe/a/b/orig"
   has "dedup: (a) the original is the one proposed" "$out" "unconfigured  orig "
   has "dedup: (b) all-scratch group: fewest components wins" "$out" "  $universe/tmp/x/b -> $universe/vendor/bbbbbbbb"
   has "dedup: (b) ...then the shorter path" "$out" "  $universe/dist/bbbbbbbbbbbbbb -> $universe/vendor/bbbbbbbb"
-  has "dedup: (c) a copy of an enrolled repo names it" "$out" "  $universe/copies/c-clone -> enrolled-c"
+  has "dedup: (c) a copy of an enrolled repo names it" "$out" "  $universe/copies/c-clone -> enrolled-c (already enrolled)"
   has "dedup: (d) a .git-file copy collapses into the plain checkout" "$out" "  $universe/d -> $universe/dd/main-checkout"
   hasnt "dedup: (d) a linked worktree is not a repository" "$out" "dd/wt"
   has "dedup: (d) a lone .git-file checkout is kept" "$out" "unconfigured  solo-gitfile"
   has "dedup: (e) unreadable history is listed as skipped" "$out" $'Skipped (no readable history)\n  '"$universe/broken"
+  has "dedup: I3 a skipped repo says how to recover it" "$out" \
+    "  $universe/broken: history unreadable, e.g. an alternates entry pointing at a deleted repository; run \`git -C $universe/broken fsck\` or fix .git/objects/info/alternates"
   has "dedup: (e) its intact clone is still proposed" "$out" "unconfigured  broken-copy"
   has "dedup: (f) an unrelated repo is untouched" "$out" "unconfigured  lone-x"
   has "dedup: (f) a lone scratch-looking repo is kept" "$out" "unconfigured  lone-scratch"
-  is  "dedup: only canonical repos are ranked" "$(grep -cE '^ +[0-9]+\. ' <<< "$out")" "7"
+  is  "dedup: only canonical repos are ranked" "$(grep -cE '^ +[0-9]+\. ' <<< "$out")" "11"
   hasnt "dedup: (i) no credential in the human output" "$out" "SECRET"
   hasnt "dedup: (i) no remote URL in the human output" "$out" "example.com"
 
@@ -1462,10 +1490,13 @@ GOLD
   json="$("$root/bin/meute" plan --json "$universe" 2>"$FIXTURE/plan-dedup.err")"; rc=$?
   is  "dedup json: exits 0" "$rc" "0"
   is  "dedup json: a single JSON object" "$(jq -s 'length == 1 and (.[0] | type) == "object"' <<< "$json")" "true"
-  is  "dedup json: counts" "$(jq -c '[.discovered,.configured,.unconfigured,(.duplicates|length),(.skipped|length)]' <<< "$json")" "[15,1,7,6,1]"
+  is  "dedup json: counts" "$(jq -c '[.discovered,.configured,.unconfigured,(.duplicates|length),(.skipped|length)]' <<< "$json")" "[20,1,11,7,1]"
+  is  "dedup json: I2 diverged copies are listed" "$(jq -c '.diverged' <<< "$json")" \
+    "[{\"path\":\"$universe/output/ahead\",\"of\":\"$universe/a/b/orig\"}]"
+  is  "dedup json: I2 ...and are items" "$(jq --arg p "$universe/output/ahead" '[.items[] | select(.path == $p)] | length' <<< "$json")" "1"
   is  "dedup json: every discovered repo is in exactly one class" \
     "$(jq -e '.discovered == .configured + .unconfigured + (.duplicates|length) + (.skipped|length)' <<< "$json" >/dev/null; echo $?)" "0"
-  is  "dedup json: items cover canonical repos only" "$(jq '[.items[].path] | unique | length' <<< "$json")" "7"
+  is  "dedup json: items cover canonical repos only" "$(jq '[.items[].path] | unique | length' <<< "$json")" "11"
   is  "dedup json: a duplicate names its canonical path" \
     "$(jq -c --arg p "$universe/output/x" '.duplicates[] | select(.path == $p) | [.of, .reason]' <<< "$json")" \
     "[\"$universe/a/b/orig\",\"duplicate of $universe/a/b/orig\"]"
@@ -1485,7 +1516,9 @@ GOLD
 
   # The queue itself: one set of entries per canonical copy, none for a copy.
   "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
-  is  "dedup stage: entries cover the canonical copies only" "$(jq '[.entries[].path] | unique | length' "$queue")" "7"
+  is  "dedup stage: entries cover the canonical copies only" "$(jq '[.entries[].path] | unique | length' "$queue")" "11"
+  is  "dedup stage: I2 the diverged copy is staged" \
+    "$(jq --arg p "$universe/output/ahead" '[.entries[] | select(.path == $p)] | length' "$queue")" "1"
   is  "dedup stage: no duplicate or skipped path is staged" \
     "$(jq --argjson j "$json" '[$j.duplicates[].path, $j.skipped[].path] as $d | [.entries[] | select(.path as $p | $d | index($p))] | length' "$queue")" "0"
 
@@ -1496,7 +1529,7 @@ GOLD
   out="$("$root/bin/meute" plan --enqueue --only "$universe/output/x" "$universe" 2>&1; echo "rc=$?")"
   hasnt "dedup only: a duplicate is refused" "$out" "rc=0"
   has   "dedup only: ...naming the canonical path" "$out" \
-    "$universe/output/x is a duplicate of $universe/a/b/orig; pass $universe/a/b/orig instead"
+    "$universe/output/x is a duplicate of $universe/a/b/orig; pass $universe/a/b/orig instead, or enroll $universe/output/x in repos.local.yaml to audit it separately"
   out="$("$root/bin/meute" plan --enqueue --only "$universe/lone-x" --only "$universe/copies/c-clone" "$universe" 2>&1; echo "rc=$?")"
   hasnt "dedup only: a copy of an enrolled repo is refused" "$out" "rc=0"
   has   "dedup only: ...naming the enrolled repo" "$out" "already enrolled as enrolled-c"

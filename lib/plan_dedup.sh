@@ -9,9 +9,13 @@
 # own audits and re-audit the same code on the operator's quota. So the plan
 # keys every repository by its root commit and stages one copy per key.
 #
-# Identity is the root commit (`rev-list --max-parents=0 HEAD`, the
-# lexicographically smallest when there are several), never the remote URL:
-# a URL can embed a credential, so this file never reads one. A repository
+# Identity is the set of root commits (`rev-list --max-parents=0 HEAD`,
+# sorted and joined), never the remote URL: a URL can embed a credential, so
+# this file never reads one. The whole set, not one root: a repository that
+# merged an unrelated history (a subtree, --allow-unrelated-histories) shares
+# a root with that other project, and must not be collapsed into it; an older
+# clone from before such a merge keys apart, which is the safe way round. A
+# repository
 # whose history cannot be walked (a missing object, a broken alternate) has
 # no identity: it is skipped, never collapsed with anything. A shallow clone
 # reports its boundary commit, so it keys apart from its full original --
@@ -22,10 +26,19 @@
 # not a .git-file checkout when a plain one exists; fewest path components
 # below the scan root; shortest path; then byte order. The rest are listed as
 # duplicates of it. A lone repository is always kept, scratch-looking or not.
+# A copy whose HEAD commit the canonical (or enrolled) repository does not
+# have is diverged: it holds work the kept copy lacks, so it is kept and
+# planned too, and reported. Uncommitted edits in a copy are ignored.
+#
+# Safe on untrusted checkouts: rev-list, rev-parse and cat-file read only the
+# object store and refs -- no index, no hooks, no filters -- and an
+# alternates entry is a read-only object lookup. The whole-history walk that
+# --max-parents=0 needs is accepted: 7.2 s over a real 107-repo portfolio.
 #
 # Expects plan_scan_repos to have run. plan_dedup sets PLAN_UNCONFIGURED to
-# the canonical copies only, PLAN_DUPLICATES / PLAN_DUP_OF / PLAN_DUP_LABEL /
-# PLAN_DUP_REASON for the rest, and PLAN_SKIPPED.
+# the canonical and diverged copies, PLAN_DUPLICATES / PLAN_DUP_OF /
+# PLAN_DUP_LABEL / PLAN_DUP_REASON for the rest, PLAN_DIVERGED / PLAN_DIV_OF,
+# and PLAN_SKIPPED.
 
 # Directory names that mark a scratch, build-output or vendored copy, compared
 # with each path component below the scan root; also any component ending in
@@ -35,19 +48,33 @@
 PLAN_SCRATCH_NAMES=( output outputs build builds dist vendor third_party upstream
   runtime tmp temp .local-research .worktrees worktrees checkout node_modules )
 
-PLAN_DUPLICATES=(); PLAN_SKIPPED=()
-declare -A PLAN_DUP_OF=() PLAN_DUP_LABEL=() PLAN_DUP_REASON=()
+PLAN_DUPLICATES=(); PLAN_SKIPPED=(); PLAN_DIVERGED=()
+declare -A PLAN_DUP_OF=() PLAN_DUP_LABEL=() PLAN_DUP_REASON=() PLAN_DIV_OF=()
+
+# What a skipped repository's owner can do about it, after its path.
+PLAN_SKIP_HINT="history unreadable, e.g. an alternates entry pointing at a deleted repository"
 
 # The repository's identity key on stdout, or status 1 when its history
 # cannot be read. git's own status decides: partial output from a failed
 # walk is not an identity.
 plan_root_commit() {
   local out
+  local root key=""
   out="$(git -C "$1" rev-list --max-parents=0 HEAD 2>/dev/null)" || return 1
-  out="$(LC_ALL=C sort <<< "$out")"
-  out="${out%%$'\n'*}"
-  [[ "$out" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || return 1
-  printf '%s' "$out"
+  while IFS= read -r root; do
+    [[ "$root" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || return 1
+    key+="${key:+,}${root}"
+  done < <(LC_ALL=C sort -u <<< "$out")
+  [[ -n "$key" ]] || return 1
+  printf '%s' "$key"
+}
+
+# Does the kept repository $2 have copy $1's HEAD commit? If not, $1 holds
+# commits $2 lacks. An unreadable HEAD counts as diverged: keep, do not hide.
+plan_head_in() {
+  local oid
+  oid="$(git -C "$1" rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null)" || return 1
+  git -C "$2" cat-file -e "${oid}^{commit}" 2>/dev/null
 }
 
 # Does this path, relative to the scan root, look like a scratch copy?
@@ -77,8 +104,13 @@ plan_rank_line() {
     "${#comps[@]}" "${#real}" "$real"
 }
 
-# Record $1 as a duplicate of $2 (a path), shown as $3, for reason $4.
+# Record $1 as a duplicate of $2 (a path), shown as $3, for reason $4 --
+# unless $2 lacks $1's HEAD commit: then $1 is diverged, and kept.
 plan_mark_duplicate() {
+  if ! plan_head_in "$1" "$2"; then
+    PLAN_DIV_OF["$1"]="$2"
+    return 0
+  fi
   PLAN_DUP_OF["$1"]="$2"; PLAN_DUP_LABEL["$1"]="$3"; PLAN_DUP_REASON["$1"]="$4"
 }
 
@@ -86,8 +118,8 @@ plan_dedup() {
   local scan_dir="$1" real key name
   local -A anchor=() canonical=() canonical_path=()
   local -a lines=() kept=()
-  PLAN_DUPLICATES=(); PLAN_SKIPPED=()
-  PLAN_DUP_OF=(); PLAN_DUP_LABEL=(); PLAN_DUP_REASON=()
+  PLAN_DUPLICATES=(); PLAN_SKIPPED=(); PLAN_DIVERGED=()
+  PLAN_DUP_OF=(); PLAN_DUP_LABEL=(); PLAN_DUP_REASON=(); PLAN_DIV_OF=()
   # An enrolled repository anchors its group. Several enrolled copies: the
   # first by path. One with unreadable history anchors nothing and stays
   # configured.
@@ -106,17 +138,19 @@ plan_dedup() {
     [[ -n "$key" ]] || continue
     if [[ -n "${anchor[$key]+present}" ]]; then
       name="${PLAN_KNOWN_NAME[$(dir_id "${anchor[$key]}")]:-<unnamed>}"
-      plan_mark_duplicate "$real" "${anchor[$key]}" "$name" "already enrolled as ${name}"
+      plan_mark_duplicate "$real" "${anchor[$key]}" "${name} (already enrolled)" "already enrolled as ${name}"
     elif [[ -n "${canonical[$key]+present}" ]]; then
       plan_mark_duplicate "$real" "${canonical[$key]}" "${canonical[$key]}" "duplicate of ${canonical[$key]}"
     else
       canonical["$key"]="$real"; canonical_path["$real"]=1
     fi
   done < <( (( ${#lines[@]} )) && printf '%s\n' "${lines[@]}" | LC_ALL=C sort )
-  # Keep the scan's path order for both lists, so ranks stay as before.
+  # Keep the scan's path order for every list, so ranks stay as before.
   for real in "${PLAN_UNCONFIGURED[@]}"; do
     if [[ -n "${PLAN_DUP_OF[$real]+present}" ]]; then
       PLAN_DUPLICATES+=( "$real" )
+    elif [[ -n "${PLAN_DIV_OF[$real]+present}" ]]; then
+      PLAN_DIVERGED+=( "$real" ); kept+=( "$real" )
     elif [[ -n "${canonical_path[$real]+present}" ]]; then
       kept+=( "$real" )
     fi
@@ -133,7 +167,7 @@ plan_refuse_collapsed() {
     [[ "$(dir_id "$real")" == "$id" ]] || continue
     of="${PLAN_DUP_OF[$real]}"
     [[ "${PLAN_DUP_REASON[$real]}" == "duplicate of "* ]] \
-      && die "plan: --only ${path} is a duplicate of ${of}; pass ${of} instead"
+      && die "plan: --only ${path} is a duplicate of ${of}; pass ${of} instead, or enroll ${path} in repos.local.yaml to audit it separately"
     die "plan: --only ${path} is a duplicate of ${of} (${PLAN_DUP_REASON[$real]}); it is not staged"
   done
   for real in "${PLAN_SKIPPED[@]}"; do
@@ -153,18 +187,30 @@ plan_print_dedup() {
       printf '  %s -> %s\n' "$real" "${PLAN_DUP_LABEL[$real]}"
     done
   fi
+  if (( ${#PLAN_DIVERGED[@]} )); then
+    printf '\nDiverged copies (kept)\n'
+    for real in "${PLAN_DIVERGED[@]}"; do
+      printf '  %s has commits %s lacks\n' "$real" "${PLAN_DIV_OF[$real]}"
+    done
+  fi
   if (( ${#PLAN_SKIPPED[@]} )); then
     printf '\nSkipped (no readable history)\n'
-    printf '  %s\n' "${PLAN_SKIPPED[@]}"
+    for real in "${PLAN_SKIPPED[@]}"; do
+      printf '  %s: %s; run `git -C %s fsck` or fix .git/objects/info/alternates\n' \
+        "$real" "$PLAN_SKIP_HINT" "$real"
+    done
   fi
   return 0
 }
 
-# The two JSON lists, as the `duplicates` and `skipped` arrays on stdout,
-# one per line.
+# The three JSON lists, as the `duplicates`, `skipped` and `diverged`
+# arrays on stdout, one per line.
 plan_dedup_json() {
   local real
-  local -a dups=() skips=()
+  local -a dups=() skips=() divs=()
+  for real in "${PLAN_DIVERGED[@]}"; do
+    divs+=( "$(jq -cn --arg path "$real" --arg of "${PLAN_DIV_OF[$real]}" '{path:$path, of:$of}')" )
+  done
   for real in "${PLAN_DUPLICATES[@]}"; do
     dups+=( "$(jq -cn --arg path "$real" --arg of "${PLAN_DUP_OF[$real]}" \
       --arg reason "${PLAN_DUP_REASON[$real]}" '{path:$path, of:$of, reason:$reason}')" )
@@ -174,4 +220,5 @@ plan_dedup_json() {
   done
   if (( ${#dups[@]} )); then printf '%s\n' "${dups[@]}" | jq -cs .; else echo '[]'; fi
   if (( ${#skips[@]} )); then printf '%s\n' "${skips[@]}" | jq -cs .; else echo '[]'; fi
+  if (( ${#divs[@]} )); then printf '%s\n' "${divs[@]}" | jq -cs .; else echo '[]'; fi
 }
