@@ -264,6 +264,38 @@ process.stdout.write(JSON.stringify(r));"""
         out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
         self.assertEqual(json.loads(out), [True, True, True, False, False])
 
+    def test_run_js_never_uses_innerhtml(self):
+        js = self.web("run.js")
+        for banned in ("innerHTML", "insertAdjacentHTML", "outerHTML", "document.write", "style="):
+            self.assertNotIn(banned, js)
+
+    def test_run_js_sends_token_header(self):
+        self.assertIn("X-Meute-Token", self.web("run.js"))
+
+    def test_index_loads_run_js(self):
+        resp, raw = self.request("GET", "/")
+        self.assertIn('<script src="/static/run.js" defer>', raw.decode())
+        resp, raw = self.request("GET", "/static/run.js")
+        self.assertEqual(resp.status, 200)
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_run_js_pure_helpers_under_node(self):
+        js = self.web("run.js")
+        start = js.index("// PURE-BEGIN")
+        end = js.index("// PURE-END")
+        script = js[start:end] + """
+const r = [
+  groupByRepo([{repo: "a", path: "/p/a", task: "t1", reason: "r"}, {repo: "b", path: "/p/b", task: "t2"},
+               {repo: "a", path: "/p/a", task: "t3"}]).map((g) => [g.path, g.tasks.length]),
+  enqueuePayload([{path: "/p/a", checked: true}, {path: "/p/b", checked: false}, {path: "/p/a", checked: true}]),
+  progressValues({total: 4, done: 1}), progressValues({total: 0, done: 0}), progressValues(null),
+];
+process.stdout.write(JSON.stringify(r));"""
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(json.loads(out), [
+            [["/p/a", 2], ["/p/b", 1]], {"paths": ["/p/a"]},
+            {"max": 4, "value": 1}, {"max": 1, "value": 0}, {"max": 1, "value": 0}])
+
 
 class FakeRun:
     def __init__(self):

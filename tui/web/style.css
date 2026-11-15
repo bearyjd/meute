@@ -32,3 +32,21 @@ tr.decided { opacity: 0.55; }
 #panel pre { white-space: pre-wrap; word-break: break-word; margin: 0 0 12px; font: 12px/1.5 ui-monospace, monospace; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .actions input[type=text] { flex: 1 1 180px; }
+.muted { color: #9aa3b0; }
+.plan-group { padding: 6px 0; border-bottom: 1px solid #262a31; }
+.plan-repo { display: flex; gap: 8px; align-items: center; }
+.plan-tasks { margin: 4px 0 0 28px; padding-left: 16px; color: #b8bfca; }
+.run-progress { margin-top: 16px; padding: 12px; background: #1a1d23; border: 1px solid #2c3038; }
+.run-head { display: flex; gap: 12px; align-items: center; }
+.run-head progress { flex: 1 1 auto; height: 14px; }
+.badge { padding: 2px 8px; border-radius: 3px; background: #343a44; }
+.state-running { background: #1f6f43; color: #fff; }
+.state-stopping { background: #8a6d1a; color: #fff; }
+.run-recent { list-style: none; padding: 0; font: 12px/1.6 ui-monospace, monospace; }
+.res-ok, .res-done, .res-success { color: #6fcf8e; }
+.res-error, .res-failed, .res-fail { color: #ff7b72; }
+.res-skipped, .res-timeout, .res-paused { color: #e3b341; }
+#run-notice { min-height: 24px; }
+#run-notice.ok { color: #6fcf8e; }
+#run-notice.err { color: #ff7b72; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
