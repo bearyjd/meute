@@ -68,6 +68,11 @@ def line_epoch(rec: dict) -> float | None:
         return None
 
 
+def _at_or_after(rec: dict, since: float) -> bool:
+    epoch = line_epoch(rec)
+    return epoch is not None and epoch >= since
+
+
 def log_size(path: str) -> int:
     try:
         return os.path.getsize(path)
@@ -88,12 +93,19 @@ def read_log(path: str, offset: int = 0) -> list[dict]:
     return [rec for rec in map(parse_line, lines) if rec]
 
 
-def classify(records: list[dict], returncode: int) -> dict:
-    """The outcome of one run.sh call, from the log lines it appended."""
-    if not records:
+def classify(records: list[dict], returncode: int, slot: str, since: float) -> dict:
+    """The outcome of one run.sh call, from the log lines appended during it.
+
+    Only a line for this call's slot that started at or after the call counts:
+    a timer firing the other slot (or a late line from an older run) writes
+    to the same log and is not this call's outcome.
+    """
+    own = [rec for rec in records
+           if rec.get("slot") == slot and _at_or_after(rec, since)]
+    if not own:
         return {"status": "error", "repo": None, "task": None,
                 "reason": f"run.sh exited {returncode} without a log line"}
-    last = records[-1]
+    last = own[-1]
     status = last.get("status")
     return {"status": status if status in ("ok", "skipped") else "error",
             "repo": last.get("repo"), "task": last.get("task"),
@@ -135,10 +147,6 @@ def completed_keys(state_dir: str) -> set[str]:
             return {row.split("\t", 1)[0] for row in f.read().splitlines() if row}
     except FileNotFoundError:
         return set()
-
-
-def entry_key(name: str, task: str) -> str:
-    return f"plan/{name}/{task}"
 
 
 def progress(entries: list[tuple[str, str]], records: list[dict],

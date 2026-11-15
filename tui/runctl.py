@@ -5,7 +5,8 @@ the CLI or slip past a gate:
 
   plan()     bin/meute plan --json                       (read-only)
   enqueue()  bin/meute plan --enqueue --only <p>... -- <scan>
-  start()    one background loop of `bin/run.sh daily`, one queue item per call
+  start()    one background loop of `bin/run.sh <slot> --repo <name> --task <task>`,
+             one staged item per call
 
 run.sh applies the hold, the lock, the self-budget and the quota floor itself;
 this module only decides whether to call it again. It reads the outcome of each
@@ -13,10 +14,15 @@ call from the lines that call appended to state/log, never from the exit code
 (run.sh exits 0 on every skip).
 
 run.sh falls back to the manifest's own queue once the staged plan has nothing
-eligible for the slot, so the loop stops before that: it asks lib/manifest.py
-which staged items the daily slot still has, and stops when none are left or
-when a call ran something that was not staged. Weekly-only staged items are
-left to the weekly timer.
+eligible for the slot, so the loop never lets it choose: before each call it
+asks lib/manifest.py which staged items are still pending for the daily slot,
+then (when none) for the weekly slot, and names the first one with --repo/--task.
+Forcing skips run.sh's cursor and its per-candidate share/cap checks, never the
+hold, the lock, the self-budget or the quota floor (re-probed after selection
+for forced entries), and a forced name matches no manifest entry, so a fallback
+finds nothing to run. As defence in depth the loop still stops if a call logged
+something that was not staged. It stops with "staged plan finished" when both
+slots have nothing pending.
 
 Subprocesses start in their own session and are never signalled: Stop and a
 server exit both let the in-flight item finish.
@@ -190,12 +196,17 @@ class RunController:
         while True:
             if self._stopping.is_set():
                 return "stopped"
-            pending = self._pending_daily()
+            slot, pending = "daily", self._pending("daily")
             if not pending:
-                return self._finished_reason()
+                slot, pending = "weekly", self._pending("weekly")
+            if not pending:
+                return "staged plan finished"
+            repo, task = pending[0]
             with self._lock:
-                self._current = {"repo": pending[0][0], "task": pending[0][1]}
-            outcome = self._run_once()
+                if self._stopping.is_set():
+                    return "stopped"
+                self._current = {"repo": repo, "task": task, "slot": slot}
+            outcome = self._run_once(slot, repo, task)
             if outcome["status"] == "skipped":
                 return f"skipped: {outcome['reason'] or 'no reason given'}"
             staged = set(rp.load_queue(self.state_dir)[0])
@@ -206,11 +217,13 @@ class RunController:
             if errors >= MAX_ERRORS:
                 return f"stopped after {MAX_ERRORS} consecutive errors"
 
-    def _run_once(self) -> dict:
+    def _run_once(self, slot: str, repo: str, task: str) -> dict:
         offset = rp.log_size(self.log_path)
+        started = int(self.clock())
         out = os.path.join(self.state_dir, RUN_OUTPUT)
-        rc, _ = self.runner([self.run_sh, "daily"], self.root, out_path=out)
-        return rp.classify(rp.read_log(self.log_path, offset), rc)
+        argv = [self.run_sh, slot, "--repo", repo, "--task", task]
+        rc, _ = self.runner(argv, self.root, out_path=out)
+        return rp.classify(rp.read_log(self.log_path, offset), rc, slot, started)
 
     def _manifest(self) -> str:
         override = os.environ.get("MEUTE_MANIFEST")
@@ -219,12 +232,12 @@ class RunController:
         local = os.path.join(self.root, "repos.local.yaml")
         return local if os.path.isfile(local) else os.path.join(self.root, "repos.yaml")
 
-    def _pending_daily(self) -> list[tuple[str, str]]:
-        """Staged items the daily slot can still run, as lib/manifest.py expands them."""
+    def _pending(self, slot: str) -> list[tuple[str, str]]:
+        """Staged items `slot` can still run, as lib/manifest.py expands them."""
         if not os.path.isfile(self.queue_path):
             return []
         argv = [sys.executable, os.path.join(self.root, "lib", "manifest.py"), "plan-queue",
-                self._manifest(), self.queue_path, "daily"]
+                self._manifest(), self.queue_path, slot]
         rc, out = self.runner(argv, self.root)
         if rc != 0:
             raise RunnerFailed("stopped: the staged plan queue failed validation")
@@ -235,18 +248,12 @@ class RunController:
                 entry = json.loads(line)
             except ValueError:
                 raise RunnerFailed("stopped: unreadable staged plan queue") from None
+            repo, task = entry.get("repo"), entry.get("task")
+            if not isinstance(repo, str) or not isinstance(task, str):
+                raise RunnerFailed("stopped: unreadable staged plan queue")
             if entry.get("key") not in done:
-                pending.append((entry.get("repo"), entry.get("task")))
+                pending.append((repo, task))
         return pending
-
-    def _finished_reason(self) -> str:
-        entries, archived, _ = rp.load_queue(self.state_dir)
-        done = rp.completed_keys(self.state_dir)
-        waiting = 0 if archived else sum(rp.entry_key(n, t) not in done for n, t in entries)
-        if waiting:
-            return (f"daily items finished; {waiting} staged item(s) are weekly-only "
-                    "and wait for the weekly timer")
-        return "staged plan finished"
 
     # ---------------------------------------------------------- status ---
     def status(self) -> dict:

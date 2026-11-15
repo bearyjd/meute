@@ -17,7 +17,7 @@ import runctl  # noqa: E402
 SCAN = "/scan root/projects"
 ALPHA = "/scan root/projects/alpha repo"
 BETA = "/scan root/projects/beta"
-WEEKLY_TASKS = {"drift"}
+WEEKLY_ONLY = {"drift"}  # like repos.yaml's slots: [weekly]; other tasks run in both
 
 
 def iso(delta_seconds=0):
@@ -40,6 +40,8 @@ class FakeFleet:
         self.calls = []
         self.steps = []
         self.enqueue_rc = 0
+        self.last_argv = ["run.sh", "daily"]
+        self.on_pending = None
 
     # -- what the runner sees --
     def __call__(self, argv, cwd, out_path=None):
@@ -54,8 +56,11 @@ class FakeFleet:
             self.write_queue(only)
             return 0, "Staged"
         if "plan-queue" in argv:
-            return 0, self.daily_entries()
+            if self.on_pending:
+                self.on_pending()
+            return 0, self.slot_entries(argv[-1])
         if base == "run.sh":
+            self.last_argv = list(argv)
             step = self.steps.pop(0) if self.steps else self.skip("script exhausted")
             return step()
         raise AssertionError(f"unexpected argv {argv}")
@@ -72,7 +77,7 @@ class FakeFleet:
         with open(os.path.join(self.state, "plan-queue.json"), "w") as f:
             json.dump({"version": 1, "scan": SCAN, "allow_web": False, "entries": entries}, f)
 
-    def daily_entries(self):
+    def slot_entries(self, slot):
         path = os.path.join(self.state, "plan-queue.json")
         if not os.path.exists(path):
             return ""
@@ -80,7 +85,7 @@ class FakeFleet:
             entries = json.load(f)["entries"]
         return "".join(json.dumps({"key": f"plan/{e['name']}/{e['task']}", "repo": e["name"],
                                    "task": e["task"]}) + "\n"
-                       for e in entries if e["task"] not in WEEKLY_TASKS)
+                       for e in entries if slot == "weekly" or e["task"] not in WEEKLY_ONLY)
 
     # -- scripted run.sh outcomes --
     def log(self, line):
@@ -89,7 +94,7 @@ class FakeFleet:
 
     def ok(self, repo, task="audit", status="ok"):
         def step():
-            self.log(f"{iso()}\tweek=2026-W46\tslot=daily\tstatus={status}\tkind=plan"
+            self.log(f"{iso()}\tweek=2026-W46\tslot={self.last_argv[1]}\tstatus={status}\tkind=plan"
                      f"\trepo={repo}\ttask={task}\tdur=1s")
             with open(os.path.join(self.state, "plan-complete"), "a") as f:
                 f.write(f"plan/{repo}/{task}\t{iso()}\n")
@@ -101,8 +106,16 @@ class FakeFleet:
 
     def skip(self, reason):
         def step():
-            self.log(f"{iso()}\tweek=2026-W46\tslot=daily\tstatus=skipped\treason={reason}\tdur=0s")
+            self.log(f"{iso()}\tweek=2026-W46\tslot={self.last_argv[1]}\tstatus=skipped"
+                     f"\treason={reason}\tdur=0s")
             return 0, ""
+        return step
+
+    def forced(self):
+        """ok for whatever --repo/--task this call named."""
+        def step():
+            argv = self.last_argv
+            return self.ok(argv[argv.index("--repo") + 1], argv[argv.index("--task") + 1])()
         return step
 
     def die(self):
@@ -245,8 +258,7 @@ class LoopTests(RunCtlCase):
     def test_loop_stops_after_three_consecutive_errors(self):
         self.ctl.enqueue([ALPHA, BETA])
         a, b = name_for(ALPHA), name_for(BETA)
-        # an ok resets the count; a non-zero exit with no log line is an error,
-        # and so is exit 0 with no new log line
+        # an ok resets the count; no new log line (any exit code) is an error
         no_line = lambda: (0, "")  # noqa: E731
         self.fleet.steps = [self.fleet.die(), self.fleet.ok(a), self.fleet.die(),
                             no_line, self.fleet.die(), self.fleet.ok(b)]
@@ -277,13 +289,56 @@ class LoopTests(RunCtlCase):
         self.assertEqual(len(self.fleet.run_calls()), 1)
         self.assertIn("manifest", status["stopped_reason"])
 
-    def test_loop_never_runs_when_only_weekly_items_are_staged(self):
+    def test_loop_runs_weekly_slot_when_only_weekly_items_are_staged(self):
         self.fleet.tasks = ["drift"]
         self.ctl.enqueue([ALPHA])
+        self.fleet.steps = [self.fleet.forced(), self.fleet.forced()]
+        status = self.run_to_end()
+        self.assertEqual([c[1] for c in self.fleet.run_calls()], ["weekly"])
+        self.assertEqual(status["stopped_reason"], "staged plan finished")
+        self.assertEqual((status["total"], status["done"], status["remaining"]), (1, 1, 0))
+
+    def test_mixed_queue_runs_daily_first_then_weekly_then_stops(self):
+        self.fleet.tasks = ["audit", "drift"]
+        self.ctl.enqueue([ALPHA, BETA])
+        self.fleet.steps = [self.fleet.forced() for _ in range(6)]
+        status = self.run_to_end()
+        a, b = name_for(ALPHA), name_for(BETA)
+        self.assertEqual([c[1:] for c in self.fleet.run_calls()], [
+            ["daily", "--repo", a, "--task", "audit"],
+            ["daily", "--repo", b, "--task", "audit"],
+            ["weekly", "--repo", a, "--task", "drift"],
+            ["weekly", "--repo", b, "--task", "drift"]])
+        self.assertEqual(status["stopped_reason"], "staged plan finished")
+        self.assertEqual((status["total"], status["done"], status["remaining"]), (4, 4, 0))
+
+    def test_run_names_the_staged_item_with_repo_and_task(self):
+        self.ctl.enqueue([ALPHA])
+        self.fleet.steps = [self.fleet.forced()]
+        self.run_to_end()
+        call = self.fleet.run_calls()[0]
+        self.assertTrue(call[0].endswith(os.path.join("bin", "run.sh")))
+        self.assertEqual(call[1:], ["daily", "--repo", name_for(ALPHA), "--task", "audit"])
+
+    def test_stop_during_pending_check_makes_no_run_call(self):
+        self.ctl.enqueue([ALPHA])
+        self.fleet.on_pending = self.ctl.stop
+        self.fleet.steps = [self.fleet.forced()]
         status = self.run_to_end()
         self.assertEqual(self.fleet.run_calls(), [])
-        self.assertIn("weekly", status["stopped_reason"])
-        self.assertEqual(status["remaining"], 1)
+        self.assertEqual(status["stopped_reason"], "stopped")
+
+    def test_foreign_timer_line_after_own_line_is_not_credited(self):
+        self.ctl.enqueue([ALPHA, BETA])
+
+        def step():
+            self.fleet.forced()()
+            self.fleet.log(f"{iso()}\tslot=weekly\tstatus=skipped\treason=other timer")
+            return 0, ""
+        self.fleet.steps = [step, self.fleet.forced()]
+        status = self.run_to_end()
+        self.assertEqual(len(self.fleet.run_calls()), 2)
+        self.assertEqual(status["stopped_reason"], "staged plan finished")
 
 
 class StatusTests(RunCtlCase):
