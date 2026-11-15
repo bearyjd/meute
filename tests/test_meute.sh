@@ -1228,6 +1228,111 @@ STUB
   is  "plan: the retired plan is archived alongside the first" "$(find "$root/state" -name 'plan-queue.completed-*' | wc -l)" "2"
 }
 
+# `plan --json` is the machine face of the same inventory (the web inbox reads
+# it) and `--enqueue --only` stages a chosen subset. Own fixture, own state dir.
+test_plan_json() {
+  local universe="$FIXTURE/plan-json"
+  local root="$universe/meute-stand-in"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$REPO/tasks/architecture-review.md" \
+     "$REPO/tasks/market-comparison.md" "$REPO/tasks/scout.md" "$root/tasks/"
+  git -C "$root" init -q -b main
+  echo x > "$root/f.txt"; git -C "$root" add -A
+  git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+  local r
+  for r in repo-alpha "repo with space" repo-gamma already-configured; do
+    mkdir -p "$universe/$r"
+    git -C "$universe/$r" init -q -b main
+    echo x > "$universe/$r/f.txt"; git -C "$universe/$r" add -A
+    git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
+  done
+  python3 - "$root" "$universe" <<'PY'
+import sys, pathlib, yaml
+root, universe = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"},
+              "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk",
+                            "writes_code": False, "network": "proxied"},
+              "tier2-scout": {"tools": "Read,Grep,Glob,Bash", "permission_mode": "dontAsk",
+                              "allowed_tools": "Bash(gh issue list:*)", "writes_code": False, "network": "proxied"}},
+    "tasks": {
+        "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]},
+        "architecture-review": {"tier": "tier2", "template": "tasks/architecture-review.md", "slots": ["weekly"]},
+        "market-comparison": {"tier": "tier2-web", "template": "tasks/market-comparison.md", "slots": ["weekly"]},
+        "scout": {"tier": "tier2-scout", "template": "tasks/scout.md", "slots": ["weekly"]},
+    },
+    "repos": [{"name": "already-configured", "path": str(universe / "already-configured"),
+               "spec": "already here", "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+  local out err rc queue="$root/state/plan-queue.json"
+
+  # Plain human output is the contract the JSON must not disturb.
+  out="$("$root/bin/meute" plan "$universe" 2>/dev/null)"
+  has "plan json: human item line is unchanged" "$out" $'1. repo with space          audit-security         security baseline'
+  has "plan json: human exclusion line is unchanged" "$out" "excluded 1 web-research task(s): market-comparison"
+
+  # --json: exactly one object on stdout, notes on stderr, read-only.
+  out="$("$root/bin/meute" plan --json "$universe" 2>"$FIXTURE/plan-json.err")"; rc=$?
+  is  "plan json: exits 0" "$rc" "0"
+  is  "plan json: stdout is one valid JSON object" "$(jq -e 'type == "object"' <<< "$out" >/dev/null 2>&1; echo $?)" "0"
+  is  "plan json: stdout is a single document" "$(jq -s length <<< "$out")" "1"
+  is  "plan json: counts" "$(jq -c '[.discovered,.configured,.unconfigured]' <<< "$out")" "[4,1,3]"
+  is  "plan json: scan is the directory" "$(jq -r .scan <<< "$out")" "$universe"
+  is  "plan json: items == unconfigured repos x tasks" "$(jq '.items | length' <<< "$out")" "6"
+  is  "plan json: ranks are 1..n" "$(jq -c '[.items[].rank]' <<< "$out")" "[1,2,3,4,5,6]"
+  is  "plan json: first item" "$(jq -c '.items[0] | [.rank,.repo,.path,.task,.reason]' <<< "$out")" \
+    "[1,\"repo with space\",\"$universe/repo with space\",\"audit-security\",\"security baseline\"]"
+  is  "plan json: second reason" "$(jq -r '.items[1].reason' <<< "$out")" "structure and maintainability"
+  is  "plan json: web exclusion" "$(jq -c .excluded.web <<< "$out")" '["market-comparison"]'
+  is  "plan json: other exclusion" "$(jq -c .excluded.other <<< "$out")" '["scout"]'
+  is  "plan json: read-only (no queue written)" "$(test -e "$queue"; echo $?)" "1"
+  out="$("$root/bin/meute" plan --json --allow-web "$universe" 2>/dev/null)"
+  is  "plan json: --allow-web ranks the web task" "$(jq '.items | length' <<< "$out")" "9"
+  is  "plan json: --allow-web empties excluded.web" "$(jq -c .excluded.web <<< "$out")" "[]"
+  out="$("$root/bin/meute" plan --json --enqueue "$universe" 2>&1; echo "rc=$?")"
+  has "plan json: --json with --enqueue is refused" "$out" "rc=2"
+  is  "plan json: ...and stages nothing" "$(test -e "$queue"; echo $?)" "1"
+
+  # --only
+  out="$("$root/bin/meute" plan --only "$universe/repo-alpha" "$universe" 2>&1; echo "rc=$?")"
+  has "plan only: without --enqueue is a usage error" "$out" "rc=2"
+  has "plan only: ...that says so" "$out" "--only requires --enqueue"
+  is  "plan only: ...and stages nothing" "$(test -e "$queue"; echo $?)" "1"
+
+  "$root/bin/meute" plan --enqueue --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
+  is  "plan only: one repo, both tasks staged" "$(jq '.entries | length' "$queue")" "2"
+  is  "plan only: entries are for that repo only" "$(jq -r '[.entries[].path] | unique | .[]' "$queue")" "$universe/repo-alpha"
+  "$root/bin/meute" plan --enqueue --only "$universe/repo with space" --only "$universe/repo-gamma" "$universe" >/dev/null 2>&1
+  is  "plan only: repeatable, spaces survive" "$(jq -r '[.entries[].path] | unique | join("|")' "$queue")" \
+    "$universe/repo with space|$universe/repo-gamma"
+  is  "plan only: a spelled-differently path matches by identity" \
+    "$("$root/bin/meute" plan --enqueue --only "$universe/repo-alpha/../repo-alpha/" "$universe" >/dev/null 2>&1; echo $?)" "0"
+
+  local before after
+  "$root/bin/meute" plan --enqueue --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
+  before="$(md5sum "$queue" | cut -d' ' -f1)"
+  for r in "/nonexistent/nope" "$universe/already-configured" "$root" "$universe"; do
+    out="$("$root/bin/meute" plan --enqueue --only "$r" "$universe" 2>&1; echo "rc=$?")"
+    hasnt "plan only: refuses '$r'" "$out" "rc=0"
+    has   "plan only: '$r' names the problem" "$out" "not an unconfigured repository"
+  done
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/repo-gamma" --only "/nonexistent" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "plan only: one bad path among good ones refuses" "$out" "rc=0"
+  after="$(md5sum "$queue" | cut -d' ' -f1)"
+  is  "plan only: a refused --only leaves the queue byte-identical" "$after" "$before"
+  rm -f "$queue"
+  "$root/bin/meute" plan --enqueue --only /nonexistent "$universe" >/dev/null 2>&1 || true
+  is  "plan only: a refused --only creates no queue" "$(test -e "$queue"; echo $?)" "1"
+}
+
 # A staged plan end to end: the runner cuts a worktree in an unenrolled
 # repository, the stub engine runs in it, the report lands under the synthetic
 # name, and nothing is left behind -- no worktree, no branch, no commit in
@@ -5760,6 +5865,7 @@ test_plan_tier_class
 test_plan_identity
 test_plan_worktrees
 test_plan
+test_plan_json
 test_plan_run
 test_repo_default_branch
 test_inbox

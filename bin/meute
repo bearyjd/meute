@@ -30,13 +30,15 @@
 #   resume                        lift the pause early
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
-#   plan [--enqueue] [--allow-web] [dir]
+#   plan [--enqueue [--only <repo>]...] [--allow-web] [--json] [dir]
 #                                  read-only portfolio inventory and proposed audit plan;
 #                                  --enqueue stages only read-only work for the normal runner
 #                                  (each staged run still cuts a scratch branch and worktree
 #                                  in the repository); tasks that reach the web are left out
 #                                  unless --allow-web, and a tier that can shell out is never
 #                                  staged -- enroll the repository for that instead
+#                                  --only stages just the named unconfigured repos (repeatable)
+#                                  --json prints the inventory and ranking as one JSON object
 #                                  defaults to this checkout's parent directory
 #   tui                           the triage inbox, in the terminal (PRP-003 screen 1)
 #   web [--host H] [--port P] [--insecure-public]
@@ -613,17 +615,23 @@ cmd_resume() {
 # the result for the runner. The work lives in lib/plan.sh; this is the
 # command line.
 cmd_plan() {
-  local enqueue=0 allow_web=0 requested="" scan_dir
+  local enqueue=0 allow_web=0 json=0 requested="" scan_dir
+  local -a only=()
   while (( $# )); do
     case "$1" in
       --enqueue) enqueue=1 ;;
       --allow-web) allow_web=1 ;;
+      --json) json=1 ;;
+      --only) (( $# >= 2 )) || die "plan: --only needs a path"; only+=( "$2" ); shift ;;
       --) shift; [[ $# -eq 1 ]] || die "plan: expected at most one directory"; requested="$1"; break ;;
       -*) die "plan: unknown option: $1" ;;
       *) [[ -z "$requested" ]] || die "plan: expected at most one directory"; requested="$1" ;;
     esac
     shift
   done
+  # Usage errors exit 2, apart from the runtime refusals that exit 1.
+  (( ${#only[@]} == 0 || enqueue )) || { note "plan: --only requires --enqueue"; exit 2; }
+  (( ! json || ! enqueue )) || { note "plan: --json is read-only and cannot be combined with --enqueue"; exit 2; }
   requested="${requested:-$(dirname "$MEUTE_ROOT")}"
   scan_dir="$(cd "$requested" 2>/dev/null && pwd)" || die "plan: no such directory: ${requested}"
   # A manifest the runner would refuse is not one to plan against.
@@ -639,6 +647,11 @@ cmd_plan() {
 
   plan_collect_tasks "$allow_web"
   plan_scan_repos "$scan_dir" "$max_depth"
+  if (( json )); then
+    plan_print_json "$scan_dir"
+    return 0
+  fi
+  (( ${#only[@]} == 0 )) || plan_restrict_to "${only[@]}"
   plan_print "$scan_dir" "$max_depth"
   if (( enqueue )); then
     plan_stage "$scan_dir" "$allow_web"

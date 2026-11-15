@@ -171,6 +171,63 @@ plan_scan_repos() {
   done < <(printf '%s\n' "${PLAN_REPOS[@]}" | LC_ALL=C sort -u)
 }
 
+# Why a task is in the plan, in one phrase. The one home for the wording: the
+# human preview and the JSON printer both ask here, so they cannot drift.
+plan_reason() {
+  case "$1" in
+    audit-security) printf '%s' "security baseline" ;;
+    architecture-review) printf '%s' "structure and maintainability" ;;
+    suggest-features) printf '%s' "feature opportunities" ;;
+    market-comparison) printf '%s' "market gaps" ;;
+    *) printf '%s' "declared read-only analysis" ;;
+  esac
+}
+
+# The same inventory as plan_print, as one JSON object on stdout and nothing
+# else. Read-only. Item order and ranks follow plan_print exactly.
+plan_print_json() {
+  local scan_dir="$1" real task rank=1 items
+  local -a lines=()
+  if (( ${#PLAN_TASKS[@]} )); then
+    for real in "${PLAN_UNCONFIGURED[@]}"; do
+      for task in "${PLAN_TASKS[@]}"; do
+        lines+=( "$(jq -cn --argjson rank "$rank" --arg repo "$(basename "$real")" \
+          --arg path "$real" --arg task "$task" --arg reason "$(plan_reason "$task")" \
+          '{rank:$rank, repo:$repo, path:$path, task:$task, reason:$reason}')" )
+        rank=$(( rank + 1 ))
+      done
+    done
+  fi
+  items="$( (( ${#lines[@]} )) && printf '%s\n' "${lines[@]}" | jq -s . || echo '[]' )"
+  jq -n --arg scan "$scan_dir" --argjson items "$items" \
+    --argjson discovered "${#PLAN_REPOS[@]}" --argjson configured "${#PLAN_CONFIGURED[@]}" \
+    --argjson unconfigured "${#PLAN_UNCONFIGURED[@]}" \
+    --argjson web "$(jq -cn '$ARGS.positional' --args "${PLAN_WEB_TASKS[@]}")" \
+    --argjson other "$(jq -cn '$ARGS.positional' --args "${PLAN_OTHER_TASKS[@]}")" \
+    '{scan:$scan, discovered:$discovered, configured:$configured, unconfigured:$unconfigured,
+      items:$items, excluded:{web:$web, other:$other}}'
+}
+
+# Narrow PLAN_UNCONFIGURED to the paths named with --only. Compared by
+# identity (dir_id), like the scan. A path that is not an unconfigured
+# repository the scan found refuses the whole request before anything is staged.
+plan_restrict_to() {
+  local -A want=()
+  local -a kept=()
+  local path real id
+  for path in "$@"; do
+    id="$(dir_id "$path")"
+    for real in "${PLAN_UNCONFIGURED[@]}"; do
+      [[ "$(dir_id "$real")" == "$id" ]] && { want["$id"]=1; break; }
+    done
+    [[ -n "${want[$id]+present}" ]] || die "plan: --only ${path}: not an unconfigured repository found by the scan"
+  done
+  for real in "${PLAN_UNCONFIGURED[@]}"; do
+    [[ -n "${want[$(dir_id "$real")]+present}" ]] && kept+=( "$real" )
+  done
+  PLAN_UNCONFIGURED=( "${kept[@]}" )
+}
+
 # The inventory and the ranked proposal, with what was left out and why.
 plan_print() {
   local scan_dir="$1" max_depth="$2" real task reason rank=1
@@ -196,13 +253,7 @@ plan_print() {
   else
     for real in "${PLAN_UNCONFIGURED[@]}"; do
       for task in "${PLAN_TASKS[@]}"; do
-        case "$task" in
-          audit-security) reason="security baseline" ;;
-          architecture-review) reason="structure and maintainability" ;;
-          suggest-features) reason="feature opportunities" ;;
-          market-comparison) reason="market gaps" ;;
-          *) reason="declared read-only analysis" ;;
-        esac
+        reason="$(plan_reason "$task")"
         printf '  %3d. %-24s %-22s %s\n' "$rank" "$(basename "$real")" "$task" "$reason"
         rank=$(( rank + 1 ))
       done
