@@ -265,5 +265,115 @@ process.stdout.write(JSON.stringify(r));"""
         self.assertEqual(json.loads(out), [True, True, True, False, False])
 
 
+class FakeRun:
+    def __init__(self):
+        self.calls = []
+        self.start_error = None
+
+    def plan(self):
+        self.calls.append(("plan",))
+        return {"scan": "/s", "items": []}
+
+    def enqueue(self, paths):
+        self.calls.append(("enqueue", paths))
+        if not paths:
+            raise ValueError("select at least one repository")
+        return {"ok": True, "message": "staged", "staged": len(paths)}
+
+    def start(self):
+        self.calls.append(("start",))
+        if self.start_error:
+            raise self.start_error
+        return {"state": "running"}
+
+    def stop(self):
+        self.calls.append(("stop",))
+
+    def status(self):
+        self.calls.append(("status",))
+        return {"state": "idle", "total": 0}
+
+
+class RunEndpointTests(WebTestCase):
+    def setUp(self):
+        self.run = FakeRun()
+        self.inbox = FakeInbox()
+        self.server, self.token = webserver.make_server("127.0.0.1", 0, self.inbox, self.run)
+        self.port = self.server.server_port
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop)
+
+    def test_run_endpoints_require_token(self):
+        for path, body in (("/api/enqueue", {"paths": ["/a"]}), ("/api/run/start", {}),
+                           ("/api/run/stop", {})):
+            resp, _ = self.request("POST", path, body, token=False)
+            self.assertEqual(resp.status, 403, path)
+            resp, _ = self.request("POST", path, body, headers={"X-Meute-Token": "nope"})
+            self.assertEqual(resp.status, 403, path)
+            resp, _ = self.request("POST", path, body, headers={"Origin": "http://evil.example"})
+            self.assertEqual(resp.status, 403, path)
+        self.assertEqual(self.run.calls, [])
+
+    def test_run_gets_require_host(self):
+        for path in ("/api/plan", "/api/run/status"):
+            resp, _ = self.request("GET", path, host="evil.example:80")
+            self.assertEqual(resp.status, 403, path)
+        self.assertEqual(self.run.calls, [])
+
+    def test_enqueue_empty_is_400(self):
+        resp, raw = self.request("POST", "/api/enqueue", {"paths": []})
+        self.assertEqual(resp.status, 400)
+        self.assertFalse(json.loads(raw)["ok"])
+
+    def test_enqueue_bad_body_is_400(self):
+        for body in ([1], {"paths": "x"}, {}):
+            resp, _ = self.request("POST", "/api/enqueue", body)
+            self.assertEqual(resp.status, 400, body)
+        self.assertEqual(self.run.calls, [])
+
+    def test_enqueue_passes_paths(self):
+        resp, raw = self.request("POST", "/api/enqueue", {"paths": ["/a b", "/c"]})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.run.calls, [("enqueue", ["/a b", "/c"])])
+        self.assertEqual(json.loads(raw)["staged"], 2)
+
+    def test_start_conflict_is_409(self):
+        self.run.start_error = webserver.runctl.RunConflict("the fleet is paused")
+        resp, raw = self.request("POST", "/api/run/start", {})
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(json.loads(raw), {"ok": False, "message": "the fleet is paused"})
+
+    def test_start_value_error_is_400(self):
+        self.run.start_error = ValueError("nothing is staged")
+        resp, _ = self.request("POST", "/api/run/start", {})
+        self.assertEqual(resp.status, 400)
+
+    def test_start_stop_status_plan(self):
+        resp, raw = self.request("POST", "/api/run/start", {})
+        self.assertEqual((resp.status, json.loads(raw)), (200, {"state": "running"}))
+        resp, raw = self.request("POST", "/api/run/stop", {})
+        self.assertEqual(resp.status, 200)
+        resp, raw = self.request("GET", "/api/run/status")
+        self.assertEqual(json.loads(raw), {"state": "idle", "total": 0})
+        resp, raw = self.request("GET", "/api/plan")
+        self.assertEqual(json.loads(raw)["scan"], "/s")
+        self.assertEqual([c[0] for c in self.run.calls], ["start", "stop", "status", "plan"])
+
+    def test_runner_failure_is_502(self):
+        def boom():
+            raise webserver.runctl.RunnerFailed("meute plan --json failed (exit 1)")
+        self.run.plan = boom
+        resp, raw = self.request("GET", "/api/plan")
+        self.assertEqual(resp.status, 502)
+        self.assertIn("exit 1", json.loads(raw)["message"])
+
+    def test_default_run_mod_is_a_run_controller(self):
+        server, _ = webserver.make_server("127.0.0.1", 0, self.inbox)
+        self.addCleanup(server.server_close)
+        self.assertIsInstance(server.run_mod, webserver.runctl.RunController)
+        self.assertEqual(server.run_mod.root, webserver.ROOT)
+
+
 if __name__ == "__main__":
     unittest.main()

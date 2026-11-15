@@ -25,6 +25,9 @@ ROOT = os.environ.get("MEUTE_ROOT") or os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import inbox  # noqa: E402
 
+sys.path.insert(0, HERE)
+import runctl  # noqa: E402
+
 WEB_DIR = os.path.join(HERE, "web")
 STATIC_TYPES = {
     "app.js": "text/javascript; charset=utf-8",
@@ -124,16 +127,58 @@ def post_act(h: "Handler", query: dict) -> None:
     h.send_json(200, mod.act(*args))
 
 
+def call_run(h: "Handler", method: str, *args) -> None:
+    """Call run_mod.<method>; map its refusals to 409 / 400 / 502."""
+    try:
+        result = getattr(h.server.run_mod, method)(*args)
+    except runctl.RunConflict as e:
+        return h.send_error_json(409, str(e))
+    except ValueError as e:
+        return h.send_error_json(400, str(e))
+    except runctl.RunnerFailed as e:
+        return h.send_error_json(502, str(e))
+    h.send_json(200, result if result is not None else {"ok": True})
+
+
+def get_plan(h: "Handler", query: dict) -> None:
+    call_run(h, "plan")
+
+
+def post_enqueue(h: "Handler", query: dict) -> None:
+    payload = h.read_json()
+    paths = payload.get("paths") if isinstance(payload, dict) else None
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        raise BadRequest("paths must be a list of strings")
+    call_run(h, "enqueue", paths)
+
+
+def post_run_start(h: "Handler", query: dict) -> None:
+    call_run(h, "start")
+
+
+def post_run_stop(h: "Handler", query: dict) -> None:
+    call_run(h, "stop")
+
+
+def get_run_status(h: "Handler", query: dict) -> None:
+    call_run(h, "status")
+
+
 ROUTES = {
     ("GET", "/"): get_index,
     ("GET", "/api/inbox"): get_inbox,
     ("GET", "/api/finding"): get_finding,
     ("POST", "/api/act"): post_act,
+    ("GET", "/api/plan"): get_plan,
+    ("POST", "/api/enqueue"): post_enqueue,
+    ("POST", "/api/run/start"): post_run_start,
+    ("POST", "/api/run/stop"): post_run_stop,
+    ("GET", "/api/run/status"): get_run_status,
 }
 
 
 def route(method: str, path: str):
-    """Dispatch: handler for (method, path), or None. Task 4 extends ROUTES."""
+    """Dispatch: handler for (method, path), or None."""
     if method == "GET" and path.startswith("/static/"):
         name = path[len("/static/"):]
         return get_static(name) if name in STATIC_TYPES else None
@@ -223,13 +268,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None):
-    """Build (server, token). port=0 picks a free port: read server.server_port."""
+    """Build (server, token). port=0 picks a free port: read server.server_port.
+
+    run_mod defaults to a RunController for ROOT; constructing one runs nothing.
+    """
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     server.token = secrets.token_urlsafe(32)
     server.bound_host = host
     server.inbox_mod = inbox_mod
-    server.run_mod = run_mod
+    server.run_mod = run_mod if run_mod is not None else runctl.RunController(ROOT)
     return server, server.token
 
 
