@@ -2,6 +2,8 @@
 import http.client
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import unittest
@@ -240,6 +242,27 @@ class PageTests(WebTestCase):
 
     def test_app_js_sends_token_header(self):
         self.assertIn("X-Meute-Token", self.web("app.js"))
+
+    def test_key_handler_ignores_buttons(self):
+        # A focused button must keep Enter for itself: the global handler
+        # re-selecting the row would wipe the dismiss/resolve fields.
+        js = self.web("app.js")
+        self.assertIn('closest("button")', js)
+        self.assertIn('t.tagName === "TEXTAREA"', js)
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_key_handler_behaviour_under_node(self):
+        js = self.web("app.js")
+        start = js.index("function typing(")
+        end = js.index("}\n", js.index("closest", start)) + 2
+        script = js[start:end] + """
+const mk = (tag, inBtn) => ({tagName: tag, closest: (s) => (s === "button" && inBtn ? {} : null)});
+const r = [typing({target: mk("BUTTON", true)}), typing({target: mk("SPAN", true)}),
+  typing({target: mk("INPUT", false)}), typing({target: mk("BODY", false)}),
+  typing({target: mk("TR", false)})];
+process.stdout.write(JSON.stringify(r));"""
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(json.loads(out), [True, True, True, False, False])
 
 
 if __name__ == "__main__":

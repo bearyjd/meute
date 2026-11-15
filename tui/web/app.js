@@ -199,8 +199,10 @@ async function refresh() {
 
 // ---- wiring ---------------------------------------------------------------
 function typing(e) {
-  const t = e.target.tagName;
-  return t === "INPUT" || t === "SELECT" || t === "TEXTAREA";
+  const t = e.target;
+  if (!t || !t.tagName) return false;
+  return t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA"
+    || !!(t.closest && t.closest("button"));
 }
 
 document.addEventListener("keydown", (e) => {
