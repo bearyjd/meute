@@ -296,6 +296,41 @@ process.stdout.write(JSON.stringify(r));"""
             [["/p/a", 2], ["/p/b", 1]], {"paths": ["/p/a"]},
             {"max": 4, "value": 1}, {"max": 1, "value": 0}, {"max": 1, "value": 0}])
 
+    def _node_pure(self, body):
+        js = self.web("run.js")
+        script = js[js.index("// PURE-BEGIN"):js.index("// PURE-END")] + body
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+        return json.loads(out)
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_run_js_stale_poll_response_dropped(self):
+        r = self._node_pure("process.stdout.write(JSON.stringify([shouldApply(2, 3), shouldApply(3, 3), shouldApply(4, 3)]));")
+        self.assertEqual(r, [False, False, True])
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_run_js_stop_not_blocked_by_busy(self):
+        r = self._node_pure("""const b = (o) => buttonFlags(Object.assign({state: "running", pollFailed: false,
+  busy: false, stopBusy: false, anyChecked: true}, o)).stop;
+process.stdout.write(JSON.stringify([b({busy: true}), b({stopBusy: true}), b({pollFailed: true, busy: true}),
+  b({pollFailed: true, stopBusy: true})]));""")
+        self.assertEqual(r, [True, False, True, False])
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_run_js_button_flags_unknown_state_disables_start_enqueue(self):
+        r = self._node_pure("""const f = (o) => buttonFlags(Object.assign({state: "idle", pollFailed: false,
+  busy: false, stopBusy: false, anyChecked: true}, o));
+const pick = (x) => [x.start, x.enqueue, x.stop];
+process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), pick(f({state: "running"})),
+  pick(f({busy: true})), pick(f({anyChecked: false}))]));""")
+        self.assertEqual(r, [[True, True, False], [False, False, True], [False, False, True],
+                             [False, False, False], [True, False, False]])
+
+    def test_run_js_poll_error_has_own_element(self):
+        js = self.web("run.js")
+        self.assertIn("run-status-error", js)
+        self.assertNotIn('"status failed', js)
+        self.assertLess(len(js.splitlines()), 400)
+
 
 class FakeRun:
     def __init__(self):

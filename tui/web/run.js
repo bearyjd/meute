@@ -3,7 +3,8 @@
 // No decision logic here: the server decides. All dynamic text uses
 // textContent (via el() from app.js, which loads first). Token: TOKEN from app.js.
 const POLL_MS = 2000;
-const runUi = { groups: [], timer: null, status: null, planned: false, busy: false };
+const runUi = { groups: [], timer: null, status: null, planned: false, busy: false,
+  stopBusy: false, pollFailed: false, seq: 0, applied: 0, timerInFlight: false };
 
 // PURE-BEGIN
 function groupByRepo(items) {
@@ -28,6 +29,22 @@ function enqueuePayload(entries) {
 function progressValues(st) {
   if (!st || !(st.total > 0)) return { max: 1, value: 0 };
   return { max: st.total, value: Math.min(st.done || 0, st.total) };
+}
+
+// A response is applied only if it is newer than the last one applied.
+function shouldApply(seq, lastApplied) { return seq > lastApplied; }
+
+// Button enabled flags. Unknown state (last poll failed) disables Start/Enqueue;
+// Stop is never blocked by busy, only by its own in-flight call.
+function buttonFlags(f) {
+  const st = f.pollFailed ? null : f.state;
+  const idle = st === "idle";
+  return {
+    enqueue: !!f.anyChecked && idle && !f.busy,
+    start: idle && !f.busy,
+    stop: f.pollFailed ? !f.stopBusy : st !== "idle" && !f.stopBusy,
+    plan: !f.busy,
+  };
 }
 // PURE-END
 
@@ -73,9 +90,11 @@ function buildRunSection() {
   prog.children[3].id = "run-recent";
   const msg = el("div", "", null);
   msg.id = "run-notice";
+  const serr = el("div", "", "err");
+  serr.id = "run-status-error";
   const list = el("div", null, "run-plan-list");
   list.id = "run-plan-list";
-  root.replaceChildren(bar, help, msg, list, prog);
+  root.replaceChildren(bar, help, msg, serr, list, prog);
 }
 
 function renderPlan(plan) {
@@ -115,12 +134,14 @@ function checkedEntries() {
 }
 
 function syncButtons() {
-  const st = runUi.status ? runUi.status.state : "idle";
-  const any = checkedEntries().some((e) => e.checked);
-  $("run-enqueue").disabled = !any || st !== "idle" || runUi.busy;
-  $("run-start").disabled = st !== "idle" || runUi.busy;
-  $("run-stop").disabled = st === "idle";
-  $("run-plan").disabled = runUi.busy;
+  const fl = buttonFlags({
+    state: runUi.status ? runUi.status.state : "idle", pollFailed: runUi.pollFailed,
+    busy: runUi.busy, stopBusy: runUi.stopBusy, anyChecked: checkedEntries().some((e) => e.checked),
+  });
+  $("run-enqueue").disabled = !fl.enqueue;
+  $("run-start").disabled = !fl.start;
+  $("run-stop").disabled = !fl.stop;
+  $("run-plan").disabled = !fl.plan;
 }
 
 function renderStatus(st) {
@@ -146,15 +167,35 @@ function renderStatus(st) {
   syncButtons();
 }
 
-async function pollStatus() {
-  try { renderStatus(await runCall("GET", "/api/run/status")); }
-  catch (e) { runNotice("status failed: " + e.message, false); }
+async function pollStatus(fromTimer) {
+  if (fromTimer) {
+    if (runUi.timerInFlight) return;
+    runUi.timerInFlight = true;
+  }
+  runUi.seq += 1;
+  const mine = runUi.seq;
+  try {
+    const st = await runCall("GET", "/api/run/status");
+    if (!shouldApply(mine, runUi.applied)) return;
+    runUi.applied = mine;
+    runUi.pollFailed = false;
+    $("run-status-error").textContent = "";
+    renderStatus(st);
+  } catch (e) {
+    if (!shouldApply(mine, runUi.applied)) return;
+    runUi.applied = mine;
+    runUi.pollFailed = true;
+    $("run-status-error").textContent = "status unavailable: " + e.message;
+    syncButtons();
+  } finally {
+    if (fromTimer) runUi.timerInFlight = false;
+  }
 }
 
 function startPolling() {
   if (runUi.timer !== null) return;
   pollStatus();
-  runUi.timer = setInterval(pollStatus, POLL_MS);
+  runUi.timer = setInterval(() => pollStatus(true), POLL_MS);
 }
 
 function stopPolling() {
@@ -204,12 +245,20 @@ function doStart() {
   });
 }
 
-function doStop() {
-  return guarded(async () => {
+async function doStop() {
+  if (runUi.stopBusy) return;
+  runUi.stopBusy = true;
+  syncButtons();
+  try {
     const res = await runCall("POST", "/api/run/stop", {});
     runNotice(res.message || "stopping after the current item", true);
-    await pollStatus();
-  });
+  } catch (e) {
+    runNotice(e.message, false);
+  } finally {
+    runUi.stopBusy = false;
+    syncButtons();
+  }
+  await pollStatus();
 }
 
 function selectNone() {
