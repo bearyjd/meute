@@ -679,9 +679,11 @@ cmd_tui() {
   exec "$py" "${MEUTE_ROOT}/tui/app.py"   # MEUTE_ROOT is already exported
 }
 
-# textual-serve renders the identical app in a browser over a websocket: one
-# codebase, same keybindings, usable on a phone. It has NO authentication, so
-# a non-loopback bind requires an explicit acknowledgement of that risk.
+# `meute web` serves the stdlib web inbox (tui/webserver.py, plain python3, no
+# venv). It has a per-process token and Host/Origin checks but no login, and it
+# can start fleet runs, so a non-loopback bind requires an explicit
+# acknowledgement. The server only accepts requests whose Host header is the
+# bound host:port, so a non-loopback bind must use the address the browser uses.
 cmd_web() {
   local host="127.0.0.1" port="8642" insecure_public=0
   while (( $# )); do
@@ -693,13 +695,14 @@ cmd_web() {
     esac
     shift
   done
-  local py; py="$(tui_python)"
-  if [[ "$host" != "127.0.0.1" && "$host" != "localhost" && "$host" != "::1" ]]; then
+  # The server binds an IPv4 socket; an IPv6 literal (::1, ::) cannot work.
+  [[ "$host" != *:* ]] || die "web: IPv6 host ${host} is not supported; use an IPv4 address (127.0.0.1 is the default)"
+  if [[ "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
     (( insecure_public )) || die "web: refusing non-loopback host ${host}; pass --insecure-public to acknowledge the unauthenticated inbox"
-    note "WARNING: binding ${host} -- the inbox has no auth; anyone who can reach it can promote and dismiss"
+    note "WARNING: binding ${host} -- there is no login; anyone who can reach it can triage findings AND start fleet runs that spend your Claude/Codex quota. Browse to exactly http://${host}:${port}/ (the Host check only accepts the bound host:port)"
   fi
   note "inbox at http://${host}:${port}/  (Ctrl-C to stop)"
-  exec "$py" "${MEUTE_ROOT}/tui/serve.py" --host "$host" --port "$port"
+  exec python3 "${MEUTE_ROOT}/tui/webserver.py" --host "$host" --port "$port"
 }
 
 main() {

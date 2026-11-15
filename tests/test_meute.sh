@@ -3090,17 +3090,56 @@ PY3
   done
 }
 
-# textual-serve deliberately has no authentication. Pin the CLI boundary so an
-# accidental --host does not expose report triage on a shared network.
+# The web inbox has a token and Host/Origin guards but no login, and it can
+# start fleet runs. Pin the CLI boundary so an accidental --host does not
+# expose it on a shared network.
 test_web_bind_guard() {
-  local out rc
-  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 0.0.0.0' _ "$REPO" 2>&1)"; rc=$?
+  local out rc stub="$FIXTURE/webstub"; mkdir -p "$stub"
+  printf '#!/bin/sh\necho "python3-stub $*"\n' > "$stub/python3"; chmod +x "$stub/python3"
+  web() { PATH="$stub:$PATH" bash -c 'source "$1/bin/meute"; shift; cmd_web "$@"' _ "$REPO" "$@" 2>&1; }
+  out="$(web --host 0.0.0.0)"; rc=$?
   is "web: refuses non-loopback without explicit acknowledgement" "$rc" "1"
   has "web: names the required public-bind flag" "$out" "--insecure-public"
-  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 127.0.0.1 --port 8123' _ "$REPO" 2>&1)"
-  has "web: loopback remains available without acknowledgement" "$out" "--host 127.0.0.1 --port 8123"
-  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 0.0.0.0 --insecure-public' _ "$REPO" 2>&1)"
+  out="$(web --host 127.0.0.1 --port 8123)"
+  has "web: loopback remains available without acknowledgement" "$out" "webserver.py --host 127.0.0.1 --port 8123"
+  out="$(web --host 0.0.0.0 --insecure-public)"
   has "web: explicit insecure opt-in permits non-loopback" "$out" "--host 0.0.0.0"
+  has "web: warning says fleet runs spend quota" "$out" "start fleet runs"
+  out="$(web --host ::1)"; rc=$?
+  is  "web: IPv6 host is rejected" "$rc" "1"
+  has "web: IPv6 rejection explains itself" "$out" "IPv6"
+  local body; body="$(sed -n '/^cmd_web()/,/^}/p' "$REPO/bin/meute")"
+  has   "web: cmd_web execs webserver.py" "$body" "tui/webserver.py"
+  hasnt "web: cmd_web no longer execs serve.py" "$body" "serve.py"
+}
+
+# The web inbox is stdlib-only (plain python3, no venv), and the runner
+# still never reaches into tui/. Every unittest file must pass.
+test_web_invariants() {
+  local f bad out rc
+  for f in webserver runctl runprogress; do
+    bad="$(python3 - "$REPO/tui/$f.py" "$REPO/tui" "$REPO/lib" <<'PY2'
+import ast, os, sys
+std = sys.stdlib_module_names
+local = {n[:-3] for d in sys.argv[2:] for n in os.listdir(d) if n.endswith(".py")}
+tree = ast.parse(open(sys.argv[1]).read())
+bad = []
+for n in ast.walk(tree):
+    mods = [a.name for a in n.names] if isinstance(n, ast.Import) else \
+           [n.module or ""] if isinstance(n, ast.ImportFrom) and n.level == 0 else []
+    bad += [m for m in mods if m.split(".")[0] not in std and m.split(".")[0] not in local]
+print(" ".join(bad))
+PY2
+)"
+    is "invariant: tui/$f.py imports only stdlib/local modules" "$bad" ""
+  done
+  is "invariant: web files never import textual or flask" \
+     "$(grep -lE '^\s*(import|from) (textual|flask)' "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" | wc -l)" "0"
+  is "invariant: run.sh still never references tui/" "$(grep -c 'tui/' "$REPO/bin/run.sh")" "0"
+  for f in "$REPO"/tests/test_*.py; do
+    out="$(cd "$REPO/tests" && python3 -m unittest "$(basename "$f" .py)" 2>&1)"; rc=$?
+    is "unittest: $(basename "$f") exits 0" "$rc" "0"
+  done
 }
 
 # Findings were gated on the task NAME `audit-security` in two places, so the
@@ -5909,5 +5948,6 @@ test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
 test_real_repo_untouched
+test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))
