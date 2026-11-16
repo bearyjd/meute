@@ -180,9 +180,10 @@ test_exit_log_line() {
   has "exit log: ...still saying why on stderr"             "$out" "meute: manifest failed validation"
   mv "$root/repos.yaml.good" "$root/repos.yaml"
 
-  # A death no die() reports: mktemp fails under set -e.
+  # A death with no temp directory to work in. (TMPDIR no longer reaches it:
+  # since P0.4 the run's directory is under state/tmp or MEUTE_TMPDIR.)
   before="$(_log_lines "$log")"
-  rc=0; out="$(env TMPDIR=/nonexistent "${fire[@]}" 2>&1)" || rc=$?
+  rc=0; out="$(env MEUTE_TMPDIR=/nonexistent "${fire[@]}" 2>&1)" || rc=$?
   is  "exit log: a failed mktemp adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
   has "exit log: ...with code=died"                     "$(tail -1 "$log" 2>/dev/null)" $'\tcode=died'
 
@@ -288,7 +289,7 @@ PY
   printf 'version: 1\nrepos: not-a-list\n' > "$root/repos.yaml"
   _strict "a runner that died is 70" 70 "${run[@]}" daily --strict-exit
   _strict "...but 1 without the flag" 1 "${run[@]}" daily
-  _strict "a death no die() reports is 70" 70 env TMPDIR=/nonexistent "${run[@]}" daily --strict-exit
+  _strict "a death with no temp directory is 70" 70 env MEUTE_TMPDIR=/nonexistent "${run[@]}" daily --strict-exit
   mv "$root/repos.yaml.good" "$root/repos.yaml"
 
   # The codes with no reachable trigger in a fixture (the load and disk gates
@@ -301,4 +302,64 @@ PY
       "$(MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/outcome.sh"; outcome_exit_status "$1"' _ "$code")" "$want"
   done
   unset -f _strict
+}
+
+# P0.4 (R3, R14 part): a fire's temp files live in one directory of its own,
+# under state/tmp (or MEUTE_TMPDIR), and that directory goes on every exit.
+# Before, five bare mktemp files per full run landed in $TMPDIR and stayed
+# (queue_file's RETURN trap never fires: main exits, it does not return), and
+# a full or unwritable /tmp killed the fire. The sentinel TMPDIR catches a
+# file that escapes the run's directory; the state/tmp count catches a run
+# directory that is never removed.
+_count_entries() { [[ -d "$1" ]] && find "$1" -mindepth 1 | wc -l || echo 0; }
+
+test_run_tmp_cleaned() {
+  local root="$FIXTURE/runtmp" repo="$FIXTURE/runtmp/git-lk" sentinel="$FIXTURE/runtmp-sentinel" rc
+  _runlock_fixture "$root" "$repo" tier2
+  mkdir -p "$sentinel"
+
+  # _tmp_case <label> <expected last-log fragment or ""> <quota> [run.sh args...]
+  _tmp_case() {
+    local label="$1" want="$2" quota="$3"; shift 3
+    env TMPDIR="$sentinel" PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB="$quota" "$root/bin/run.sh" daily "$@" >/dev/null 2>&1
+    is "run tmp: $label leaves nothing in TMPDIR"   "$(_count_entries "$sentinel")" "0"
+    is "run tmp: $label leaves nothing in state/tmp" "$(_count_entries "$root/state/tmp")" "0"
+    [[ -z "$want" ]] || has "run tmp: $label ends as expected" "$(tail -1 "$root/state/log" 2>/dev/null)" "$want"
+  }
+  _tmp_case "a full run"    $'\tcode=ok'               100
+  _tmp_case "a dry run"     ""                         100 --dry-run
+  _tmp_case "a skipped run" $'\tcode=nothing-eligible' 10
+  unset -f _tmp_case
+
+  # A dry run's point is the prompt it names, so that file is not a temp file:
+  # it outlives the run at one fixed path under state/, overwritten each time.
+  local out prompt
+  out="$(env TMPDIR="$sentinel" PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  prompt="$(grep -oE 'prompt=\S+' <<< "$out" | cut -d= -f2)"
+  is  "run tmp: a dry run's prompt is kept at a fixed state path" "$prompt" "$root/state/dry-run-prompt.md"
+  has "run tmp: ...and is readable after the run"                  "$(cat "$prompt" 2>/dev/null)" "Task lk"
+
+  # /tmp unwritable is no longer fatal: the run's directory is under state/.
+  rc=0; env TMPDIR=/nonexistent PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1 || rc=$?
+  has "run tmp: a run with TMPDIR unwritable completes" "$(tail -1 "$root/state/log")" $'\tcode=ok'
+  is  "run tmp: ...and exits 0"                         "$rc" "0"
+
+  # MEUTE_TMPDIR moves it; the run's directory is created and removed there.
+  local alt="$FIXTURE/runtmp-alt"; mkdir -p "$alt"
+  env MEUTE_TMPDIR="$alt" TMPDIR="$sentinel" PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1
+  has "run tmp: MEUTE_TMPDIR is honoured"     "$(tail -1 "$root/state/log")" $'\tcode=ok'
+  is  "run tmp: ...and left empty"            "$(_count_entries "$alt")" "0"
+  is  "run tmp: ...with nothing in TMPDIR"    "$(_count_entries "$sentinel")" "0"
+
+  # The runner's temp files are private to the user who runs it.
+  has "run tmp: the run directory template is private" \
+    "$(MEUTE_ROOT="$REPO" bash -c 'die() { exit 1; }; source "$MEUTE_ROOT/lib/tmp.sh"; tmp_init "$1"; stat -c %a "$RUN_TMP"; tmp_cleanup' _ "$root/state")" "700"
+
+  # meute findings: same treatment. Its temp file used to be a bare mktemp.
+  local want got
+  want="$(meute findings --new 2>&1)"
+  rc=0; got="$(TMPDIR=/nonexistent meute findings --new 2>&1)" || rc=$?
+  is "run tmp: meute findings works with TMPDIR unwritable" "$got" "$want"
+  is "run tmp: ...and exits 0"                              "$rc" "0"
+  is "run tmp: ...leaving nothing in state/tmp"             "$(_count_entries "$FIXTURE/state/tmp")" "0"
 }
