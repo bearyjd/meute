@@ -52,6 +52,8 @@ PY
 }
 validate() { MEUTE_ROOT="${2:-$(dirname "$1")}" python3 "$REPO/lib/manifest.py" validate "$1" 2>&1 || true; }
 
+source "$REPO/tests/test_resilience.sh"
+
 # ---------------------------------------------------------------- fixture ---
 setup() {
   mkdir -p "$FIXTURE"/{state,tasks,reports/alpha,reports/beta}
@@ -3213,9 +3215,21 @@ PY2
   has "gates: ...naming the floor as the reason"                     "$out" "below floor 30%"
   has "gates: ...and the real source, not the stub"                  "$out" "quota=20:quota-subscription.sh"
 
-  # Both clear -> the run proceeds to selection.
+  # Both clear -> the run proceeds to selection. Past the gates the dry run
+  # reaches preflight, so a stub `claude` answers it: the suite must not
+  # depend on a signed-in CLI on the host (CI runners have none).
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then
+  printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$root/stub/claude"
   printf '{"captured_at":1,"seven_day":{"used_percentage":10,"resets_at":9999999999}}' > "$snap"
-  out="$("$root/bin/run.sh" daily --dry-run 2>&1)"
+  out="$(PATH="$root/stub:$PATH" "$root/bin/run.sh" daily --dry-run 2>&1)"
   has "gates: both clear and the run goes ahead" "$out" "would run: key=r/audit-security"
 
   # The agent's cwd is the worktree and dontAsk refuses reads outside it, so
@@ -6220,6 +6234,7 @@ test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
 test_p09_statusline_tmp
+test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
