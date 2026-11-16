@@ -6222,6 +6222,7 @@ test_p2_probe_cleanup
 test_run_lock_not_inherited
 test_run_lock_git_hooks
 test_run_lock_error_paths
+test_exit_log_line
 test_real_repo_untouched
 test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"

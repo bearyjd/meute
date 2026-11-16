@@ -43,6 +43,7 @@ set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
+source "${MEUTE_ROOT}/lib/outcome.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
@@ -108,9 +109,6 @@ OUT_DIR=""
 BRANCH=""
 BASE_SHA=""
 
-note() { printf 'meute: %s\n' "$*" >&2; }
-die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
-
 # --------------------------------------------------------------------------
 # state/cursor holds the round-robin cursors (one key per slot, a separate one
 # per slot for a staged plan) and the per-(repo,task) lens rotation counters.
@@ -120,29 +118,6 @@ die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
 # --------------------------------------------------------------------------
 state_get() { kv_get "$CURSOR_FILE" "$1"; }
 state_set() { kv_set "$CURSOR_FILE" "$1" "$2"; }
-
-# One line per invocation, always, including every skip path. This file is the
-# audit trail for unattended runs — if it is silent, the runner did not fire.
-log_run() {
-  local status="$1"; shift
-  local line duration=$(( SECONDS - START_EPOCH ))
-  line="$(printf '%s\tweek=%s\tslot=%s\tstatus=%s' "$STARTED_AT" "$THIS_WEEK" "${SLOT:-none}" "$status")"
-  local field
-  for field in "$@"; do line+="$(printf '\t%s' "$field")"; done
-  line+="$(printf '\tdur=%ss' "$duration")"
-  # PRP-004's columns, on every line class so a reader can rely on them:
-  # runtime= (host|container), image= (12 hex of the image ID actually run),
-  # stage= (preflight|build|review|resolve|publish), pr= (URL). Phase 2b
-  # fills the first two; the rest stay `-` until the phase that fills them.
-  line+="$(printf '\truntime=%s\timage=%s\tstage=%s\tpr=%s' \
-             "${LOG_RUNTIME:--}" "${LOG_IMAGE:--}" "${LOG_STAGE:--}" "${LOG_PR:--}")"
-  printf '%s\n' "$line" >> "$LOG_FILE"
-  printf '%s\n' "$line" >&2
-}
-
-# Exit 0 on every "not this time" path: cron must not see a scheduled chore
-# declining to run as a failure.
-skip() { log_run "skipped" "reason=$1" "${@:2}"; exit 0; }
 
 # The header comment above, however long it grows: everything after the
 # shebang up to the first line that is not a comment.
@@ -334,9 +309,9 @@ skip_nothing_eligible() {
     fi
     engines+=( "$engine" )
   done
-  (( ${#verdicts[@]} )) || skip "no eligible entry for slot ${SLOT}"
+  (( ${#verdicts[@]} )) || skip nothing-eligible "no eligible entry for slot ${SLOT}"
   local why; why="$(printf '%s; ' "${verdicts[@]}")"
-  skip "no eligible entry for slot ${SLOT} (${why%; })" \
+  skip nothing-eligible "no eligible entry for slot ${SLOT} (${why%; })" \
     "quota=$(IFS=,; printf '%s' "${quotas[*]}")" "engine=$(IFS=,; printf '%s' "${engines[*]}")"
 }
 
@@ -402,7 +377,7 @@ select_entry() {
 }
 
 main() {
-  parse_args "$@"
+  parse_args "$@"; trap outcome_on_exit EXIT
   mkdir -p "$STATE_DIR" "$WORKTREE_DIR" "${MEUTE_ROOT}/reports"
   command -v jq >/dev/null || die "jq is required"
   scrub_env
@@ -412,11 +387,11 @@ main() {
   # down should decline without needing a lock, a valid manifest or a quota
   # probe. See lib/fleet.sh for why a manual hold exists at all.
   if hold_active; then
-    skip "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
+    skip hold "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
   fi
 
   # One runner at a time. A slow run must not stack up under a tight timer.
-  runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip "another run holds the lock"
+  runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip lock "another run holds the lock"
 
   python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "manifest failed validation"
 
@@ -430,9 +405,9 @@ main() {
   local rc=0; fleet_wire_self_budget || rc=$?
   (( rc == 127 )) && die "lib/fleet.sh is missing fleet_wire_self_budget"
   if (( rc == 0 )); then
-    BUDGET_LEFT="$(fleet_self_budget_remaining)" || skip "self-budget probe failed"
+    BUDGET_LEFT="$(fleet_self_budget_remaining)" || skip budget "self-budget probe failed"
     (( BUDGET_LEFT < 1 )) \
-      && skip "meute's own weekly ceiling is spent" "budget=${BUDGET_LEFT}"
+      && skip budget "meute's own weekly ceiling is spent" "budget=${BUDGET_LEFT}"
   fi
 
   local queue_file
@@ -475,7 +450,7 @@ main() {
     select_entry || true
     entry="$SELECTED"
   fi
-  (( ${#QUEUE[@]} )) || skip "no queue entries for slot ${SLOT}"
+  (( ${#QUEUE[@]} )) || skip no-queue "no queue entries for slot ${SLOT}"
   [[ -n "$entry" ]] || skip_nothing_eligible
 
   # The selected entry's pool, from the reading eligible() cached -- or, for
@@ -487,11 +462,11 @@ main() {
   engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
   if [[ -n "$engine" ]]; then
     quota_for_engine "$engine"
-    [[ "$QUOTA_PROBE" != "fail" ]] || skip "${engine} quota probe failed"
+    [[ "$QUOTA_PROBE" != "fail" ]] || skip quota-unknown "${engine} quota probe failed"
     remaining="${QUOTA_PROBE%% *}"
     QUOTA_SOURCE="${QUOTA_PROBE#* }"
     (( remaining < QUOTA_FLOOR )) \
-      && skip "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
+      && skip quota-floor "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
     remaining_at_start="$remaining"
   fi
   run_entry "$entry"
@@ -659,7 +634,7 @@ run_entry() {
   # after that check, where a child the engine left running could still
   # commit before cleanup.
   (( SCRATCH_LFS_OVERRIDE )) && DISCARD_BRANCH=1
-  trap cleanup EXIT
+  trap 'outcome_on_exit cleanup' EXIT
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
     # other side of the mount, so the container gets a self-contained clone
