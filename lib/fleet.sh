@@ -126,6 +126,7 @@ week_runs() {
   awk -v wk="week=${THIS_WEEK}" -v kf="$kind" '
     index($0, wk) == 0        { next }
     index($0, "status=skipped") { next }
+    index($0, "\tcode=died\t")  { next }
     kf != "" && index($0, "kind=" kf) == 0 { next }
     { n++ } END { print n + 0 }' "$LOG_FILE"
 }
