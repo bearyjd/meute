@@ -6239,6 +6239,7 @@ test_run_lock_git_hooks
 test_run_lock_error_paths
 test_exit_log_line
 test_strict_exit_codes
+test_run_tmp_cleaned
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

@@ -52,6 +52,7 @@ source "${MEUTE_ROOT}/lib/container.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 source "${MEUTE_ROOT}/lib/runlock.sh"
+source "${MEUTE_ROOT}/lib/tmp.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 # The harness is public; a real fleet config names private projects and says what
 # they do. repos.local.yaml is gitignored and wins when present, so you never have
@@ -151,7 +152,7 @@ cleanup() {
       git -C "$REPO_PATH" branch -q -D "$BRANCH" >/dev/null 2>&1 || true
     fi
   fi
-  return $rc
+  tmp_cleanup; return $rc
 }
 
 parse_args() {
@@ -377,10 +378,10 @@ select_entry() {
 }
 
 main() {
-  outcome_scan_args "$@"; parse_args "$@"; trap outcome_on_exit EXIT
+  outcome_scan_args "$@"; parse_args "$@"; trap 'outcome_on_exit tmp_cleanup' EXIT
   mkdir -p "$STATE_DIR" "$WORKTREE_DIR" "${MEUTE_ROOT}/reports"
   command -v jq >/dev/null || die "jq is required"
-  scrub_env
+  scrub_env; tmp_init "$STATE_DIR"
   type -P git >/dev/null || die "git is required"
 
   # Cheapest verdict first, and it depends on nothing: a fleet you have stood
@@ -412,7 +413,6 @@ main() {
 
   local queue_file
   queue_file="$(mktemp)"
-  trap 'rm -f "$queue_file"' RETURN
   # A portfolio plan exists only after an explicit `meute plan --enqueue`.
   # It is independently re-expanded and refuses writing tiers in manifest.py;
   # then the ordinary timers prioritize it until every staged item is attempted.
@@ -587,7 +587,7 @@ run_entry() {
   # reach would fail every Read the template asks for.
   local agent_path="$WORKTREE"
   (( CONTAINER_MODE )) && agent_path="/work"
-  local prompt_file; prompt_file="$(mktemp)"
+  local prompt_file="${STATE_DIR}/dry-run-prompt.md"; (( DRY_RUN )) || prompt_file="$(mktemp)"
   python3 "$MANIFEST_PY" render "$template" \
     "REPO_NAME=${repo}" "REPO_SPEC=${spec}" "REPO_PATH=${agent_path}" \
     "TASK=${task}" "TIER=${tier}" "DATE=${DATE}" "BRANCH=${BRANCH}" \
