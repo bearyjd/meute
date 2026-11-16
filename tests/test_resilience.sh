@@ -199,6 +199,98 @@ test_run_lock_error_paths() {
   rmdir "$root/state/lock-info"
 }
 
+# P0.2 (R1): every fire leaves exactly one state/log line, and that line names
+# its outcome in a code= field. A fatal path used to exit with
+# nothing in state/log, so a broken manifest stopped the fleet silently.
+_log_lines() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
+
+test_exit_log_line() {
+  local root="$FIXTURE/exitlog" repo="$FIXTURE/exitlog/git-lk" log out rc before
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  local fire=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily )
+
+  # A manifest that fails validation: one died line, naming the cause.
+  cp "$root/repos.yaml" "$root/repos.yaml.good"
+  printf 'version: 1\nrepos: not-a-list\n' > "$root/repos.yaml"
+  before="$(_log_lines "$log")"
+  rc=0; out="$("${fire[@]}" 2>&1)" || rc=$?
+  is  "exit log: an invalid manifest adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=died"                         "$(tail -1 "$log" 2>/dev/null)" $'\tcode=died'
+  has "exit log: ...and status=error"                       "$(tail -1 "$log" 2>/dev/null)" $'\tstatus=error'
+  has "exit log: ...naming the cause in detail="            "$(tail -1 "$log" 2>/dev/null)" "detail=manifest failed validation"
+  is  "exit log: ...and the run still fails"                "$rc" "1"
+  has "exit log: ...still saying why on stderr"             "$out" "meute: manifest failed validation"
+  mv "$root/repos.yaml.good" "$root/repos.yaml"
+
+  # A death no die() reports: mktemp fails under set -e.
+  before="$(_log_lines "$log")"
+  rc=0; out="$(env TMPDIR=/nonexistent "${fire[@]}" 2>&1)" || rc=$?
+  is  "exit log: a failed mktemp adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=died"                     "$(tail -1 "$log" 2>/dev/null)" $'\tcode=died'
+
+  # A skip: one line, its reason= unchanged, and a code= from the fixed list.
+  printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "testing" > "$root/state/hold"
+  before="$(_log_lines "$log")"
+  rc=0; out="$("${fire[@]}" 2>&1)" || rc=$?
+  is  "exit log: a hold adds exactly one line"   "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...keeping its reason="         "$(tail -1 "$log")" $'\treason=paused until'
+  has "exit log: ...with code=hold"              "$(tail -1 "$log")" $'\tcode=hold'
+  is  "exit log: ...and exits 0"                 "$rc" "0"
+  rm -f "$root/state/hold"
+
+  local held; exec {held}>"$root/state/.lock"; flock -n "$held"
+  before="$(_log_lines "$log")"
+  "${fire[@]}" >/dev/null 2>&1
+  exec {held}>&-
+  is  "exit log: a held lock adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=lock"                 "$(tail -1 "$log")" $'\tcode=lock'
+
+  before="$(_log_lines "$log")"
+  env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=10 "$root/bin/run.sh" daily >/dev/null 2>&1
+  is  "exit log: a quota below the floor adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=nothing-eligible"                  "$(tail -1 "$log")" $'\tcode=nothing-eligible'
+
+  # A completed run: exactly one line (no second line from the exit trap),
+  # still ending in code=.
+  before="$(_log_lines "$log")"
+  rc=0; "${fire[@]}" >/dev/null 2>&1 || rc=$?
+  is  "exit log: a completed run adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...status=ok"                          "$(tail -1 "$log")" $'\tstatus=ok'
+  has "exit log: ...with code=ok"                       "$(tail -1 "$log")" $'\tcode=ok'
+  is  "exit log: ...and exits 0"                        "$rc" "0"
+
+  # A failed run logs its own line and exits 1; the exit trap adds nothing.
+  sed -i 's/is_error:false/is_error:true/' "$root/stub/claude"
+  before="$(_log_lines "$log")"
+  rc=0; "${fire[@]}" >/dev/null 2>&1 || rc=$?
+  is  "exit log: a failed run adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=failed"                "$(tail -1 "$log")" $'\tcode=failed'
+  is  "exit log: ...and exits 1"                     "$rc" "1"
+  sed -i 's/is_error:true/is_error:false/' "$root/stub/claude"
+
+  # A dry run is not a fire and writes nothing, as before.
+  before="$(_log_lines "$log")"
+  "${fire[@]}" --dry-run >/dev/null 2>&1
+  is  "exit log: a dry run adds no line" "$(( $(_log_lines "$log") - before ))" "0"
+
+  # A died fire ran no engine, so it is not a run and spends no budget. The
+  # log now holds two died lines, three skips, one ok and one failed: 2 runs.
+  is  "exit log: died fires are not runs in the inbox" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.runs)" "2"
+  is  "exit log: ...nor spend weekly_runs" \
+      "$(MEUTE_ROOT="$root" MEUTE_WEEKLY_RUNS=10 "$root/contrib/quota-self-budget.sh")" "80"
+  is  "exit log: ...nor count in week_runs" \
+      "$(LOG_FILE="$log" THIS_WEEK="$(date +%G-%V)"; source "$root/lib/fleet.sh"; week_runs)" "2"
+  has "exit log: ...nor in the status total" \
+      "$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)" "  2 runs ("
+  local last_ok; last_ok="$(grep $'\tcode=failed\t' "$log" | tail -1 | cut -f1)"
+  printf '9999-12-31T00:00:00+00:00\tweek=%s\tslot=daily\tstatus=error\tdetail=x\tcode=died\tdur=0s\truntime=-\timage=-\tstage=-\tpr=-\n' \
+    "$(date +%G-%V)" >> "$log"
+  is  "exit log: ...nor become the inbox's last_run" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.last_run)" "$last_ok"
+}
+
 # P0.10: a workflow runs both suites on push and PR, using no third-party
 # action beyond checkout, so a red test blocks merge.
 test_p0_ci_workflow() {
