@@ -95,7 +95,7 @@ emit() {
 # the fleet run at full speed exactly when the operator asked it not to.
 run_configured_probe() {
   local command="$1" label="$2" raw
-  if raw="$(eval "$command" 2>/dev/null)"; then
+  if raw="$(env MEUTE_ROOT="$MEUTE_ROOT" timeout --kill-after=5 30 bash -Eeuo pipefail -c "$command" 2>/dev/null)"; then
     emit "${raw//[[:space:]]/}" "$(basename "${command%% *}")"
     exit $?
   fi

@@ -447,3 +447,90 @@ test_run_tmp_cleaned() {
   is "run tmp: ...and exits 0"                              "$rc" "0"
   is "run tmp: ...leaving nothing in state/tmp"             "$(_count_entries "$FIXTURE/state/tmp")" "0"
 }
+
+# P0.6 (R9): a probe that hangs used to hang the fire while it held the lock.
+# Each probe is now bounded (30 s), so a hung one reads as "unknown" and the
+# slot is declined, not wedged. The three cases run side by side because each
+# one costs the full bound when the guard is missing.
+test_bounded_probes() {
+  local root="$FIXTURE/probes" repo="$FIXTURE/probes/git-lk" d
+  _runlock_fixture "$root" "$repo" tier2
+  # A root whose quota.sh itself hangs, to reach the outer bound at the call site.
+  local hroot="$FIXTURE/probes-hang"
+  _runlock_fixture "$hroot" "$FIXTURE/probes-hang/git-lk" tier2
+  rm "$hroot/bin"; mkdir "$hroot/bin"; cp "$REPO/bin/run.sh" "$hroot/bin/run.sh"
+  printf '#!/usr/bin/env bash\nsleep 300\n' > "$hroot/bin/quota.sh"; chmod +x "$hroot/bin/quota.sh"
+  # A self-budget adapter that hangs.
+  local broot="$FIXTURE/probes-budget"; mkdir -p "$broot/contrib"
+  printf '#!/usr/bin/env bash\nsleep 300\n' > "$broot/contrib/quota-self-budget.sh"; chmod +x "$broot/contrib/quota-self-budget.sh"
+
+  local t0=$SECONDS
+  ( env PATH="$root/stub:$PATH" MEUTE_CLAUDE_QUOTA_CMD='sleep 300' timeout 90 "$root/bin/run.sh" daily --repo lk --task t >/dev/null 2>&1
+    echo $((SECONDS - t0)) > "$root/elapsed" ) &
+  ( env PATH="$hroot/stub:$PATH" timeout 90 "$hroot/bin/run.sh" daily --repo lk --task t >/dev/null 2>&1
+    echo $((SECONDS - t0)) > "$hroot/elapsed" ) &
+  ( MEUTE_ROOT="$broot" timeout 90 bash -c 'source "$1"; fleet_self_budget_remaining' _ "$REPO/lib/fleet.sh" >/dev/null 2>&1
+    echo "$?" > "$broot/rc"; echo $((SECONDS - t0)) > "$broot/elapsed" ) &
+  # quota.sh called directly (doctor and status do), without run.sh's bound.
+  ( MEUTE_CLAUDE_QUOTA_CMD='sleep 300' timeout 90 "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1
+    echo "$?" > "$root/direct.rc"; echo $((SECONDS - t0)) > "$root/direct.elapsed" ) &
+  wait
+
+  [[ "$(cat "$root/direct.rc")" == 1 && "$(cat "$root/direct.elapsed")" -lt 40 ]] \
+    && ok "probes: quota.sh on its own gives up on a hung command within 40 s" \
+    || bad "probes: quota.sh on its own gives up on a hung command within 40 s" "rc=$(cat "$root/direct.rc") took $(cat "$root/direct.elapsed") s"
+  has "probes: a hung configured quota command is skipped as quota-unknown" "$(tail -1 "$root/state/log" 2>/dev/null)" "code=quota-unknown"
+  [[ "$(cat "$root/elapsed")" -lt 40 ]] && ok "probes: ...within 40 s" || bad "probes: ...within 40 s" "took $(cat "$root/elapsed") s"
+  has "probes: a hung quota.sh is skipped as quota-unknown" "$(tail -1 "$hroot/state/log" 2>/dev/null)" "code=quota-unknown"
+  [[ "$(cat "$hroot/elapsed")" -lt 45 ]] && ok "probes: ...within 45 s" || bad "probes: ...within 45 s" "took $(cat "$hroot/elapsed") s"
+  [[ "$(cat "$broot/rc")" != 0 && "$(cat "$broot/elapsed")" -lt 40 ]] \
+    && ok "probes: a hung self-budget adapter fails within 40 s" \
+    || bad "probes: a hung self-budget adapter fails within 40 s" "rc=$(cat "$broot/rc") took $(cat "$broot/elapsed") s"
+}
+
+# P0.6 (R9): bounding the probe must not loosen it. eval ran a configured probe
+# under quota.sh's own pipefail and nounset, with quota.sh's MEUTE_ROOT in scope;
+# the bounded child shell has to keep all three, or a broken probe reads as a quota.
+test_probe_shell_options() {
+  local rc out
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='false | echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a pipeline whose first stage fails still declines (exit 1)" "$rc" "1"
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='echo $MEUTE_UNSET_PROBE_VAR; echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a probe reading an unset variable still declines (exit 1)" "$rc" "1"
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='false; echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a probe whose earlier command fails declines (exit 1)" "$rc" "1"
+  rc=0; out="$(env -u MEUTE_ROOT MEUTE_CLAUDE_QUOTA_CMD='test "$MEUTE_ROOT" = "'"$REPO"'" && echo 77' \
+    "$REPO/bin/quota.sh" --engine claude 2>/dev/null)" || rc=$?
+  is "probes: a probe sees quota.sh's MEUTE_ROOT when the caller did not export it" "$rc:$out" "0:77"
+}
+
+# P0.6 (R9, R7 part): the generated service gets resource limits and a start
+# timeout, so a hung fire can neither starve the desktop nor outlive its
+# manifest's longest timeout_seconds (60 in this fixture) plus ten minutes.
+test_unit_limits() {
+  local root="$FIXTURE/unitlimits" repo="$FIXTURE/unitlimits/git-lk" home="$FIXTURE/unitlimits/home" stub="$FIXTURE/unitlimits/sysstub" unit
+  _runlock_fixture "$root" "$repo" tier2
+  mkdir -p "$home" "$stub"
+  printf '#!/usr/bin/env bash\n[[ "$*" == *show* ]] && printf "LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nNextElapseUSecRealtime=Sun 2026-08-30 03:17:00 EDT\\n"\nexit 0\n' > "$stub/systemctl"
+  printf '#!/usr/bin/env bash\nprintf "yes\\n"\n' > "$stub/loginctl"
+  chmod +x "$stub/systemctl" "$stub/loginctl"
+  XDG_CONFIG_HOME="$home/.config" PATH="$stub:$PATH" MEUTE_MANIFEST="$root/repos.yaml" \
+    "$root/bin/meute" install-timers >/dev/null 2>&1
+  for unit in daily weekly; do
+    local text; text="$(cat "$home/.config/systemd/user/meute-${unit}.service" 2>/dev/null)"
+    has "unit limits: ${unit} service has Nice=10"                 "$text" "Nice=10"
+    has "unit limits: ${unit} service has IOSchedulingClass=idle"  "$text" "IOSchedulingClass=idle"
+    has "unit limits: ${unit} service has CPUWeight=20"            "$text" "CPUWeight=20"
+    has "unit limits: ${unit} service has TimeoutStartSec = max timeout + 600" "$text" "TimeoutStartSec=660"
+  done
+
+  # doctor: an installed unit without the directives is flagged; one with them is not.
+  local old="$FIXTURE/unitlimits/old"; mkdir -p "$old"
+  printf '[Service]\nType=oneshot\nExecStart=/x/run.sh daily\n' > "$old/meute-daily.service"
+  cp "$home/.config/systemd/user/meute-weekly.service" "$old/meute-weekly.service"
+  local out
+  out="$(bash -c 'source "$1"; d_warn() { printf "WARN %s\n" "$*"; }; doctor_unit_limits "$2"' _ "$REPO/bin/meute" "$old" 2>&1)"
+  has   "unit limits: doctor warns on a unit lacking them"   "$out" "meute-daily.service"
+  has   "unit limits: ...and says to re-run install-timers"  "$out" "re-run install-timers"
+  hasnt "unit limits: ...but not on a current unit"          "$out" "meute-weekly.service"
+}

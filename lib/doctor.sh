@@ -241,6 +241,7 @@ cmd_doctor() {
     local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     if [[ -f "${unit_dir}/meute-daily.timer" ]]; then
       d_ok "units installed in ${unit_dir}"
+      doctor_unit_limits "$unit_dir"
       local slot state detail
       for slot in daily weekly; do
         IFS=$'\t' read -r state detail <<<"$(timer_state "meute-${slot}.timer")"
