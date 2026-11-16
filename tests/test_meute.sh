@@ -6231,6 +6231,9 @@ test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
+test_run_lock_not_inherited
+test_run_lock_git_hooks
+test_run_lock_error_paths
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
