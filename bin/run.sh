@@ -406,7 +406,7 @@ main() {
   mkdir -p "$STATE_DIR" "$WORKTREE_DIR" "${MEUTE_ROOT}/reports"
   command -v jq >/dev/null || die "jq is required"
   scrub_env
-  command -v git >/dev/null || die "git is required"
+  type -P git >/dev/null || die "git is required"
 
   # Cheapest verdict first, and it depends on nothing: a fleet you have stood
   # down should decline without needing a lock, a valid manifest or a quota
