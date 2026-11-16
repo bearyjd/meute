@@ -2,6 +2,49 @@
 # tests/test_meute.sh, which supplies REPO, FIXTURE and the ok/bad/is/has
 # helpers; nothing here runs on its own.
 
+# P0.9: the status-line capture must not leave rate-limits.json.* strays when
+# the final rename fails or the render is killed, and sweeps old strays.
+test_p09_statusline_tmp() {
+  local root="$FIXTURE/p09" cap="$REPO/contrib/statusline-capture.sh"
+  local state="$root/state" shim="$root/shim" doc
+  mkdir -p "$state" "$shim"
+  doc='{"rate_limits":{"five_hour":{"used_percentage":5,"resets_at":9999999999}}}'
+
+  # mv shimmed to fail, then a normal run: nothing may be left behind.
+  printf '#!/bin/sh\nexit 1\n' > "$shim/mv"; chmod +x "$shim/mv"
+  printf '%s' "$doc" | PATH="$shim:$PATH" MEUTE_ROOT="$root" "$cap" -- 'true'
+  is "p0.9 capture: a failed rename leaves no stray temp file" \
+     "$(ls "$state" | grep -c '^rate-limits\.json\.')" "0"
+  printf '%s' "$doc" | MEUTE_ROOT="$root" "$cap" -- 'true'
+  is "p0.9 capture: the normal run still writes the snapshot" \
+     "$(jq -r .five_hour.used_percentage "$state/rate-limits.json")" "5"
+  is "p0.9 capture: ...and leaves no sibling files" \
+     "$(ls "$state" | grep -c '^rate-limits\.json\.')" "0"
+
+  # opportunistic sweep: old strays go, a fresh sibling (a concurrent render) stays.
+  rm -f "$state/rate-limits.json"
+  : > "$state/rate-limits.json.OLD123"; touch -d '20 minutes ago' "$state/rate-limits.json.OLD123"
+  : > "$state/rate-limits.json.NEW123"
+  printf '%s' "$doc" | MEUTE_ROOT="$root" "$cap" -- 'true'
+  [[ ! -e "$state/rate-limits.json.OLD123" ]] && ok "p0.9 capture: a stray older than 10 minutes is swept" \
+    || bad "p0.9 capture: a stray older than 10 minutes is swept" "still present"
+  [[ -e "$state/rate-limits.json.NEW123" ]] && ok "p0.9 capture: a fresh sibling is left alone" \
+    || bad "p0.9 capture: a fresh sibling is left alone" "was deleted"
+  rm -f "$state"/rate-limits.json.*
+
+  # an unwritable state dir must not put a redirect error on stderr: the
+  # status line this script wraps must never break.
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "p0.9 capture: unwritable state dir stays silent" "running as root; chmod cannot block writes"
+  else
+    rm -f "$state/rate-limits.json"; chmod 555 "$state"
+    local err
+    err="$(printf '%s' "$doc" | MEUTE_ROOT="$root" "$cap" -- 'true' 2>&1 >/dev/null)"
+    chmod 755 "$state"
+    is "p0.9 capture: unwritable state dir stays silent" "$err" ""
+  fi
+}
+
 # P0.1 (R2): the run lock is fd 9 of run.sh. Every child used to inherit it,
 # so an engine that left a process behind (here: one in its own session,
 # which no process-group kill reaches) held the lock after run.sh exited and
@@ -231,6 +274,38 @@ test_exit_log_line() {
   before="$(_log_lines "$log")"
   "${fire[@]}" --dry-run >/dev/null 2>&1
   is  "exit log: a dry run adds no line" "$(( $(_log_lines "$log") - before ))" "0"
+
+  # A died fire ran no engine, so it is not a run and spends no budget. The
+  # log now holds two died lines, three skips, one ok and one failed: 2 runs.
+  is  "exit log: died fires are not runs in the inbox" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.runs)" "2"
+  is  "exit log: ...nor spend weekly_runs" \
+      "$(MEUTE_ROOT="$root" MEUTE_WEEKLY_RUNS=10 "$root/contrib/quota-self-budget.sh")" "80"
+  is  "exit log: ...nor count in week_runs" \
+      "$(LOG_FILE="$log" THIS_WEEK="$(date +%G-%V)"; source "$root/lib/fleet.sh"; week_runs)" "2"
+  has "exit log: ...nor in the status total" \
+      "$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)" "  2 runs ("
+  local last_ok; last_ok="$(grep $'\tcode=failed\t' "$log" | tail -1 | cut -f1)"
+  printf '9999-12-31T00:00:00+00:00\tweek=%s\tslot=daily\tstatus=error\tdetail=x\tcode=died\tdur=0s\truntime=-\timage=-\tstage=-\tpr=-\n' \
+    "$(date +%G-%V)" >> "$log"
+  is  "exit log: ...nor become the inbox's last_run" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.last_run)" "$last_ok"
+}
+
+# P0.10: a workflow runs both suites on push and PR, using no third-party
+# action beyond checkout, so a red test blocks merge.
+test_p0_ci_workflow() {
+  local wf="$REPO/.github/workflows/test.yml"
+  [[ -f "$wf" ]] || { bad "ci workflow exists" "missing $wf"; return; }
+  ok "ci workflow exists"
+  local text; text="$(cat "$wf")"
+  has "ci triggers on push" "$text" "push:"
+  has "ci triggers on pull_request" "$text" "pull_request:"
+  has "ci runs the shell suite" "$text" "bash tests/test_meute.sh"
+  has "ci runs the unit suite" "$text" "python3 -m unittest discover tests"
+  local bad_uses
+  bad_uses="$(grep -E '^\s*-?\s*uses:' "$wf" | grep -v 'actions/checkout@' || true)"
+  is "ci uses only actions/checkout" "$bad_uses" ""
 }
 
 # P0.3 (R1, second half): --strict-exit (or MEUTE_STRICT_EXIT=1) makes the exit
@@ -345,11 +420,20 @@ test_run_tmp_cleaned() {
   is  "run tmp: ...and exits 0"                         "$rc" "0"
 
   # MEUTE_TMPDIR moves it; the run's directory is created and removed there.
-  local alt="$FIXTURE/runtmp-alt"; mkdir -p "$alt"
-  env MEUTE_TMPDIR="$alt" TMPDIR="$sentinel" PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1
-  has "run tmp: MEUTE_TMPDIR is honoured"     "$(tail -1 "$root/state/log")" $'\tcode=ok'
-  is  "run tmp: ...and left empty"            "$(_count_entries "$alt")" "0"
-  is  "run tmp: ...with nothing in TMPDIR"    "$(_count_entries "$sentinel")" "0"
+  # A probe engine records the TMPDIR it is handed mid-run, so a runner that
+  # ignored MEUTE_TMPDIR (and used state/tmp) fails here, not just elsewhere.
+  local alt="$FIXTURE/runtmp-alt" probe="$FIXTURE/runtmp-probe" seen
+  mkdir -p "$alt" "$probe"
+  printf '#!/usr/bin/env bash\n[[ "$1" == auth ]] || { [[ -d "$TMPDIR" ]] && printf "%%s\\n" "$TMPDIR" > "%s/seen"; }\nexec "%s/stub/claude" "$@"\n' \
+    "$probe" "$root" > "$probe/claude"
+  chmod +x "$probe/claude"
+  env MEUTE_TMPDIR="$alt" TMPDIR="$sentinel" PATH="$probe:$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1
+  seen="$(cat "$probe/seen" 2>/dev/null)"
+  has "run tmp: MEUTE_TMPDIR is honoured"           "$(tail -1 "$root/state/log")" $'\tcode=ok'
+  has "run tmp: ...the run directory is made there" "$seen" "$alt/run."
+  is  "run tmp: ...and removed after the run"       "$([[ -n "$seen" && ! -e "$seen" ]] && echo gone || echo "present:$seen")" "gone"
+  is  "run tmp: ...and left empty"                  "$(_count_entries "$alt")" "0"
+  is  "run tmp: ...with nothing in TMPDIR"          "$(_count_entries "$sentinel")" "0"
 
   # The runner's temp files are private to the user who runs it.
   has "run tmp: the run directory template is private" \

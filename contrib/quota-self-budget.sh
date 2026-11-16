@@ -42,10 +42,12 @@ if [[ -z "${MEUTE_WEEKLY_RUNS:-}${MEUTE_WEEKLY_COST_USD:-}" ]]; then
   exit 1
 fi
 
-# Only completed runs count. Skips consumed nothing.
+# Only completed runs count. Skips consumed nothing, and neither did a died
+# fire (code=died): the runner failed before any engine ran.
 used="$(awk -F'\t' -v wk="week=${WEEK}" -v mode="${MEUTE_WEEKLY_RUNS:+runs}" '
   index($0, wk) == 0            { next }
   index($0, "status=skipped")   { next }
+  index($0, "\tcode=died\t")    { next }
   {
     if (mode == "runs") { n += 1; next }
     for (i = 1; i <= NF; i++)
