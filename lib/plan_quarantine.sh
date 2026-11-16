@@ -8,11 +8,11 @@
 # follows, so OUTCOME_CODE and OUTCOME_LOGGED are put back as they were.
 #
 # plan-queue also fails when the manifest is what broke (edited mid-run, say).
-# The plan is not at fault then, so it stays put and this returns 1 for the
-# caller to die on the manifest, as the runner always has.
+# The plan is not at fault then, so it stays put and this dies on the manifest,
+# as the runner always has.
 plan_quarantine() {
   local reason="$1" dest
-  python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null 2>&1 || return 1
+  python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null 2>&1 || die "manifest failed validation"
   dest="${STATE_DIR}/plan-queue.invalid-$(date +%Y%m%dT%H%M%S).json"
   [[ ! -e "$dest" ]] || dest="${dest}.$$"
   if ! mv -- "$PLAN_QUEUE_FILE" "$dest"; then

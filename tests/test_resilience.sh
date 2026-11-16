@@ -579,10 +579,11 @@ test_plan_quarantine_manifest_broken() {
     "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.yaml" "$root/state/plan-queue.json" daily >/dev/null 2>&1; echo $?)" "0"
   # The stub agent breaks the manifest while it runs.
   sed -i "2i printf 'version: [\\\\n' > '$root/repos.yaml'" "$root/stub/claude"
-  rc=0; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1 || rc=$?
+  local out; rc=0; out="$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily 2>&1)" || rc=$?
   is  "plan quarantine (manifest broken): the manifest really broke" \
     "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" >/dev/null 2>&1; echo $?)" "1"
   is  "plan quarantine (manifest broken): the fire fails on the manifest" "$(( rc != 0 ))" "1"
+  has "plan quarantine (manifest broken): ...saying so on stderr" "$out" "meute: manifest failed validation"
   is  "plan quarantine (manifest broken): the plan stays in place" "$(cat "$root/state/plan-queue.json" 2>/dev/null)" "$plan"
   is  "plan quarantine (manifest broken): nothing is quarantined" \
     "$(compgen -G "$root/state/plan-queue.invalid-*" || echo none)" "none"
