@@ -58,7 +58,7 @@ cmd_status() {
   if fleet_load_scope 2>/dev/null; then in_flight="$(tier3_in_flight 2>/dev/null || echo 0)"; fi
   printf '  tier-3 in flight  %s of %s\n' "${in_flight:-0}" "${TIER3_CAP}"
 
-  local new_count; new_count="$(cmd_reports --new 2>/dev/null | grep -c '^NEW' || true)"
+  local new_count; new_count="$(python3 "$INBOX_PY" counts 2>/dev/null || true)"; new_count="${new_count#reports_new=}"
   printf '  reports unread    %s\n' "${new_count:-0}"
 }
 

@@ -3,6 +3,9 @@
 
     python3 lib/inbox.py dump              -- the whole inbox as one JSON object
     python3 lib/inbox.py report <id>       -- one report's body (markdown)
+    python3 lib/inbox.py counts            -- `reports_new=<n>`, for `meute status`
+    python3 lib/inbox.py findings [--new|--all] --tsv
+                                           -- one row per finding, for `meute findings`
     python3 lib/inbox.py promote <id> <n>
     python3 lib/inbox.py dismiss <id> <n> <reason> [message]
     python3 lib/inbox.py resolve <id> <n> <message>
@@ -134,6 +137,38 @@ def load_reports() -> tuple[list[dict], list[dict]]:
     return reports, findings
 
 
+def count_new_reports() -> int:
+    """Reports with no decision recorded: what `meute reports --new` lists.
+    Reads no report bodies, so an unreadable one still counts, as it does there."""
+    rows = _state_rows()
+    return sum(1 for rid in _report_ids() if rows.get(rid, ("new",))[0] == "new")
+
+
+def findings_tsv(only_new: bool) -> list[str]:
+    """`repo rank severity report#n STATE title` rows, tab separated, unsorted:
+    the shape bin/meute's cmd_findings sorts and lays out. One process for every
+    report, where the shell version spawned several per finding."""
+    rows = _state_rows()
+    out: list[str] = []
+    for rid in _report_ids():
+        try:
+            meta, body = report_lib.read(report_path(rid))
+        except Exception:  # unreadable: no rows, as `report.py findings` failing
+            continue
+        if not report_lib.has_findings_section(body):
+            continue
+        repo = meta.get("repo") or ("" if meta.get("repo") == "" else "?")
+        for f in report_lib.parse_findings(body):
+            state = rows.get(f"{rid}#{f['n']}", ("new",))[0]
+            if only_new and state != "new":
+                continue
+            out.append("\t".join((
+                repo, str(SEVERITY_RANK[f["severity"]]), f["severity"],
+                f"{rid}#{f['n']}", "NEW" if state == "new" else state,
+                f["title"].split("\t")[0])))
+    return out
+
+
 def finding_body(rid: str, n: int) -> str:
     """The markdown of one finding, from its `###` header to the next."""
     _, body = report_lib.read(report_path(rid))
@@ -260,6 +295,11 @@ def main(argv: list[str]) -> int:
         _, body = report_lib.read(report_path(args[0]))
         _meute("show", args[0], check=False)  # marks it read, same as the CLI
         sys.stdout.write(body)
+    elif cmd == "counts":
+        print(f"reports_new={count_new_reports()}")
+    elif cmd == "findings" and "--tsv" in args:
+        for row in findings_tsv("--new" in args):
+            print(row)
     elif cmd in ("promote", "dismiss", "resolve") and len(args) >= 2:
         result = act(cmd, args[0], int(args[1]), *args[2:])
         print(json.dumps(result))
