@@ -3213,9 +3213,21 @@ PY2
   has "gates: ...naming the floor as the reason"                     "$out" "below floor 30%"
   has "gates: ...and the real source, not the stub"                  "$out" "quota=20:quota-subscription.sh"
 
-  # Both clear -> the run proceeds to selection.
+  # Both clear -> the run proceeds to selection. Past the gates the dry run
+  # reaches preflight, so a stub `claude` answers it: the suite must not
+  # depend on a signed-in CLI on the host (CI runners have none).
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then
+  printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$root/stub/claude"
   printf '{"captured_at":1,"seven_day":{"used_percentage":10,"resets_at":9999999999}}' > "$snap"
-  out="$("$root/bin/run.sh" daily --dry-run 2>&1)"
+  out="$(PATH="$root/stub:$PATH" "$root/bin/run.sh" daily --dry-run 2>&1)"
   has "gates: both clear and the run goes ahead" "$out" "would run: key=r/audit-security"
 
   # The agent's cwd is the worktree and dontAsk refuses reads outside it, so
