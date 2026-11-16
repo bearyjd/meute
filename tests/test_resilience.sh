@@ -230,6 +230,22 @@ test_exit_log_line() {
   before="$(_log_lines "$log")"
   "${fire[@]}" --dry-run >/dev/null 2>&1
   is  "exit log: a dry run adds no line" "$(( $(_log_lines "$log") - before ))" "0"
+
+  # A died fire ran no engine, so it is not a run and spends no budget. The
+  # log now holds two died lines, three skips, one ok and one failed: 2 runs.
+  is  "exit log: died fires are not runs in the inbox" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.runs)" "2"
+  is  "exit log: ...nor spend weekly_runs" \
+      "$(MEUTE_ROOT="$root" MEUTE_WEEKLY_RUNS=10 "$root/contrib/quota-self-budget.sh")" "80"
+  is  "exit log: ...nor count in week_runs" \
+      "$(LOG_FILE="$log" THIS_WEEK="$(date +%G-%V)"; source "$root/lib/fleet.sh"; week_runs)" "2"
+  has "exit log: ...nor in the status total" \
+      "$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)" "  2 runs ("
+  local last_ok; last_ok="$(grep $'\tcode=failed\t' "$log" | tail -1 | cut -f1)"
+  printf '9999-12-31T00:00:00+00:00\tweek=%s\tslot=daily\tstatus=error\tdetail=x\tcode=died\tdur=0s\truntime=-\timage=-\tstage=-\tpr=-\n' \
+    "$(date +%G-%V)" >> "$log"
+  is  "exit log: ...nor become the inbox's last_run" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.last_run)" "$last_ok"
 }
 
 # P0.10: a workflow runs both suites on push and PR, using no third-party
