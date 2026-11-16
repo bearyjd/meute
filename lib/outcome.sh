@@ -13,6 +13,18 @@
 #   died    the runner itself failed before writing a line
 #   and one of OUTCOME_SKIP_CODES for a fire that declined to run.
 #
+# Exit status. Without --strict-exit (or MEUTE_STRICT_EXIT=1) a skip exits 0 and
+# every failure exits 1, so cron and the installed units see no change. With it
+# the status names the outcome, so a loop can branch on $? alone:
+#    0  ran ok (a dry run included)      13  quota (floor, or probe failed)
+#    1  ran and failed                   14  nothing eligible (or no queue)
+#    2  usage                            15  host not healthy (load, disk)
+#   10  hold                             70  the runner itself died
+#   11  another run holds the lock
+#   12  budget (meute's own ceiling)
+# The code= field in state/log is the same vocabulary; tui/runprogress.py
+# reads it in preference to the free text.
+#
 # Expects from the caller: LOG_FILE, STARTED_AT, THIS_WEEK, START_EPOCH, SLOT,
 # and the LOG_RUNTIME/LOG_IMAGE/LOG_STAGE/LOG_PR columns (unset reads as "-").
 
@@ -20,9 +32,39 @@ readonly OUTCOME_SKIP_CODES="hold lock budget quota-floor quota-unknown nothing-
 OUTCOME_LOGGED=0
 OUTCOME_CODE=""
 OUTCOME_LAST_NOTE=""
+OUTCOME_STRICT=0
+OUTCOME_USAGE=0
+
+# outcome_scan_args "$@": turn strict exits on before argument parsing, so a
+# usage error is reported with the strict status whatever order the flags came.
+outcome_scan_args() {
+  [[ "${MEUTE_STRICT_EXIT:-}" != "1" ]] || OUTCOME_STRICT=1
+  local arg
+  for arg in "$@"; do [[ "$arg" != "--strict-exit" ]] || OUTCOME_STRICT=1; done
+}
+
+# outcome_exit_status <code>: the strict exit status for a code= token.
+outcome_exit_status() {
+  case "$1" in
+    ok) echo 0 ;;
+    failed) echo 1 ;;
+    hold) echo 10 ;;
+    lock) echo 11 ;;
+    budget) echo 12 ;;
+    quota-floor|quota-unknown) echo 13 ;;
+    nothing-eligible|no-queue) echo 14 ;;
+    load|disk) echo 15 ;;
+    *) echo 70 ;;
+  esac
+}
 
 note() { OUTCOME_LAST_NOTE="$*"; printf 'meute: %s\n' "$*" >&2; }
 # The EXIT trap logs the message as detail=.
+# A usage error: 1 as ever, 2 under --strict-exit.
+usage_die() {
+  OUTCOME_USAGE=1; OUTCOME_LAST_NOTE="$*"; printf 'meute: %s\n' "$*" >&2
+  exit $(( OUTCOME_STRICT ? 2 : 1 ))
+}
 die()  { OUTCOME_LAST_NOTE="$*"; printf 'meute: %s\n' "$*" >&2; exit 1; }
 
 # One line per invocation, always, including every skip path. This file is the
@@ -54,6 +96,7 @@ skip() {
   [[ " $OUTCOME_SKIP_CODES " == *" $1 "* ]] || die "skip: unknown code: $1"
   OUTCOME_CODE="$1"
   log_run "skipped" "reason=$2" "${@:3}"
+  (( ! OUTCOME_STRICT )) || exit "$(outcome_exit_status "$1")"
   exit 0
 }
 
@@ -71,6 +114,7 @@ outcome_on_exit() {
     detail="${detail//[$'\t\r\n']/ }"
     OUTCOME_CODE="died"
     log_run "error" "detail=${detail}"
+    (( ! OUTCOME_STRICT || OUTCOME_USAGE )) || exit "$(outcome_exit_status died)"
   fi
   return "$rc"
 }
