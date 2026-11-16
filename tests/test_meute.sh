@@ -6248,5 +6248,7 @@ test_plan_quarantine_manifest_broken
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
+test_p0_5_single_process_reads
+test_p0_5_findings_failure_and_nonregular
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

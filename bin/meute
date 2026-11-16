@@ -60,6 +60,7 @@ readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 readonly REPORT_PY="${MEUTE_ROOT}/lib/report.py"
+readonly INBOX_PY="${MEUTE_ROOT}/lib/inbox.py"
 if [[ -n "${MEUTE_MANIFEST:-}" ]]; then
   readonly MANIFEST="$MEUTE_MANIFEST"
 elif [[ -f "${MEUTE_ROOT}/repos.local.yaml" ]]; then
@@ -179,24 +180,12 @@ cmd_findings() {
   # Under state/tmp, not $TMPDIR, and gone however the command ends.
   tmp_init "$STATE_DIR"; trap tmp_cleanup EXIT
   local tmp; tmp="$(mktemp)"
-  local id path meta repo n total state sev title loc
-  while read -r id; do
-    [[ -n "$id" ]] || continue
-    path="$(report_path "$id")"
-    meta="$(python3 "$REPORT_PY" meta "$path" 2>/dev/null || echo '{}')"
-    repo="$(jq -r '.repo // "?"' <<< "$meta")"
-    # Content-driven: any report with a Findings section, not one task name.
-    total="$(python3 "$REPORT_PY" findings "$path" 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
-    for (( n = 1; n <= total; n++ )); do
-      state="$(finding_state "$id" "$n")"
-      [[ "$filter" == "--new" && "$state" != "new" ]] && continue
-      local f; f="$(python3 "$REPORT_PY" findings "$path" | jq -r --argjson n "$n" '.[] | select(.n == $n) | "\(.severity)\t\(.location)\t\(.title)"')"
-      sev="$(cut -f1 <<< "$f")"; loc="$(cut -f2 <<< "$f")"; title="$(cut -f3 <<< "$f")"
-      printf '%s\t%s\t%s\t%s#%s\t%s\t%s\n' \
-        "$repo" "$(awk -v s="$sev" '{for(i=1;i<=NF;i+=2) if($i==s) print $(i+1)}' <<< "$SEVERITY_RANK")" \
-        "$sev" "$id" "$n" "$([[ "$state" == new ]] && echo NEW || echo "$state")" "$title" >> "$tmp"
-    done
-  done < <(report_ids)
+  # One process reads every report; the shell only sorts and lays out.
+  # A crash must not read as "no findings": stderr stays visible and the exit
+  # status is non-zero.
+  if ! python3 "$INBOX_PY" findings "$filter" --tsv > "$tmp"; then
+    rm -f "$tmp"; die "findings failed: lib/inbox.py exited with an error (see above)"
+  fi
 
   if [[ ! -s "$tmp" ]]; then rm -f "$tmp"; note "no ${filter#--} findings"; return 0; fi
   # grouped by repo, most severe first inside each group

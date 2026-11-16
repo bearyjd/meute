@@ -3,6 +3,9 @@
 
     python3 lib/inbox.py dump              -- the whole inbox as one JSON object
     python3 lib/inbox.py report <id>       -- one report's body (markdown)
+    python3 lib/inbox.py counts            -- `reports_new=<n>`, for `meute status`
+    python3 lib/inbox.py findings [--new|--all] --tsv
+                                           -- one row per finding, for `meute findings`
     python3 lib/inbox.py promote <id> <n>
     python3 lib/inbox.py dismiss <id> <n> <reason> [message]
     python3 lib/inbox.py resolve <id> <n> <message>
@@ -56,9 +59,11 @@ def _state_rows() -> dict[str, tuple[str, str, str]]:
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             parts = line.rstrip("\n").split("\t")
-            if len(parts) >= 2:
-                rows[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "",
-                                  parts[3] if len(parts) > 3 else "")
+            # First row for a key wins, as bin/meute's kv_row; a key-only row
+            # (no tab) is a decision with an empty state, not "new".
+            rows.setdefault(parts[0], (parts[1] if len(parts) > 1 else "",
+                                       parts[2] if len(parts) > 2 else "",
+                                       parts[3] if len(parts) > 3 else ""))
     return rows
 
 
@@ -67,12 +72,15 @@ def _report_ids() -> list[str]:
     ids: list[str] = []
     if not os.path.isdir(base):
         return ids
+    # Regular files in real directories only: what bin/meute's `find -type f`
+    # lists, so the count and the list agree with `meute reports`.
     for repo in sorted(os.listdir(base)):
         d = os.path.join(base, repo)
-        if not os.path.isdir(d):
+        if os.path.islink(d) or not os.path.isdir(d):
             continue
         for name in sorted(os.listdir(d)):
-            if name.endswith(".md"):
+            p = os.path.join(d, name)
+            if name.endswith(".md") and os.path.isfile(p) and not os.path.islink(p):
                 ids.append(f"{repo}/{name[:-3]}")
     return ids
 
@@ -132,6 +140,39 @@ def load_reports() -> tuple[list[dict], list[dict]]:
         reports.append(entry)
     findings.sort(key=lambda f: (f["repo"], f["rank"], f["report"], f["n"]))
     return reports, findings
+
+
+def count_new_reports() -> int:
+    """Reports with no decision recorded: what `meute reports --new` lists.
+    Reads no report bodies, so an unreadable one still counts, as it does there."""
+    rows = _state_rows()
+    return sum(1 for rid in _report_ids() if rows.get(rid, ("new",))[0] == "new")
+
+
+def findings_tsv(only_new: bool) -> list[str]:
+    """`repo rank severity report#n STATE title` rows, tab separated, unsorted:
+    the shape bin/meute's cmd_findings sorts and lays out. One process for every
+    report, where the shell version spawned several per finding."""
+    rows = _state_rows()
+    out: list[str] = []
+    for rid in _report_ids():
+        try:
+            meta, body = report_lib.read(report_path(rid))
+        except Exception as e:  # skip it, but say so: never a silent "no findings"
+            sys.stderr.write(f"meute: skipping unreadable report {rid}: {e}\n")
+            continue
+        if not report_lib.has_findings_section(body):
+            continue
+        repo = meta.get("repo") or ("" if meta.get("repo") == "" else "?")
+        for f in report_lib.parse_findings(body):
+            state = rows.get(f"{rid}#{f['n']}", ("new",))[0]
+            if only_new and state != "new":
+                continue
+            out.append("\t".join((
+                repo, str(SEVERITY_RANK[f["severity"]]), f["severity"],
+                f"{rid}#{f['n']}", "NEW" if state == "new" else state,
+                f["title"].split("\t")[0])))
+    return out
 
 
 def finding_body(rid: str, n: int) -> str:
@@ -262,6 +303,11 @@ def main(argv: list[str]) -> int:
         _, body = report_lib.read(report_path(args[0]))
         _meute("show", args[0], check=False)  # marks it read, same as the CLI
         sys.stdout.write(body)
+    elif cmd == "counts":
+        print(f"reports_new={count_new_reports()}")
+    elif cmd == "findings" and "--tsv" in args:
+        for row in findings_tsv("--new" in args):
+            print(row)
     elif cmd in ("promote", "dismiss", "resolve") and len(args) >= 2:
         result = act(cmd, args[0], int(args[1]), *args[2:])
         print(json.dumps(result))
