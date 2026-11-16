@@ -73,3 +73,31 @@ test_p0_ci_workflow() {
   bad_uses="$(grep -E '^\s*-?\s*uses:' "$wf" | grep -v 'actions/checkout@' || true)"
   is "ci uses only actions/checkout" "$bad_uses" ""
 }
+
+# P0.5 follow-ups: a crash in inbox.py must be loud, and non-regular `.md`
+# entries (symlinks, directories) are not reports, in the count or the list.
+test_p0_5_findings_failure_and_nonregular() {
+  local root="$FIXTURE/p05b" out rc
+  mkdir -p "$root/reports/alpha" "$root/reports/beta" "$root/state" "$root/tasks" "$root/lib"
+  ln -sfn "$REPO/bin" "$root/bin"
+  cp "$REPO"/lib/* "$root/lib/" 2>/dev/null
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  cp "$FIXTURE/repos.yaml" "$root/repos.yaml"
+  printf -- '---\nrepo: alpha\ntask: audit-security\ntier: tier2\nstarted: 2026-09-01T04:00:00-04:00\nstatus: ok\n---\n\n## Summary\nx\n\n## Findings\n\n### [HIGH] Real one\n- **Anchor:** `src/a.py:1`\n' \
+    > "$root/reports/alpha/audit-01.md"
+  # Non-regular entries that the shell `find -type f` never listed.
+  ln -s "audit-01.md" "$root/reports/alpha/audit-link.md"
+  mkdir "$root/reports/beta/dir.md"
+  out="$("$root/bin/meute" status 2>&1 | grep 'reports unread')"
+  has "p0.5: unread count ignores symlinks and directories" "$out" "reports unread    1"
+  out="$("$root/bin/meute" findings --all 2>&1)"
+  is "p0.5: findings ignores symlinked report" "$(grep -c 'audit-link' <<< "$out")" "0"
+
+  # A crashing inbox.py: stderr is shown, a warning is printed, exit is non-zero.
+  printf 'import sys\nsys.stderr.write("boom-from-inbox\\n")\nsys.exit(3)\n' > "$root/lib/inbox.py"
+  rc=0; out="$("$root/bin/meute" findings --new 2>&1)" || rc=$?
+  is  "p0.5: findings exits non-zero when inbox.py crashes" "$(( rc != 0 ))" "1"
+  has "p0.5: findings shows the inbox.py error" "$out" "boom-from-inbox"
+  has "p0.5: findings warns instead of 'no new findings'" "$out" "meute: findings failed"
+  is  "p0.5: no false 'no new findings' on crash" "$(grep -c 'no new findings' <<< "$out")" "0"
+}

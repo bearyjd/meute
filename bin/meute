@@ -177,7 +177,11 @@ cmd_findings() {
   local filter="${1:---new}"
   local tmp; tmp="$(mktemp)"
   # One process reads every report; the shell only sorts and lays out.
-  python3 "$INBOX_PY" findings "$filter" --tsv > "$tmp" 2>/dev/null || : > "$tmp"
+  # A crash must not read as "no findings": stderr stays visible and the exit
+  # status is non-zero.
+  if ! python3 "$INBOX_PY" findings "$filter" --tsv > "$tmp"; then
+    rm -f "$tmp"; die "findings failed: lib/inbox.py exited with an error (see above)"
+  fi
 
   if [[ ! -s "$tmp" ]]; then rm -f "$tmp"; note "no ${filter#--} findings"; return 0; fi
   # grouped by repo, most severe first inside each group

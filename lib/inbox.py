@@ -70,12 +70,15 @@ def _report_ids() -> list[str]:
     ids: list[str] = []
     if not os.path.isdir(base):
         return ids
+    # Regular files in real directories only: what bin/meute's `find -type f`
+    # lists, so the count and the list agree with `meute reports`.
     for repo in sorted(os.listdir(base)):
         d = os.path.join(base, repo)
-        if not os.path.isdir(d):
+        if os.path.islink(d) or not os.path.isdir(d):
             continue
         for name in sorted(os.listdir(d)):
-            if name.endswith(".md"):
+            p = os.path.join(d, name)
+            if name.endswith(".md") and os.path.isfile(p) and not os.path.islink(p):
                 ids.append(f"{repo}/{name[:-3]}")
     return ids
 
