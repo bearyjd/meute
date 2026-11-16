@@ -153,7 +153,7 @@ podman_available() {
 
 podman_run() {
   local -a podman; read -ra podman <<< "$(podman_cmd)"
-  timeout "$PODMAN_TIMEOUT" "${podman[@]}" "$@"
+  timeout "$PODMAN_TIMEOUT" "${podman[@]}" "$@" 9>&-
 }
 
 # What the tag points at right now: "<digest> <id>", from ONE inspect.
@@ -495,7 +495,7 @@ container_run() {
   local -a podman; read -ra podman <<< "$(podman_cmd)"
   local seconds; seconds="$(jq -r '.timeout_seconds // ""' <<< "$entry")"
   timeout --kill-after="$CONTAINER_STOP_TIMEOUT" "$(container_outer_bound "$seconds")" \
-    "${podman[@]}" run --pidfile "${piddir}/pid" "${CONTAINER_ARGV[@]:1}" || rc=$?
+    "${podman[@]}" run --pidfile "${piddir}/pid" "${CONTAINER_ARGV[@]:1}" 9>&- || rc=$?
   [[ -s "${piddir}/pid" ]] && CONTAINER_STARTED=1
   rm -f "${piddir}/pid"; rmdir "$piddir" 2>/dev/null \
     || container_note "could not remove the pidfile directory ${piddir}"

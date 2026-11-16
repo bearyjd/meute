@@ -3,6 +3,7 @@
 # Lock and temp files. Only state/.gitkeep and reports/.gitkeep are tracked;
 # the fleet's own state/cursor, state/log and reports/ are ignored below.
 state/.lock
+state/lock-info
 state/.kv.*
 .omc/
 # Your real fleet config: names your projects and describes what they do.
