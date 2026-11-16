@@ -62,7 +62,9 @@ if command -v jq >/dev/null 2>&1; then
     trap 'rm -f "$tmp"' EXIT
     find "$(dirname "$SNAPSHOT")" -maxdepth 1 -name 'rate-limits.json.*' \
       -mmin +10 -delete 2>/dev/null
-    printf '%s\n' "$snapshot" > "$tmp" 2>/dev/null \
+    # The braces carry the 2>/dev/null: a redirect failure on the printf is
+    # reported by the shell before the printf's own 2>/dev/null applies.
+    { printf '%s\n' "$snapshot" > "$tmp"; } 2>/dev/null \
       && mv -f "$tmp" "$SNAPSHOT" 2>/dev/null
     # exec below skips the EXIT trap, so clean up explicitly as well.
     rm -f "$tmp"

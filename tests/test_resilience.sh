@@ -30,6 +30,18 @@ test_p09_statusline_tmp() {
   [[ -e "$state/rate-limits.json.NEW123" ]] && ok "p0.9 capture: a fresh sibling is left alone" \
     || bad "p0.9 capture: a fresh sibling is left alone" "was deleted"
   rm -f "$state"/rate-limits.json.*
+
+  # an unwritable state dir must not put a redirect error on stderr: the
+  # status line this script wraps must never break.
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "p0.9 capture: unwritable state dir stays silent" "running as root; chmod cannot block writes"
+  else
+    rm -f "$state/rate-limits.json"; chmod 555 "$state"
+    local err
+    err="$(printf '%s' "$doc" | MEUTE_ROOT="$root" "$cap" -- 'true' 2>&1 >/dev/null)"
+    chmod 755 "$state"
+    is "p0.9 capture: unwritable state dir stays silent" "$err" ""
+  fi
 }
 
 # P0.10: a workflow runs both suites on push and PR, using no third-party
