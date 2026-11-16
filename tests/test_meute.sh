@@ -50,6 +50,8 @@ PY
 }
 validate() { MEUTE_ROOT="${2:-$(dirname "$1")}" python3 "$REPO/lib/manifest.py" validate "$1" 2>&1 || true; }
 
+source "$REPO/tests/test_resilience.sh"
+
 # ---------------------------------------------------------------- fixture ---
 setup() {
   mkdir -p "$FIXTURE"/{state,tasks,reports/alpha,reports/beta}
@@ -6217,6 +6219,7 @@ test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
+test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
