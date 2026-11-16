@@ -59,9 +59,11 @@ def _state_rows() -> dict[str, tuple[str, str, str]]:
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             parts = line.rstrip("\n").split("\t")
-            if len(parts) >= 2:
-                rows[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "",
-                                  parts[3] if len(parts) > 3 else "")
+            # First row for a key wins, as bin/meute's kv_row; a key-only row
+            # (no tab) is a decision with an empty state, not "new".
+            rows.setdefault(parts[0], (parts[1] if len(parts) > 1 else "",
+                                       parts[2] if len(parts) > 2 else "",
+                                       parts[3] if len(parts) > 3 else ""))
     return rows
 
 
@@ -156,7 +158,8 @@ def findings_tsv(only_new: bool) -> list[str]:
     for rid in _report_ids():
         try:
             meta, body = report_lib.read(report_path(rid))
-        except Exception:  # unreadable: no rows, as `report.py findings` failing
+        except Exception as e:  # skip it, but say so: never a silent "no findings"
+            sys.stderr.write(f"meute: skipping unreadable report {rid}: {e}\n")
             continue
         if not report_lib.has_findings_section(body):
             continue

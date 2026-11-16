@@ -93,6 +93,26 @@ test_p0_5_findings_failure_and_nonregular() {
   out="$("$root/bin/meute" findings --all 2>&1)"
   is "p0.5: findings ignores symlinked report" "$(grep -c 'audit-link' <<< "$out")" "0"
 
+  # state/reports parity with the shell kv_row: first duplicate wins, a
+  # key-only row (no tab) is not a decision.
+  printf 'alpha/audit-01#1\tdismissed\t2026-09-02\nalpha/audit-01#1\tactioned\t2026-09-03\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --all 2>&1)"
+  has "p0.5: duplicate state rows: first wins" "$(grep 'audit-01#1' <<< "$out")" "dismissed"
+  printf 'alpha/audit-01#1\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p0.5: key-only state row hides the finding from --new" "$(grep -c 'audit-01#1' <<< "$out")" "0"
+  : > "$root/state/reports"
+
+  # An unreadable report is named on stderr, not silently dropped.
+  if [[ "$(id -u)" != 0 ]]; then
+    cp "$root/reports/alpha/audit-01.md" "$root/reports/alpha/audit-02.md"
+    chmod 000 "$root/reports/alpha/audit-02.md"
+    out="$("$root/bin/meute" findings --all 2>&1)"
+    chmod 644 "$root/reports/alpha/audit-02.md"
+    has "p0.5: unreadable report is warned about" "$out" "skipping unreadable report alpha/audit-02"
+    rm "$root/reports/alpha/audit-02.md"
+  fi
+
   # A crashing inbox.py: stderr is shown, a warning is printed, exit is non-zero.
   printf 'import sys\nsys.stderr.write("boom-from-inbox\\n")\nsys.exit(3)\n' > "$root/lib/inbox.py"
   rc=0; out="$("$root/bin/meute" findings --new 2>&1)" || rc=$?
