@@ -18,6 +18,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 
 import yaml
 
@@ -73,16 +74,47 @@ def validate_merged(new_data: dict, root: str) -> None:
         build_queue(new_data, slot, root)
 
 
+def replace_atomically(path: str, write, mode_from: str | None = None) -> None:
+    """Write a dot-prefixed temp beside `path`, fsync, then rename over it.
+
+    A crash or full disk mid-write must leave the old file whole, never an
+    empty or half-dumped one every following fire dies on (R12). The temp
+    name `.<basename>.<pid>.tmp` matches the `.repos.local.*` gitignore rule.
+    The mode is kept from `path`, or taken from `mode_from` when `path` is
+    new, so a first backup of a 0600 manifest is 0600, not the umask default.
+    The parent directory is fsynced after the rename so the new entry, not
+    the old one, is what survives a power loss.
+    """
+    directory = os.path.dirname(path) or "."
+    temp = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        mode_source = path if os.path.exists(path) else mode_from
+        if mode_source is not None:
+            shutil.copymode(mode_source, temp)
+        os.replace(temp, path)
+    except BaseException:
+        if os.path.exists(temp):
+            os.unlink(temp)
+        raise
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def write_with_backup(manifest: str, new_data: dict) -> None:
     """The resolved file is what changes, so the backup sits beside it, not beside a link."""
     target = os.path.realpath(manifest)
-    backup = f"{target}.bak"
     with open(target, "r", encoding="utf-8") as handle:
         original = handle.read()
-    with open(backup, "w", encoding="utf-8") as handle:
-        handle.write(original)
-    with open(target, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(new_data, handle, sort_keys=False, default_flow_style=False)
+    replace_atomically(f"{target}.bak", lambda handle: handle.write(original), mode_from=target)
+    replace_atomically(target, lambda handle: yaml.safe_dump(
+        new_data, handle, sort_keys=False, default_flow_style=False))
 
 
 def find_project(data: dict, repo_name: str) -> tuple:
