@@ -223,6 +223,8 @@ MD
 }
 
 # ------------------------------------------------------------------ tests ---
+source "$REPO/tests/test_resilience.sh"
+
 test_summaries() {
   is "summary: audit with findings"  "$(report summary "$FIXTURE/reports/alpha/audit-security-2026-08-28.md")" "CRIT×1 HIGH×2"
   is "summary: audit with none"      "$(report summary "$FIXTURE/reports/alpha/audit-security-2026-08-20.md")" "no findings"
@@ -6217,6 +6219,7 @@ test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
+test_run_lock_not_inherited
 test_real_repo_untouched
 test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"

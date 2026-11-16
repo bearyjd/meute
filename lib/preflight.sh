@@ -138,7 +138,7 @@ preflight_container_codex() {
 preflight_claude() {
   local status key_source plan
   command -v claude >/dev/null || die "preflight: the 'claude' CLI is not on PATH."
-  status="$("${ENGINE_ENV[@]}" claude auth status --json 2>/dev/null)" \
+  status="$("${ENGINE_ENV[@]}" claude auth status --json 2>/dev/null 9>&-)" \
     || die "preflight: 'claude auth status' failed — most likely not signed in. Run:  claude auth login"
   [[ "$(jq -r '.loggedIn // false' <<< "$status")" == "true" ]] \
     || die "preflight: claude is not logged in. Run:  claude auth login"
@@ -154,7 +154,7 @@ preflight_claude() {
 preflight_codex() {
   local status
   command -v codex >/dev/null || die "preflight: the 'codex' CLI is not on PATH."
-  status="$("${ENGINE_ENV[@]}" codex login status 2>&1)" \
+  status="$("${ENGINE_ENV[@]}" codex login status 2>&1 9>&-)" \
     || die "preflight: codex is not logged in. Run:  codex login"
   grep -qi 'chatgpt' <<< "$status" \
     || die "preflight: codex did not report a ChatGPT subscription (got: ${status}). Run:  codex login"

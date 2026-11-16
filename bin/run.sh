@@ -49,6 +49,7 @@ source "${MEUTE_ROOT}/lib/engines.sh"
 source "${MEUTE_ROOT}/lib/container.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
+source "${MEUTE_ROOT}/lib/runlock.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 # The harness is public; a real fleet config names private projects and says what
 # they do. repos.local.yaml is gitignored and wins when present, so you never have
@@ -309,7 +310,7 @@ declare -A QUOTA_BY_ENGINE=()
 quota_for_engine() {
   local engine="$1"
   if [[ -z "${QUOTA_BY_ENGINE[$engine]+set}" ]]; then
-    QUOTA_BY_ENGINE[$engine]="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source)" \
+    QUOTA_BY_ENGINE[$engine]="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source 9>&-)" \
       || QUOTA_BY_ENGINE[$engine]="fail"
   fi
   QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"
@@ -415,8 +416,7 @@ main() {
   fi
 
   # One runner at a time. A slow run must not stack up under a tight timer.
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || skip "another run holds the lock"
+  runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip "another run holds the lock"
 
   python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "manifest failed validation"
 
@@ -675,7 +675,7 @@ run_entry() {
     if (( SCRATCH_LFS_OVERRIDE )); then checkout_c=( -c core.hooksPath=/dev/null ); fi
     # From BASE_SHA, not $base_ref: the ref can move after it was resolved,
     # and the tree checked out must be the one LFS detection was asked of.
-    git -C "$REPO_PATH" "${checkout_c[@]}" worktree add -q -b "$BRANCH" "$WORKTREE" "$BASE_SHA" \
+    git -C "$REPO_PATH" "${checkout_c[@]}" worktree add -q -b "$BRANCH" "$WORKTREE" "$BASE_SHA" 9>&- \
       || abort_entry "$entry" "worktree-add-failed"
   fi
   copy_worktree_files "$entry"
@@ -707,7 +707,7 @@ run_entry() {
       *) die "unknown engine: $engine" ;;
     esac
     container_run "$entry" build "$engine" "$WORKTREE" "$OUT_DIR" -- \
-      "${ENGINE_ARGV[@]}" > "$out" 2> "$err" || rc=$?
+      "${ENGINE_ARGV[@]}" 9>&- > "$out" 2> "$err" || rc=$?
   else
     case "$engine" in
       claude) engine_argv_claude "$prompt_file"; engine_cd=( cd "$WORKTREE" ) ;;
@@ -715,7 +715,7 @@ run_entry() {
       *) die "unknown engine: $engine" ;;
     esac
     ( "${engine_cd[@]}" && timeout --kill-after=30 "$TIMEOUT_SECONDS" \
-        "${ENGINE_ENV[@]}" "${ENGINE_ARGV[@]}" ) > "$out" 2> "$err" || rc=$?
+        "${ENGINE_ENV[@]}" "${ENGINE_ARGV[@]}" ) 9>&- > "$out" 2> "$err" || rc=$?
   fi
   case "$engine" in
     claude) extract_claude "$out" || true ;;
