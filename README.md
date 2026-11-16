@@ -303,6 +303,14 @@ not fall back to the stub — falling back would silently disable the gate at
 exactly the moment you asked for it. Fail closed, always. That includes a
 `state/rate-limits.json` that exists but cannot be read.
 
+**Probes run bounded, with errexit on.** Each configured probe command runs
+under `timeout 30` in `bash -Eeuo pipefail`, so a hung probe declines the slot
+instead of stalling the fire. Because errexit is on, a probe whose earlier
+command fails now declines even if its last command prints a value
+(`false; echo 50` declines; before, it reported 50). This is a deliberate
+fail-closed behaviour change: write probes so every command succeeds, or chain
+them with `&&` or `||` where a failure is expected.
+
 #### Codex
 
 Codex has no built-in balance source, and none of the Claude sources — the
