@@ -6225,6 +6225,8 @@ test_run_lock_error_paths
 test_exit_log_line
 test_strict_exit_codes
 test_run_tmp_cleaned
+test_bounded_probes
+test_unit_limits
 test_real_repo_untouched
 test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"

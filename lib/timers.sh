@@ -177,6 +177,7 @@ Type=oneshot
 WorkingDirectory=${MEUTE_ROOT}
 Environment=PATH=${path_line}
 ExecStart=${MEUTE_ROOT}/bin/run.sh ${slot}
+$(unit_limit_lines)
 # stdout and stderr go to the journal; the runner also appends to state/log.
 UNIT
     cat > "${unit_dir}/meute-${slot}.timer" <<UNIT

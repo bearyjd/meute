@@ -186,5 +186,5 @@ fleet_wire_self_budget() {
 # meaningful after fleet_wire_self_budget returned 0. Fails (non-zero) if the
 # adapter cannot answer, which the caller must treat as "decline", not "fine".
 fleet_self_budget_remaining() {
-  "${MEUTE_ROOT}/contrib/quota-self-budget.sh"
+  timeout --kill-after=5 30 "${MEUTE_ROOT}/contrib/quota-self-budget.sh"
 }

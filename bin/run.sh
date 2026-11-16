@@ -286,7 +286,7 @@ declare -A QUOTA_BY_ENGINE=()
 quota_for_engine() {
   local engine="$1"
   if [[ -z "${QUOTA_BY_ENGINE[$engine]+set}" ]]; then
-    QUOTA_BY_ENGINE[$engine]="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source 9>&-)" \
+    QUOTA_BY_ENGINE[$engine]="$(timeout --kill-after=5 35 "${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source 9>&-)" \
       || QUOTA_BY_ENGINE[$engine]="fail"
   fi
   QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"
