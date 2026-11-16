@@ -6244,6 +6244,7 @@ test_bounded_probes
 test_probe_shell_options
 test_unit_limits
 test_plan_quarantine
+test_plan_quarantine_manifest_broken
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
