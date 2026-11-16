@@ -404,6 +404,22 @@ test_bounded_probes() {
     || bad "probes: a hung self-budget adapter fails within 40 s" "rc=$(cat "$broot/rc") took $(cat "$broot/elapsed") s"
 }
 
+# P0.6 (R9): bounding the probe must not loosen it. eval ran a configured probe
+# under quota.sh's own pipefail and nounset, with quota.sh's MEUTE_ROOT in scope;
+# the bounded child shell has to keep all three, or a broken probe reads as a quota.
+test_probe_shell_options() {
+  local rc out
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='false | echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a pipeline whose first stage fails still declines (exit 1)" "$rc" "1"
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='echo $MEUTE_UNSET_PROBE_VAR; echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a probe reading an unset variable still declines (exit 1)" "$rc" "1"
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='false; echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a probe whose earlier command fails declines (exit 1)" "$rc" "1"
+  rc=0; out="$(env -u MEUTE_ROOT MEUTE_CLAUDE_QUOTA_CMD='test "$MEUTE_ROOT" = "'"$REPO"'" && echo 77' \
+    "$REPO/bin/quota.sh" --engine claude 2>/dev/null)" || rc=$?
+  is "probes: a probe sees quota.sh's MEUTE_ROOT when the caller did not export it" "$rc:$out" "0:77"
+}
+
 # P0.6 (R9, R7 part): the generated service gets resource limits and a start
 # timeout, so a hung fire can neither starve the desktop nor outlive its
 # manifest's longest timeout_seconds (60 in this fixture) plus ten minutes.
