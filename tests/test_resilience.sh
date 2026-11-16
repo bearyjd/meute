@@ -534,3 +534,58 @@ test_unit_limits() {
   has   "unit limits: ...and says to re-run install-timers"  "$out" "re-run install-timers"
   hasnt "unit limits: ...but not on a current unit"          "$out" "meute-weekly.service"
 }
+
+# P0.8 (R13). A staged plan that fails validation used to
+# make the runner die before the manifest queue was read, so nothing ran until
+# someone deleted the file. Now the file is renamed aside, one code=plan-invalid
+# line says so, and the same fire runs the manifest's next item.
+test_plan_quarantine() {
+  local root="$FIXTURE/planq" repo="$FIXTURE/planq/git-lk" log out rc before bad
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  local fire=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily )
+
+  for bad in '{"version":2}' '{broken'; do
+    rm -f "$root"/state/plan-queue.invalid-*.json "$root/state/plan-queue.json"
+    printf '%s\n' "$bad" > "$root/state/plan-queue.json"
+    : > "$log"
+    rc=0; out="$("${fire[@]}" 2>&1)" || rc=$?
+    is  "plan quarantine: ${bad}: the fire exits 0"                    "$rc" "0"
+    has "plan quarantine: ${bad}: the manifest item ran (status=ok)"   "$(tail -1 "$log")" $'\tstatus=ok'
+    is  "plan quarantine: ${bad}: one plan-invalid error line"         "$(grep -c $'\tstatus=error\t.*code=plan-invalid' "$log")" "1"
+    is  "plan quarantine: ${bad}: the staged file is gone"             "$([[ -e "$root/state/plan-queue.json" ]] && echo present || echo gone)" "gone"
+    is  "plan quarantine: ${bad}: ...renamed aside, content intact"    "$(cat "$root"/state/plan-queue.invalid-*.json 2>/dev/null)" "$bad"
+  done
+
+  # The next fire is plain: nothing staged, one line, no second quarantine.
+  : > "$log"
+  rc=0; "${fire[@]}" >/dev/null 2>&1 || rc=$?
+  is  "plan quarantine: the next fire is unaffected"  "$(grep -c 'plan-invalid' "$log")" "0"
+  is  "plan quarantine: ...and exits 0"              "$rc" "0"
+}
+
+# P0.8 review: only a bad plan is quarantined. A manifest that breaks while a
+# valid plan is staged (here the agent run corrupts it, so validate has already
+# passed and the post-run plan-queue call is the first to see it) must leave
+# the plan where it is; the fire dies on the manifest as it always did.
+test_plan_quarantine_manifest_broken() {
+  local root="$FIXTURE/planqm" repo="$FIXTURE/planqm/git-lk" log rc
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  printf '{"version":1,"scan":"%s","allow_web":false,"entries":[{"name":"plan-001-x","path":"%s","task":"t"}]}\n' \
+    "$root" "$repo" > "$root/state/plan-queue.json"
+  local plan; plan="$(cat "$root/state/plan-queue.json")"
+  is "plan quarantine (manifest broken): the staged plan is valid" \
+    "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.yaml" "$root/state/plan-queue.json" daily >/dev/null 2>&1; echo $?)" "0"
+  # The stub agent breaks the manifest while it runs.
+  sed -i "2i printf 'version: [\\\\n' > '$root/repos.yaml'" "$root/stub/claude"
+  local out; rc=0; out="$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily 2>&1)" || rc=$?
+  is  "plan quarantine (manifest broken): the manifest really broke" \
+    "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" >/dev/null 2>&1; echo $?)" "1"
+  is  "plan quarantine (manifest broken): the fire fails on the manifest" "$(( rc != 0 ))" "1"
+  has "plan quarantine (manifest broken): ...saying so on stderr" "$out" "meute: manifest failed validation"
+  is  "plan quarantine (manifest broken): the plan stays in place" "$(cat "$root/state/plan-queue.json" 2>/dev/null)" "$plan"
+  is  "plan quarantine (manifest broken): nothing is quarantined" \
+    "$(compgen -G "$root/state/plan-queue.invalid-*" || echo none)" "none"
+  is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
+}
