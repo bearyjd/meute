@@ -202,12 +202,43 @@ process.stdout.write(JSON.stringify([b({busy: true}), b({stopBusy: true}), b({po
     @unittest.skipUnless(HAS_NODE, "node not installed")
     def test_run_js_button_flags_unknown_state_disables_start_enqueue(self):
         r = node_pure("""const f = (o) => buttonFlags(Object.assign({state: "idle", pollFailed: false,
-  busy: false, stopBusy: false, anyChecked: true}, o));
+  busy: false, stopBusy: false, anyChecked: true, staged: true}, o));
 const pick = (x) => [x.start, x.enqueue, x.stop];
 process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), pick(f({state: "running"})),
-  pick(f({busy: true})), pick(f({anyChecked: false}))]));""")
+  pick(f({busy: true})), pick(f({anyChecked: false})), pick(f({staged: false}))]));""")
         self.assertEqual(r, [[True, True, False], [False, False, True], [False, False, True],
-                             [False, False, False], [True, False, False]])
+                             [False, False, False], [True, False, False], [False, True, False]])
+
+    @unittest.skipUnless(HAS_NODE, "node not installed")
+    def test_run_js_start_needs_something_staged(self):
+        r = node_pure("""const flags = (st, o) => buttonFlags(Object.assign({state: "idle", pollFailed: false,
+  busy: false, stopBusy: false, anyChecked: true, staged: isStaged(st)}, o));
+const sh = (x) => [x.start, x.stop, x.hint];
+process.stdout.write(JSON.stringify([
+  sh(flags({total: 3, remaining: 3})),                    // idle + staged
+  sh(flags({total: 0, remaining: 0})),                    // empty queue
+  sh(flags({total: 3, remaining: 0})),                    // finished plan
+  sh(flags(null)),                                        // no status yet
+  sh(flags({total: 3, remaining: 3}, {state: "running"})),
+  sh(flags({total: 3, remaining: 3}, {pollFailed: true})),
+  sh(flags({total: 3, remaining: 3}, {busy: true})),
+  [isStaged({total: 2, remaining: 1}), isStaged({total: 2}), isStaged(undefined)]]));""")
+        self.assertEqual(r, [
+            [True, False, False],      # Start enabled, no hint
+            [False, False, True],      # nothing staged: hint
+            [False, False, True],
+            [False, False, True],
+            [False, True, False],      # running: Stop unchanged, no hint
+            [False, True, False],      # unknown: Start off, Stop on, no hint
+            [False, False, False],
+            [True, False, False]])
+
+    def test_run_js_start_hint_is_text_only_and_wired(self):
+        js = web_file("run.js")
+        self.assertIn("run-start-hint", js)
+        self.assertIn("nothing staged: Plan, tick repos, Enqueue first", js)
+        self.assertIn("staged: isStaged(runUi.status)", js)
+        self.assertNotIn("innerHTML", js)
 
     @unittest.skipUnless(HAS_NODE, "node not installed")
     def test_enqueue_confirm_shows_full_path_per_repo(self):
@@ -259,6 +290,29 @@ process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), p
         self.assertEqual(r[3], {})
         self.assertEqual(r[4], "1 duplicate copy hidden")
         self.assertEqual(r[5], "3 duplicate copies hidden")
+
+    @unittest.skipUnless(HAS_NODE, "node not installed")
+    def test_hostile_keys_do_not_count_as_rows(self):
+        r = node_pure("""const bad = ["__proto__", "constructor", "toString"];
+const plan = {items: [{path: "/p/a", repo: "a", task: "t"}],
+  duplicates: bad.map((k) => ({path: "/d/" + k, of: k})),
+  skipped: bad.map((k) => ({path: k}))};
+const sum = planDedupSummary(plan);
+const copies = copiesByCanonical(bad.map((k) => ({path: "/c/" + k, of: k})));
+const groups = groupByRepo(bad.map((k) => ({path: k, repo: k, task: "t"})));
+process.stdout.write(JSON.stringify([sum, bad.map((k) => copies[k]), groups.map((g) => g.path),
+  planDedupSummary({items: "x", duplicates: 5, skipped: {}, diverged: null}),
+  copiesByCanonical("x"), groupByRepo({})]));""")
+        title = r[0]["title"].split("\n")
+        self.assertEqual(r[0]["text"], "3 duplicate copies collapsed, 3 skipped")
+        self.assertEqual(r[0]["skipped"], ["__proto__", "constructor", "toString"])
+        for k in ("__proto__", "constructor", "toString"):   # their `of` has no row
+            self.assertIn("/d/" + k + " -> " + k, title)
+        self.assertEqual(r[1], [["/c/__proto__"], ["/c/constructor"], ["/c/toString"]])
+        self.assertEqual(r[2], ["__proto__", "constructor", "toString"])
+        self.assertEqual(r[3], {"text": "0 duplicate copies collapsed, 0 skipped", "title": "", "skipped": []})
+        self.assertEqual(r[4], {})
+        self.assertEqual(r[5], [])
 
     def test_run_js_hidden_copies_use_text_and_title_only(self):
         js = web_file("run.js")

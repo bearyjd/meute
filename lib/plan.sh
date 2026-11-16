@@ -244,9 +244,12 @@ plan_print() {
   printf '  scan: %s (max depth: %s)\n' "$scan_dir" "$max_depth"
   printf '  discovered: %d  configured: %d  unconfigured: %d' \
     "${#PLAN_REPOS[@]}" "${#PLAN_CONFIGURED[@]}" "${#PLAN_UNCONFIGURED[@]}"
+  # Diverged copies are a subset of unconfigured, so say so rather than add a
+  # number that would make the line stop summing to discovered.
+  (( ${#PLAN_DIVERGED[@]} == 0 )) || printf ' (incl. %d diverged cop%s)' \
+    "${#PLAN_DIVERGED[@]}" "$( (( ${#PLAN_DIVERGED[@]} == 1 )) && echo y || echo ies)"
   (( ${#PLAN_DUPLICATES[@]} + ${#PLAN_SKIPPED[@]} + ${#PLAN_DIVERGED[@]} == 0 )) \
-    || printf '  duplicates: %d  skipped: %d  diverged: %d' \
-         "${#PLAN_DUPLICATES[@]}" "${#PLAN_SKIPPED[@]}" "${#PLAN_DIVERGED[@]}"
+    || printf '  duplicates: %d  skipped: %d' "${#PLAN_DUPLICATES[@]}" "${#PLAN_SKIPPED[@]}"
   printf '\n\nComparison\n'
   for real in "${PLAN_CONFIGURED[@]}"; do
     printf '  configured    %-24s %s\n' "${PLAN_KNOWN_NAME[$(dir_id "$real")]:-<unnamed>}" "$real"

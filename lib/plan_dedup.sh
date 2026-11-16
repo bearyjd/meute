@@ -49,7 +49,7 @@ PLAN_SCRATCH_NAMES=( output outputs build builds dist vendor third_party upstrea
   runtime tmp temp .local-research .worktrees worktrees checkout node_modules )
 
 PLAN_DUPLICATES=(); PLAN_SKIPPED=(); PLAN_DIVERGED=()
-declare -A PLAN_DUP_OF=() PLAN_DUP_LABEL=() PLAN_DUP_REASON=() PLAN_DIV_OF=()
+declare -A PLAN_DUP_OF=() PLAN_DUP_LABEL=() PLAN_DUP_REASON=() PLAN_DIV_OF=() PLAN_DIV_BLIND=()
 
 # What a skipped repository's owner can do about it, after its path.
 PLAN_SKIP_HINT="history unreadable, e.g. an alternates entry pointing at a deleted repository"
@@ -69,12 +69,13 @@ plan_root_commit() {
   printf '%s' "$key"
 }
 
-# Does the kept repository $2 have copy $1's HEAD commit? If not, $1 holds
-# commits $2 lacks. An unreadable HEAD counts as diverged: keep, do not hide.
+# Does the kept repository $2 have copy $1's HEAD commit? Returns 0 if so, 2
+# if not ($1 holds commits $2 lacks), 1 if $1's HEAD cannot be read. Either
+# failure counts as diverged: keep, do not hide.
 plan_head_in() {
   local oid
   oid="$(git -C "$1" rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null)" || return 1
-  git -C "$2" cat-file -e "${oid}^{commit}" 2>/dev/null
+  git -C "$2" cat-file -e "${oid}^{commit}" 2>/dev/null || return 2
 }
 
 # Does this path, relative to the scan root, look like a scratch copy?
@@ -107,8 +108,11 @@ plan_rank_line() {
 # Record $1 as a duplicate of $2 (a path), shown as $3, for reason $4 --
 # unless $2 lacks $1's HEAD commit: then $1 is diverged, and kept.
 plan_mark_duplicate() {
-  if ! plan_head_in "$1" "$2"; then
+  local rc=0
+  plan_head_in "$1" "$2" || rc=$?
+  if (( rc )); then
     PLAN_DIV_OF["$1"]="$2"
+    (( rc == 1 )) && PLAN_DIV_BLIND["$1"]=1
     return 0
   fi
   PLAN_DUP_OF["$1"]="$2"; PLAN_DUP_LABEL["$1"]="$3"; PLAN_DUP_REASON["$1"]="$4"
@@ -119,7 +123,7 @@ plan_dedup() {
   local -A anchor=() canonical=() canonical_path=()
   local -a lines=() kept=()
   PLAN_DUPLICATES=(); PLAN_SKIPPED=(); PLAN_DIVERGED=()
-  PLAN_DUP_OF=(); PLAN_DUP_LABEL=(); PLAN_DUP_REASON=(); PLAN_DIV_OF=()
+  PLAN_DUP_OF=(); PLAN_DUP_LABEL=(); PLAN_DUP_REASON=(); PLAN_DIV_OF=(); PLAN_DIV_BLIND=()
   # An enrolled repository anchors its group. Several enrolled copies: the
   # first by path. One with unreadable history anchors nothing and stays
   # configured.
@@ -190,7 +194,11 @@ plan_print_dedup() {
   if (( ${#PLAN_DIVERGED[@]} )); then
     printf '\nDiverged copies (kept)\n'
     for real in "${PLAN_DIVERGED[@]}"; do
-      printf '  %s has commits %s lacks\n' "$real" "${PLAN_DIV_OF[$real]}"
+      if [[ -n "${PLAN_DIV_BLIND[$real]+present}" ]]; then
+        printf '  %s: HEAD unreadable (kept; compared with %s)\n' "$real" "${PLAN_DIV_OF[$real]}"
+      else
+        printf '  %s has commits %s lacks\n' "$real" "${PLAN_DIV_OF[$real]}"
+      fi
     done
   fi
   if (( ${#PLAN_SKIPPED[@]} )); then

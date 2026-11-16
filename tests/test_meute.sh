@@ -1416,6 +1416,11 @@ GOLD
   # (c) A copy of an enrolled repository is never staged.
   dedup_repo "$universe/configured-c" group-c
   git clone -q "$universe/configured-c" "$universe/copies/c-clone"
+  # (c2) A clone of an enrolled repository with a commit of its own is diverged:
+  # kept and proposed, not hidden as "already enrolled".
+  git clone -q "$universe/configured-c" "$universe/copies/c-ahead"
+  echo ahead >> "$universe/copies/c-ahead/f.txt"
+  git -C "$universe/copies/c-ahead" -c user.email=t@t -c user.name=t commit -qam ahead
   # (d) A .git-file checkout loses to a plain one even with the shorter,
   # shallower path; a `git worktree add` checkout is not a repository at all;
   # a lone .git-file checkout is kept.
@@ -1456,15 +1461,21 @@ GOLD
 
   out="$("$root/bin/meute" plan "$universe" 2>/dev/null)"
   has "dedup: counts name every class" "$out" \
-    "discovered: 20  configured: 1  unconfigured: 11  duplicates: 7  skipped: 1  diverged: 1"
+    "discovered: 21  configured: 1  unconfigured: 12 (incl. 2 diverged copies)  duplicates: 7  skipped: 1"
+  hasnt "dedup: the old diverged count is gone from the inventory line" "$out" "  diverged: "
   has "dedup: the duplicates section is counted" "$out" "Duplicates collapsed (7)"
   has "dedup: I1 a clone of a two-root repo collapses into it" "$out" "  $universe/output/m-clone -> $universe/merge/m"
   has "dedup: I1 the two-root repo is its own repository" "$out" "unconfigured  m "
   has "dedup: I1 ...and so is each single-root ancestor (p)" "$out" "unconfigured  p "
   has "dedup: I1 ...(q)" "$out" "unconfigured  q "
   has "dedup: I2 a diverged copy is reported as kept" "$out" \
-    $'Diverged copies (kept)\n  '"$universe/output/ahead has commits $universe/a/b/orig lacks"
+    "  $universe/output/ahead has commits $universe/a/b/orig lacks"
+  has "dedup: I2 ...under its own section" "$out" "Diverged copies (kept)"
   has "dedup: I2 ...and proposed" "$out" "unconfigured  ahead "
+  has "dedup: (c2) a diverged copy of an enrolled repo is reported as kept" "$out" \
+    "  $universe/copies/c-ahead has commits $universe/configured-c lacks"
+  has "dedup: (c2) ...and proposed" "$out" "unconfigured  c-ahead "
+  hasnt "dedup: (c2) ...not collapsed as already enrolled" "$out" "$universe/copies/c-ahead -> "
   has "dedup: I2 uncommitted edits alone are still a duplicate" "$out" "  $universe/build/y -> $universe/a/b/orig"
   has "dedup: (a) a scratch clone collapses into the original" "$out" "  $universe/output/x -> $universe/a/b/orig"
   has "dedup: (a) ...and so does the other" "$out" "  $universe/build/y -> $universe/a/b/orig"
@@ -1481,7 +1492,7 @@ GOLD
   has "dedup: (e) its intact clone is still proposed" "$out" "unconfigured  broken-copy"
   has "dedup: (f) an unrelated repo is untouched" "$out" "unconfigured  lone-x"
   has "dedup: (f) a lone scratch-looking repo is kept" "$out" "unconfigured  lone-scratch"
-  is  "dedup: only canonical repos are ranked" "$(grep -cE '^ +[0-9]+\. ' <<< "$out")" "11"
+  is  "dedup: only canonical repos are ranked" "$(grep -cE '^ +[0-9]+\. ' <<< "$out")" "12"
   hasnt "dedup: (i) no credential in the human output" "$out" "SECRET"
   hasnt "dedup: (i) no remote URL in the human output" "$out" "example.com"
 
@@ -1490,13 +1501,22 @@ GOLD
   json="$("$root/bin/meute" plan --json "$universe" 2>"$FIXTURE/plan-dedup.err")"; rc=$?
   is  "dedup json: exits 0" "$rc" "0"
   is  "dedup json: a single JSON object" "$(jq -s 'length == 1 and (.[0] | type) == "object"' <<< "$json")" "true"
-  is  "dedup json: counts" "$(jq -c '[.discovered,.configured,.unconfigured,(.duplicates|length),(.skipped|length)]' <<< "$json")" "[20,1,11,7,1]"
-  is  "dedup json: I2 diverged copies are listed" "$(jq -c '.diverged' <<< "$json")" \
-    "[{\"path\":\"$universe/output/ahead\",\"of\":\"$universe/a/b/orig\"}]"
+  is  "dedup json: counts" "$(jq -c '[.discovered,.configured,.unconfigured,(.duplicates|length),(.skipped|length)]' <<< "$json")" "[21,1,12,7,1]"
+  is  "dedup json: I2 diverged copies are listed" "$(jq -c '.diverged | sort_by(.path)' <<< "$json")" \
+    "[{\"path\":\"$universe/copies/c-ahead\",\"of\":\"$universe/configured-c\"},{\"path\":\"$universe/output/ahead\",\"of\":\"$universe/a/b/orig\"}]"
+  is  "dedup json: (c2) a diverged enrolled-repo copy is not a duplicate" \
+    "$(jq --arg p "$universe/copies/c-ahead" '[.duplicates[] | select(.path == $p)] | length' <<< "$json")" "0"
+  is  "dedup json: (c2) ...and is an item" \
+    "$(jq --arg p "$universe/copies/c-ahead" '[.items[] | select(.path == $p)] | length' <<< "$json")" "1"
+  is  "dedup json: (c2) a copy at the enrolled HEAD IS collapsed, as already enrolled" \
+    "$(jq -r --arg p "$universe/copies/c-clone" '.duplicates[] | select(.path == $p) | .reason' <<< "$json")" \
+    "already enrolled as enrolled-c"
+  is  "dedup json: the diverged count is a subset of unconfigured" \
+    "$(jq -e '(.diverged|length) == 2 and .unconfigured == 12' <<< "$json" >/dev/null; echo $?)" "0"
   is  "dedup json: I2 ...and are items" "$(jq --arg p "$universe/output/ahead" '[.items[] | select(.path == $p)] | length' <<< "$json")" "1"
   is  "dedup json: every discovered repo is in exactly one class" \
     "$(jq -e '.discovered == .configured + .unconfigured + (.duplicates|length) + (.skipped|length)' <<< "$json" >/dev/null; echo $?)" "0"
-  is  "dedup json: items cover canonical repos only" "$(jq '[.items[].path] | unique | length' <<< "$json")" "11"
+  is  "dedup json: items cover canonical repos only" "$(jq '[.items[].path] | unique | length' <<< "$json")" "12"
   is  "dedup json: a duplicate names its canonical path" \
     "$(jq -c --arg p "$universe/output/x" '.duplicates[] | select(.path == $p) | [.of, .reason]' <<< "$json")" \
     "[\"$universe/a/b/orig\",\"duplicate of $universe/a/b/orig\"]"
@@ -1516,7 +1536,7 @@ GOLD
 
   # The queue itself: one set of entries per canonical copy, none for a copy.
   "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
-  is  "dedup stage: entries cover the canonical copies only" "$(jq '[.entries[].path] | unique | length' "$queue")" "11"
+  is  "dedup stage: entries cover the canonical copies only" "$(jq '[.entries[].path] | unique | length' "$queue")" "12"
   is  "dedup stage: I2 the diverged copy is staged" \
     "$(jq --arg p "$universe/output/ahead" '[.entries[] | select(.path == $p)] | length' "$queue")" "1"
   is  "dedup stage: no duplicate or skipped path is staged" \
@@ -1545,6 +1565,26 @@ GOLD
 # meute's own checkout. Also where the plan-vs-manifest bookkeeping (separate
 # cursors, forced re-runs, `meute status`) is pinned, since it needs real
 # attempts rather than dry runs.
+# A diverged copy whose own HEAD cannot be read is kept too, but the human
+# line must not claim it "has commits" the kept copy lacks.
+test_plan_dedup_head_wording() {
+  local d="$FIXTURE/plan-dedup-head" out
+  dedup_repo "$d/kept" kept
+  git clone -q "$d/kept" "$d/ahead"
+  echo ahead >> "$d/ahead/f.txt"
+  git -C "$d/ahead" -c user.email=t@t -c user.name=t commit -qam ahead
+  mkdir -p "$d/nohead"
+  out="$( source "$REPO/lib/plan_dedup.sh"
+          PLAN_DUPLICATES=(); PLAN_SKIPPED=()
+          plan_mark_duplicate "$d/ahead" "$d/kept" x x
+          plan_mark_duplicate "$d/nohead" "$d/kept" x x
+          PLAN_DIVERGED=( "$d/ahead" "$d/nohead" )
+          plan_print_dedup )"
+  has "dedup head: a copy with commits says so" "$out" "  $d/ahead has commits $d/kept lacks"
+  has "dedup head: an unreadable HEAD says so" "$out" "  $d/nohead: HEAD unreadable"
+  hasnt "dedup head: ...and does not claim commits" "$out" "$d/nohead has commits"
+}
+
 test_plan_run() {
   local universe="$FIXTURE/plan-run"
   local root="$universe/meute-stand-in"
@@ -6134,6 +6174,7 @@ test_plan_worktrees
 test_plan
 test_plan_json
 test_plan_dedup
+test_plan_dedup_head_wording
 test_plan_run
 test_repo_default_branch
 test_inbox

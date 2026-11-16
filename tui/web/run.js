@@ -9,8 +9,9 @@ const runUi = { groups: [], timer: null, status: null, planned: false, busy: fal
 // PURE-BEGIN
 function groupByRepo(items) {
   const order = [];
-  const byPath = {};
-  (items || []).forEach((it) => {
+  const byPath = Object.create(null);
+  (Array.isArray(items) ? items : []).forEach((it) => {
+    if (!it) return;
     if (!byPath[it.path]) {
       byPath[it.path] = { repo: it.repo, path: it.path, tasks: [] };
       order.push(it.path);
@@ -34,14 +35,20 @@ function progressValues(st) {
 // A response is applied only if it is newer than the last one applied.
 function shouldApply(seq, lastApplied) { return seq > lastApplied; }
 
+// Something is staged when the last applied status has work left to do; a
+// finished plan (remaining 0), an empty queue or no status at all is not.
+function isStaged(st) { return !!st && st.total > 0 && st.remaining > 0; }
+
 // Button enabled flags. Unknown state (last poll failed) disables Start/Enqueue;
+// Start also needs something staged (`hint`: idle, but nothing to start).
 // Stop is never blocked by busy, only by its own in-flight call.
 function buttonFlags(f) {
   const st = f.pollFailed ? null : f.state;
   const idle = st === "idle";
   return {
     enqueue: !!f.anyChecked && idle && !f.busy,
-    start: idle && !f.busy,
+    start: idle && !f.busy && !!f.staged,
+    hint: idle && !f.busy && !f.staged,
     stop: f.pollFailed ? !f.stopBusy : st !== "idle" && !f.stopBusy,
     plan: !f.busy,
   };
@@ -73,8 +80,8 @@ function enqueueConfirmText(entries) {
 function planDedupSummary(plan) {
   const arr = (v) => (Array.isArray(v) ? v.filter((x) => x && typeof x.path === "string") : []);
   const dups = arr(plan.duplicates), skipped = arr(plan.skipped), diverged = arr(plan.diverged);
-  const rows = {};
-  (plan.items || []).forEach((it) => { if (it) rows[it.path] = true; });
+  const rows = Object.create(null);
+  (Array.isArray(plan.items) ? plan.items : []).forEach((it) => { if (it) rows[it.path] = true; });
   let text = dups.length + " duplicate copies collapsed, " + skipped.length + " skipped";
   if (diverged.length) {
     text += ", " + diverged.length + (diverged.length === 1 ? " diverged copy kept" : " diverged copies kept");
@@ -87,8 +94,8 @@ function planDedupSummary(plan) {
 
 // Collapsed copies keyed by the path they are a copy of, in plan order.
 function copiesByCanonical(dups) {
-  const by = {};
-  (dups || []).forEach((d) => {
+  const by = Object.create(null);
+  (Array.isArray(dups) ? dups : []).forEach((d) => {
     if (!d || typeof d.path !== "string" || typeof d.of !== "string") return;
     (by[d.of] = by[d.of] || []).push(d.path);
   });
@@ -126,8 +133,11 @@ function buildRunSection() {
   const root = $("run");
   const bar = el("div", null, "toolbar");
   const mk = (id, label) => { const b = el("button", label); b.type = "button"; b.id = id; return b; };
+  const hint = el("span", "", "muted");
+  hint.id = "run-start-hint";
   bar.append(mk("run-plan", "Plan"), mk("run-all", "select all"), mk("run-none", "select none"),
-    mk("run-enqueue", "Enqueue selected"), mk("run-start", "Start"), mk("run-stop", "Stop"));
+    mk("run-enqueue", "Enqueue selected"), mk("run-start", "Start"),
+    hint, mk("run-stop", "Stop"));
   const help = el("p", "Tick the repos to analyse, then Enqueue selected. Enqueueing again replaces the "
     + "staged queue (it does not add to it). Nothing is ticked by default.", "muted");
   const prog = el("div", null, "run-progress");
@@ -207,9 +217,11 @@ function syncButtons() {
   const fl = buttonFlags({
     state: runUi.status ? runUi.status.state : "idle", pollFailed: runUi.pollFailed,
     busy: runUi.busy, stopBusy: runUi.stopBusy, anyChecked: checkedEntries().some((e) => e.checked),
+    staged: isStaged(runUi.status),
   });
   $("run-enqueue").disabled = !fl.enqueue;
   $("run-start").disabled = !fl.start;
+  $("run-start-hint").textContent = fl.hint ? "nothing staged: Plan, tick repos, Enqueue first" : "";
   $("run-stop").disabled = !fl.stop;
   $("run-plan").disabled = !fl.plan;
 }
