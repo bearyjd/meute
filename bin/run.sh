@@ -164,8 +164,7 @@ parse_args() {
       --task)     FORCE_TASK="${2:?--task needs a value}"; shift ;;
       --dry-run)  DRY_RUN=1 ;;
       --strict-exit) ;;   # read by outcome_scan_args, before anything can fail
-      # Exits with validate's own status ($?, 1 on error), even under --strict-exit.
-      --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;
+      --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;   # validate's own status, even under --strict-exit
       --help|-h)  usage; exit 0 ;;
       *)          usage_die "unknown argument: $1 (try --help)" ;;
     esac
