@@ -30,13 +30,15 @@
 #   resume                        lift the pause early
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
-#   plan [--enqueue] [--allow-web] [dir]
+#   plan [--enqueue [--only <repo>]...] [--allow-web] [--json] [dir]
 #                                  read-only portfolio inventory and proposed audit plan;
 #                                  --enqueue stages only read-only work for the normal runner
 #                                  (each staged run still cuts a scratch branch and worktree
 #                                  in the repository); tasks that reach the web are left out
 #                                  unless --allow-web, and a tier that can shell out is never
 #                                  staged -- enroll the repository for that instead
+#                                  --only stages just the named unconfigured repos (repeatable)
+#                                  --json prints the inventory and ranking as one JSON object
 #                                  defaults to this checkout's parent directory
 #   tui                           the triage inbox, in the terminal (PRP-003 screen 1)
 #   web [--host H] [--port P] [--insecure-public]
@@ -82,6 +84,7 @@ source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/container.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 source "${MEUTE_ROOT}/lib/plan.sh"
+source "${MEUTE_ROOT}/lib/plan_dedup.sh"
 source "${MEUTE_ROOT}/lib/status.sh"
 source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
@@ -613,17 +616,23 @@ cmd_resume() {
 # the result for the runner. The work lives in lib/plan.sh; this is the
 # command line.
 cmd_plan() {
-  local enqueue=0 allow_web=0 requested="" scan_dir
+  local enqueue=0 allow_web=0 json=0 requested="" scan_dir
+  local -a only=()
   while (( $# )); do
     case "$1" in
       --enqueue) enqueue=1 ;;
       --allow-web) allow_web=1 ;;
+      --json) json=1 ;;
+      --only) (( $# >= 2 )) || die "plan: --only needs a path"; only+=( "$2" ); shift ;;
       --) shift; [[ $# -eq 1 ]] || die "plan: expected at most one directory"; requested="$1"; break ;;
       -*) die "plan: unknown option: $1" ;;
       *) [[ -z "$requested" ]] || die "plan: expected at most one directory"; requested="$1" ;;
     esac
     shift
   done
+  # Usage errors exit 2, apart from the runtime refusals that exit 1.
+  (( ${#only[@]} == 0 || enqueue )) || { note "plan: --only requires --enqueue"; exit 2; }
+  (( ! json || ! enqueue )) || { note "plan: --json is read-only and cannot be combined with --enqueue"; exit 2; }
   requested="${requested:-$(dirname "$MEUTE_ROOT")}"
   scan_dir="$(cd "$requested" 2>/dev/null && pwd)" || die "plan: no such directory: ${requested}"
   # A manifest the runner would refuse is not one to plan against.
@@ -639,6 +648,13 @@ cmd_plan() {
 
   plan_collect_tasks "$allow_web"
   plan_scan_repos "$scan_dir" "$max_depth"
+  # One canonical copy per repository; copies are listed, never staged.
+  plan_dedup "$scan_dir"
+  if (( json )); then
+    plan_print_json "$scan_dir"
+    return 0
+  fi
+  (( ${#only[@]} == 0 )) || plan_restrict_to "${only[@]}"
   plan_print "$scan_dir" "$max_depth"
   if (( enqueue )); then
     plan_stage "$scan_dir" "$allow_web"
@@ -666,27 +682,37 @@ cmd_tui() {
   exec "$py" "${MEUTE_ROOT}/tui/app.py"   # MEUTE_ROOT is already exported
 }
 
-# textual-serve renders the identical app in a browser over a websocket: one
-# codebase, same keybindings, usable on a phone. It has NO authentication, so
-# a non-loopback bind requires an explicit acknowledgement of that risk.
+# `meute web` serves the stdlib web inbox (tui/webserver.py, plain python3, no
+# venv). It has a per-process token and Host/Origin checks but no login, and it
+# can start fleet runs, so a non-loopback bind requires an explicit
+# acknowledgement. The server only accepts requests whose Host header is the
+# bound host:port, so a non-loopback bind must use the address the browser uses.
 cmd_web() {
   local host="127.0.0.1" port="8642" insecure_public=0
   while (( $# )); do
     case "$1" in
-      --host) host="${2:?--host needs a value}"; shift ;;
-      --port) port="${2:?--port needs a value}"; shift ;;
+      --host) (( $# >= 2 )) || die "web: --host needs a value"; host="$2"; [[ "$host" != --* ]] || die "web: --host needs a value, got '${host}'"; shift ;;
+      --port) port="${2:?--port needs a value}"; [[ "$port" != --* ]] || die "web: --port needs a value, got '${port}'"; shift ;;
       --insecure-public) insecure_public=1 ;;
       *) die "web: unknown argument $1" ;;
     esac
     shift
   done
-  local py; py="$(tui_python)"
-  if [[ "$host" != "127.0.0.1" && "$host" != "localhost" && "$host" != "::1" ]]; then
+  [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
+    || die "web: --port must be an integer 1-65535, got '${port}'"
+  # The server accepts only Host == the bound host:port, and no browser sends
+  # Host 0.0.0.0: a wildcard bind would answer every request with 403.
+  case "$host" in
+    ""|0|0.0.0.0|"*") die "web: --host '${host}' is a wildcard bind, which cannot work (the server only accepts the exact bound host:port as Host); bind the specific address the browser will use, e.g. a LAN or tailnet IP, with --insecure-public" ;;
+  esac
+  # The server binds an IPv4 socket; an IPv6 literal (::1, ::) cannot work.
+  [[ "$host" != *:* ]] || die "web: IPv6 host ${host} is not supported; use an IPv4 address (127.0.0.1 is the default)"
+  if [[ "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
     (( insecure_public )) || die "web: refusing non-loopback host ${host}; pass --insecure-public to acknowledge the unauthenticated inbox"
-    note "WARNING: binding ${host} -- the inbox has no auth; anyone who can reach it can promote and dismiss"
+    note "WARNING: binding ${host} -- there is no login; anyone who can reach it can triage findings AND start fleet runs that spend your Claude/Codex quota. Browse to exactly http://${host}:${port}/ (the Host check only accepts the bound host:port)"
   fi
   note "inbox at http://${host}:${port}/  (Ctrl-C to stop)"
-  exec "$py" "${MEUTE_ROOT}/tui/serve.py" --host "$host" --port "$port"
+  exec python3 "${MEUTE_ROOT}/tui/webserver.py" --host "$host" --port "$port"
 }
 
 main() {

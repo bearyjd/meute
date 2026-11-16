@@ -150,23 +150,69 @@ the inbox is the same thing with a cursor:
 ./bin/meute resolve <id> -f <n> -m "fixed in PR #12"
 
 ./bin/meute tui                      # the inbox in the terminal
-./bin/meute web                      # the identical inbox in a browser, loopback only
+./bin/meute web                      # the web inbox + Run tab in a browser, loopback only
 ```
 
-`tui` and `web` are one Textual app (PRP-003): `j`/`k` move, `Enter` shows the
+`tui` is a Textual app (PRP-003): `j`/`k` move, `Enter` shows the
 finding with its evidence, `p` promotes, `d` dismisses (a reason is required —
 it is the sole promoted-vs-dismissed signal per lens), `r` resolves, `/`
 filters on any column, `g` jumps to the next repo, `a` shows decided findings
 too. Every action goes through the CLI commands above, so the two can never
 disagree. Tabs for the tier-3 drafts awaiting merge and for every report.
 
-The UI lives in its own uv venv under `tui/`, created on first use. **The
-runner has no dependency on it**: `bin/run.sh` succeeds on a machine where
-that venv was never created, and the suite pins that. `web` is textual-serve
-and has no authentication — it binds `127.0.0.1` by default. To bind off loopback,
-pass both `--host <addr>` and `--insecure-public`. The latter is an explicit
-acknowledgement that anyone who can reach the listener can triage findings; a
-tailnet address is the sensible way to use it from a phone.
+The Textual UI lives in its own uv venv under `tui/`, created on first use.
+**The runner has no dependency on it**: `bin/run.sh` succeeds on a machine where
+that venv was never created, and the suite pins that.
+
+`meute web` is a separate, real web page (design:
+`docs/superpowers/specs/2026-11-15-web-inbox-design.md`) served by the
+stdlib-only `tui/webserver.py` under plain `python3` -- no venv, no Textual. It
+has an inbox tab (triage findings) and a **Run tab** that launches the fleet's
+work:
+
+1. **Plan** -- read-only; lists the repos/tasks `meute plan` proposes. Copies
+   of a repository are not offered: a line under each repo says how many
+   duplicate copies were hidden (the paths are in its tooltip), and a summary
+   above the list counts the copies collapsed and the repos skipped; the
+   skipped paths are listed under it.
+2. **Tick repos** -- nothing is ticked by default, and Enqueue stays disabled
+   until at least one is.
+3. **Enqueue** -- stages only the ticked repos. Re-enqueueing *replaces* the
+   staged queue rather than adding to it.
+4. **Start** (after a confirm click) -- Go runs the daily slot, then the weekly
+   slot, for the staged items only (staged read-only tasks are mostly
+   weekly-only; repos.yaml lists at least one read-only task for both slots), one
+   item at a time. Each item is forced via `--repo/--task`; the quota floor,
+   pause, lock and budget still apply. Stop lets the current item finish.
+5. **Progress** -- the page polls the run status (current item, done/remaining,
+   recent outcomes).
+
+Safety model: it binds `127.0.0.1` by default (loopback only). Every POST needs
+a per-process token plus Host/Origin checks. Start refuses while the fleet is
+paused or a run is already going, and the runner's own quota floor still
+applies. To bind off loopback, pass both `--host <addr>` and `--insecure-public`
+(IPv4 only; IPv6 hosts are rejected). `<addr>` must be the specific address the
+browser will use, such as a LAN or tailnet IP: wildcard binds (`0.0.0.0`, `0`,
+`*`) are rejected, because the Host check would refuse every request. The
+`--insecure-public` flag acknowledges that anyone who can
+reach the listener can triage findings **and start fleet runs that spend your
+Claude/Codex quota**. A tailnet address is the sensible way to use it from a
+phone.
+
+Host rule: the server accepts only the exact bound `host:port` as the Host
+header. With the default bind, browse to `127.0.0.1:<port>`; with
+`--host localhost` the browser must use `localhost:<port>` (`127.0.0.1:<port>`
+then returns 403); a non-loopback bind must be browsed at the same address.
+
+Known limitation: if a scheduled timer finishes the same staged item between
+the page's pending check (a `lib/manifest.py` subprocess) and `run.sh` taking
+its lock -- a window of tens to hundreds of milliseconds -- one duplicate
+read-only run can occur. Closing it needs a `run.sh` change, so it is accepted.
+
+Browsers mark requests another site starts (an `<img>`, a no-cors fetch) with
+`Sec-Fetch-Site: cross-site` or `same-site`; the server refuses those with 403
+on every route, so a web page cannot make it run `meute plan` scans. A second
+`meute web` on a busy port exits with `meute web: port <p> is already in use`.
 
 ## Quota gates
 
@@ -335,6 +381,24 @@ by absolute path, and is gitignored for that reason, as is the `state/.kv.*`
 scratch its bookkeeping uses — and the runner prefers it until every entry is
 attempted (or found missing), then archives it and returns to the manifest.
 Enrollment in `repos.local.yaml` is never a side effect.
+
+A scan usually finds the same repository more than once — scratch clones under
+`output/` or `build/`, vendored upstream checkouts, a `--separate-git-dir`
+checkout. `plan` keys each repository by its set of root commits (never its remote URL,
+which can embed a credential; the whole set, so a repo that merged another
+project's history is not mistaken for that project) and plans one copy per key. A copy of an enrolled
+repository is not planned at all. Otherwise the canonical copy is the first by:
+not scratch-looking (a path component such as `output`, `build`, `vendor`,
+`upstream`, `tmp` or `.local-research`; the list is in `lib/plan_dedup.sh`), not
+a `.git`-file checkout, fewest path components, shortest path, then byte order —
+so the same tree always picks the same copy. The other copies are listed under
+"Duplicates collapsed" and in `--json`'s `duplicates`, and never staged;
+`--only` on one is refused with the canonical path to pass instead (or enroll
+the copy to audit it separately). A copy whose HEAD commit the kept copy lacks
+is *diverged*: it is kept and planned too, and listed under "Diverged copies
+(kept)" and in `diverged`. A repository whose history cannot be read is listed
+as skipped, with a hint (`git fsck`, a dangling alternates entry). A repository with no copies
+is always kept, whatever its path looks like.
 
 A staged plan only includes tasks whose tier tools are a subset of `Read,Grep,Glob`.
 `--allow-web` adds tasks that also use `WebSearch,WebFetch` — note that this sends

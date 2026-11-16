@@ -25,6 +25,8 @@
 # plan_collect_tasks sets PLAN_TASKS / PLAN_WEB_TASKS / PLAN_OTHER_TASKS.
 # plan_scan_repos    sets PLAN_REPOS / PLAN_CONFIGURED / PLAN_UNCONFIGURED /
 #                    PLAN_KNOWN_NAME.
+# plan_dedup (lib/plan_dedup.sh) then narrows PLAN_UNCONFIGURED to one
+# canonical copy per root commit; everything below plans only those.
 
 declare -A PLAN_KNOWN_NAME=()
 
@@ -171,14 +173,84 @@ plan_scan_repos() {
   done < <(printf '%s\n' "${PLAN_REPOS[@]}" | LC_ALL=C sort -u)
 }
 
+# Why a task is in the plan, in one phrase. The one home for the wording: the
+# human preview and the JSON printer both ask here, so they cannot drift.
+plan_reason() {
+  case "$1" in
+    audit-security) printf '%s' "security baseline" ;;
+    architecture-review) printf '%s' "structure and maintainability" ;;
+    suggest-features) printf '%s' "feature opportunities" ;;
+    market-comparison) printf '%s' "market gaps" ;;
+    *) printf '%s' "declared read-only analysis" ;;
+  esac
+}
+
+# The same inventory as plan_print, as one JSON object on stdout and nothing
+# else. Read-only. Item order and ranks follow plan_print exactly.
+plan_print_json() {
+  local scan_dir="$1" real task rank=1 items
+  local -a lines=()
+  if (( ${#PLAN_TASKS[@]} )); then
+    for real in "${PLAN_UNCONFIGURED[@]}"; do
+      for task in "${PLAN_TASKS[@]}"; do
+        lines+=( "$(jq -cn --argjson rank "$rank" --arg repo "$(basename "$real")" \
+          --arg path "$real" --arg task "$task" --arg reason "$(plan_reason "$task")" \
+          '{rank:$rank, repo:$repo, path:$path, task:$task, reason:$reason}')" )
+        rank=$(( rank + 1 ))
+      done
+    done
+  fi
+  items="$( (( ${#lines[@]} )) && printf '%s\n' "${lines[@]}" | jq -s . || echo '[]' )"
+  # `unconfigured` counts canonical and diverged copies (lib/plan_dedup.sh);
+  # `discovered` stays the raw count, so it is the sum of the four classes.
+  local -a dedup=()
+  mapfile -t dedup < <(plan_dedup_json)
+  jq -n --arg scan "$scan_dir" --argjson items "$items" \
+    --argjson discovered "${#PLAN_REPOS[@]}" --argjson configured "${#PLAN_CONFIGURED[@]}" \
+    --argjson unconfigured "${#PLAN_UNCONFIGURED[@]}" \
+    --argjson duplicates "${dedup[0]}" --argjson skipped "${dedup[1]}" --argjson diverged "${dedup[2]}" \
+    --argjson web "$(jq -cn '$ARGS.positional' --args "${PLAN_WEB_TASKS[@]}")" \
+    --argjson other "$(jq -cn '$ARGS.positional' --args "${PLAN_OTHER_TASKS[@]}")" \
+    '{scan:$scan, discovered:$discovered, configured:$configured, unconfigured:$unconfigured,
+      items:$items, excluded:{web:$web, other:$other}, duplicates:$duplicates, skipped:$skipped, diverged:$diverged}'
+}
+
+# Narrow PLAN_UNCONFIGURED to the paths named with --only. Compared by
+# identity (dir_id), like the scan. A path that is not an unconfigured
+# repository the scan found -- or one dedup set aside -- refuses the whole
+# request before anything is staged.
+plan_restrict_to() {
+  local -A want=()
+  local -a kept=()
+  local path real id
+  for path in "$@"; do
+    plan_refuse_collapsed "$path"
+    id="$(dir_id "$path")"
+    for real in "${PLAN_UNCONFIGURED[@]}"; do
+      [[ "$(dir_id "$real")" == "$id" ]] && { want["$id"]=1; break; }
+    done
+    [[ -n "${want[$id]+present}" ]] || die "plan: --only ${path}: not an unconfigured repository found by the scan"
+  done
+  for real in "${PLAN_UNCONFIGURED[@]}"; do
+    [[ -n "${want[$(dir_id "$real")]+present}" ]] && kept+=( "$real" )
+  done
+  PLAN_UNCONFIGURED=( "${kept[@]}" )
+}
+
 # The inventory and the ranked proposal, with what was left out and why.
 plan_print() {
   local scan_dir="$1" max_depth="$2" real task reason rank=1
   printf 'Portfolio inventory (read-only)\n'
   printf '  scan: %s (max depth: %s)\n' "$scan_dir" "$max_depth"
-  printf '  discovered: %d  configured: %d  unconfigured: %d\n' \
+  printf '  discovered: %d  configured: %d  unconfigured: %d' \
     "${#PLAN_REPOS[@]}" "${#PLAN_CONFIGURED[@]}" "${#PLAN_UNCONFIGURED[@]}"
-  printf '\nComparison\n'
+  # Diverged copies are a subset of unconfigured, so say so rather than add a
+  # number that would make the line stop summing to discovered.
+  (( ${#PLAN_DIVERGED[@]} == 0 )) || printf ' (incl. %d diverged cop%s)' \
+    "${#PLAN_DIVERGED[@]}" "$( (( ${#PLAN_DIVERGED[@]} == 1 )) && echo y || echo ies)"
+  (( ${#PLAN_DUPLICATES[@]} + ${#PLAN_SKIPPED[@]} + ${#PLAN_DIVERGED[@]} == 0 )) \
+    || printf '  duplicates: %d  skipped: %d' "${#PLAN_DUPLICATES[@]}" "${#PLAN_SKIPPED[@]}"
+  printf '\n\nComparison\n'
   for real in "${PLAN_CONFIGURED[@]}"; do
     printf '  configured    %-24s %s\n' "${PLAN_KNOWN_NAME[$(dir_id "$real")]:-<unnamed>}" "$real"
   done
@@ -186,6 +258,7 @@ plan_print() {
     printf '  unconfigured  %-24s %s\n' "$(basename "$real")" "$real"
   done
   (( ${#PLAN_REPOS[@]} )) || printf '  (no Git repositories found)\n'
+  plan_print_dedup
 
   printf '\nProposed read-only analysis plan\n'
   printf '  Ranking: unconfigured repositories first; then security, architecture, features, market; path breaks ties.\n'
@@ -196,13 +269,7 @@ plan_print() {
   else
     for real in "${PLAN_UNCONFIGURED[@]}"; do
       for task in "${PLAN_TASKS[@]}"; do
-        case "$task" in
-          audit-security) reason="security baseline" ;;
-          architecture-review) reason="structure and maintainability" ;;
-          suggest-features) reason="feature opportunities" ;;
-          market-comparison) reason="market gaps" ;;
-          *) reason="declared read-only analysis" ;;
-        esac
+        reason="$(plan_reason "$task")"
         printf '  %3d. %-24s %-22s %s\n' "$rank" "$(basename "$real")" "$task" "$reason"
         rank=$(( rank + 1 ))
       done

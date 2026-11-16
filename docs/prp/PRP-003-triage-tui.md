@@ -101,6 +101,8 @@ Revisit only if startup latency or distribution becomes a real complaint.
 
 Runtime is a `uv`-managed venv inside the repo. No system Python dependency.
 
+> Note (2026-11-15): the browser view is now a real web page (stdlib server, inbox plus a Run tab), not textual-serve; see [the web inbox spec](../superpowers/specs/2026-11-15-web-inbox-design.md). `meute tui` stays the Textual app.
+
 **Consequence for PRP-001:** meute currently depends on bash, git, jq, and
 python3 + PyYAML — nothing more. Textual, `textual-plotext`, a uv venv and
 `delta` are a materially larger surface. The hard invariant below is what keeps

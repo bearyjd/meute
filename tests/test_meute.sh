@@ -655,7 +655,7 @@ test_discover() {
   for r in repo-alpha repo-beta already-configured; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -867,7 +867,7 @@ test_plan_identity() {
   for r in meute-stand-in already-configured repo-alpha; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -961,7 +961,7 @@ test_plan_worktrees() {
   for r in meute-stand-in repo-alpha repo-beta; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -1024,7 +1024,7 @@ test_plan() {
   for r in repo-alpha repo-beta already-configured nested/repo-gamma; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -1228,12 +1228,363 @@ STUB
   is  "plan: the retired plan is archived alongside the first" "$(find "$root/state" -name 'plan-queue.completed-*' | wc -l)" "2"
 }
 
+# `plan --json` is the machine face of the same inventory (the web inbox reads
+# it) and `--enqueue --only` stages a chosen subset. Own fixture, own state dir.
+test_plan_json() {
+  local universe="$FIXTURE/plan-json"
+  local root="$universe/meute-stand-in"
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"
+  ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$REPO/tasks/architecture-review.md" \
+     "$REPO/tasks/market-comparison.md" "$REPO/tasks/scout.md" "$root/tasks/"
+  git -C "$root" init -q -b main
+  echo x > "$root/f.txt"; git -C "$root" add -A
+  git -C "$root" -c user.email=t@t -c user.name=t commit -qm init
+  local r
+  for r in repo-alpha "repo with space" repo-gamma already-configured; do
+    mkdir -p "$universe/$r"
+    git -C "$universe/$r" init -q -b main
+    echo "$r" > "$universe/$r/f.txt"; git -C "$universe/$r" add -A
+    git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
+  done
+  python3 - "$root" "$universe" <<'PY'
+import sys, pathlib, yaml
+root, universe = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"},
+              "tier2-web": {"tools": "Read,Grep,Glob,WebSearch,WebFetch", "permission_mode": "dontAsk",
+                            "writes_code": False, "network": "proxied"},
+              "tier2-scout": {"tools": "Read,Grep,Glob,Bash", "permission_mode": "dontAsk",
+                              "allowed_tools": "Bash(gh issue list:*)", "writes_code": False, "network": "proxied"}},
+    "tasks": {
+        "audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]},
+        "architecture-review": {"tier": "tier2", "template": "tasks/architecture-review.md", "slots": ["weekly"]},
+        "market-comparison": {"tier": "tier2-web", "template": "tasks/market-comparison.md", "slots": ["weekly"]},
+        "scout": {"tier": "tier2-scout", "template": "tasks/scout.md", "slots": ["weekly"]},
+    },
+    "repos": [{"name": "already-configured", "path": str(universe / "already-configured"),
+               "spec": "already here", "tasks": ["audit-security"]}],
+    "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+  local out err rc queue="$root/state/plan-queue.json"
+
+  # Plain human output is the contract the JSON must not disturb.
+  out="$("$root/bin/meute" plan "$universe" 2>/dev/null)"
+  has "plan json: human item line is unchanged" "$out" $'1. repo with space          audit-security         security baseline'
+  has "plan json: human exclusion line is unchanged" "$out" "excluded 1 web-research task(s): market-comparison"
+
+  # --json: exactly one object on stdout, notes on stderr, read-only.
+  out="$("$root/bin/meute" plan --json "$universe" 2>"$FIXTURE/plan-json.err")"; rc=$?
+  is  "plan json: exits 0" "$rc" "0"
+  is  "plan json: stdout is one valid JSON object" "$(jq -e 'type == "object"' <<< "$out" >/dev/null 2>&1; echo $?)" "0"
+  is  "plan json: stdout is a single document" "$(jq -s length <<< "$out")" "1"
+  is  "plan json: counts" "$(jq -c '[.discovered,.configured,.unconfigured]' <<< "$out")" "[4,1,3]"
+  is  "plan json: scan is the directory" "$(jq -r .scan <<< "$out")" "$universe"
+  is  "plan json: items == unconfigured repos x tasks" "$(jq '.items | length' <<< "$out")" "6"
+  is  "plan json: ranks are 1..n" "$(jq -c '[.items[].rank]' <<< "$out")" "[1,2,3,4,5,6]"
+  is  "plan json: first item" "$(jq -c '.items[0] | [.rank,.repo,.path,.task,.reason]' <<< "$out")" \
+    "[1,\"repo with space\",\"$universe/repo with space\",\"audit-security\",\"security baseline\"]"
+  is  "plan json: second reason" "$(jq -r '.items[1].reason' <<< "$out")" "structure and maintainability"
+  is  "plan json: web exclusion" "$(jq -c .excluded.web <<< "$out")" '["market-comparison"]'
+  is  "plan json: other exclusion" "$(jq -c .excluded.other <<< "$out")" '["scout"]'
+  is  "plan json: read-only (no queue written)" "$(test -e "$queue"; echo $?)" "1"
+  out="$("$root/bin/meute" plan --json --allow-web "$universe" 2>/dev/null)"
+  is  "plan json: --allow-web ranks the web task" "$(jq '.items | length' <<< "$out")" "9"
+  is  "plan json: --allow-web empties excluded.web" "$(jq -c .excluded.web <<< "$out")" "[]"
+  out="$("$root/bin/meute" plan --json --enqueue "$universe" 2>&1; echo "rc=$?")"
+  has "plan json: --json with --enqueue is refused" "$out" "rc=2"
+  is  "plan json: ...and stages nothing" "$(test -e "$queue"; echo $?)" "1"
+
+  # --only
+  out="$("$root/bin/meute" plan --only "$universe/repo-alpha" "$universe" 2>&1; echo "rc=$?")"
+  has "plan only: without --enqueue is a usage error" "$out" "rc=2"
+  has "plan only: ...that says so" "$out" "--only requires --enqueue"
+  is  "plan only: ...and stages nothing" "$(test -e "$queue"; echo $?)" "1"
+
+  "$root/bin/meute" plan --enqueue --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
+  is  "plan only: one repo, both tasks staged" "$(jq '.entries | length' "$queue")" "2"
+  is  "plan only: entries are for that repo only" "$(jq -r '[.entries[].path] | unique | .[]' "$queue")" "$universe/repo-alpha"
+  "$root/bin/meute" plan --enqueue --only "$universe/repo with space" --only "$universe/repo-gamma" "$universe" >/dev/null 2>&1
+  is  "plan only: repeatable, spaces survive" "$(jq -r '[.entries[].path] | unique | join("|")' "$queue")" \
+    "$universe/repo with space|$universe/repo-gamma"
+  is  "plan only: a spelled-differently path matches by identity" \
+    "$("$root/bin/meute" plan --enqueue --only "$universe/repo-alpha/../repo-alpha/" "$universe" >/dev/null 2>&1; echo $?)" "0"
+
+  local before after
+  "$root/bin/meute" plan --enqueue --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
+  before="$(md5sum "$queue" | cut -d' ' -f1)"
+  for r in "/nonexistent/nope" "$universe/already-configured" "$root" "$universe"; do
+    out="$("$root/bin/meute" plan --enqueue --only "$r" "$universe" 2>&1; echo "rc=$?")"
+    hasnt "plan only: refuses '$r'" "$out" "rc=0"
+    has   "plan only: '$r' names the problem" "$out" "not an unconfigured repository"
+  done
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/repo-gamma" --only "/nonexistent" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "plan only: one bad path among good ones refuses" "$out" "rc=0"
+  after="$(md5sum "$queue" | cut -d' ' -f1)"
+  is  "plan only: a refused --only leaves the queue byte-identical" "$after" "$before"
+  rm -f "$queue"
+  "$root/bin/meute" plan --enqueue --only /nonexistent "$universe" >/dev/null 2>&1 || true
+  is  "plan only: a refused --only creates no queue" "$(test -e "$queue"; echo $?)" "1"
+}
+
+# A plan fixture universe: meute-stand-in (pruned) with one read-only task and
+# a manifest enrolling the repos named as name=relative-path arguments.
+dedup_universe() {
+  local universe="$1" root="$1/meute-stand-in" spec; shift
+  mkdir -p "$root"/{state,tasks}
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO/tasks/audit-security.md" "$root/tasks/"
+  python3 - "$root" "$universe" "$@" <<'PY'
+import sys, pathlib, yaml
+root, universe = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+repos = [{"name": n, "path": str(universe / p), "spec": "enrolled", "tasks": ["audit-security"]}
+         for n, p in (a.split("=", 1) for a in sys.argv[3:])]
+yaml.safe_dump({
+    "version": 1,
+    "defaults": {"engine": "claude", "model": "sonnet", "file_budget": 5, "timeout_seconds": 60},
+    "policy": {"quota_floor_percent": 30, "community_share": 0.2,
+               "tier3_max_in_flight": 3, "branch_prefix": "meute"},
+    "tiers": {"tier2": {"tools": "Read,Grep,Glob", "permission_mode": "dontAsk", "writes_code": False, "network": "proxied"}},
+    "tasks": {"audit-security": {"tier": "tier2", "template": "tasks/audit-security.md", "slots": ["daily"]}},
+    "repos": repos, "community": [],
+}, open(root / "repos.local.yaml", "w"), sort_keys=False)
+PY
+}
+
+# A repository with one commit whose content is unique to it, so its root
+# commit is its own: two `git init`s with identical content, author and
+# second share a root commit, which is exactly what dedup keys on.
+dedup_repo() {
+  mkdir -p "$1"
+  git -C "$1" init -q -b main
+  printf '%s\n' "$2" > "$1/f.txt"; git -C "$1" add -A
+  git -C "$1" -c user.email=t@t -c user.name=t commit -qm "init $2"
+}
+
+# Copies of one repository (scratch clones under output/, build/, vendored
+# checkouts, a --separate-git-dir checkout) are one repository: one canonical
+# copy is planned, the rest are listed as collapsed. Identity is the root
+# commit, never the remote URL.
+test_plan_dedup() {
+  local universe="$FIXTURE/plan-dedup" golden="$FIXTURE/plan-dedup-golden"
+  local root="$universe/meute-stand-in" out err rc json before
+  local queue="$root/state/plan-queue.json"
+
+  # (j) A tree without copies prints exactly what it printed before dedup.
+  dedup_universe "$golden" "enrolled-g=enrolled-g"
+  dedup_repo "$golden/repo-one" one; dedup_repo "$golden/nest/repo-two" two
+  dedup_repo "$golden/enrolled-g" g
+  out="$("$golden/meute-stand-in/bin/meute" plan "$golden" 2>/dev/null)"
+  is "dedup: a tree without copies prints the same output as before" "$out" "$(sed "s|@U@|$golden|g" <<'GOLD'
+Portfolio inventory (read-only)
+  scan: @U@ (max depth: 4)
+  discovered: 3  configured: 1  unconfigured: 2
+
+Comparison
+  configured    enrolled-g               @U@/enrolled-g
+  unconfigured  repo-two                 @U@/nest/repo-two
+  unconfigured  repo-one                 @U@/repo-one
+
+Proposed read-only analysis plan
+  Ranking: unconfigured repositories first; then security, architecture, features, market; path breaks ties.
+    1. repo-two                 audit-security         security baseline
+    2. repo-one                 audit-security         security baseline
+
+No manifest, repository, or state files were changed. Stage this exact plan for the runner with: meute plan --enqueue @U@ (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).
+GOLD
+)"
+  hasnt "dedup: ...with no duplicates section" "$out" "Duplicates collapsed"
+
+  dedup_universe "$universe" "enrolled-c=configured-c"
+  # (a) The original sits deeper than its scratch clones: only the
+  # not-scratch rule can pick it. Its origin embeds a credential (i).
+  dedup_repo "$universe/a/b/orig" group-a
+  git -C "$universe/a/b/orig" remote add origin "https://user:SECRET@example.com/x.git"
+  git clone -q "$universe/a/b/orig" "$universe/output/x"
+  git clone -q "$universe/a/b/orig" "$universe/build/y"
+  git -C "$universe/build/y" remote set-url origin "https://user:SECRET@example.com/y.git"
+  # (b) Every copy scratch-looking: fewest components wins over the shorter path.
+  dedup_repo "$universe/tmp/x/b" group-b
+  git clone -q "$universe/tmp/x/b" "$universe/vendor/bbbbbbbb"
+  git clone -q "$universe/tmp/x/b" "$universe/dist/bbbbbbbbbbbbbb"
+  # (c) A copy of an enrolled repository is never staged.
+  dedup_repo "$universe/configured-c" group-c
+  git clone -q "$universe/configured-c" "$universe/copies/c-clone"
+  # (c2) A clone of an enrolled repository with a commit of its own is diverged:
+  # kept and proposed, not hidden as "already enrolled".
+  git clone -q "$universe/configured-c" "$universe/copies/c-ahead"
+  echo ahead >> "$universe/copies/c-ahead/f.txt"
+  git -C "$universe/copies/c-ahead" -c user.email=t@t -c user.name=t commit -qam ahead
+  # (d) A .git-file checkout loses to a plain one even with the shorter,
+  # shallower path; a `git worktree add` checkout is not a repository at all;
+  # a lone .git-file checkout is kept.
+  dedup_repo "$universe/dd/main-checkout" group-d; mkdir -p "$universe/gitstore"
+  git clone -q --separate-git-dir="$universe/gitstore/d.git" "$universe/dd/main-checkout" "$universe/d"
+  git -C "$universe/dd/main-checkout" worktree add -q "$universe/dd/wt" -b wt-branch
+  dedup_repo "$FIXTURE/plan-dedup-solo-src" solo
+  git clone -q --separate-git-dir="$universe/gitstore/solo.git" "$FIXTURE/plan-dedup-solo-src" "$universe/solo-gitfile"
+  # (e) Unreadable history (the root commit's object is gone): skipped, and
+  # its intact clone is not collapsed into it.
+  dedup_repo "$universe/broken" group-e
+  echo more >> "$universe/broken/f.txt"
+  git -C "$universe/broken" -c user.email=t@t -c user.name=t commit -qam second
+  git clone -q --no-hardlinks "$universe/broken" "$universe/broken-copy"
+  local rootc; rootc="$(git -C "$universe/broken" rev-list --max-parents=0 HEAD)"
+  rm -f "$universe/broken/.git/objects/${rootc:0:2}/${rootc:2}"
+  # (f) Unrelated repositories, one of them scratch-looking but alone.
+  dedup_repo "$universe/lone-x" lone-x
+  dedup_repo "$universe/output/lone-scratch" lone-scratch
+  # I1: m merges q's unrelated history into a clone of p, so it has two roots.
+  # Keyed by its smallest root it would collapse into p or q (whichever root
+  # sorts first); keyed by the set of roots it is its own repository, and only
+  # its clone collapses into it.
+  dedup_repo "$universe/merge/p" group-p
+  mkdir -p "$universe/merge/q"; git -C "$universe/merge/q" init -q -b main
+  echo q > "$universe/merge/q/g.txt"; git -C "$universe/merge/q" add -A
+  git -C "$universe/merge/q" -c user.email=t@t -c user.name=t commit -qm "init q"
+  git clone -q "$universe/merge/p" "$universe/merge/m"
+  git -C "$universe/merge/m" -c user.email=t@t -c user.name=t pull -q --no-rebase \
+    --allow-unrelated-histories "$universe/merge/q" main
+  git clone -q "$universe/merge/m" "$universe/output/m-clone"
+  # I2: a copy with a commit the canonical lacks is diverged, not a duplicate;
+  # a copy with only uncommitted edits is still a duplicate.
+  git clone -q "$universe/a/b/orig" "$universe/output/ahead"
+  echo ahead >> "$universe/output/ahead/f.txt"
+  git -C "$universe/output/ahead" -c user.email=t@t -c user.name=t commit -qam ahead
+  echo dirty >> "$universe/build/y/f.txt"
+
+  out="$("$root/bin/meute" plan "$universe" 2>/dev/null)"
+  has "dedup: counts name every class" "$out" \
+    "discovered: 21  configured: 1  unconfigured: 12 (incl. 2 diverged copies)  duplicates: 7  skipped: 1"
+  hasnt "dedup: the old diverged count is gone from the inventory line" "$out" "  diverged: "
+  has "dedup: the duplicates section is counted" "$out" "Duplicates collapsed (7)"
+  has "dedup: I1 a clone of a two-root repo collapses into it" "$out" "  $universe/output/m-clone -> $universe/merge/m"
+  has "dedup: I1 the two-root repo is its own repository" "$out" "unconfigured  m "
+  has "dedup: I1 ...and so is each single-root ancestor (p)" "$out" "unconfigured  p "
+  has "dedup: I1 ...(q)" "$out" "unconfigured  q "
+  has "dedup: I2 a diverged copy is reported as kept" "$out" \
+    "  $universe/output/ahead has commits $universe/a/b/orig lacks"
+  has "dedup: I2 ...under its own section" "$out" "Diverged copies (kept)"
+  has "dedup: I2 ...and proposed" "$out" "unconfigured  ahead "
+  has "dedup: (c2) a diverged copy of an enrolled repo is reported as kept" "$out" \
+    "  $universe/copies/c-ahead has commits $universe/configured-c lacks"
+  has "dedup: (c2) ...and proposed" "$out" "unconfigured  c-ahead "
+  hasnt "dedup: (c2) ...not collapsed as already enrolled" "$out" "$universe/copies/c-ahead -> "
+  has "dedup: I2 uncommitted edits alone are still a duplicate" "$out" "  $universe/build/y -> $universe/a/b/orig"
+  has "dedup: (a) a scratch clone collapses into the original" "$out" "  $universe/output/x -> $universe/a/b/orig"
+  has "dedup: (a) ...and so does the other" "$out" "  $universe/build/y -> $universe/a/b/orig"
+  has "dedup: (a) the original is the one proposed" "$out" "unconfigured  orig "
+  has "dedup: (b) all-scratch group: fewest components wins" "$out" "  $universe/tmp/x/b -> $universe/vendor/bbbbbbbb"
+  has "dedup: (b) ...then the shorter path" "$out" "  $universe/dist/bbbbbbbbbbbbbb -> $universe/vendor/bbbbbbbb"
+  has "dedup: (c) a copy of an enrolled repo names it" "$out" "  $universe/copies/c-clone -> enrolled-c (already enrolled)"
+  has "dedup: (d) a .git-file copy collapses into the plain checkout" "$out" "  $universe/d -> $universe/dd/main-checkout"
+  hasnt "dedup: (d) a linked worktree is not a repository" "$out" "dd/wt"
+  has "dedup: (d) a lone .git-file checkout is kept" "$out" "unconfigured  solo-gitfile"
+  has "dedup: (e) unreadable history is listed as skipped" "$out" $'Skipped (no readable history)\n  '"$universe/broken"
+  has "dedup: I3 a skipped repo says how to recover it" "$out" \
+    "  $universe/broken: history unreadable, e.g. an alternates entry pointing at a deleted repository; run \`git -C $universe/broken fsck\` or fix .git/objects/info/alternates"
+  has "dedup: (e) its intact clone is still proposed" "$out" "unconfigured  broken-copy"
+  has "dedup: (f) an unrelated repo is untouched" "$out" "unconfigured  lone-x"
+  has "dedup: (f) a lone scratch-looking repo is kept" "$out" "unconfigured  lone-scratch"
+  is  "dedup: only canonical repos are ranked" "$(grep -cE '^ +[0-9]+\. ' <<< "$out")" "12"
+  hasnt "dedup: (i) no credential in the human output" "$out" "SECRET"
+  hasnt "dedup: (i) no remote URL in the human output" "$out" "example.com"
+
+  # (h) JSON: one object, the new lists, and every discovered repo in exactly
+  # one class: discovered == configured + unconfigured + duplicates + skipped.
+  json="$("$root/bin/meute" plan --json "$universe" 2>"$FIXTURE/plan-dedup.err")"; rc=$?
+  is  "dedup json: exits 0" "$rc" "0"
+  is  "dedup json: a single JSON object" "$(jq -s 'length == 1 and (.[0] | type) == "object"' <<< "$json")" "true"
+  is  "dedup json: counts" "$(jq -c '[.discovered,.configured,.unconfigured,(.duplicates|length),(.skipped|length)]' <<< "$json")" "[21,1,12,7,1]"
+  is  "dedup json: I2 diverged copies are listed" "$(jq -c '.diverged | sort_by(.path)' <<< "$json")" \
+    "[{\"path\":\"$universe/copies/c-ahead\",\"of\":\"$universe/configured-c\"},{\"path\":\"$universe/output/ahead\",\"of\":\"$universe/a/b/orig\"}]"
+  is  "dedup json: (c2) a diverged enrolled-repo copy is not a duplicate" \
+    "$(jq --arg p "$universe/copies/c-ahead" '[.duplicates[] | select(.path == $p)] | length' <<< "$json")" "0"
+  is  "dedup json: (c2) ...and is an item" \
+    "$(jq --arg p "$universe/copies/c-ahead" '[.items[] | select(.path == $p)] | length' <<< "$json")" "1"
+  is  "dedup json: (c2) a copy at the enrolled HEAD IS collapsed, as already enrolled" \
+    "$(jq -r --arg p "$universe/copies/c-clone" '.duplicates[] | select(.path == $p) | .reason' <<< "$json")" \
+    "already enrolled as enrolled-c"
+  is  "dedup json: the diverged count is a subset of unconfigured" \
+    "$(jq -e '(.diverged|length) == 2 and .unconfigured == 12' <<< "$json" >/dev/null; echo $?)" "0"
+  is  "dedup json: I2 ...and are items" "$(jq --arg p "$universe/output/ahead" '[.items[] | select(.path == $p)] | length' <<< "$json")" "1"
+  is  "dedup json: every discovered repo is in exactly one class" \
+    "$(jq -e '.discovered == .configured + .unconfigured + (.duplicates|length) + (.skipped|length)' <<< "$json" >/dev/null; echo $?)" "0"
+  is  "dedup json: items cover canonical repos only" "$(jq '[.items[].path] | unique | length' <<< "$json")" "12"
+  is  "dedup json: a duplicate names its canonical path" \
+    "$(jq -c --arg p "$universe/output/x" '.duplicates[] | select(.path == $p) | [.of, .reason]' <<< "$json")" \
+    "[\"$universe/a/b/orig\",\"duplicate of $universe/a/b/orig\"]"
+  is  "dedup json: a copy of an enrolled repo says so" \
+    "$(jq -r --arg p "$universe/copies/c-clone" '.duplicates[] | select(.path == $p) | .reason' <<< "$json")" \
+    "already enrolled as enrolled-c"
+  is  "dedup json: skipped carries its reason" "$(jq -c '.skipped' <<< "$json")" \
+    "[{\"path\":\"$universe/broken\",\"reason\":\"no readable history\"}]"
+  is  "dedup json: no duplicate path is an item" \
+    "$(jq '[.duplicates[].path] as $d | [.items[] | select(.path as $p | $d | index($p))] | length' <<< "$json")" "0"
+  hasnt "dedup json: (i) no credential in the JSON" "$json" "SECRET"
+  hasnt "dedup json: (i) no credential on stderr" "$(cat "$FIXTURE/plan-dedup.err")" "SECRET"
+  # (b) Determinism: the same tree, the same choice.
+  is  "dedup json: (b) a second run picks the same copies" \
+    "$("$root/bin/meute" plan --json "$universe" 2>/dev/null | jq -c '[.duplicates, .items]')" \
+    "$(jq -c '[.duplicates, .items]' <<< "$json")"
+
+  # The queue itself: one set of entries per canonical copy, none for a copy.
+  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  is  "dedup stage: entries cover the canonical copies only" "$(jq '[.entries[].path] | unique | length' "$queue")" "12"
+  is  "dedup stage: I2 the diverged copy is staged" \
+    "$(jq --arg p "$universe/output/ahead" '[.entries[] | select(.path == $p)] | length' "$queue")" "1"
+  is  "dedup stage: no duplicate or skipped path is staged" \
+    "$(jq --argjson j "$json" '[$j.duplicates[].path, $j.skipped[].path] as $d | [.entries[] | select(.path as $p | $d | index($p))] | length' "$queue")" "0"
+
+  # (g) --only: a duplicate is refused and names the copy to pass instead.
+  "$root/bin/meute" plan --enqueue --only "$universe/a/b/orig" "$universe" >/dev/null 2>&1
+  is  "dedup only: the canonical copy stages only itself" "$(jq -r '[.entries[].path] | unique | join("|")' "$queue")" "$universe/a/b/orig"
+  before="$(md5sum "$queue" | cut -d' ' -f1)"
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/output/x" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "dedup only: a duplicate is refused" "$out" "rc=0"
+  has   "dedup only: ...naming the canonical path" "$out" \
+    "$universe/output/x is a duplicate of $universe/a/b/orig; pass $universe/a/b/orig instead, or enroll $universe/output/x in repos.local.yaml to audit it separately"
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/lone-x" --only "$universe/copies/c-clone" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "dedup only: a copy of an enrolled repo is refused" "$out" "rc=0"
+  has   "dedup only: ...naming the enrolled repo" "$out" "already enrolled as enrolled-c"
+  out="$("$root/bin/meute" plan --enqueue --only "$universe/broken" "$universe" 2>&1; echo "rc=$?")"
+  hasnt "dedup only: a skipped repo is refused" "$out" "rc=0"
+  has   "dedup only: ...saying why" "$out" "no readable history"
+  is  "dedup only: refusals leave the queue byte-identical" "$(md5sum "$queue" | cut -d' ' -f1)" "$before"
+}
+
 # A staged plan end to end: the runner cuts a worktree in an unenrolled
 # repository, the stub engine runs in it, the report lands under the synthetic
 # name, and nothing is left behind -- no worktree, no branch, no commit in
 # meute's own checkout. Also where the plan-vs-manifest bookkeeping (separate
 # cursors, forced re-runs, `meute status`) is pinned, since it needs real
 # attempts rather than dry runs.
+# A diverged copy whose own HEAD cannot be read is kept too, but the human
+# line must not claim it "has commits" the kept copy lacks.
+test_plan_dedup_head_wording() {
+  local d="$FIXTURE/plan-dedup-head" out
+  dedup_repo "$d/kept" kept
+  git clone -q "$d/kept" "$d/ahead"
+  echo ahead >> "$d/ahead/f.txt"
+  git -C "$d/ahead" -c user.email=t@t -c user.name=t commit -qam ahead
+  mkdir -p "$d/nohead"
+  out="$( source "$REPO/lib/plan_dedup.sh"
+          PLAN_DUPLICATES=(); PLAN_SKIPPED=()
+          plan_mark_duplicate "$d/ahead" "$d/kept" x x
+          plan_mark_duplicate "$d/nohead" "$d/kept" x x
+          PLAN_DIVERGED=( "$d/ahead" "$d/nohead" )
+          plan_print_dedup )"
+  has "dedup head: a copy with commits says so" "$out" "  $d/ahead has commits $d/kept lacks"
+  has "dedup head: an unreadable HEAD says so" "$out" "  $d/nohead: HEAD unreadable"
+  hasnt "dedup head: ...and does not claim commits" "$out" "$d/nohead has commits"
+}
+
 test_plan_run() {
   local universe="$FIXTURE/plan-run"
   local root="$universe/meute-stand-in"
@@ -1250,7 +1601,7 @@ test_plan_run() {
   for r in repo-alpha alpha-cfg beta-cfg; do
     mkdir -p "$universe/$r"
     git -C "$universe/$r" init -q -b main
-    echo x > "$universe/$r/f.txt"
+    echo "$r" > "$universe/$r/f.txt"
     git -C "$universe/$r" add -A
     git -C "$universe/$r" -c user.email=t@t -c user.name=t commit -qm init
   done
@@ -1297,7 +1648,7 @@ STUB
     "$(grep -cE '^plan-repo-alpha-[0-9a-f]{6}$' <<< "$alpha_name")" "1"
   mkdir -p "$universe/repo-aaa"
   git -C "$universe/repo-aaa" init -q -b main
-  echo x > "$universe/repo-aaa/f.txt"; git -C "$universe/repo-aaa" add -A
+  echo repo-aaa > "$universe/repo-aaa/f.txt"; git -C "$universe/repo-aaa" add -A
   git -C "$universe/repo-aaa" -c user.email=t@t -c user.name=t commit -qm init
   "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
   alpha_again="$(jq -r '.entries[] | select(.path | endswith("/repo-alpha")) | .name' "$root/state/plan-queue.json" | sort -u)"
@@ -2985,17 +3336,78 @@ PY3
   done
 }
 
-# textual-serve deliberately has no authentication. Pin the CLI boundary so an
-# accidental --host does not expose report triage on a shared network.
+# The web inbox has a token and Host/Origin guards but no login, and it can
+# start fleet runs. Pin the CLI boundary so an accidental --host does not
+# expose it on a shared network.
 test_web_bind_guard() {
-  local out rc
-  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 0.0.0.0' _ "$REPO" 2>&1)"; rc=$?
+  local out rc stub="$FIXTURE/webstub"; mkdir -p "$stub"
+  printf '#!/bin/sh\necho "python3-stub $*"\n' > "$stub/python3"; chmod +x "$stub/python3"
+  web() { PATH="$stub:$PATH" bash -c 'source "$1/bin/meute"; shift; cmd_web "$@"' _ "$REPO" "$@" 2>&1; }
+  out="$(web --host 192.0.2.10)"; rc=$?
   is "web: refuses non-loopback without explicit acknowledgement" "$rc" "1"
   has "web: names the required public-bind flag" "$out" "--insecure-public"
-  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 127.0.0.1 --port 8123' _ "$REPO" 2>&1)"
-  has "web: loopback remains available without acknowledgement" "$out" "--host 127.0.0.1 --port 8123"
-  out="$(bash -c 'source "$1/bin/meute"; tui_python() { printf "%s\\n" /bin/echo; }; cmd_web --host 0.0.0.0 --insecure-public' _ "$REPO" 2>&1)"
-  has "web: explicit insecure opt-in permits non-loopback" "$out" "--host 0.0.0.0"
+  out="$(web --host 127.0.0.1 --port 8123)"
+  has "web: loopback remains available without acknowledgement" "$out" "webserver.py --host 127.0.0.1 --port 8123"
+  out="$(web --host 192.0.2.10 --insecure-public)"
+  has "web: explicit insecure opt-in permits non-loopback" "$out" "webserver.py --host 192.0.2.10"
+  has "web: warning says fleet runs spend quota" "$out" "start fleet runs"
+  # The Host check accepts only the bound host:port, and no browser sends
+  # Host 0.0.0.0, so a wildcard bind could only ever answer 403.
+  local wild
+  for wild in 0.0.0.0 0 '*' ''; do
+    out="$(web --host "$wild" --insecure-public)"; rc=$?
+    is  "web: wildcard host '${wild}' rejected even with --insecure-public" "$rc" "1"
+    has "web: wildcard host '${wild}' message says to bind a specific address" "$out" "specific address"
+    hasnt "web: wildcard host '${wild}' never starts the server" "$out" "python3-stub"
+  done
+  out="$(web --host ::1)"; rc=$?
+  is  "web: IPv6 host is rejected" "$rc" "1"
+  has "web: IPv6 rejection explains itself" "$out" "IPv6"
+  out="$(web --port --insecure-public)"; rc=$?
+  is  "web: --port swallowing a flag is rejected" "$rc" "1"
+  has "web: --port flag-value message is clear" "$out" "--port needs a value"
+  out="$(web --port abc)"; rc=$?
+  is  "web: non-numeric port rejected" "$rc" "1"
+  has "web: bad port message names the range" "$out" "1-65535"
+  out="$(web --port 70000)"; rc=$?
+  is  "web: out-of-range port rejected" "$rc" "1"
+  out="$(web --port 0)"; rc=$?
+  is  "web: port 0 rejected" "$rc" "1"
+  out="$(web --host --insecure-public)"; rc=$?
+  is  "web: --host swallowing a flag is rejected" "$rc" "1"
+  local body; body="$(sed -n '/^cmd_web()/,/^}/p' "$REPO/bin/meute")"
+  has   "web: cmd_web execs webserver.py" "$body" "tui/webserver.py"
+  hasnt "web: cmd_web no longer execs serve.py" "$body" "serve.py"
+}
+
+# The web inbox is stdlib-only (plain python3, no venv), and the runner
+# still never reaches into tui/. Every unittest file must pass.
+test_web_invariants() {
+  local f bad rc out
+  for f in "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" \
+           "$REPO/lib/inbox.py" "$REPO/lib/report.py"; do
+    bad="$(python3 - "$f" <<'PY2'
+import ast, sys
+std = sys.stdlib_module_names
+# the only sibling modules the web files may import (never serve/app/model)
+siblings = {"inbox", "report", "runctl", "runprogress"}
+tree = ast.parse(open(sys.argv[1]).read())
+bad = []
+for n in ast.walk(tree):
+    mods = [a.name for a in n.names] if isinstance(n, ast.Import) else \
+           [n.module or ""] if isinstance(n, ast.ImportFrom) and n.level == 0 else []
+    bad += [m for m in mods if m.split(".")[0] not in std and m.split(".")[0] not in siblings]
+print(" ".join(bad))
+PY2
+)"; rc=$?
+    is "invariant: $(basename "$f") AST check ran" "$rc" "0"
+    is "invariant: $(basename "$f") imports only stdlib and its web siblings" "$bad" ""
+  done
+  [[ -f "$REPO/bin/run.sh" ]]; is "invariant: bin/run.sh exists" "$?" "0"
+  for f in "$REPO"/tests/test_*.py; do
+    out="$(cd "$REPO/tests" && python3 -m unittest "$(basename "$f" .py)" 2>&1)"; rc=$?
+    is "unittest: $(basename "$f") exits 0" "$rc" "0"
+  done
 }
 
 # Findings were gated on the task NAME `audit-security` in two places, so the
@@ -3171,7 +3583,7 @@ PY2
   has "model: a stub reads UNMEASURED, never ok" "$hdr" "UNMEASURED (stub)"
 
   # PRP-003's hard invariant: the runner never depends on the UI.
-  is  "invariant: run.sh never references tui/" "$(grep -c 'tui/' "$REPO/bin/run.sh")" "0"
+  is  "invariant: run.sh never references tui/" "$(grep -c 'tui/' "$REPO/bin/run.sh" 2>&1; true)" "0"
   is  "invariant: lib/ never imports textual"   "$(grep -rlc 'textual' "$REPO/lib" | wc -l)" "0"
   is  "invariant: tui/model.py imports no textual" "$(grep -c 'textual' "$REPO/tui/model.py")" "0"
 }
@@ -5760,6 +6172,9 @@ test_plan_tier_class
 test_plan_identity
 test_plan_worktrees
 test_plan
+test_plan_json
+test_plan_dedup
+test_plan_dedup_head_wording
 test_plan_run
 test_repo_default_branch
 test_inbox
@@ -5803,5 +6218,6 @@ test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
 test_real_repo_untouched
+test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

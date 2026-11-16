@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="meute-token" content="__TOKEN__">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>meute</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>meute</h1>
+  <nav id="tabs">
+    <button type="button" data-tab="findings" class="active">Findings</button>
+    <button type="button" data-tab="drafts">Drafts</button>
+    <button type="button" data-tab="reports">Reports</button>
+    <button type="button" data-tab="run">Run</button>
+  </nav>
+  <span id="status"></span>
+</header>
+<div id="notice" role="status"></div>
+<main>
+  <section id="findings" class="tab">
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="filter any column ( / )" autocomplete="off">
+      <label><input id="show-decided" type="checkbox"> show decided</label>
+      <span id="count"></span>
+    </div>
+    <div class="split">
+      <table id="findings-table">
+        <thead><tr>
+          <th>repo</th><th>sev</th><th>title</th><th>location</th><th>lens</th><th>date</th><th>state</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <aside id="panel" hidden>
+        <h2 id="panel-title"></h2>
+        <pre id="panel-body"></pre>
+        <div class="actions">
+          <button type="button" id="act-promote">Promote</button>
+          <select id="dismiss-reason"></select>
+          <input id="dismiss-message" type="text" placeholder="dismiss note (optional)">
+          <button type="button" id="act-dismiss">Dismiss</button>
+          <input id="resolve-message" type="text" placeholder="resolve message (required)">
+          <button type="button" id="act-resolve">Resolve</button>
+        </div>
+      </aside>
+    </div>
+  </section>
+  <section id="drafts" class="tab" hidden>
+    <table id="drafts-table"><thead><tr>
+      <th>repo</th><th>branch</th><th>date</th><th>subject</th><th>base</th><th>lines</th><th>absorbed</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+  <section id="reports" class="tab" hidden>
+    <table id="reports-table"><thead><tr>
+      <th>repo</th><th>task</th><th>lens</th><th>date</th><th>state</th><th>findings</th><th>summary</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+  <section id="run" class="tab" hidden></section>
+</main>
+<script src="/static/app.js" defer></script>
+<script src="/static/run.js" defer></script>
+</body>
+</html>
