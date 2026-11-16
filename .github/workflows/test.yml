@@ -1,0 +1,25 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PyYAML
+        run: python3 -m pip install --user pyyaml
+      - name: Git identity for fixture repos
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+      - name: Shell suite
+        run: bash tests/test_meute.sh
+      - name: Unit suite
+        run: python3 -m unittest discover tests

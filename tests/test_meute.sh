@@ -33,6 +33,8 @@ hasnt(){ [[ "$2" != *"$3"* ]] && ok "$1" || bad "$1" "[$2] unexpectedly contains
 # read as a pass, and must not fail a suite on a host that lacks the facility.
 skip() { printf '  skip  %s\n        %s\n' "$1" "$2"; }
 
+source "$REPO/tests/test_resilience.sh"
+
 meute() { "$FIXTURE/bin/meute" "$@"; }
 report() { python3 "$REPO/lib/report.py" "$@"; }
 
@@ -49,6 +51,8 @@ yaml.safe_dump(d, open(dst, "w"), sort_keys=False)
 PY
 }
 validate() { MEUTE_ROOT="${2:-$(dirname "$1")}" python3 "$REPO/lib/manifest.py" validate "$1" 2>&1 || true; }
+
+source "$REPO/tests/test_resilience.sh"
 
 # ---------------------------------------------------------------- fixture ---
 setup() {
@@ -223,8 +227,6 @@ MD
 }
 
 # ------------------------------------------------------------------ tests ---
-source "$REPO/tests/test_resilience.sh"
-
 test_summaries() {
   is "summary: audit with findings"  "$(report summary "$FIXTURE/reports/alpha/audit-security-2026-08-28.md")" "CRIT×1 HIGH×2"
   is "summary: audit with none"      "$(report summary "$FIXTURE/reports/alpha/audit-security-2026-08-20.md")" "no findings"
@@ -3213,9 +3215,21 @@ PY2
   has "gates: ...naming the floor as the reason"                     "$out" "below floor 30%"
   has "gates: ...and the real source, not the stub"                  "$out" "quota=20:quota-subscription.sh"
 
-  # Both clear -> the run proceeds to selection.
+  # Both clear -> the run proceeds to selection. Past the gates the dry run
+  # reaches preflight, so a stub `claude` answers it: the suite must not
+  # depend on a signed-in CLI on the host (CI runners have none).
+  mkdir -p "$root/stub"
+  cat > "$root/stub/claude" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth" ]]; then
+  printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'
+  exit 0
+fi
+exit 1
+STUB
+  chmod +x "$root/stub/claude"
   printf '{"captured_at":1,"seven_day":{"used_percentage":10,"resets_at":9999999999}}' > "$snap"
-  out="$("$root/bin/run.sh" daily --dry-run 2>&1)"
+  out="$(PATH="$root/stub:$PATH" "$root/bin/run.sh" daily --dry-run 2>&1)"
   has "gates: both clear and the run goes ahead" "$out" "would run: key=r/audit-security"
 
   # The agent's cwd is the worktree and dontAsk refuses reads outside it, so
@@ -6219,12 +6233,14 @@ test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
+test_p09_statusline_tmp
 test_run_lock_not_inherited
 test_run_lock_git_hooks
 test_run_lock_error_paths
 test_exit_log_line
 test_strict_exit_codes
 test_run_tmp_cleaned
+test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
