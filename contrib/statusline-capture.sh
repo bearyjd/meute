@@ -54,9 +54,18 @@ if command -v jq >/dev/null 2>&1; then
         and (.five_hour == $new.five_hour) and (.seven_day == $new.seven_day)
       ' "$SNAPSHOT" >/dev/null 2>&1; then
     mkdir -p "$(dirname "$SNAPSHOT")" 2>/dev/null
-    tmp="$(mktemp "${SNAPSHOT}.XXXXXX" 2>/dev/null)" \
-      && printf '%s\n' "$snapshot" > "$tmp" \
-      && mv -f "$tmp" "$SNAPSHOT"
+    # A fixed per-process name, removed on any exit path, so a failed rename or
+    # a killed render cannot leave a stray behind (the old mktemp name leaked
+    # one per failure). Strays from a SIGKILLed render, which no trap can
+    # catch, are swept once they are older than any live render could be.
+    tmp="${SNAPSHOT}.tmp.$$"
+    trap 'rm -f "$tmp"' EXIT
+    find "$(dirname "$SNAPSHOT")" -maxdepth 1 -name 'rate-limits.json.*' \
+      -mmin +10 -delete 2>/dev/null
+    printf '%s\n' "$snapshot" > "$tmp" 2>/dev/null \
+      && mv -f "$tmp" "$SNAPSHOT" 2>/dev/null
+    # exec below skips the EXIT trap, so clean up explicitly as well.
+    rm -f "$tmp"
   fi
 fi
 
