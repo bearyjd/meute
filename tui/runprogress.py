@@ -93,20 +93,36 @@ def read_log(path: str, offset: int = 0) -> list[dict]:
     return [rec for rec in map(parse_line, lines) if rec]
 
 
+# The code= tokens of lib/outcome.sh, and run.sh's --strict-exit statuses.
+_SKIP_CODES = frozenset({"hold", "lock", "budget", "quota-floor", "quota-unknown",
+                         "nothing-eligible", "no-queue", "load", "disk"})
+_SKIP_STATUSES = frozenset(range(10, 16))
+
+
 def classify(records: list[dict], returncode: int, slot: str, since: float) -> dict:
     """The outcome of one run.sh call, from the log lines appended during it.
 
     Only a line for this call's slot that started at or after the call counts:
     a timer firing the other slot (or a late line from an older run) writes
-    to the same log and is not this call's outcome.
+    to the same log and is not this call's outcome. The line's code= decides
+    when it has one; the free-text status is the fallback for older lines.
+    Without a line, a strict-exit status of 10-15 still says "skipped".
     """
     own = [rec for rec in records
            if rec.get("slot") == slot and _at_or_after(rec, since)]
     if not own:
-        return {"status": "error", "repo": None, "task": None,
+        return {"status": "skipped" if returncode in _SKIP_STATUSES else "error",
+                "repo": None, "task": None,
                 "reason": f"run.sh exited {returncode} without a log line"}
     last = own[-1]
+    code = last.get("code")
     status = last.get("status")
+    if code == "ok":
+        status = "ok"
+    elif code in _SKIP_CODES:
+        status = "skipped"
+    elif code in ("failed", "died"):
+        status = "error"
     return {"status": status if status in ("ok", "skipped") else "error",
             "repo": last.get("repo"), "task": last.get("task"),
             "reason": last.get("reason") or last.get("detail")}

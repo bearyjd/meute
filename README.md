@@ -122,6 +122,30 @@ if another run holds it. Subscription auth works headless — credentials live i
 `~/.claude/.credentials.json`, not a keychain agent that a cron job could not
 reach.
 
+### Exit codes
+
+By default `run.sh` exits 0 on every skip and 1 on a failure, so cron and the
+installed units behave as they always have. `--strict-exit` (or
+`MEUTE_STRICT_EXIT=1`) makes the status name the outcome, so a loop can branch
+on `$?` alone:
+
+| status | meaning |
+|-------:|---------|
+| 0 | ran ok (a dry run included) |
+| 1 | ran and failed |
+| 2 | usage error |
+| 10 | hold |
+| 11 | another run holds the lock |
+| 12 | budget (meute's own ceiling) |
+| 13 | quota (below the floor, or the probe failed) |
+| 14 | nothing eligible (or no queue) |
+| 15 | host not healthy (load, disk) |
+| 70 | the runner itself died |
+
+The `code=` field of the `state/log` line uses the same vocabulary (`hold`,
+`lock`, `budget`, `quota-floor`, `quota-unknown`, `nothing-eligible`,
+`no-queue`, `load`, `disk`, `ok`, `failed`, `died`).
+
 ## Subscription-only
 
 meute never runs on metered API billing. Claude Code silently prefers an API key

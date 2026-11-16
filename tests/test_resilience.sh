@@ -231,3 +231,74 @@ test_exit_log_line() {
   "${fire[@]}" --dry-run >/dev/null 2>&1
   is  "exit log: a dry run adds no line" "$(( $(_log_lines "$log") - before ))" "0"
 }
+
+# P0.3 (R1, second half): --strict-exit (or MEUTE_STRICT_EXIT=1) makes the exit
+# status say how the fire ended, so a loop can branch on $? alone. Without it
+# every skip still exits 0 (cron and the installed units are unaffected; the
+# P0.2 tests above pin that). One case per code in the table.
+test_strict_exit_codes() {
+  local root="$FIXTURE/strict" repo="$FIXTURE/strict/git-lk" log rc
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  cp "$root/repos.yaml" "$root/repos.yaml.good"
+  local run=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" )
+  # _strict <label> <expected status> <command...>
+  _strict() {
+    local label="$1" want="$2"; shift 2
+    local got=0; "$@" >/dev/null 2>&1 || got=$?
+    is "strict exit: $label" "$got" "$want"
+  }
+
+  _strict "a completed run is 0"           0 "${run[@]}" daily --strict-exit
+  _strict "a dry run is 0"                 0 "${run[@]}" daily --dry-run --strict-exit
+
+  sed -i 's/is_error:false/is_error:true/' "$root/stub/claude"
+  _strict "a run that ran and failed is 1" 1 "${run[@]}" daily --strict-exit
+  sed -i 's/is_error:true/is_error:false/' "$root/stub/claude"
+
+  _strict "a missing slot is 2 (usage)"     2 "${run[@]}" --strict-exit
+  _strict "an unknown argument is 2 (usage)" 2 "${run[@]}" daily --bogus --strict-exit
+
+  printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "testing" > "$root/state/hold"
+  _strict "a hold is 10" 10 "${run[@]}" daily --strict-exit
+  _strict "the env var enables it too" 10 env MEUTE_STRICT_EXIT=1 "${run[@]}" daily
+  _strict "...but a hold is 0 without either" 0 "${run[@]}" daily
+  rm -f "$root/state/hold"
+
+  local held; exec {held}>"$root/state/.lock"; flock -n "$held"
+  _strict "a held lock is 11" 11 "${run[@]}" daily --strict-exit
+  exec {held}>&-
+
+  cp "$root/repos.yaml.good" "$root/repos.yaml"
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"]["weekly_runs"] = 1
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
+  _strict "a spent self-budget is 12" 12 "${run[@]}" daily --strict-exit
+  cp "$root/repos.yaml.good" "$root/repos.yaml"
+
+  _strict "a quota below the floor is 13" 13 \
+    env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=10 "$root/bin/run.sh" daily --repo lk --task t --strict-exit
+  _strict "an unreadable quota is 13" 13 \
+    env PATH="$root/stub:$PATH" MEUTE_CLAUDE_QUOTA_CMD=false "$root/bin/run.sh" daily --repo lk --task t --strict-exit
+  _strict "nothing eligible is 14" 14 \
+    env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=10 "$root/bin/run.sh" daily --strict-exit
+
+  printf 'version: 1\nrepos: not-a-list\n' > "$root/repos.yaml"
+  _strict "a runner that died is 70" 70 "${run[@]}" daily --strict-exit
+  _strict "...but 1 without the flag" 1 "${run[@]}" daily
+  _strict "a death no die() reports is 70" 70 env TMPDIR=/nonexistent "${run[@]}" daily --strict-exit
+  mv "$root/repos.yaml.good" "$root/repos.yaml"
+
+  # The codes with no reachable trigger in a fixture (the load and disk gates
+  # are not wired yet) are pinned through the table itself.
+  local code want
+  for code in "hold 10" "lock 11" "budget 12" "quota-floor 13" "quota-unknown 13" \
+              "nothing-eligible 14" "no-queue 14" "load 15" "disk 15" "ok 0" "failed 1" "died 70"; do
+    want="${code#* }"; code="${code% *}"
+    is "strict exit: table maps code=$code to $want" \
+      "$(MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/outcome.sh"; outcome_exit_status "$1"' _ "$code")" "$want"
+  done
+  unset -f _strict
+}

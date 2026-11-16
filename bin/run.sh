@@ -24,6 +24,7 @@
 #                            and stepped over, and plan bookkeeping still happens (a
 #                            vanished staged repo is marked missing, a finished plan
 #                            is archived)
+#   --strict-exit            exit status names the outcome (also MEUTE_STRICT_EXIT=1); table in lib/outcome.sh
 #   --validate               validate the manifest and exit
 #   --help
 #
@@ -162,17 +163,16 @@ parse_args() {
       --repo)     FORCE_REPO="${2:?--repo needs a value}"; shift ;;
       --task)     FORCE_TASK="${2:?--task needs a value}"; shift ;;
       --dry-run)  DRY_RUN=1 ;;
+      --strict-exit) ;;   # read by outcome_scan_args, before anything can fail
       --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;
       --help|-h)  usage; exit 0 ;;
-      *)          die "unknown argument: $1 (try --help)" ;;
+      *)          usage_die "unknown argument: $1 (try --help)" ;;
     esac
     shift
   done
-  [[ -n "$SLOT" ]] || die "missing slot: expected 'daily' or 'weekly' (try --help)"
-  [[ -z "$ENGINE_OVERRIDE" || "$ENGINE_OVERRIDE" =~ ^(claude|codex)$ ]] \
-    || die "unknown engine: $ENGINE_OVERRIDE"
-  [[ -z "$RUNTIME_OVERRIDE" || "$RUNTIME_OVERRIDE" =~ ^(host|container)$ ]] \
-    || die "unknown runtime: $RUNTIME_OVERRIDE (expected host or container)"
+  [[ -n "$SLOT" ]] || usage_die "missing slot: expected 'daily' or 'weekly' (try --help)"
+  [[ -z "$ENGINE_OVERRIDE" || "$ENGINE_OVERRIDE" =~ ^(claude|codex)$ ]] || usage_die "unknown engine: $ENGINE_OVERRIDE"
+  [[ -z "$RUNTIME_OVERRIDE" || "$RUNTIME_OVERRIDE" =~ ^(host|container)$ ]] || usage_die "unknown runtime: $RUNTIME_OVERRIDE (expected host or container)"
 }
 
 
@@ -377,7 +377,7 @@ select_entry() {
 }
 
 main() {
-  parse_args "$@"; trap outcome_on_exit EXIT
+  outcome_scan_args "$@"; parse_args "$@"; trap outcome_on_exit EXIT
   mkdir -p "$STATE_DIR" "$WORKTREE_DIR" "${MEUTE_ROOT}/reports"
   command -v jq >/dev/null || die "jq is required"
   scrub_env
