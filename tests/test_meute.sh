@@ -33,6 +33,8 @@ hasnt(){ [[ "$2" != *"$3"* ]] && ok "$1" || bad "$1" "[$2] unexpectedly contains
 # read as a pass, and must not fail a suite on a host that lacks the facility.
 skip() { printf '  skip  %s\n        %s\n' "$1" "$2"; }
 
+source "$REPO/tests/test_resilience.sh"
+
 meute() { "$FIXTURE/bin/meute" "$@"; }
 report() { python3 "$REPO/lib/report.py" "$@"; }
 
@@ -6231,6 +6233,7 @@ test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
+test_p09_statusline_tmp
 test_run_lock_not_inherited
 test_run_lock_git_hooks
 test_run_lock_error_paths
