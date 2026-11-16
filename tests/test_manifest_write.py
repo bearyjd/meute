@@ -1,6 +1,7 @@
 """write_with_backup must never leave the manifest truncated (R12, P0.7)."""
 
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,31 @@ class WriteWithBackupTest(unittest.TestCase):
         os.chmod(self.target, 0o600)
         manifest_write.write_with_backup(self.target, {"repos": []})
         self.assertEqual(os.stat(self.target).st_mode & 0o777, 0o600)
+
+    def test_first_backup_takes_manifest_mode_not_umask(self):
+        os.chmod(self.target, 0o600)
+        old_umask = os.umask(0o022)
+        try:
+            manifest_write.write_with_backup(self.target, {"repos": []})
+        finally:
+            os.umask(old_umask)
+        self.assertEqual(os.stat(self.target + ".bak").st_mode & 0o777, 0o600)
+
+    def test_fsyncs_parent_directory_after_replace(self):
+        real_fsync = os.fsync
+        synced = []
+
+        def record(fd):
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode):
+                synced.append((info.st_dev, info.st_ino))
+            real_fsync(fd)
+
+        with mock.patch.object(manifest_write.os, "fsync", side_effect=record):
+            manifest_write.write_with_backup(self.target, {"repos": []})
+        parent = os.stat(self.tmp.name)
+        # once for the .bak rename, once for the manifest rename
+        self.assertEqual(synced, [(parent.st_dev, parent.st_ino)] * 2)
 
     def test_writes_through_symlink_to_resolved_file(self):
         link = os.path.join(self.tmp.name, "alias.yaml")
