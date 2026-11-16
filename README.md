@@ -122,6 +122,30 @@ if another run holds it. Subscription auth works headless — credentials live i
 `~/.claude/.credentials.json`, not a keychain agent that a cron job could not
 reach.
 
+### Exit codes
+
+By default `run.sh` exits 0 on every skip and 1 on a failure, so cron and the
+installed units behave as they always have. `--strict-exit` (or
+`MEUTE_STRICT_EXIT=1`) makes the status name the outcome, so a loop can branch
+on `$?` alone:
+
+| status | meaning |
+|-------:|---------|
+| 0 | ran ok (a dry run included) |
+| 1 | ran and failed |
+| 2 | usage error |
+| 10 | hold |
+| 11 | another run holds the lock |
+| 12 | budget (meute's own ceiling) |
+| 13 | quota (below the floor, or the probe failed) |
+| 14 | nothing eligible (or no queue) |
+| 15 | host not healthy (load, disk) |
+| 70 | the runner itself died |
+
+The `code=` field of the `state/log` line uses the same vocabulary (`hold`,
+`lock`, `budget`, `quota-floor`, `quota-unknown`, `nothing-eligible`,
+`no-queue`, `load`, `disk`, `ok`, `failed`, `died`).
+
 ## Subscription-only
 
 meute never runs on metered API billing. Claude Code silently prefers an API key
@@ -278,6 +302,14 @@ MEUTE_CLAUDE_QUOTA_CMD='contrib/quota-llm-usage-tracker.sh' ./bin/run.sh daily  
 not fall back to the stub — falling back would silently disable the gate at
 exactly the moment you asked for it. Fail closed, always. That includes a
 `state/rate-limits.json` that exists but cannot be read.
+
+**Probes run bounded, with errexit on.** Each configured probe command runs
+under `timeout 30` in `bash -Eeuo pipefail`, so a hung probe declines the slot
+instead of stalling the fire. Because errexit is on, a probe whose earlier
+command fails now declines even if its last command prints a value
+(`false; echo 50` declines; before, it reported 50). This is a deliberate
+fail-closed behaviour change: write probes so every command succeeds, or chain
+them with `&&` or `||` where a failure is expected.
 
 #### Codex
 

@@ -24,6 +24,7 @@
 #                            and stepped over, and plan bookkeeping still happens (a
 #                            vanished staged repo is marked missing, a finished plan
 #                            is archived)
+#   --strict-exit            exit status names the outcome (also MEUTE_STRICT_EXIT=1); table in lib/outcome.sh
 #   --validate               validate the manifest and exit
 #   --help
 #
@@ -43,6 +44,7 @@ set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
+source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
@@ -50,6 +52,7 @@ source "${MEUTE_ROOT}/lib/container.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 source "${MEUTE_ROOT}/lib/runlock.sh"
+source "${MEUTE_ROOT}/lib/tmp.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 # The harness is public; a real fleet config names private projects and says what
 # they do. repos.local.yaml is gitignored and wins when present, so you never have
@@ -108,9 +111,6 @@ OUT_DIR=""
 BRANCH=""
 BASE_SHA=""
 
-note() { printf 'meute: %s\n' "$*" >&2; }
-die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
-
 # --------------------------------------------------------------------------
 # state/cursor holds the round-robin cursors (one key per slot, a separate one
 # per slot for a staged plan) and the per-(repo,task) lens rotation counters.
@@ -120,29 +120,6 @@ die()  { printf 'meute: %s\n' "$*" >&2; exit 1; }
 # --------------------------------------------------------------------------
 state_get() { kv_get "$CURSOR_FILE" "$1"; }
 state_set() { kv_set "$CURSOR_FILE" "$1" "$2"; }
-
-# One line per invocation, always, including every skip path. This file is the
-# audit trail for unattended runs — if it is silent, the runner did not fire.
-log_run() {
-  local status="$1"; shift
-  local line duration=$(( SECONDS - START_EPOCH ))
-  line="$(printf '%s\tweek=%s\tslot=%s\tstatus=%s' "$STARTED_AT" "$THIS_WEEK" "${SLOT:-none}" "$status")"
-  local field
-  for field in "$@"; do line+="$(printf '\t%s' "$field")"; done
-  line+="$(printf '\tdur=%ss' "$duration")"
-  # PRP-004's columns, on every line class so a reader can rely on them:
-  # runtime= (host|container), image= (12 hex of the image ID actually run),
-  # stage= (preflight|build|review|resolve|publish), pr= (URL). Phase 2b
-  # fills the first two; the rest stay `-` until the phase that fills them.
-  line+="$(printf '\truntime=%s\timage=%s\tstage=%s\tpr=%s' \
-             "${LOG_RUNTIME:--}" "${LOG_IMAGE:--}" "${LOG_STAGE:--}" "${LOG_PR:--}")"
-  printf '%s\n' "$line" >> "$LOG_FILE"
-  printf '%s\n' "$line" >&2
-}
-
-# Exit 0 on every "not this time" path: cron must not see a scheduled chore
-# declining to run as a failure.
-skip() { log_run "skipped" "reason=$1" "${@:2}"; exit 0; }
 
 # The header comment above, however long it grows: everything after the
 # shebang up to the first line that is not a comment.
@@ -175,7 +152,7 @@ cleanup() {
       git -C "$REPO_PATH" branch -q -D "$BRANCH" >/dev/null 2>&1 || true
     fi
   fi
-  return $rc
+  tmp_cleanup; return $rc
 }
 
 parse_args() {
@@ -187,17 +164,16 @@ parse_args() {
       --repo)     FORCE_REPO="${2:?--repo needs a value}"; shift ;;
       --task)     FORCE_TASK="${2:?--task needs a value}"; shift ;;
       --dry-run)  DRY_RUN=1 ;;
-      --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;
+      --strict-exit) ;;   # read by outcome_scan_args, before anything can fail
+      --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;   # validate's own status, even under --strict-exit
       --help|-h)  usage; exit 0 ;;
-      *)          die "unknown argument: $1 (try --help)" ;;
+      *)          usage_die "unknown argument: $1 (try --help)" ;;
     esac
     shift
   done
-  [[ -n "$SLOT" ]] || die "missing slot: expected 'daily' or 'weekly' (try --help)"
-  [[ -z "$ENGINE_OVERRIDE" || "$ENGINE_OVERRIDE" =~ ^(claude|codex)$ ]] \
-    || die "unknown engine: $ENGINE_OVERRIDE"
-  [[ -z "$RUNTIME_OVERRIDE" || "$RUNTIME_OVERRIDE" =~ ^(host|container)$ ]] \
-    || die "unknown runtime: $RUNTIME_OVERRIDE (expected host or container)"
+  [[ -n "$SLOT" ]] || usage_die "missing slot: expected 'daily' or 'weekly' (try --help)"
+  [[ -z "$ENGINE_OVERRIDE" || "$ENGINE_OVERRIDE" =~ ^(claude|codex)$ ]] || usage_die "unknown engine: $ENGINE_OVERRIDE"
+  [[ -z "$RUNTIME_OVERRIDE" || "$RUNTIME_OVERRIDE" =~ ^(host|container)$ ]] || usage_die "unknown runtime: $RUNTIME_OVERRIDE (expected host or container)"
 }
 
 
@@ -310,7 +286,7 @@ declare -A QUOTA_BY_ENGINE=()
 quota_for_engine() {
   local engine="$1"
   if [[ -z "${QUOTA_BY_ENGINE[$engine]+set}" ]]; then
-    QUOTA_BY_ENGINE[$engine]="$("${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source 9>&-)" \
+    QUOTA_BY_ENGINE[$engine]="$(timeout --kill-after=5 35 "${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source 9>&-)" \
       || QUOTA_BY_ENGINE[$engine]="fail"
   fi
   QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"
@@ -334,9 +310,9 @@ skip_nothing_eligible() {
     fi
     engines+=( "$engine" )
   done
-  (( ${#verdicts[@]} )) || skip "no eligible entry for slot ${SLOT}"
+  (( ${#verdicts[@]} )) || skip nothing-eligible "no eligible entry for slot ${SLOT}"
   local why; why="$(printf '%s; ' "${verdicts[@]}")"
-  skip "no eligible entry for slot ${SLOT} (${why%; })" \
+  skip nothing-eligible "no eligible entry for slot ${SLOT} (${why%; })" \
     "quota=$(IFS=,; printf '%s' "${quotas[*]}")" "engine=$(IFS=,; printf '%s' "${engines[*]}")"
 }
 
@@ -349,7 +325,7 @@ retire_completed_plan() {
   local all_file entry key archive complete=1
   all_file="$(mktemp)"
   python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" all > "$all_file" \
-    || { rm -f "$all_file"; die "staged plan queue failed validation"; }
+    || { rm -f "$all_file"; plan_quarantine "staged plan queue failed validation"; return 0; }
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     key="$(jq -r '.key' <<< "$entry")"
@@ -402,21 +378,21 @@ select_entry() {
 }
 
 main() {
-  parse_args "$@"
+  outcome_scan_args "$@"; parse_args "$@"; trap 'outcome_on_exit tmp_cleanup' EXIT
   mkdir -p "$STATE_DIR" "$WORKTREE_DIR" "${MEUTE_ROOT}/reports"
   command -v jq >/dev/null || die "jq is required"
-  scrub_env
+  scrub_env; tmp_init "$STATE_DIR"
   type -P git >/dev/null || die "git is required"
 
   # Cheapest verdict first, and it depends on nothing: a fleet you have stood
   # down should decline without needing a lock, a valid manifest or a quota
   # probe. See lib/fleet.sh for why a manual hold exists at all.
   if hold_active; then
-    skip "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
+    skip hold "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
   fi
 
   # One runner at a time. A slow run must not stack up under a tight timer.
-  runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip "another run holds the lock"
+  runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip lock "another run holds the lock"
 
   python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "manifest failed validation"
 
@@ -430,14 +406,13 @@ main() {
   local rc=0; fleet_wire_self_budget || rc=$?
   (( rc == 127 )) && die "lib/fleet.sh is missing fleet_wire_self_budget"
   if (( rc == 0 )); then
-    BUDGET_LEFT="$(fleet_self_budget_remaining)" || skip "self-budget probe failed"
+    BUDGET_LEFT="$(fleet_self_budget_remaining)" || skip budget "self-budget probe failed"
     (( BUDGET_LEFT < 1 )) \
-      && skip "meute's own weekly ceiling is spent" "budget=${BUDGET_LEFT}"
+      && skip budget "meute's own weekly ceiling is spent" "budget=${BUDGET_LEFT}"
   fi
 
   local queue_file
   queue_file="$(mktemp)"
-  trap 'rm -f "$queue_file"' RETURN
   # A portfolio plan exists only after an explicit `meute plan --enqueue`.
   # It is independently re-expanded and refuses writing tiers in manifest.py;
   # then the ordinary timers prioritize it until every staged item is attempted.
@@ -446,7 +421,7 @@ main() {
   fi
   if [[ -f "$PLAN_QUEUE_FILE" ]]; then
     python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$SLOT" > "$queue_file" \
-      || die "staged plan queue failed validation"
+      || plan_quarantine "staged plan queue failed validation"
     if [[ -s "$queue_file" ]]; then
       PLAN_MODE=1
     fi
@@ -475,7 +450,7 @@ main() {
     select_entry || true
     entry="$SELECTED"
   fi
-  (( ${#QUEUE[@]} )) || skip "no queue entries for slot ${SLOT}"
+  (( ${#QUEUE[@]} )) || skip no-queue "no queue entries for slot ${SLOT}"
   [[ -n "$entry" ]] || skip_nothing_eligible
 
   # The selected entry's pool, from the reading eligible() cached -- or, for
@@ -487,11 +462,11 @@ main() {
   engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
   if [[ -n "$engine" ]]; then
     quota_for_engine "$engine"
-    [[ "$QUOTA_PROBE" != "fail" ]] || skip "${engine} quota probe failed"
+    [[ "$QUOTA_PROBE" != "fail" ]] || skip quota-unknown "${engine} quota probe failed"
     remaining="${QUOTA_PROBE%% *}"
     QUOTA_SOURCE="${QUOTA_PROBE#* }"
     (( remaining < QUOTA_FLOOR )) \
-      && skip "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
+      && skip quota-floor "${engine} quota ${remaining}% below floor ${QUOTA_FLOOR}%" "quota=${remaining}:${QUOTA_SOURCE}" "engine=${engine}"
     remaining_at_start="$remaining"
   fi
   run_entry "$entry"
@@ -612,7 +587,7 @@ run_entry() {
   # reach would fail every Read the template asks for.
   local agent_path="$WORKTREE"
   (( CONTAINER_MODE )) && agent_path="/work"
-  local prompt_file; prompt_file="$(mktemp)"
+  local prompt_file="${STATE_DIR}/dry-run-prompt.md"; (( DRY_RUN )) || prompt_file="$(mktemp)"
   python3 "$MANIFEST_PY" render "$template" \
     "REPO_NAME=${repo}" "REPO_SPEC=${spec}" "REPO_PATH=${agent_path}" \
     "TASK=${task}" "TIER=${tier}" "DATE=${DATE}" "BRANCH=${BRANCH}" \
@@ -659,7 +634,7 @@ run_entry() {
   # after that check, where a child the engine left running could still
   # commit before cleanup.
   (( SCRATCH_LFS_OVERRIDE )) && DISCARD_BRANCH=1
-  trap cleanup EXIT
+  trap 'outcome_on_exit cleanup' EXIT
   if (( CONTAINER_MODE )); then
     # A linked worktree's .git points at a host path that is not there on the
     # other side of the mount, so the container gets a self-contained clone

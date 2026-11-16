@@ -90,8 +90,10 @@ source "${MEUTE_ROOT}/lib/status.sh"
 source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
 source "${MEUTE_ROOT}/lib/timers.sh"
+source "${MEUTE_ROOT}/lib/unitlimits.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
+source "${MEUTE_ROOT}/lib/tmp.sh"
 
 SCRUBBED=""
 AUTH_MODE=""
@@ -175,6 +177,8 @@ readonly DISMISS_REASONS="false-positive wont-fix out-of-scope duplicate too-lar
 
 cmd_findings() {
   local filter="${1:---new}"
+  # Under state/tmp, not $TMPDIR, and gone however the command ends.
+  tmp_init "$STATE_DIR"; trap tmp_cleanup EXIT
   local tmp; tmp="$(mktemp)"
   # One process reads every report; the shell only sorts and lays out.
   # A crash must not read as "no findings": stderr stays visible and the exit

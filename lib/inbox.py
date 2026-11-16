@@ -237,6 +237,8 @@ def load_status() -> dict:
                 if fields.get("status") == "skipped":
                     out["declined"] += 1
                     continue
+                if fields.get("code") == "died":
+                    continue  # the runner died before any engine ran
                 out["runs"] += 1
                 try:
                     out["cost"] += float(fields.get("cost", "0") or 0)

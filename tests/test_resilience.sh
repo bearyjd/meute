@@ -2,6 +2,49 @@
 # tests/test_meute.sh, which supplies REPO, FIXTURE and the ok/bad/is/has
 # helpers; nothing here runs on its own.
 
+# P0.9: the status-line capture must not leave rate-limits.json.* strays when
+# the final rename fails or the render is killed, and sweeps old strays.
+test_p09_statusline_tmp() {
+  local root="$FIXTURE/p09" cap="$REPO/contrib/statusline-capture.sh"
+  local state="$root/state" shim="$root/shim" doc
+  mkdir -p "$state" "$shim"
+  doc='{"rate_limits":{"five_hour":{"used_percentage":5,"resets_at":9999999999}}}'
+
+  # mv shimmed to fail, then a normal run: nothing may be left behind.
+  printf '#!/bin/sh\nexit 1\n' > "$shim/mv"; chmod +x "$shim/mv"
+  printf '%s' "$doc" | PATH="$shim:$PATH" MEUTE_ROOT="$root" "$cap" -- 'true'
+  is "p0.9 capture: a failed rename leaves no stray temp file" \
+     "$(ls "$state" | grep -c '^rate-limits\.json\.')" "0"
+  printf '%s' "$doc" | MEUTE_ROOT="$root" "$cap" -- 'true'
+  is "p0.9 capture: the normal run still writes the snapshot" \
+     "$(jq -r .five_hour.used_percentage "$state/rate-limits.json")" "5"
+  is "p0.9 capture: ...and leaves no sibling files" \
+     "$(ls "$state" | grep -c '^rate-limits\.json\.')" "0"
+
+  # opportunistic sweep: old strays go, a fresh sibling (a concurrent render) stays.
+  rm -f "$state/rate-limits.json"
+  : > "$state/rate-limits.json.OLD123"; touch -d '20 minutes ago' "$state/rate-limits.json.OLD123"
+  : > "$state/rate-limits.json.NEW123"
+  printf '%s' "$doc" | MEUTE_ROOT="$root" "$cap" -- 'true'
+  [[ ! -e "$state/rate-limits.json.OLD123" ]] && ok "p0.9 capture: a stray older than 10 minutes is swept" \
+    || bad "p0.9 capture: a stray older than 10 minutes is swept" "still present"
+  [[ -e "$state/rate-limits.json.NEW123" ]] && ok "p0.9 capture: a fresh sibling is left alone" \
+    || bad "p0.9 capture: a fresh sibling is left alone" "was deleted"
+  rm -f "$state"/rate-limits.json.*
+
+  # an unwritable state dir must not put a redirect error on stderr: the
+  # status line this script wraps must never break.
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "p0.9 capture: unwritable state dir stays silent" "running as root; chmod cannot block writes"
+  else
+    rm -f "$state/rate-limits.json"; chmod 555 "$state"
+    local err
+    err="$(printf '%s' "$doc" | MEUTE_ROOT="$root" "$cap" -- 'true' 2>&1 >/dev/null)"
+    chmod 755 "$state"
+    is "p0.9 capture: unwritable state dir stays silent" "$err" ""
+  fi
+}
+
 # P0.1 (R2): the run lock is fd 9 of run.sh. Every child used to inherit it,
 # so an engine that left a process behind (here: one in its own session,
 # which no process-group kill reaches) held the lock after run.sh exited and
@@ -213,6 +256,99 @@ test_p0_5_single_process_reads() {
   is  "p0.5: footer" "$(tail -1 <<< "$out_new")" "meute: act with: meute promote <id> -f <n>   |   meute dismiss <id> -f <n> -r <reason>"
 }
 
+# P0.2 (R1): every fire leaves exactly one state/log line, and that line names
+# its outcome in a code= field. A fatal path used to exit with
+# nothing in state/log, so a broken manifest stopped the fleet silently.
+_log_lines() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
+
+test_exit_log_line() {
+  local root="$FIXTURE/exitlog" repo="$FIXTURE/exitlog/git-lk" log out rc before
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  local fire=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily )
+
+  # A manifest that fails validation: one died line, naming the cause.
+  cp "$root/repos.yaml" "$root/repos.yaml.good"
+  printf 'version: 1\nrepos: not-a-list\n' > "$root/repos.yaml"
+  before="$(_log_lines "$log")"
+  rc=0; out="$("${fire[@]}" 2>&1)" || rc=$?
+  is  "exit log: an invalid manifest adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=died"                         "$(tail -1 "$log" 2>/dev/null)" $'\tcode=died'
+  has "exit log: ...and status=error"                       "$(tail -1 "$log" 2>/dev/null)" $'\tstatus=error'
+  has "exit log: ...naming the cause in detail="            "$(tail -1 "$log" 2>/dev/null)" "detail=manifest failed validation"
+  is  "exit log: ...and the run still fails"                "$rc" "1"
+  has "exit log: ...still saying why on stderr"             "$out" "meute: manifest failed validation"
+  mv "$root/repos.yaml.good" "$root/repos.yaml"
+
+  # A death with no temp directory to work in. (TMPDIR no longer reaches it:
+  # since P0.4 the run's directory is under state/tmp or MEUTE_TMPDIR.)
+  before="$(_log_lines "$log")"
+  rc=0; out="$(env MEUTE_TMPDIR=/nonexistent "${fire[@]}" 2>&1)" || rc=$?
+  is  "exit log: a failed mktemp adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=died"                     "$(tail -1 "$log" 2>/dev/null)" $'\tcode=died'
+
+  # A skip: one line, its reason= unchanged, and a code= from the fixed list.
+  printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "testing" > "$root/state/hold"
+  before="$(_log_lines "$log")"
+  rc=0; out="$("${fire[@]}" 2>&1)" || rc=$?
+  is  "exit log: a hold adds exactly one line"   "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...keeping its reason="         "$(tail -1 "$log")" $'\treason=paused until'
+  has "exit log: ...with code=hold"              "$(tail -1 "$log")" $'\tcode=hold'
+  is  "exit log: ...and exits 0"                 "$rc" "0"
+  rm -f "$root/state/hold"
+
+  local held; exec {held}>"$root/state/.lock"; flock -n "$held"
+  before="$(_log_lines "$log")"
+  "${fire[@]}" >/dev/null 2>&1
+  exec {held}>&-
+  is  "exit log: a held lock adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=lock"                 "$(tail -1 "$log")" $'\tcode=lock'
+
+  before="$(_log_lines "$log")"
+  env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=10 "$root/bin/run.sh" daily >/dev/null 2>&1
+  is  "exit log: a quota below the floor adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=nothing-eligible"                  "$(tail -1 "$log")" $'\tcode=nothing-eligible'
+
+  # A completed run: exactly one line (no second line from the exit trap),
+  # still ending in code=.
+  before="$(_log_lines "$log")"
+  rc=0; "${fire[@]}" >/dev/null 2>&1 || rc=$?
+  is  "exit log: a completed run adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...status=ok"                          "$(tail -1 "$log")" $'\tstatus=ok'
+  has "exit log: ...with code=ok"                       "$(tail -1 "$log")" $'\tcode=ok'
+  is  "exit log: ...and exits 0"                        "$rc" "0"
+
+  # A failed run logs its own line and exits 1; the exit trap adds nothing.
+  sed -i 's/is_error:false/is_error:true/' "$root/stub/claude"
+  before="$(_log_lines "$log")"
+  rc=0; "${fire[@]}" >/dev/null 2>&1 || rc=$?
+  is  "exit log: a failed run adds exactly one line" "$(( $(_log_lines "$log") - before ))" "1"
+  has "exit log: ...with code=failed"                "$(tail -1 "$log")" $'\tcode=failed'
+  is  "exit log: ...and exits 1"                     "$rc" "1"
+  sed -i 's/is_error:true/is_error:false/' "$root/stub/claude"
+
+  # A dry run is not a fire and writes nothing, as before.
+  before="$(_log_lines "$log")"
+  "${fire[@]}" --dry-run >/dev/null 2>&1
+  is  "exit log: a dry run adds no line" "$(( $(_log_lines "$log") - before ))" "0"
+
+  # A died fire ran no engine, so it is not a run and spends no budget. The
+  # log now holds two died lines, three skips, one ok and one failed: 2 runs.
+  is  "exit log: died fires are not runs in the inbox" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.runs)" "2"
+  is  "exit log: ...nor spend weekly_runs" \
+      "$(MEUTE_ROOT="$root" MEUTE_WEEKLY_RUNS=10 "$root/contrib/quota-self-budget.sh")" "80"
+  is  "exit log: ...nor count in week_runs" \
+      "$(LOG_FILE="$log" THIS_WEEK="$(date +%G-%V)"; source "$root/lib/fleet.sh"; week_runs)" "2"
+  has "exit log: ...nor in the status total" \
+      "$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" status 2>&1)" "  2 runs ("
+  local last_ok; last_ok="$(grep $'\tcode=failed\t' "$log" | tail -1 | cut -f1)"
+  printf '9999-12-31T00:00:00+00:00\tweek=%s\tslot=daily\tstatus=error\tdetail=x\tcode=died\tdur=0s\truntime=-\timage=-\tstage=-\tpr=-\n' \
+    "$(date +%G-%V)" >> "$log"
+  is  "exit log: ...nor become the inbox's last_run" \
+      "$(MEUTE_ROOT="$root" python3 "$root/lib/inbox.py" dump | jq -r .status.last_run)" "$last_ok"
+}
+
 # P0.10: a workflow runs both suites on push and PR, using no third-party
 # action beyond checkout, so a red test blocks merge.
 test_p0_ci_workflow() {
@@ -275,4 +411,286 @@ test_p0_5_findings_failure_and_nonregular() {
   has "p0.5: findings shows the inbox.py error" "$out" "boom-from-inbox"
   has "p0.5: findings warns instead of 'no new findings'" "$out" "meute: findings failed"
   is  "p0.5: no false 'no new findings' on crash" "$(grep -c 'no new findings' <<< "$out")" "0"
+}
+
+# P0.3 (R1, second half): --strict-exit (or MEUTE_STRICT_EXIT=1) makes the exit
+# status say how the fire ended, so a loop can branch on $? alone. Without it
+# every skip still exits 0 (cron and the installed units are unaffected; the
+# P0.2 tests above pin that). One case per code in the table.
+test_strict_exit_codes() {
+  local root="$FIXTURE/strict" repo="$FIXTURE/strict/git-lk" log rc
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  cp "$root/repos.yaml" "$root/repos.yaml.good"
+  local run=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" )
+  # _strict <label> <expected status> <command...>
+  _strict() {
+    local label="$1" want="$2"; shift 2
+    local got=0; "$@" >/dev/null 2>&1 || got=$?
+    is "strict exit: $label" "$got" "$want"
+  }
+
+  _strict "a completed run is 0"           0 "${run[@]}" daily --strict-exit
+  _strict "a dry run is 0"                 0 "${run[@]}" daily --dry-run --strict-exit
+
+  sed -i 's/is_error:false/is_error:true/' "$root/stub/claude"
+  _strict "a run that ran and failed is 1" 1 "${run[@]}" daily --strict-exit
+  sed -i 's/is_error:true/is_error:false/' "$root/stub/claude"
+
+  _strict "a missing slot is 2 (usage)"     2 "${run[@]}" --strict-exit
+  _strict "an unknown argument is 2 (usage)" 2 "${run[@]}" daily --bogus --strict-exit
+
+  printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "testing" > "$root/state/hold"
+  _strict "a hold is 10" 10 "${run[@]}" daily --strict-exit
+  _strict "the env var enables it too" 10 env MEUTE_STRICT_EXIT=1 "${run[@]}" daily
+  _strict "...but a hold is 0 without either" 0 "${run[@]}" daily
+  rm -f "$root/state/hold"
+
+  local held; exec {held}>"$root/state/.lock"; flock -n "$held"
+  _strict "a held lock is 11" 11 "${run[@]}" daily --strict-exit
+  exec {held}>&-
+
+  cp "$root/repos.yaml.good" "$root/repos.yaml"
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"]["weekly_runs"] = 1
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
+  _strict "a spent self-budget is 12" 12 "${run[@]}" daily --strict-exit
+  cp "$root/repos.yaml.good" "$root/repos.yaml"
+
+  _strict "a quota below the floor is 13" 13 \
+    env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=10 "$root/bin/run.sh" daily --repo lk --task t --strict-exit
+  _strict "an unreadable quota is 13" 13 \
+    env PATH="$root/stub:$PATH" MEUTE_CLAUDE_QUOTA_CMD=false "$root/bin/run.sh" daily --repo lk --task t --strict-exit
+  _strict "nothing eligible is 14" 14 \
+    env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=10 "$root/bin/run.sh" daily --strict-exit
+
+  printf 'version: 1\nrepos: not-a-list\n' > "$root/repos.yaml"
+  _strict "a runner that died is 70" 70 "${run[@]}" daily --strict-exit
+  _strict "...but 1 without the flag" 1 "${run[@]}" daily
+  _strict "a death with no temp directory is 70" 70 env MEUTE_TMPDIR=/nonexistent "${run[@]}" daily --strict-exit
+  mv "$root/repos.yaml.good" "$root/repos.yaml"
+
+  # The codes with no reachable trigger in a fixture (the load and disk gates
+  # are not wired yet) are pinned through the table itself.
+  local code want
+  for code in "hold 10" "lock 11" "budget 12" "quota-floor 13" "quota-unknown 13" \
+              "nothing-eligible 14" "no-queue 14" "load 15" "disk 15" "ok 0" "failed 1" "died 70"; do
+    want="${code#* }"; code="${code% *}"
+    is "strict exit: table maps code=$code to $want" \
+      "$(MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/outcome.sh"; outcome_exit_status "$1"' _ "$code")" "$want"
+  done
+  unset -f _strict
+}
+
+# P0.4 (R3, R14 part): a fire's temp files live in one directory of its own,
+# under state/tmp (or MEUTE_TMPDIR), and that directory goes on every exit.
+# Before, five bare mktemp files per full run landed in $TMPDIR and stayed
+# (queue_file's RETURN trap never fires: main exits, it does not return), and
+# a full or unwritable /tmp killed the fire. The sentinel TMPDIR catches a
+# file that escapes the run's directory; the state/tmp count catches a run
+# directory that is never removed.
+_count_entries() { [[ -d "$1" ]] && find "$1" -mindepth 1 | wc -l || echo 0; }
+
+test_run_tmp_cleaned() {
+  local root="$FIXTURE/runtmp" repo="$FIXTURE/runtmp/git-lk" sentinel="$FIXTURE/runtmp-sentinel" rc
+  _runlock_fixture "$root" "$repo" tier2
+  mkdir -p "$sentinel"
+
+  # _tmp_case <label> <expected last-log fragment or ""> <quota> [run.sh args...]
+  _tmp_case() {
+    local label="$1" want="$2" quota="$3"; shift 3
+    env TMPDIR="$sentinel" PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB="$quota" "$root/bin/run.sh" daily "$@" >/dev/null 2>&1
+    is "run tmp: $label leaves nothing in TMPDIR"   "$(_count_entries "$sentinel")" "0"
+    is "run tmp: $label leaves nothing in state/tmp" "$(_count_entries "$root/state/tmp")" "0"
+    [[ -z "$want" ]] || has "run tmp: $label ends as expected" "$(tail -1 "$root/state/log" 2>/dev/null)" "$want"
+  }
+  _tmp_case "a full run"    $'\tcode=ok'               100
+  _tmp_case "a dry run"     ""                         100 --dry-run
+  _tmp_case "a skipped run" $'\tcode=nothing-eligible' 10
+  unset -f _tmp_case
+
+  # A dry run's point is the prompt it names, so that file is not a temp file:
+  # it outlives the run at one fixed path under state/, overwritten each time.
+  local out prompt
+  out="$(env TMPDIR="$sentinel" PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  prompt="$(grep -oE 'prompt=\S+' <<< "$out" | cut -d= -f2)"
+  is  "run tmp: a dry run's prompt is kept at a fixed state path" "$prompt" "$root/state/dry-run-prompt.md"
+  has "run tmp: ...and is readable after the run"                  "$(cat "$prompt" 2>/dev/null)" "Task lk"
+
+  # /tmp unwritable is no longer fatal: the run's directory is under state/.
+  rc=0; env TMPDIR=/nonexistent PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1 || rc=$?
+  has "run tmp: a run with TMPDIR unwritable completes" "$(tail -1 "$root/state/log")" $'\tcode=ok'
+  is  "run tmp: ...and exits 0"                         "$rc" "0"
+
+  # MEUTE_TMPDIR moves it; the run's directory is created and removed there.
+  # A probe engine records the TMPDIR it is handed mid-run, so a runner that
+  # ignored MEUTE_TMPDIR (and used state/tmp) fails here, not just elsewhere.
+  local alt="$FIXTURE/runtmp-alt" probe="$FIXTURE/runtmp-probe" seen
+  mkdir -p "$alt" "$probe"
+  printf '#!/usr/bin/env bash\n[[ "$1" == auth ]] || { [[ -d "$TMPDIR" ]] && printf "%%s\\n" "$TMPDIR" > "%s/seen"; }\nexec "%s/stub/claude" "$@"\n' \
+    "$probe" "$root" > "$probe/claude"
+  chmod +x "$probe/claude"
+  env MEUTE_TMPDIR="$alt" TMPDIR="$sentinel" PATH="$probe:$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1
+  seen="$(cat "$probe/seen" 2>/dev/null)"
+  has "run tmp: MEUTE_TMPDIR is honoured"           "$(tail -1 "$root/state/log")" $'\tcode=ok'
+  has "run tmp: ...the run directory is made there" "$seen" "$alt/run."
+  is  "run tmp: ...and removed after the run"       "$([[ -n "$seen" && ! -e "$seen" ]] && echo gone || echo "present:$seen")" "gone"
+  is  "run tmp: ...and left empty"                  "$(_count_entries "$alt")" "0"
+  is  "run tmp: ...with nothing in TMPDIR"          "$(_count_entries "$sentinel")" "0"
+
+  # The runner's temp files are private to the user who runs it.
+  has "run tmp: the run directory template is private" \
+    "$(MEUTE_ROOT="$REPO" bash -c 'die() { exit 1; }; source "$MEUTE_ROOT/lib/tmp.sh"; tmp_init "$1"; stat -c %a "$RUN_TMP"; tmp_cleanup' _ "$root/state")" "700"
+
+  # meute findings: same treatment. Its temp file used to be a bare mktemp.
+  local want got
+  want="$(meute findings --new 2>&1)"
+  rc=0; got="$(TMPDIR=/nonexistent meute findings --new 2>&1)" || rc=$?
+  is "run tmp: meute findings works with TMPDIR unwritable" "$got" "$want"
+  is "run tmp: ...and exits 0"                              "$rc" "0"
+  is "run tmp: ...leaving nothing in state/tmp"             "$(_count_entries "$FIXTURE/state/tmp")" "0"
+}
+
+# P0.6 (R9): a probe that hangs used to hang the fire while it held the lock.
+# Each probe is now bounded (30 s), so a hung one reads as "unknown" and the
+# slot is declined, not wedged. The three cases run side by side because each
+# one costs the full bound when the guard is missing.
+test_bounded_probes() {
+  local root="$FIXTURE/probes" repo="$FIXTURE/probes/git-lk" d
+  _runlock_fixture "$root" "$repo" tier2
+  # A root whose quota.sh itself hangs, to reach the outer bound at the call site.
+  local hroot="$FIXTURE/probes-hang"
+  _runlock_fixture "$hroot" "$FIXTURE/probes-hang/git-lk" tier2
+  rm "$hroot/bin"; mkdir "$hroot/bin"; cp "$REPO/bin/run.sh" "$hroot/bin/run.sh"
+  printf '#!/usr/bin/env bash\nsleep 300\n' > "$hroot/bin/quota.sh"; chmod +x "$hroot/bin/quota.sh"
+  # A self-budget adapter that hangs.
+  local broot="$FIXTURE/probes-budget"; mkdir -p "$broot/contrib"
+  printf '#!/usr/bin/env bash\nsleep 300\n' > "$broot/contrib/quota-self-budget.sh"; chmod +x "$broot/contrib/quota-self-budget.sh"
+
+  local t0=$SECONDS
+  ( env PATH="$root/stub:$PATH" MEUTE_CLAUDE_QUOTA_CMD='sleep 300' timeout 90 "$root/bin/run.sh" daily --repo lk --task t >/dev/null 2>&1
+    echo $((SECONDS - t0)) > "$root/elapsed" ) &
+  ( env PATH="$hroot/stub:$PATH" timeout 90 "$hroot/bin/run.sh" daily --repo lk --task t >/dev/null 2>&1
+    echo $((SECONDS - t0)) > "$hroot/elapsed" ) &
+  ( MEUTE_ROOT="$broot" timeout 90 bash -c 'source "$1"; fleet_self_budget_remaining' _ "$REPO/lib/fleet.sh" >/dev/null 2>&1
+    echo "$?" > "$broot/rc"; echo $((SECONDS - t0)) > "$broot/elapsed" ) &
+  # quota.sh called directly (doctor and status do), without run.sh's bound.
+  ( MEUTE_CLAUDE_QUOTA_CMD='sleep 300' timeout 90 "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1
+    echo "$?" > "$root/direct.rc"; echo $((SECONDS - t0)) > "$root/direct.elapsed" ) &
+  wait
+
+  [[ "$(cat "$root/direct.rc")" == 1 && "$(cat "$root/direct.elapsed")" -lt 40 ]] \
+    && ok "probes: quota.sh on its own gives up on a hung command within 40 s" \
+    || bad "probes: quota.sh on its own gives up on a hung command within 40 s" "rc=$(cat "$root/direct.rc") took $(cat "$root/direct.elapsed") s"
+  has "probes: a hung configured quota command is skipped as quota-unknown" "$(tail -1 "$root/state/log" 2>/dev/null)" "code=quota-unknown"
+  [[ "$(cat "$root/elapsed")" -lt 40 ]] && ok "probes: ...within 40 s" || bad "probes: ...within 40 s" "took $(cat "$root/elapsed") s"
+  has "probes: a hung quota.sh is skipped as quota-unknown" "$(tail -1 "$hroot/state/log" 2>/dev/null)" "code=quota-unknown"
+  [[ "$(cat "$hroot/elapsed")" -lt 45 ]] && ok "probes: ...within 45 s" || bad "probes: ...within 45 s" "took $(cat "$hroot/elapsed") s"
+  [[ "$(cat "$broot/rc")" != 0 && "$(cat "$broot/elapsed")" -lt 40 ]] \
+    && ok "probes: a hung self-budget adapter fails within 40 s" \
+    || bad "probes: a hung self-budget adapter fails within 40 s" "rc=$(cat "$broot/rc") took $(cat "$broot/elapsed") s"
+}
+
+# P0.6 (R9): bounding the probe must not loosen it. eval ran a configured probe
+# under quota.sh's own pipefail and nounset, with quota.sh's MEUTE_ROOT in scope;
+# the bounded child shell has to keep all three, or a broken probe reads as a quota.
+test_probe_shell_options() {
+  local rc out
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='false | echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a pipeline whose first stage fails still declines (exit 1)" "$rc" "1"
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='echo $MEUTE_UNSET_PROBE_VAR; echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a probe reading an unset variable still declines (exit 1)" "$rc" "1"
+  rc=0; MEUTE_CLAUDE_QUOTA_CMD='false; echo 50' "$REPO/bin/quota.sh" --engine claude >/dev/null 2>&1 || rc=$?
+  is "probes: a probe whose earlier command fails declines (exit 1)" "$rc" "1"
+  rc=0; out="$(env -u MEUTE_ROOT MEUTE_CLAUDE_QUOTA_CMD='test "$MEUTE_ROOT" = "'"$REPO"'" && echo 77' \
+    "$REPO/bin/quota.sh" --engine claude 2>/dev/null)" || rc=$?
+  is "probes: a probe sees quota.sh's MEUTE_ROOT when the caller did not export it" "$rc:$out" "0:77"
+}
+
+# P0.6 (R9, R7 part): the generated service gets resource limits and a start
+# timeout, so a hung fire can neither starve the desktop nor outlive its
+# manifest's longest timeout_seconds (60 in this fixture) plus ten minutes.
+test_unit_limits() {
+  local root="$FIXTURE/unitlimits" repo="$FIXTURE/unitlimits/git-lk" home="$FIXTURE/unitlimits/home" stub="$FIXTURE/unitlimits/sysstub" unit
+  _runlock_fixture "$root" "$repo" tier2
+  mkdir -p "$home" "$stub"
+  printf '#!/usr/bin/env bash\n[[ "$*" == *show* ]] && printf "LoadState=loaded\\nUnitFileState=enabled\\nActiveState=active\\nNextElapseUSecRealtime=Sun 2026-08-30 03:17:00 EDT\\n"\nexit 0\n' > "$stub/systemctl"
+  printf '#!/usr/bin/env bash\nprintf "yes\\n"\n' > "$stub/loginctl"
+  chmod +x "$stub/systemctl" "$stub/loginctl"
+  XDG_CONFIG_HOME="$home/.config" PATH="$stub:$PATH" MEUTE_MANIFEST="$root/repos.yaml" \
+    "$root/bin/meute" install-timers >/dev/null 2>&1
+  for unit in daily weekly; do
+    local text; text="$(cat "$home/.config/systemd/user/meute-${unit}.service" 2>/dev/null)"
+    has "unit limits: ${unit} service has Nice=10"                 "$text" "Nice=10"
+    has "unit limits: ${unit} service has IOSchedulingClass=idle"  "$text" "IOSchedulingClass=idle"
+    has "unit limits: ${unit} service has CPUWeight=20"            "$text" "CPUWeight=20"
+    has "unit limits: ${unit} service has TimeoutStartSec = max timeout + 600" "$text" "TimeoutStartSec=660"
+  done
+
+  # doctor: an installed unit without the directives is flagged; one with them is not.
+  local old="$FIXTURE/unitlimits/old"; mkdir -p "$old"
+  printf '[Service]\nType=oneshot\nExecStart=/x/run.sh daily\n' > "$old/meute-daily.service"
+  cp "$home/.config/systemd/user/meute-weekly.service" "$old/meute-weekly.service"
+  local out
+  out="$(bash -c 'source "$1"; d_warn() { printf "WARN %s\n" "$*"; }; doctor_unit_limits "$2"' _ "$REPO/bin/meute" "$old" 2>&1)"
+  has   "unit limits: doctor warns on a unit lacking them"   "$out" "meute-daily.service"
+  has   "unit limits: ...and says to re-run install-timers"  "$out" "re-run install-timers"
+  hasnt "unit limits: ...but not on a current unit"          "$out" "meute-weekly.service"
+}
+
+# P0.8 (R13). A staged plan that fails validation used to
+# make the runner die before the manifest queue was read, so nothing ran until
+# someone deleted the file. Now the file is renamed aside, one code=plan-invalid
+# line says so, and the same fire runs the manifest's next item.
+test_plan_quarantine() {
+  local root="$FIXTURE/planq" repo="$FIXTURE/planq/git-lk" log out rc before bad
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  local fire=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily )
+
+  for bad in '{"version":2}' '{broken'; do
+    rm -f "$root"/state/plan-queue.invalid-*.json "$root/state/plan-queue.json"
+    printf '%s\n' "$bad" > "$root/state/plan-queue.json"
+    : > "$log"
+    rc=0; out="$("${fire[@]}" 2>&1)" || rc=$?
+    is  "plan quarantine: ${bad}: the fire exits 0"                    "$rc" "0"
+    has "plan quarantine: ${bad}: the manifest item ran (status=ok)"   "$(tail -1 "$log")" $'\tstatus=ok'
+    is  "plan quarantine: ${bad}: one plan-invalid error line"         "$(grep -c $'\tstatus=error\t.*code=plan-invalid' "$log")" "1"
+    is  "plan quarantine: ${bad}: the staged file is gone"             "$([[ -e "$root/state/plan-queue.json" ]] && echo present || echo gone)" "gone"
+    is  "plan quarantine: ${bad}: ...renamed aside, content intact"    "$(cat "$root"/state/plan-queue.invalid-*.json 2>/dev/null)" "$bad"
+  done
+
+  # The next fire is plain: nothing staged, one line, no second quarantine.
+  : > "$log"
+  rc=0; "${fire[@]}" >/dev/null 2>&1 || rc=$?
+  is  "plan quarantine: the next fire is unaffected"  "$(grep -c 'plan-invalid' "$log")" "0"
+  is  "plan quarantine: ...and exits 0"              "$rc" "0"
+}
+
+# P0.8 review: only a bad plan is quarantined. A manifest that breaks while a
+# valid plan is staged (here the agent run corrupts it, so validate has already
+# passed and the post-run plan-queue call is the first to see it) must leave
+# the plan where it is; the fire dies on the manifest as it always did.
+test_plan_quarantine_manifest_broken() {
+  local root="$FIXTURE/planqm" repo="$FIXTURE/planqm/git-lk" log rc
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  printf '{"version":1,"scan":"%s","allow_web":false,"entries":[{"name":"plan-001-x","path":"%s","task":"t"}]}\n' \
+    "$root" "$repo" > "$root/state/plan-queue.json"
+  local plan; plan="$(cat "$root/state/plan-queue.json")"
+  is "plan quarantine (manifest broken): the staged plan is valid" \
+    "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.yaml" "$root/state/plan-queue.json" daily >/dev/null 2>&1; echo $?)" "0"
+  # The stub agent breaks the manifest while it runs.
+  sed -i "2i printf 'version: [\\\\n' > '$root/repos.yaml'" "$root/stub/claude"
+  local out; rc=0; out="$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily 2>&1)" || rc=$?
+  is  "plan quarantine (manifest broken): the manifest really broke" \
+    "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" >/dev/null 2>&1; echo $?)" "1"
+  is  "plan quarantine (manifest broken): the fire fails on the manifest" "$(( rc != 0 ))" "1"
+  has "plan quarantine (manifest broken): ...saying so on stderr" "$out" "meute: manifest failed validation"
+  is  "plan quarantine (manifest broken): the plan stays in place" "$(cat "$root/state/plan-queue.json" 2>/dev/null)" "$plan"
+  is  "plan quarantine (manifest broken): nothing is quarantined" \
+    "$(compgen -G "$root/state/plan-queue.invalid-*" || echo none)" "none"
+  is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }

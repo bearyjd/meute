@@ -126,6 +126,7 @@ week_runs() {
   awk -v wk="week=${THIS_WEEK}" -v kf="$kind" '
     index($0, wk) == 0        { next }
     index($0, "status=skipped") { next }
+    index($0, "\tcode=died\t")  { next }
     kf != "" && index($0, "kind=" kf) == 0 { next }
     { n++ } END { print n + 0 }' "$LOG_FILE"
 }
@@ -186,5 +187,5 @@ fleet_wire_self_budget() {
 # meaningful after fleet_wire_self_budget returned 0. Fails (non-zero) if the
 # adapter cannot answer, which the caller must treat as "decline", not "fine".
 fleet_self_budget_remaining() {
-  "${MEUTE_ROOT}/contrib/quota-self-budget.sh"
+  timeout --kill-after=5 30 "${MEUTE_ROOT}/contrib/quota-self-budget.sh"
 }

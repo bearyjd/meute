@@ -39,6 +39,36 @@ class ClassifyTests(unittest.TestCase):
         out = runprogress.classify([self.rec("weekly", "ok")], 0, "daily", time.time() - 5)
         self.assertEqual(out["status"], "error")
 
+    def coded(self, status, code):
+        return runprogress.parse_line(
+            f"{iso(0)}\tslot=daily\tstatus={status}\treason=text\tcode={code}\trepo=r\ttask=t")
+
+    def test_code_is_preferred_over_the_status_text(self):
+        since = time.time() - 5
+        for code, want in [("ok", "ok"), ("failed", "error"), ("died", "error"),
+                           ("hold", "skipped"), ("lock", "skipped"), ("budget", "skipped"),
+                           ("quota-floor", "skipped"), ("quota-unknown", "skipped"),
+                           ("nothing-eligible", "skipped"), ("no-queue", "skipped"),
+                           ("load", "skipped"), ("disk", "skipped")]:
+            with self.subTest(code=code):
+                # status says the opposite of the code: the code wins
+                other = "error" if want != "error" else "ok"
+                out = runprogress.classify([self.coded(other, code)], 0, "daily", since)
+                self.assertEqual(out["status"], want)
+
+    def test_unknown_code_falls_back_to_status_text(self):
+        out = runprogress.classify([self.coded("skipped", "future-code")], 0, "daily",
+                                   time.time() - 5)
+        self.assertEqual(out["status"], "skipped")
+
+    def test_strict_exit_status_stands_in_for_a_missing_line(self):
+        since = time.time() + 5
+        for rc, want in [(0, "error"), (1, "error"), (10, "skipped"), (11, "skipped"),
+                         (13, "skipped"), (15, "skipped"), (70, "error")]:
+            with self.subTest(rc=rc):
+                out = runprogress.classify([], rc, "daily", since)
+                self.assertEqual(out["status"], want)
+
 
 class LoadQueueTests(unittest.TestCase):
     def test_queue_archived_between_isfile_and_getmtime_reads_the_archive(self):

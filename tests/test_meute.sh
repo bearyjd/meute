@@ -33,6 +33,8 @@ hasnt(){ [[ "$2" != *"$3"* ]] && ok "$1" || bad "$1" "[$2] unexpectedly contains
 # read as a pass, and must not fail a suite on a host that lacks the facility.
 skip() { printf '  skip  %s\n        %s\n' "$1" "$2"; }
 
+source "$REPO/tests/test_resilience.sh"
+
 meute() { "$FIXTURE/bin/meute" "$@"; }
 report() { python3 "$REPO/lib/report.py" "$@"; }
 
@@ -1739,7 +1741,7 @@ STUB
   has   "status: a plan the runner refuses is reported as invalid" "$out" "staged plan: invalid — "
   has   "status: ...with the validator's reason"                    "$out" "invalid plan queue JSON"
   hasnt "status: ...never as an empty plan"                         "$out" "0 of 0 attempted"
-  has   "status: ...and next says the runner is blocked on it"      "$out" "next daily   - (staged plan invalid; the runner refuses to run)"
+  has   "status: ...and next says the runner will quarantine it"    "$out" "next daily   (staged plan invalid; the runner will quarantine it) "
   rm -f "$root/state/plan-queue.json"
 }
 
@@ -6231,9 +6233,18 @@ test_billing_scrub_one_list
 test_p2b_credential_volume_is_shared
 test_p2b_engine_override_credential
 test_p2_probe_cleanup
+test_p09_statusline_tmp
 test_run_lock_not_inherited
 test_run_lock_git_hooks
 test_run_lock_error_paths
+test_exit_log_line
+test_strict_exit_codes
+test_run_tmp_cleaned
+test_bounded_probes
+test_probe_shell_options
+test_unit_limits
+test_plan_quarantine
+test_plan_quarantine_manifest_broken
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

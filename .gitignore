@@ -5,6 +5,9 @@
 state/.lock
 state/lock-info
 state/.kv.*
+# Each fire's own temp directory (lib/tmp.sh), removed on exit.
+state/tmp/
+state/dry-run-prompt.md
 .omc/
 # Your real fleet config: names your projects and describes what they do.
 # The harness is public; that list is yours. Anchored on the prefix, because
