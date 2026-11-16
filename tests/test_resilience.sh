@@ -420,11 +420,20 @@ test_run_tmp_cleaned() {
   is  "run tmp: ...and exits 0"                         "$rc" "0"
 
   # MEUTE_TMPDIR moves it; the run's directory is created and removed there.
-  local alt="$FIXTURE/runtmp-alt"; mkdir -p "$alt"
-  env MEUTE_TMPDIR="$alt" TMPDIR="$sentinel" PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1
-  has "run tmp: MEUTE_TMPDIR is honoured"     "$(tail -1 "$root/state/log")" $'\tcode=ok'
-  is  "run tmp: ...and left empty"            "$(_count_entries "$alt")" "0"
-  is  "run tmp: ...with nothing in TMPDIR"    "$(_count_entries "$sentinel")" "0"
+  # A probe engine records the TMPDIR it is handed mid-run, so a runner that
+  # ignored MEUTE_TMPDIR (and used state/tmp) fails here, not just elsewhere.
+  local alt="$FIXTURE/runtmp-alt" probe="$FIXTURE/runtmp-probe" seen
+  mkdir -p "$alt" "$probe"
+  printf '#!/usr/bin/env bash\n[[ "$1" == auth ]] || { [[ -d "$TMPDIR" ]] && printf "%%s\\n" "$TMPDIR" > "%s/seen"; }\nexec "%s/stub/claude" "$@"\n' \
+    "$probe" "$root" > "$probe/claude"
+  chmod +x "$probe/claude"
+  env MEUTE_TMPDIR="$alt" TMPDIR="$sentinel" PATH="$probe:$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily >/dev/null 2>&1
+  seen="$(cat "$probe/seen" 2>/dev/null)"
+  has "run tmp: MEUTE_TMPDIR is honoured"           "$(tail -1 "$root/state/log")" $'\tcode=ok'
+  has "run tmp: ...the run directory is made there" "$seen" "$alt/run."
+  is  "run tmp: ...and removed after the run"       "$([[ -n "$seen" && ! -e "$seen" ]] && echo gone || echo "present:$seen")" "gone"
+  is  "run tmp: ...and left empty"                  "$(_count_entries "$alt")" "0"
+  is  "run tmp: ...with nothing in TMPDIR"          "$(_count_entries "$sentinel")" "0"
 
   # The runner's temp files are private to the user who runs it.
   has "run tmp: the run directory template is private" \
