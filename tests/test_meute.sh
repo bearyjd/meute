@@ -1739,7 +1739,7 @@ STUB
   has   "status: a plan the runner refuses is reported as invalid" "$out" "staged plan: invalid — "
   has   "status: ...with the validator's reason"                    "$out" "invalid plan queue JSON"
   hasnt "status: ...never as an empty plan"                         "$out" "0 of 0 attempted"
-  has   "status: ...and next says the runner is blocked on it"      "$out" "next daily   - (staged plan invalid; the runner refuses to run)"
+  has   "status: ...and next says the runner will quarantine it"    "$out" "next daily   (staged plan invalid; the runner will quarantine it) "
   rm -f "$root/state/plan-queue.json"
 }
 
@@ -6228,6 +6228,7 @@ test_run_tmp_cleaned
 test_bounded_probes
 test_probe_shell_options
 test_unit_limits
+test_plan_quarantine
 test_real_repo_untouched
 test_web_invariants
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"

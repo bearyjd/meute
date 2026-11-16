@@ -44,7 +44,7 @@ set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
-source "${MEUTE_ROOT}/lib/outcome.sh"
+source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
@@ -325,7 +325,7 @@ retire_completed_plan() {
   local all_file entry key archive complete=1
   all_file="$(mktemp)"
   python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" all > "$all_file" \
-    || { rm -f "$all_file"; die "staged plan queue failed validation"; }
+    || { rm -f "$all_file"; plan_quarantine "staged plan queue failed validation"; return 0; }
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     key="$(jq -r '.key' <<< "$entry")"
@@ -421,7 +421,7 @@ main() {
   fi
   if [[ -f "$PLAN_QUEUE_FILE" ]]; then
     python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$SLOT" > "$queue_file" \
-      || die "staged plan queue failed validation"
+      || plan_quarantine "staged plan queue failed validation"
     if [[ -s "$queue_file" ]]; then
       PLAN_MODE=1
     fi

@@ -450,3 +450,32 @@ test_unit_limits() {
   has   "unit limits: ...and says to re-run install-timers"  "$out" "re-run install-timers"
   hasnt "unit limits: ...but not on a current unit"          "$out" "meute-weekly.service"
 }
+
+# P0.8 (R13). A staged plan that fails validation used to
+# make the runner die before the manifest queue was read, so nothing ran until
+# someone deleted the file. Now the file is renamed aside, one code=plan-invalid
+# line says so, and the same fire runs the manifest's next item.
+test_plan_quarantine() {
+  local root="$FIXTURE/planq" repo="$FIXTURE/planq/git-lk" log out rc before bad
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+  local fire=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily )
+
+  for bad in '{"version":2}' '{broken'; do
+    rm -f "$root"/state/plan-queue.invalid-*.json "$root/state/plan-queue.json"
+    printf '%s\n' "$bad" > "$root/state/plan-queue.json"
+    : > "$log"
+    rc=0; out="$("${fire[@]}" 2>&1)" || rc=$?
+    is  "plan quarantine: ${bad}: the fire exits 0"                    "$rc" "0"
+    has "plan quarantine: ${bad}: the manifest item ran (status=ok)"   "$(tail -1 "$log")" $'\tstatus=ok'
+    is  "plan quarantine: ${bad}: one plan-invalid error line"         "$(grep -c $'\tstatus=error\t.*code=plan-invalid' "$log")" "1"
+    is  "plan quarantine: ${bad}: the staged file is gone"             "$([[ -e "$root/state/plan-queue.json" ]] && echo present || echo gone)" "gone"
+    is  "plan quarantine: ${bad}: ...renamed aside, content intact"    "$(cat "$root"/state/plan-queue.invalid-*.json 2>/dev/null)" "$bad"
+  done
+
+  # The next fire is plain: nothing staged, one line, no second quarantine.
+  : > "$log"
+  rc=0; "${fire[@]}" >/dev/null 2>&1 || rc=$?
+  is  "plan quarantine: the next fire is unaffected"  "$(grep -c 'plan-invalid' "$log")" "0"
+  is  "plan quarantine: ...and exits 0"              "$rc" "0"
+}

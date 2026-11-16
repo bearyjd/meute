@@ -69,12 +69,14 @@ cmd_status() {
 next_for_slot() {
   local slot="$1" key staged
   if [[ -f "$PLAN_QUEUE_FILE" ]]; then
-    # The runner dies on a plan it cannot validate; nothing runs until the
-    # file is fixed or removed, so no manifest entry is "next" either.
-    staged="$(python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$slot" 2>/dev/null)" \
-      || { printf -- '- (staged plan invalid; the runner refuses to run)\n'; return 0; }
-    key="$(next_in_queue "plan-cursor.${slot}" plan <<< "$staged")"
-    [[ -z "$key" ]] || { printf '%s\n' "$key"; return 0; }
+    # The runner quarantines a plan it cannot validate and runs the manifest
+    # queue in the same fire, so an invalid plan only changes the label.
+    if staged="$(python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$slot" 2>/dev/null)"; then
+      key="$(next_in_queue "plan-cursor.${slot}" plan <<< "$staged")"
+      [[ -z "$key" ]] || { printf '%s\n' "$key"; return 0; }
+    else
+      printf '(staged plan invalid; the runner will quarantine it) '
+    fi
   fi
   key="$(next_in_queue "cursor.${slot}" manifest \
            < <(python3 "$MANIFEST_PY" queue "$MANIFEST" "$slot" 2>/dev/null || true))"
