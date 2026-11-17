@@ -100,6 +100,7 @@ fleet_load_policy() {
   local policy
   policy="$(python3 "$MANIFEST_PY" policy "$MANIFEST")" || return 1
   QUOTA_FLOOR="$(jq -r '.quota_floor_percent' <<< "$policy")"
+  QUOTA_MAX_AGE_HOURS="$(jq -r '.quota_max_age_hours // ""' <<< "$policy")"
   COMMUNITY_SHARE="$(jq -r '.community_share' <<< "$policy")"
   TIER3_CAP="$(jq -r '.tier3_max_in_flight' <<< "$policy")"
   BRANCH_PREFIX="$(jq -r '.branch_prefix' <<< "$policy")"

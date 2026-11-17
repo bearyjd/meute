@@ -91,6 +91,10 @@ cmd_doctor() {
   if python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null 2>&1; then
     d_ok "$(basename "$MANIFEST") is valid"
     fleet_load_policy >/dev/null 2>&1 || true
+    local unknown_keys
+    unknown_keys="$(python3 "$MANIFEST_PY" unknown-policy-keys "$MANIFEST" 2>/dev/null | paste -sd, - || true)"
+    [[ -z "$unknown_keys" ]] \
+      || d_warn "unknown policy key(s): ${unknown_keys//,/, } - not read by anything, so the default applies"
     local repos community
     repos="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('repos') or []))" "$MANIFEST")"
     community="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('community') or []))" "$MANIFEST")"
