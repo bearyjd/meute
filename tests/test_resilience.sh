@@ -966,6 +966,113 @@ EOF
   has   "host gate: min_free_mb -5 is refused" "$(validate "$root/bad4.yaml" "$root")" "policy.min_free_mb"
 }
 
+# P1.9 (R14, owner decision D8): a fire that finds what a killed runner left
+# behind (its worktree, its scratch branch, its state/tmp/run.<pid>.* directory,
+# state/.kv.* strays) clears it under the run lock. Ownership is the PID in the
+# name checked against /proc/<pid>/cmdline (MEUTE_PROC overrides /proc), so a
+# reused PID does not protect a dead runner's leftovers. `doctor` only lists.
+test_startup_sweep() {
+  local root="$FIXTURE/sweep" repo="$FIXTURE/sweep/git-lk" out wt="$FIXTURE/sweep/.worktrees"
+  _runlock_fixture "$root" "$repo" tier1
+  local g=( git -C "$repo" -c user.email=t@t -c user.name=t )
+  mkdir -p "$wt" "$root/state/tmp" "$root/proc/4242" "$root/proc/4343"
+  printf 'bash\0%s/bin/run.sh\0daily\0' "$root" > "$root/proc/4242/cmdline"   # a live runner
+  printf 'sleep\0100\0' > "$root/proc/4343/cmdline"                           # a reused PID
+  "${g[@]}" worktree add -q -b meute/dead-empty "$wt/lk-t-2026-01-01.4999991"
+  "${g[@]}" worktree add -q -b meute/dead-work  "$wt/lk-t-2026-01-01.4999992"
+  git -C "$wt/lk-t-2026-01-01.4999992" -c user.email=t@t -c user.name=t commit -q --allow-empty -m draft
+  "${g[@]}" worktree add -q -b meute/live       "$wt/lk-t-2026-01-01.4242"
+  "${g[@]}" worktree add -q -b meute/reused     "$wt/lk-t-2026-01-01.4343"
+  mkdir -p "$root/state/tmp/run.4999993.AAAAAA" "$root/state/tmp/run.4242.BBBBBB"
+  : > "$root/state/.kv.OLD111"; touch -d '2 hours ago' "$root/state/.kv.OLD111"
+  : > "$root/state/.kv.NEW111"
+  local R=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=90 MEUTE_PROC="$root/proc" )
+
+  # doctor lists, removes nothing
+  out="$("${R[@]}" "$root/bin/meute" doctor 2>&1)"
+  has "sweep: doctor lists a dead runner's worktree" "$out" "lk-t-2026-01-01.4999991"
+  has "sweep: ...and the stale kv file" "$out" ".kv.OLD111"
+  [[ -d "$wt/lk-t-2026-01-01.4999991" && -e "$root/state/.kv.OLD111" ]] \
+    && ok "sweep: doctor removed nothing" || bad "sweep: doctor removed nothing" "something is gone"
+
+  out="$("${R[@]}" "$root/bin/run.sh" daily 2>&1)"
+  [[ ! -e "$wt/lk-t-2026-01-01.4999991" ]] && ok "sweep: a dead runner's worktree is removed" \
+    || bad "sweep: a dead runner's worktree is removed" "still there"
+  [[ ! -e "$wt/lk-t-2026-01-01.4999992" ]] && ok "sweep: ...also the one whose branch has a commit" \
+    || bad "sweep: ...also the one whose branch has a commit" "still there"
+  [[ -d "$wt/lk-t-2026-01-01.4242" ]] && ok "sweep: a live runner's worktree stays" \
+    || bad "sweep: a live runner's worktree stays" "removed"
+  [[ ! -e "$wt/lk-t-2026-01-01.4343" ]] && ok "sweep: a reused PID (cmdline is not run.sh) does not protect it" \
+    || bad "sweep: a reused PID (cmdline is not run.sh) does not protect it" "still there"
+  git -C "$repo" rev-parse --verify -q refs/heads/meute/dead-empty >/dev/null \
+    && bad "sweep: an unmoved scratch branch is deleted" "branch still exists" \
+    || ok "sweep: an unmoved scratch branch is deleted"
+  git -C "$repo" rev-parse --verify -q refs/heads/meute/dead-work >/dev/null \
+    && ok "sweep: a branch with a commit is kept" || bad "sweep: a branch with a commit is kept" "deleted"
+  is "sweep: the repository's worktree list is pruned" \
+     "$(git -C "$repo" worktree list --porcelain | grep -c '^worktree .*\.4999991$')" "0"
+  [[ ! -e "$root/state/tmp/run.4999993.AAAAAA" && -d "$root/state/tmp/run.4242.BBBBBB" ]] \
+    && ok "sweep: a dead run's tmp dir goes, a live one stays" \
+    || bad "sweep: a dead run's tmp dir goes, a live one stays" "$(ls "$root/state/tmp")"
+  [[ ! -e "$root/state/.kv.OLD111" && -e "$root/state/.kv.NEW111" ]] \
+    && ok "sweep: .kv strays older than an hour go, a fresh one stays" \
+    || bad "sweep: .kv strays older than an hour go, a fresh one stays" "$(ls -A "$root/state")"
+  is "sweep: one note per removal" "$(grep -c "sweep: removed" <<< "$out")" "7"
+  has "sweep: the fire itself still ran" "$(tail -1 "$root/state/log")" "status=ok"
+
+  # A removal that fails is reported as a failure, never as "removed".
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "sweep: a failed removal is reported" "running as root; chmod cannot block rm"
+  else
+    mkdir -p "$root/state/tmp/run.4999994.CCCCCC/locked"; : > "$root/state/tmp/run.4999994.CCCCCC/locked/f"
+    chmod 555 "$root/state/tmp/run.4999994.CCCCCC/locked"
+    out="$("${R[@]}" "$root/bin/run.sh" daily 2>&1)"
+    chmod 755 "$root/state/tmp/run.4999994.CCCCCC/locked"
+    hasnt "sweep: a temp dir rm could not remove is not reported removed" "$out" "removed temp dir $root/state/tmp/run.4999994"
+    has   "sweep: ...it is reported as a failure" "$out" "sweep: could not remove temp dir $root/state/tmp/run.4999994"
+    has   "sweep: ...and the fire still ran" "$(tail -1 "$root/state/log")" "status=ok"
+    rm -rf "$root/state/tmp/run.4999994.CCCCCC"
+  fi
+
+  # Only this user's directories are swept (MEUTE_SWEEP_UID stands in for
+  # another owner), and a shared temp parent (world-writable, like /tmp) is
+  # not swept at all: run.<digits>.* there may be another tool's.
+  mkdir -p "$root/state/tmp/run.4999995.DDDDDD"
+  out="$("${R[@]}" MEUTE_SWEEP_UID=4999999 "$root/bin/run.sh" daily 2>&1)"
+  [[ -d "$root/state/tmp/run.4999995.DDDDDD" ]] && ok "sweep: a dead-looking dir owned by someone else stays" \
+    || bad "sweep: a dead-looking dir owned by someone else stays" "removed"
+  rmdir "$root/state/tmp/run.4999995.DDDDDD"
+  mkdir -p "$root/shared/run.4999996.EEEEEE"; chmod 1777 "$root/shared"
+  out="$("${R[@]}" MEUTE_TMPDIR="$root/shared" "$root/bin/run.sh" daily 2>&1)"
+  [[ -d "$root/shared/run.4999996.EEEEEE" ]] && ok "sweep: a shared MEUTE_TMPDIR is not swept" \
+    || bad "sweep: a shared MEUTE_TMPDIR is not swept" "removed"
+  has   "sweep: ...and says why" "$out" "not sweeping shared temp dir $root/shared"
+  has   "sweep: ...the fire still ran" "$(tail -1 "$root/state/log")" "status=ok"
+  chmod 755 "$root/shared"
+
+  # A symlinked run.<pid>.* (or .worktrees/*.<pid>) is never followed nor
+  # removed: the decoy it points at and the link itself are left alone.
+  mkdir -p "$root/decoy" "$root/decoy-wt"; : > "$root/decoy/keep"; : > "$root/decoy-wt/.git"; : > "$root/decoy-wt/keep"
+  ln -s "$root/decoy" "$root/state/tmp/run.4999997.FFFFFF"
+  ln -s "$root/decoy-wt" "$wt/lk-t-2026-01-01.4999997"
+  # A user's own directory under .worktrees that is no checkout (no .git) is
+  # not the runner's, whatever its name.
+  mkdir -p "$wt/notes.4999998"; : > "$wt/notes.4999998/mine"
+  out="$("${R[@]}" "$root/bin/run.sh" daily 2>&1)"
+  [[ -e "$root/decoy/keep" && -e "$root/decoy-wt/keep" ]] && ok "sweep: a symlinked dir's target survives" \
+    || bad "sweep: a symlinked dir's target survives" "$(ls -A "$root/decoy" "$root/decoy-wt")"
+  [[ -L "$root/state/tmp/run.4999997.FFFFFF" ]] && ok "sweep: ...the run.<pid> symlink is left alone" \
+    || bad "sweep: ...the run.<pid> symlink is left alone" "removed"
+  [[ -L "$wt/lk-t-2026-01-01.4999997" ]] && ok "sweep: ...the .worktrees symlink is left alone" \
+    || bad "sweep: ...the .worktrees symlink is left alone" "removed"
+  hasnt "sweep: ...and neither is reported" "$out" "4999997"
+  [[ -e "$wt/notes.4999998/mine" ]] && ok "sweep: a .worktrees dir without .git is not removed" \
+    || bad "sweep: a .worktrees dir without .git is not removed" "removed"
+  has "sweep: ...the fire still ran" "$(tail -1 "$root/state/log")" "status=ok"
+  rm -f "$root/state/tmp/run.4999997.FFFFFF" "$wt/lk-t-2026-01-01.4999997"
+  rm -rf "$root/decoy" "$root/decoy-wt" "$wt/notes.4999998"
+}
+
 # Review findings on P1.1: a hand-edited or special override file must never
 # stop the fleet or hang it, and one bad row must cost that row only, loudly.
 test_policy_override_hardening() {

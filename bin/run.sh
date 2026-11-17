@@ -48,7 +48,7 @@ set -Eeuo pipefail; umask 077  # owner-only state/ and reports/ on a shared host
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
-source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/quota_age.sh"; source "${MEUTE_ROOT}/lib/policy_override.sh"; source "${MEUTE_ROOT}/lib/hostcheck.sh"
+source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/quota_age.sh"; source "${MEUTE_ROOT}/lib/policy_override.sh"; source "${MEUTE_ROOT}/lib/hostcheck.sh"; source "${MEUTE_ROOT}/lib/sweep.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
@@ -232,6 +232,7 @@ main() {
   runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" "$WAIT_LOCK" \
     || skip lock "another run holds the lock"
   (( ! WAIT_LOCK )) || hold_gate   # a hold set while we waited for the lock
+  sweep_stale || true   # lib/sweep.sh: what a killed run left behind
 
   python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "manifest failed validation"
 

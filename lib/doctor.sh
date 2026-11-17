@@ -121,6 +121,7 @@ cmd_doctor() {
     d_err "$(basename "$MANIFEST") failed validation — run: ./bin/run.sh --validate"
   fi
 
+  doctor_stale
   doctor_containers
 
   printf '\n  quota gates\n'
@@ -315,4 +316,15 @@ doctor_containers() {
   else
     d_ok "atelier-egress running at ${actual}"
   fi
+}
+
+# What the startup sweep would remove, listed and left alone (lib/sweep.sh).
+doctor_stale() {
+  local line any=0
+  printf '\n  leftovers of killed runs\n'
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    any=1; d_warn "$line (the next fire removes it)"
+  done < <(sweep_stale --dry-run 2>/dev/null)
+  (( any )) || d_ok "nothing stale"
 }
