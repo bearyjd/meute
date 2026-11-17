@@ -478,7 +478,7 @@ PY
   # are not wired yet) are pinned through the table itself.
   local code want
   for code in "hold 10" "lock 11" "budget 12" "quota-floor 13" "quota-unknown 13" \
-              "nothing-eligible 14" "no-queue 14" "load 15" "disk 15" "ok 0" "failed 1" "died 70"; do
+              "nothing-eligible 14" "no-queue 14" "load 15" "disk 15" "already-done 16" "ok 0" "failed 1" "died 70"; do
     want="${code#* }"; code="${code% *}"
     is "strict exit: table maps code=$code to $want" \
       "$(MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/outcome.sh"; outcome_exit_status "$1"' _ "$code")" "$want"
@@ -695,6 +695,209 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): nothing is quarantined" \
     "$(compgen -G "$root/state/plan-queue.invalid-*" || echo none)" "none"
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
+}
+
+# P2.4 (R21): privacy on a shared host. Credentials in a report or a log line
+# are redacted before they reach disk; files meute creates are owner-only;
+# doctor names loose permissions and credential-bearing remotes (by repo name
+# only, never the URL).
+_P24_SECRET="hunter2-p24"
+_P24_TOKEN="ghp_$(printf 'Z%.0s' {1..36})"
+_P24_HEX="0123456789abcdef0123456789abcdef01234567"
+_P24_AZ="abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop"
+
+test_p24_redact() {
+  local red="$REPO/lib/redact.py" out long
+  out="$(printf 'clone https://alice:%s@git.example.com/x.git with %s\n' "$_P24_SECRET" "$_P24_TOKEN" \
+         | python3 "$red" 2>&1)"
+  hasnt "p2.4 redact: a URL password is removed"      "$out" "$_P24_SECRET"
+  hasnt "p2.4 redact: a GitHub token is removed"      "$out" "$_P24_TOKEN"
+  has   "p2.4 redact: ...the host is kept for triage" "$out" "@git.example.com/x.git"
+  out="$(printf 'sk-ant-api03-%s and glpat-%s and xoxb-1-%s\n' "$(printf 'q%.0s' {1..30})" \
+         "$(printf 'r%.0s' {1..20})" "$(printf 's%.0s' {1..20})" | python3 "$red")"
+  hasnt "p2.4 redact: an Anthropic key is removed" "$out" "qqqqqqqqqq"
+  hasnt "p2.4 redact: a GitLab token is removed"   "$out" "rrrrrrrrrr"
+  hasnt "p2.4 redact: a Slack token is removed"    "$out" "ssssssssss"
+  is    "p2.4 redact: ordinary text passes unchanged" \
+        "$(printf 'see https://example.com/a@b and task-sk-1\n' | python3 "$red")" \
+        "see https://example.com/a@b and task-sk-1"
+  # A token used as the bare username (legacy 40-hex GitHub PAT, Azure DevOps,
+  # Bitbucket) is a credential too; a short username such as git@ is not.
+  out="$(printf 'https://%s@github.com/o/x.git and https://%s@dev.azure.com/o/p\n' "$_P24_HEX" "$_P24_AZ" \
+         | python3 "$red")"
+  hasnt "p2.4 redact: a 40-hex token as the URL username is removed" "$out" "$_P24_HEX"
+  hasnt "p2.4 redact: an opaque token as the URL username is removed" "$out" "$_P24_AZ"
+  has   "p2.4 redact: ...the host is kept"                            "$out" "@github.com/o/x.git"
+  is    "p2.4 redact: a short URL username is left alone" \
+        "$(printf 'ssh://git@github.com/o/x.git\n' | python3 "$red")" "ssh://git@github.com/o/x.git"
+  # The password runs to the last @ of the authority, so an unencoded @ in it
+  # does not leave its tail behind.
+  hasnt "p2.4 redact: a password containing @ is removed whole" \
+        "$(printf 'https://u:p@ss-tail-p24@github.com/x\n' | python3 "$red")" "ss-tail-p24"
+  # ...but stops at a query or fragment, so an @ there does not swallow the host.
+  has   "p2.4 redact: a password stops before ? and #" \
+        "$(printf 'https://u:pw@host?a=b@c\n' | python3 "$red")" "@host?a=b@c"
+  out="$(bash -c 'source "$1"; engine_detail_clean "$2"' _ "$REPO/lib/engines.sh" \
+         "api 401: https://bob:${_P24_SECRET}@h.example/x")"
+  hasnt "p2.4 detail: engine_detail_clean redacts"       "$out" "$_P24_SECRET"
+  has   "p2.4 detail: ...and keeps the rest of the line" "$out" "api 401: https://bob:"
+  # The redaction runs before the 300-character cut, so a token the cut
+  # would split is still recognised whole.
+  long="$(printf 'x%.0s' {1..280}) ${_P24_TOKEN}"
+  out="$(bash -c 'source "$1"; engine_detail_clean "$2"' _ "$REPO/lib/engines.sh" "$long")"
+  hasnt "p2.4 detail: a token straddling the cut is still redacted" "$out" "ZZZZZZZZ"
+}
+
+test_p24_report_and_umask() {
+  local root="$FIXTURE/p24" repo="$FIXTURE/p24/git-lk" out report
+  _runlock_fixture "$root" "$repo" tier2
+  cat > "$root/stub/claude" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+jq -n '{is_error:false,result:"## Summary\nremote is https://alice:${_P24_SECRET}@git.example.com/x.git token ${_P24_TOKEN}",total_cost_usd:0.01,num_turns:1}'
+STUB
+  out="$( (umask 022; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo lk --task t) 2>&1)"
+  has "p2.4 report: the fixture run succeeds" "$out" "status=ok"
+  report="$(find "$root/reports" -name '*.md' -type f | head -1)"
+  [[ -n "$report" ]] && ok "p2.4 report: a report was written" || bad "p2.4 report: a report was written" "none under reports/"
+  hasnt "p2.4 report: write_report redacts a URL password" "$(cat "$report" 2>/dev/null)" "$_P24_SECRET"
+  hasnt "p2.4 report: write_report redacts a token"        "$(cat "$report" 2>/dev/null)" "$_P24_TOKEN"
+  has   "p2.4 report: ...and keeps the report body"        "$(cat "$report" 2>/dev/null)" "## Summary"
+  is "p2.4 umask: run.sh writes the report owner-only" "$(stat -c %a "$report" 2>/dev/null)" "600"
+  is "p2.4 umask: run.sh writes state/log owner-only"  "$(stat -c %a "$root/state/log" 2>/dev/null)" "600"
+  # mktemp is 0600 whatever the umask, so bin/meute is checked on a directory
+  # it creates: doctor makes .worktrees/ when it is missing.
+  rm -rf "$root/.worktrees"
+  (umask 022; "$root/bin/meute" doctor >/dev/null 2>&1)
+  is "p2.4 umask: bin/meute creates directories owner-only" "$(stat -c %a "$root/.worktrees" 2>/dev/null)" "700"
+}
+
+test_p24_doctor() {
+  local out st rp
+  st="$(stat -c %a "$FIXTURE/state")"; rp="$(stat -c %a "$FIXTURE/reports")"
+  chmod 755 "$FIXTURE/state"; chmod 700 "$FIXTURE/reports"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a world-readable state/ is warned about" "$out" "state/ is readable by group or others"
+  hasnt "p2.4 doctor: ...an owner-only reports/ is not"        "$out" "reports/ is readable by group or others"
+  chmod 700 "$FIXTURE/state"
+  out="$(meute doctor 2>&1)"
+  hasnt "p2.4 doctor: an owner-only state/ is not warned about" "$out" "state/ is readable by group or others"
+  chmod 750 "$FIXTURE/state"
+  has   "p2.4 doctor: a group-readable state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  local m
+  for m in 711 701 710 720 702 722; do
+    chmod "$m" "$FIXTURE/state"
+    has "p2.4 doctor: a ${m} state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  done
+  chmod 700 "$FIXTURE/state"
+  hasnt "p2.4 doctor: a 700 state/ is not warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  hasnt "p2.4 doctor: clean remotes raise no credential warning" "$out" "credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a credential in a remote URL is reported" "$out" "alpha: a remote URL has credentials embedded"
+  hasnt "p2.4 doctor: ...without printing the secret"           "$out" "$_P24_SECRET"
+  hasnt "p2.4 doctor: ...or the URL"                            "$out" "git.example.com"
+  hasnt "p2.4 doctor: ...and only for that repository"          "$out" "beta: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  # Each key is checked on its own: a credential in url alone, then in
+  # pushurl alone, is still found.
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://git.example.com/a.git"
+  has "p2.4 doctor: a credential in url alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote set-url p24 "https://git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  has "p2.4 doctor: a credential in pushurl alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://${_P24_HEX}@github.com/o/a.git"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a token as the URL username is reported" "$out" "alpha: a remote URL has credentials embedded"
+  hasnt "p2.4 doctor: ...without printing the token"           "$out" "$_P24_HEX"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  chmod "$st" "$FIXTURE/state"; chmod "$rp" "$FIXTURE/reports"
+}
+
+# The credential check fails closed: when it cannot look, it says so instead
+# of reporting every repository clean.
+test_p24_doctor_fail_closed() {
+  local out cfg="$FIXTURE/git-alpha/.git/config" saved
+  out="$(env MEUTE_ROOT="$FIXTURE" MANIFEST_PY=/nonexistent MANIFEST="$FIXTURE/repos.yaml" \
+         bash -c 'source "$1/lib/doctor.sh"; source "$1/lib/privacy.sh"; doctor_privacy' _ "$REPO" 2>&1)"
+  has   "p2.4 doctor: an unlistable manifest is warned about"   "$out" "could not list enrolled repositories"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
+  saved="$(cat "$cfg")"
+  printf '[[[ not a config\n' >> "$cfg"
+  out="$(meute doctor 2>&1)"
+  printf '%s\n' "$saved" > "$cfg"
+  has   "p2.4 doctor: an unreadable git config is warned about" "$out" "alpha: could not read git config"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
+}
+
+# P2.3 (R16): the gate must know how old the pool reading is. A snapshot is
+# only as true as its age; policy.quota_max_age_hours turns "old" into
+# code=quota-unknown, and `status` says which facts are measured.
+_quota_age_snapshot() {
+  # $1 root, $2 age in seconds. A window that resets far in the future.
+  printf '{"captured_at":%s,"five_hour":{"used_percentage":10,"resets_at":9999999999}}' \
+    "$(( $(date +%s) - $2 ))" > "$1/state/rate-limits.json"
+}
+test_p23_quota_age() {
+  local root="$FIXTURE/p23" repo="$FIXTURE/p23/git-lk" out log rc age
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+
+  # bin/quota.sh --age: seconds since the snapshot, "-" when the source has none.
+  _quota_age_snapshot "$root" 7200
+  age="$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)"
+  is "p2.3 quota.sh --age: reports the snapshot age in seconds" "$(( age >= 7200 && age < 7300 ))" "1"
+  is "p2.3 quota.sh --with-source: output shape is unchanged" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --with-source)" "90 quota-subscription.sh"
+  rm "$root/state/rate-limits.json"
+  is "p2.3 quota.sh --age: a stub has no age" \
+     "$(MEUTE_ROOT="$root" MEUTE_QUOTA_STUB=100 "$root/bin/quota.sh" --engine claude --age)" "-"
+
+  # Default (unset) keeps today's behaviour, and the run line records the age.
+  _quota_age_snapshot "$root" 7200
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 unset max age: an old snapshot still runs" "$(tail -1 "$log")" "status=ok"
+  has "p2.3 the run line carries quota_age=" "$(tail -1 "$log")" "quota_age=7"
+
+  # Set: an older snapshot is quota-unknown; a fresh one runs.
+  sed -i 's/^  quota_floor_percent: 30/&\n  quota_max_age_hours: 1/' "$root/repos.yaml"
+  rc=0; out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || rc=$?
+  has "p2.3 max age 1h, snapshot 2h old: declined as quota-unknown" "$(tail -1 "$log")" "code=quota-unknown"
+  has "p2.3 ...and the log says it was stale" "$(tail -1 "$log")" "stale"
+  _quota_age_snapshot "$root" 60
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 max age 1h, snapshot 1m old: runs" "$(tail -1 "$log")" "status=ok"
+
+  # A captured_at in the future must not count as fresh forever.
+  _quota_age_snapshot "$root" -3600
+  is "p2.3 quota.sh --age: a snapshot from the future is unknown, not 0s" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "unknown"
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 max age 1h, snapshot dated 1h ahead: declined as quota-unknown" "$(tail -1 "$log")" "code=quota-unknown"
+  _quota_age_snapshot "$root" -30
+  is "p2.3 quota.sh --age: 30s of clock skew is tolerated" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "0"
+  _quota_age_snapshot "$root" -3600
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+  sed -i 's/^  quota_floor_percent: 30/&\n  quota_max_age_hours: 1/' "$root/repos.yaml"
+  out="$("$root/bin/meute" status 2>&1)"
+  has "p2.3 status: a future snapshot is flagged as declined" "$out" "the runner declines"
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+
+  # status: three separate facts.
+  _quota_age_snapshot "$root" 7200
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+  out="$("$root/bin/meute" status 2>&1)"
+  has "p2.3 status: pool percentage with its age" "$out" "pool 90% remaining, snapshot 2h old"
+  has "p2.3 status: says others are not measured" "$out" "other consumers of this pool are not measured"
+
+  # Validation.
+  printf 'version: 1\npolicy:\n  quota_max_age_hours: -3\n' > "$root/bad.yaml"
+  is "p2.3 manifest: a negative max age is rejected" \
+     "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" policy "$root/bad.yaml" >/dev/null 2>&1; echo $?)" "2"
 }
 
 # P1.7 (a), R5, D7: a finding has an identity across reports. The fingerprint is
@@ -1024,4 +1227,170 @@ print(",".join(fs.verify_report(sys.argv[2], "main@" + sys.argv[3], ["src/dead.p
 PY
 )"
   is  "p1.7b rename: a plain deletion is still gone" "$out" "gone"
+# P2.6 (R20): a typo under policy: used to fall back to the default silently.
+# validate and doctor now name unknown keys; they stay a warning, never an error.
+test_p26_unknown_policy_keys() {
+  local root="$FIXTURE/p26" out rc
+  mkdir -p "$root/state"
+  cp "$REPO/repos.yaml" "$root/repos.yaml"
+  ln -s "$REPO/tasks" "$root/tasks"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" 2>&1)"
+  hasnt "p2.6 validate: known keys draw no warning" "$out" "unknown policy key"
+  sed -i 's/^  quota_floor_percent: 30.*/&\n  quota_flor_percent: 5/' "$root/repos.yaml"
+  rc=0; out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" 2>&1)" || rc=$?
+  is  "p2.6 validate: an unknown policy key is not an error" "$rc" "0"
+  has "p2.6 validate: ...it is named in a warning" "$out" "unknown policy key(s): quota_flor_percent"
+  has "p2.6 validate: ...and the manifest still validates" "$out" "ok: "
+  out="$(MEUTE_ROOT="$root" MEUTE_MANIFEST="$root/repos.yaml" "$REPO/bin/meute" doctor 2>&1)" || true
+  has "p2.6 doctor: names the unknown policy key" "$out" "unknown policy key(s): quota_flor_percent"
+}
+
+# P1.3 runner half (R11) and P1.4 (R15). A drain loop needs run.sh to wait for
+# the lock instead of skipping, to ignore a staged plan when it is draining the
+# manifest, and to refuse, under the lock, a forced staged item another fire
+# has already finished. The stub engine counts its calls in engine.calls.
+_p13_fixture() {
+  local root="$1" repo="$2"
+  _runlock_fixture "$root" "$repo" tier2
+  sed -i "2a printf x >> '$root/engine.calls'" "$root/stub/claude"
+}
+_p13_calls() { [[ -f "$1/engine.calls" ]] && wc -c < "$1/engine.calls" || echo 0; }
+# Two staged items, so marking one done does not retire the plan at startup.
+_p13_stage() {
+  printf '{"version":1,"scan":"%s","allow_web":false,"entries":[%s,%s]}\n' "$1" \
+    "{\"name\":\"plan-001-x\",\"path\":\"$2\",\"task\":\"t\"}" \
+    "{\"name\":\"plan-002-y\",\"path\":\"$2\",\"task\":\"t\"}" > "$1/state/plan-queue.json"
+}
+
+test_p1_3_source_manifest() {
+  local root="$FIXTURE/p13src" repo="$FIXTURE/p13src/git-lk" log rc plan
+  _p13_fixture "$root" "$repo"
+  log="$root/state/log"
+  local run=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --strict-exit )
+  _p13_stage "$root" "$repo"; plan="$(cat "$root/state/plan-queue.json")"
+
+  rc=0; "${run[@]}" --source manifest >/dev/null 2>&1 || rc=$?
+  is  "source manifest: the fire runs and exits 0"          "$rc" "0"
+  has "source manifest: ...the manifest item, not the plan's" "$(tail -1 "$log")" $'\trepo=lk\t'
+  is  "source manifest: the staged plan is untouched"       "$(cat "$root/state/plan-queue.json" 2>/dev/null)" "$plan"
+  is  "source manifest: no plan-complete mark is written"   "$([[ -e "$root/state/plan-complete" ]] && echo present || echo absent)" "absent"
+  is  "source manifest: no plan cursor is written"          "$(grep -c '^plan-cursor' "$root/state/cursor")" "0"
+
+  rc=0; "${run[@]}" --source bogus >/dev/null 2>&1 || rc=$?
+  is  "source manifest: an unknown source is a usage error (2)" "$rc" "2"
+  rc=0; "${run[@]}" --source plan >/dev/null 2>&1 || rc=$?
+  is  "source manifest: --source plan is the default, the staged item runs" "$rc" "0"
+  has "source manifest: ...and it is the plan's"            "$(tail -1 "$log")" $'\trepo=plan-001-x\t'
+}
+
+test_p1_4_once() {
+  local root="$FIXTURE/p14" repo="$FIXTURE/p14/git-lk" log rc key before
+  _p13_fixture "$root" "$repo"
+  log="$root/state/log"
+  local force=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily
+                --repo plan-001-x --task t --strict-exit )
+  _p13_stage "$root" "$repo"
+  key="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.yaml" "$root/state/plan-queue.json" daily | jq -r 'select(.repo == "plan-001-x") | .key')"
+  is "once: the fixture's plan key is readable" "$([[ -n "$key" ]] && echo yes)" "yes"
+
+  # Another fire finished the item between the caller's check and this lock.
+  printf '%s\t%s\n' "$key" "2026-11-16T00:00:00+00:00" > "$root/state/plan-complete"
+  before="$(_p13_calls "$root")"
+  rc=0; "${force[@]}" --once >/dev/null 2>&1 || rc=$?
+  is  "once: a finished staged item exits 16 (already-done)" "$rc" "16"
+  is  "once: ...without calling the engine"                 "$(_p13_calls "$root")" "$before"
+  has "once: ...and logs code=already-done"                 "$(tail -1 "$log")" $'\tcode=already-done\t'
+  is  "once: ...the plan is left staged"                    "$([[ -f "$root/state/plan-queue.json" ]] && echo staged)" "staged"
+  rc=0; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo plan-001-x --task t --once >/dev/null 2>&1 || rc=$?
+  is  "once: ...and exits 0 without --strict-exit (D1)"      "$rc" "0"
+
+  # Default unchanged: a forced run without --once re-runs the item.
+  rc=0; "${force[@]}" >/dev/null 2>&1 || rc=$?
+  is  "once: without --once a forced finished item still runs" "$rc" "0"
+  is  "once: ...through the engine"                         "$(_p13_calls "$root")" "$(( before + 1 ))"
+
+  # An unfinished staged item runs under --once.
+  _p13_stage "$root" "$repo"; rm -f "$root/state/plan-complete"
+  rc=0; "${force[@]}" --once >/dev/null 2>&1 || rc=$?
+  is  "once: an unfinished staged item runs under --once"   "$rc" "0"
+  is  "once: ...through the engine"                         "$(_p13_calls "$root")" "$(( before + 2 ))"
+  has "once: ...and logs it"                                "$(tail -1 "$log")" $'\trepo=plan-001-x\t'
+}
+
+# _p13_hold_lock <lock-file> <seconds> <ready-file>: hold the lock in the
+# background (the sleep does not inherit it, so killing the holder frees it).
+_p13_hold_lock() {
+  ( exec 8>"$1"; flock 8; : > "$3"; sleep "$2" 8>&- ) &
+  P13_HOLDER=$!
+  local i; for (( i = 0; i < 100; i++ )); do [[ -e "$3" ]] && return 0; sleep 0.2; done
+  return 1
+}
+
+test_p1_3_wait_lock() {
+  local root="$FIXTURE/p13wl" repo="$FIXTURE/p13wl/git-lk" log rc i
+  _p13_fixture "$root" "$repo"
+  log="$root/state/log"
+  local run=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --strict-exit )
+
+  # A holder that lets go within the wait: the fire waits, then runs.
+  _p13_hold_lock "$root/state/.lock" 4 "$root/ready1" || bad "wait lock: holder 1 took the lock" "no ready file"
+  rc=0; "${run[@]}" --wait-lock 120 >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a lock released within the wait is waited for (exit 0)" "$rc" "0"
+  has "wait lock: ...and the item runs"                    "$(tail -1 "$log")" $'\tstatus=ok\t'
+  wait "$P13_HOLDER" 2>/dev/null
+
+  # A holder that outlives the wait: skipped as lock, 11.
+  _p13_hold_lock "$root/state/.lock" 120 "$root/ready2" || bad "wait lock: holder 2 took the lock" "no ready file"
+  rc=0; "${run[@]}" --wait-lock 1 >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a lock held past the wait is skipped (11)" "$rc" "11"
+  has "wait lock: ...as code=lock"                         "$(tail -1 "$log")" $'\tcode=lock\t'
+
+  # A hold set while the fire waits is honoured once the lock is taken.
+  ( "${run[@]}" --wait-lock 137 >/dev/null 2>&1; echo $? > "$root/held.rc" ) &
+  local waiter=$!
+  for (( i = 0; i < 300; i++ )); do ps -eo args | grep -q '[f]lock -w 137' && break; sleep 0.2; done
+  (( i < 300 )) || bad "wait lock: the waiting fire reached flock -w" "not seen within 60 s"
+  printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "set during the wait" > "$root/state/hold"
+  kill "$P13_HOLDER" 2>/dev/null; wait "$P13_HOLDER" 2>/dev/null
+  wait "$waiter"
+  is  "wait lock: a hold set during the wait still stops the fire (10)" "$(cat "$root/held.rc")" "10"
+  rm -f "$root/state/hold"
+
+  rc=0; "${run[@]}" --wait-lock soon >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a non-integer wait is a usage error (2)"  "$rc" "2"
+  rc=0; "${run[@]}" --wait-lock 09 >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a zero-padded wait is a usage error, not an octal crash (2)" "$rc" "2"
+}
+
+# P2.2 (R18): state/reports is a read-modify-write with no lock, and the web
+# server is threaded, so two triage decisions landing together kept only one.
+# Twenty parallel dismissals of different findings must leave twenty rows,
+# every round; kv_set and kv_del take the same lock as kv_set_row.
+test_kv_writes_locked() {
+  local root="$FIXTURE/kvlock" id="alpha/kvlock-2026-01-01" round n rows lost=0
+  mkdir -p "$root/state" "$root/reports/alpha"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"
+  printf '# kvlock\n' > "$root/reports/${id}.md"
+  for (( round = 1; round <= 10; round++ )); do
+    rm -f "$root/state/reports"
+    for (( n = 1; n <= 20; n++ )); do
+      "$root/bin/meute" dismiss "$id" -f "$n" -r other -m "round $round" >/dev/null 2>&1 &
+    done
+    wait
+    rows="$(grep -c "^${id}#" "$root/state/reports" 2>/dev/null || true)"
+    [[ "$rows" == 20 ]] || lost=$(( lost + 1 ))
+  done
+  is "p2.2 kv lock: 20 parallel dismissals keep 20 rows in each of 10 rounds" "$lost rounds lost rows" "0 rounds lost rows"
+
+  local f="$root/state/kv"
+  rm -f "$f"
+  for (( n = 1; n <= 20; n++ )); do ( source "$REPO/lib/state.sh"; kv_set "$f" "k$n" "v$n" ) & done
+  wait
+  is "p2.2 kv lock: 20 parallel kv_set calls keep 20 rows" "$(wc -l < "$f")" "20"
+  for (( n = 1; n <= 20; n++ )); do ( source "$REPO/lib/state.sh"; kv_del "$f" "k$n" ) & done
+  wait
+  is "p2.2 kv lock: 20 parallel kv_del calls leave no row" "$(wc -l < "$f")" "0"
+  is "p2.2 kv lock: no scratch file is left beside the store" "$(ls -A "$root/state" | grep -c '^\.kv\.')" "0"
+  is "p2.2 kv lock: the lock file never reaches the public harness" \
+     "$(git -C "$REPO" check-ignore -q -- state/reports.lock; echo $?)" "0"
 }

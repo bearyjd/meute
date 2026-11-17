@@ -8,6 +8,12 @@ from dataclasses import dataclass, field
 
 
 
+def is_decided(f: dict) -> bool:
+    """Own decision, or a dismissal inherited from an earlier occurrence
+    (mirrors isDecided in tui/web/app.js)."""
+    return f["state"] != "new" or bool(f.get("inherited"))
+
+
 @dataclass
 class Model:
     findings: list[dict] = field(default_factory=list)
@@ -27,7 +33,7 @@ class Model:
     def visible(self) -> list[dict]:
         """Undecided by default, grouped by repo, most severe first -- the
         order lib/inbox.py already returns. `/` narrows on any column."""
-        rows = self.findings if self.show_decided else [f for f in self.findings if f["state"] == "new"]
+        rows = self.findings if self.show_decided else [f for f in self.findings if not is_decided(f)]
         if self.query:
             q = self.query.casefold()
             rows = [f for f in rows if q in " ".join(
@@ -66,7 +72,7 @@ class Model:
                  else "Codex unavailable")
         ceiling = s.get("ceiling")
         spend = f"${s.get('cost', 0):.2f}" + (f" of ${ceiling}" if isinstance(ceiling, float) else "")
-        new = sum(1 for f in self.findings if f["state"] == "new")
+        new = sum(1 for f in self.findings if not is_decided(f))
         return (f"{gate}  ·  {codex}  ·  week {s.get('week','?')}: {s.get('runs',0)} runs, "
                 f"{s.get('declined',0)} declined, {spend}  ·  {new} undecided")
 

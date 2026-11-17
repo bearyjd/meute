@@ -248,5 +248,25 @@ class PortInUseTests(unittest.TestCase):
         self.assertNotIn("Traceback", proc.stderr)
 
 
+class UmaskTests(unittest.TestCase):
+    """P2.4 (R21): the server and the runs it starts create owner-only files."""
+
+    def test_main_sets_owner_only_umask(self):
+        code = (
+            "import errno, os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import webserver\n"
+            "def busy(*a, **k): raise OSError(errno.EADDRINUSE, 'busy')\n"
+            "webserver.make_server = busy\n"
+            "sys.argv = ['webserver.py']\n"
+            "os.umask(0o022)\n"
+            "try:\n    webserver.main()\nexcept SystemExit:\n    pass\n"
+            "print(oct(os.umask(0)))\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code, os.path.join(ROOT, "tui")],
+                              capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.stdout.strip(), "0o77", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
