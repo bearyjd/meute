@@ -185,6 +185,48 @@ class DrainTests(RunCtlCase):
         self.assertEqual(len(self.fleet.drain_calls()), 1)
         self.assertEqual(self.ctl.status()["stopped_reason"], "stopped")
 
+    def test_stop_before_the_pid_is_known_signals_it_once_known(self):
+        self.ctl.enqueue([ALPHA])
+        self.fleet.drains = [lambda: 143]
+        self.fleet.before_drain_start = [self.ctl.stop]
+        killed = []
+        with mock.patch.object(runctl.os, "kill", lambda pid, sig: killed.append((pid, sig))):
+            self.ctl.start()
+            self.ctl.join(5)
+        self.assertEqual(killed, [(self.fleet.drain_pid, signal.SIGTERM)])
+
+    def test_stop_between_drains_never_signals_the_finished_drains_pid(self):
+        # daily's pid is gone by the time weekly starts: signalling it could hit
+        # a reused pid. Only weekly's own pid, once known, is signalled.
+        self.ctl.enqueue([ALPHA])
+        self.fleet.drains = [lambda: 0, lambda: 143]
+        self.fleet.before_drain_start = [lambda: None, self.ctl.stop]
+        killed = []
+        with mock.patch.object(runctl.os, "kill", lambda pid, sig: killed.append((pid, sig))):
+            self.ctl.start()
+            self.ctl.join(5)
+        self.assertEqual(killed, [(self.fleet.drain_pid, signal.SIGTERM)])
+
+    def test_stop_survives_a_drain_pid_owned_by_someone_else(self):
+        self.ctl.enqueue([ALPHA])
+        entered, release = threading.Event(), threading.Event()
+
+        def step():
+            entered.set()
+            release.wait(5)
+            return 143
+        self.fleet.drains = [step]
+
+        def deny(pid, sig):
+            raise PermissionError(1, "Operation not permitted")
+        with mock.patch.object(runctl.os, "kill", deny):
+            self.ctl.start()
+            self.assertTrue(entered.wait(5))
+            self.ctl.stop()  # must not raise
+            release.set()
+            self.ctl.join(5)
+        self.assertEqual(self.ctl.status()["state"], "idle")
+
 
 class StatusTests(RunCtlCase):
     def test_status_counts_from_queue_and_log(self):

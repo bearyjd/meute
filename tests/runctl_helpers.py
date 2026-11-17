@@ -45,6 +45,7 @@ class FakeFleet:
         self.on_pending = None
         self.drains = []  # scripted `meute drain` runs: each a callable returning the exit status
         self.drain_pid = 424242
+        self.before_drain_start = []  # callables run just before each drain's on_start, in order
         self.timeouts = []  # (basename of argv[0] or "manifest.py", timeout) per call
         self.duplicates = []  # plan --json's collapsed copies: [{path, of, reason}]
 
@@ -55,6 +56,8 @@ class FakeFleet:
         self.timeouts.append((tag, timeout))
         base = os.path.basename(argv[0])
         if base == "meute" and argv[1:2] == ["drain"]:
+            if self.before_drain_start:
+                self.before_drain_start.pop(0)()
             if on_start:
                 on_start(self.drain_pid)
             step = self.drains.pop(0) if self.drains else (lambda: 0)

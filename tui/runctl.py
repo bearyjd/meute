@@ -224,8 +224,8 @@ class RunController:
         """SIGTERM the drain only: its run.sh child is left to finish the item."""
         try:
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        except (ProcessLookupError, PermissionError):
+            pass  # gone already, or the pid now belongs to another user's process
 
     def join(self, timeout: float | None = None) -> None:
         """Wait for the loop to end (tests, and a clean shutdown if wanted)."""
@@ -264,7 +264,11 @@ class RunController:
         if slot == "daily" and os.path.exists(out):
             open(out, "wb").close()  # P1.3: one drain's output per run, not forever
         argv = [self.meute, "drain", slot, "--source", source]
-        rc, _ = self.runner(argv, self.root, out_path=out, on_start=self._drain_started)
+        try:
+            rc, _ = self.runner(argv, self.root, out_path=out, on_start=self._drain_started)
+        finally:
+            with self._lock:  # the pid is dead: never signal it (or a reuse of it) again
+                self._drain_pid = None
         return rc
 
     def _drain_started(self, pid: int) -> None:
