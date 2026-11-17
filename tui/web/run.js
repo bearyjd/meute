@@ -355,3 +355,4 @@ syncButtons();
 document.addEventListener("meute:tab", (e) => {
   if (e.detail === "run") startPolling(); else stopPolling();
 });
+beacon("/api/client-ready?page=run");

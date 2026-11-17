@@ -5,6 +5,8 @@
 state/.lock
 state/lock-info
 state/.kv.*
+# lib/state.sh's write lock, one per store: state/reports.lock and so on.
+state/*.lock
 # Each fire's own temp directory (lib/tmp.sh), removed on exit.
 state/tmp/
 state/dry-run-prompt.md
