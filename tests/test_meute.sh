@@ -25,6 +25,11 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0; FAILED=0
 FIXTURE="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE"' EXIT
+# The host-health gate reads the real load by default, and a busy CI host or
+# a dev box would then skip every run these tests make. Pin a calm one;
+# test_host_gate overrides it per case.
+printf '0.10 0.10 0.10 1/100 1\n' > "$FIXTURE/loadavg"
+export MEUTE_LOADAVG="$FIXTURE/loadavg" MEUTE_NCPU=4
 
 ok()   { printf '  ok    %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad()  { printf '  FAIL  %s\n        %s\n' "$1" "$2"; FAILED=$(( FAILED + 1 )); }
@@ -6255,6 +6260,7 @@ test_unit_limits
 test_plan_quarantine
 test_plan_quarantine_manifest_broken
 test_policy_override
+test_host_gate
 test_policy_override_hardening
 test_policy_override_bad_rows
 test_p24_redact

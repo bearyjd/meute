@@ -839,6 +839,133 @@ PY
   has "policy clear: the manifest's floor applies again" "$(tail -1 "$root/state/log")" "below floor 30%"
 }
 
+# P1.2 (R7, R3 part; owner decision D6): a fire on a host that is overloaded or
+# out of disk declines in a fraction of a second, before the lock and before
+# any quota probe. Load per CPU is read from MEUTE_LOADAVG (default
+# /proc/loadavg) and MEUTE_NCPU (default nproc); free space comes from
+# MEUTE_DF (default df).
+test_host_gate() {
+  local root="$FIXTURE/hostgate" repo="$FIXTURE/hostgate/git-lk" out rc line
+  _runlock_fixture "$root" "$repo" tier1
+  local R=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=90 MEUTE_NCPU=22 MEUTE_LOADAVG="$root/loadavg" )
+  printf '90.00 80.00 70.00 1/100 1\n' > "$root/loadavg"
+  printf '#!/bin/sh\nprintf "Filesystem 1M-blocks Used Available Capacity Mounted\\nfake 1000 900 100 90/\\n"\n' > "$root/df-low"
+  printf '#!/bin/sh\nprintf "Filesystem 1M-blocks Used Available Capacity Mounted\\nfake 1000 100 900 10/\\n"\n' > "$root/df-ok"
+  chmod +x "$root/df-low" "$root/df-ok"
+
+  # load 90 on 22 CPUs is 4.1 per CPU, over the default 2.0
+  local start=$SECONDS
+  out="$("${R[@]}" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  line="$(tail -1 "$root/state/log")"
+  is    "host gate: load 90 on 22 CPUs exits 15 under --strict-exit" "$rc" "15"
+  has   "host gate: ...logged as code=load" "$line" "code=load"
+  has   "host gate: ...status skipped" "$line" "status=skipped"
+  hasnt "host gate: ...nothing ran" "$line" "status=ok"
+  (( SECONDS - start <= 2 )) && ok "host gate: ...and it returned within seconds" \
+    || bad "host gate: ...and it returned within seconds" "took $(( SECONDS - start ))s"
+  [[ ! -e "$root/state/lock-info" ]] && ok "host gate: ...before the lock was taken" \
+    || bad "host gate: ...before the lock was taken" "lock-info exists"
+  "${R[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1; rc=$?
+  is    "host gate: ...exit 0 without --strict-exit, as every skip" "$rc" "0"
+
+  # a forced run obeys the load check too ...
+  "${R[@]}" "$root/bin/run.sh" daily --repo lk --task t >/dev/null 2>&1
+  has   "host gate: a forced run at load 90 is also declined" "$(tail -1 "$root/state/log")" "code=load"
+  # ... unless --ignore-load
+  "${R[@]}" "$root/bin/run.sh" daily --repo lk --task t --ignore-load >/dev/null 2>&1
+  has   "host gate: --ignore-load lets the forced run through" "$(tail -1 "$root/state/log")" "status=ok"
+
+  # below the threshold: 40 / 22 = 1.8
+  printf '40.00 40.00 40.00 1/100 1\n' > "$root/loadavg"
+  "${R[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1
+  has   "host gate: load 40 on 22 CPUs (1.8 per CPU) runs" "$(tail -1 "$root/state/log")" "status=ok"
+
+  # max_load_per_cpu: 0 disables the gate; a lower value tightens it
+  printf '90.00 80.00 70.00 1/100 1\n' > "$root/loadavg"
+  sed -i 's/^policy:/policy:\n  max_load_per_cpu: 0/' "$root/repos.yaml"
+  "${R[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1
+  has   "host gate: max_load_per_cpu: 0 disables the load check" "$(tail -1 "$root/state/log")" "status=ok"
+  sed -i 's/max_load_per_cpu: 0/max_load_per_cpu: 1.0/' "$root/repos.yaml"
+  printf '30.00 30.00 30.00 1/100 1\n' > "$root/loadavg"
+  "${R[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1
+  has   "host gate: a manifest max_load_per_cpu of 1.0 declines load 30 on 22 CPUs" "$(tail -1 "$root/state/log")" "code=load"
+  sed -i '/max_load_per_cpu/d' "$root/repos.yaml"
+
+  # disk: under min_free_mb (default 512) declines, forced runs obey it
+  printf '0.10 0.10 0.10 1/100 1\n' > "$root/loadavg"
+  out="$("${R[@]}" MEUTE_DF="$root/df-low" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  is    "host gate: 100 MB free is declined with exit 15" "$rc" "15"
+  has   "host gate: ...logged as code=disk" "$(tail -1 "$root/state/log")" "code=disk"
+  "${R[@]}" MEUTE_DF="$root/df-low" "$root/bin/run.sh" daily --repo lk --task t --ignore-load >/dev/null 2>&1
+  has   "host gate: a forced run with --ignore-load still obeys the disk check" "$(tail -1 "$root/state/log")" "code=disk"
+  "${R[@]}" MEUTE_DF="$root/df-ok" "$root/bin/run.sh" daily >/dev/null 2>&1
+  has   "host gate: 900 MB free runs" "$(tail -1 "$root/state/log")" "status=ok"
+  sed -i 's/^policy:/policy:\n  min_free_mb: 50/' "$root/repos.yaml"
+  "${R[@]}" MEUTE_DF="$root/df-low" "$root/bin/run.sh" daily >/dev/null 2>&1
+  has   "host gate: min_free_mb: 50 lets 100 MB free run" "$(tail -1 "$root/state/log")" "status=ok"
+  sed -i '/min_free_mb/d' "$root/repos.yaml"
+  # The run's temp directory is checked as well as state/: a df that is low
+  # only for $RUN_TMP (MEUTE_TMPDIR) still declines the fire as code=disk.
+  cat > "$root/df-tmplow" <<EOF
+#!/bin/sh
+case "\$2" in "$root/tmpdir"/*) a=100 ;; *) a=900 ;; esac
+printf 'Filesystem 1M-blocks Used Available Capacity Mounted\nfake 1000 0 %s 10%% /\n' "\$a"
+EOF
+  chmod +x "$root/df-tmplow"
+  out="$("${R[@]}" MEUTE_TMPDIR="$root/tmpdir" MEUTE_DF="$root/df-tmplow" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  line="$(tail -1 "$root/state/log")"
+  is    "host gate: low free space only in the run's temp dir exits 15" "$rc" "15"
+  has   "host gate: ...logged as code=disk" "$line" "code=disk"
+  has   "host gate: ...naming the temp dir" "$line" "$root/tmpdir/run."
+
+  # a df that fails (odd mount, container permissions) is "unknown": the gate
+  # passes and the fire runs, it does not die under set -e
+  printf '#!/bin/sh\nexit 1\n' > "$root/df-fail"; chmod +x "$root/df-fail"
+  out="$("${R[@]}" MEUTE_DF="$root/df-fail" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  is    "host gate: a failing df is unknown, the fire runs (exit 0)" "$rc" "0"
+  has   "host gate: ...logged as status=ok" "$(tail -1 "$root/state/log")" "status=ok"
+  hasnt "host gate: ...not code=died" "$(tail -1 "$root/state/log")" "code=died"
+
+  # a directory that cannot be written is the same verdict (root ignores modes)
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "host gate: an unwritable directory is declined" "running as root; chmod cannot block writes"
+  else
+    mkdir -p "$root/ro"; chmod 555 "$root/ro"
+    out="$(MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/hostcheck.sh"; hostcheck_writable "$1"' _ "$root/ro" 2>&1)"; rc=$?
+    is  "host gate: hostcheck_writable refuses a read-only directory" "$rc" "1"
+    chmod 755 "$root/ro"
+    MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/hostcheck.sh"; hostcheck_writable "$1"' _ "$root/ro" >/dev/null 2>&1; rc=$?
+    is  "host gate: ...and accepts a writable one" "$rc" "0"
+    # End to end: a state directory that cannot take a new file declines the
+    # fire as code=disk, through run.sh, without dying.
+    mkdir -p "$root/state/tmp"; chmod 555 "$root/state"
+    out="$("${R[@]}" MEUTE_DF="$root/df-ok" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+    chmod 755 "$root/state"
+    line="$(tail -1 "$root/state/log")"
+    is    "host gate: an unwritable state dir declines the fire with exit 15" "$rc" "15"
+    has   "host gate: ...logged as code=disk" "$line" "code=disk"
+    has   "host gate: ...naming the directory it cannot write" "$line" "cannot write to $root/state"
+    hasnt "host gate: ...not code=died" "$line" "code=died"
+  fi
+
+  # an unreadable load average is unknown: no error text, the fire runs
+  out="$("${R[@]}" MEUTE_LOADAVG="$root/no-such-loadavg" MEUTE_DF="$root/df-ok" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  is    "host gate: a missing load average is unknown, the fire runs (exit 0)" "$rc" "0"
+  hasnt "host gate: ...and prints no file error" "$out" "No such file"
+
+  # manifest: the default (neither key) validates; bad values are refused
+  out="$(validate "$root/repos.yaml" "$root")"
+  hasnt "host gate: a manifest with neither key validates" "$out" "policy."
+  yaml_edit "$root/repos.yaml" "$root/bad1.yaml" 'd["policy"]["max_load_per_cpu"] = -1'
+  has   "host gate: max_load_per_cpu -1 is refused" "$(validate "$root/bad1.yaml" "$root")" "policy.max_load_per_cpu"
+  yaml_edit "$root/repos.yaml" "$root/bad2.yaml" 'd["policy"]["max_load_per_cpu"] = True'
+  has   "host gate: max_load_per_cpu true is refused" "$(validate "$root/bad2.yaml" "$root")" "policy.max_load_per_cpu"
+  yaml_edit "$root/repos.yaml" "$root/bad3.yaml" 'd["policy"]["min_free_mb"] = "lots"'
+  has   "host gate: min_free_mb \"lots\" is refused" "$(validate "$root/bad3.yaml" "$root")" "policy.min_free_mb"
+  yaml_edit "$root/repos.yaml" "$root/bad4.yaml" 'd["policy"]["min_free_mb"] = -5'
+  has   "host gate: min_free_mb -5 is refused" "$(validate "$root/bad4.yaml" "$root")" "policy.min_free_mb"
+}
+
 # Review findings on P1.1: a hand-edited or special override file must never
 # stop the fleet or hang it, and one bad row must cost that row only, loudly.
 test_policy_override_hardening() {
