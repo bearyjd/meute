@@ -81,13 +81,13 @@ def _read_capped(path: str):
     return raw
 
 
-def read_rows(path: str, now: int, ignored: list | None = None) -> dict:
-    """key -> (value, until, reason) for rows still in force.
+def read_all_rows(path: str, now: int, ignored: list | None = None) -> list:
+    """[(key, value, until, reason)] for the rows still in force, in file order.
 
     A row that cannot be read is skipped and logged; when `ignored` is given,
     (key, why) is appended to it so the caller can say so where it is seen.
     """
-    rows = {}
+    rows = []
     raw = _read_capped(path)
     if raw is None:
         return rows
@@ -104,7 +104,10 @@ def read_rows(path: str, now: int, ignored: list | None = None) -> dict:
             skip(raw_line.split(b"\t", 1)[0].decode("ascii", "replace"), f"{path}:{number}: not UTF-8")
             continue
         fields = line.split("\t")
-        if len(fields) < 3 or fields[0] not in OVERRIDABLE:
+        if fields[0] not in OVERRIDABLE:
+            continue
+        if len(fields) < 3:
+            skip(fields[0], f"{path}:{number}: {fields[0]}: row has no until (expected key, value, until)")
             continue
         # str.isdigit() accepts '\u00b2', which int() refuses; and an until
         # of thousands of digits trips Python's int-string limit (it would be
@@ -114,13 +117,20 @@ def read_rows(path: str, now: int, ignored: list | None = None) -> dict:
             continue
         until = int(fields[2])
         value = parse_value(fields[1])
-        # A hand-edited nan/inf is no value at all: skipped like an expired
-        # row, so the other rows stay live and `policy show` agrees.
+        # A hand-edited nan/inf is no value at all: skipped and said so, so
+        # the other rows stay live and `policy show` agrees.
         if isinstance(value, float) and not math.isfinite(value):
+            skip(fields[0], f"{path}:{number}: {fields[0]}: value {fields[1][:20]!r} is not a finite number")
             continue
         if now < until <= now + MAX_SECONDS:
-            rows[fields[0]] = (value, until, fields[3] if len(fields) > 3 else "")
+            rows.append((fields[0], value, until, fields[3] if len(fields) > 3 else ""))
     return rows
+
+
+def read_rows(path: str, now: int, ignored: list | None = None) -> dict:
+    """key -> (value, until, reason): the last row in force for each key."""
+    return {key: (value, until, reason)
+            for key, value, until, reason in read_all_rows(path, now, ignored)}
 
 
 def _skipped(why: str) -> None:
@@ -151,25 +161,33 @@ def resolve(data: dict, path: str | None, now: int, env_floor: str = ""):
 
     Rows are taken one at a time in file order, then MEUTE_QUOTA_FLOOR: a row
     that does not validate on top of those already taken is ignored alone, so
-    a typo beside a tightening row costs the typo, never the tightening.
+    a typo beside a tightening row costs the typo, never the tightening; for
+    a key given twice, the last row that validates is the one taken.
     """
     from manifest import ManifestError, merged_policy
     ignored = []
-    rows = read_rows(path, now, ignored) if path else {}
-    candidates = [(key, key, row[0]) for key, row in rows.items()]
+    rows = read_all_rows(path, now, ignored) if path else []
+    # Per key the last row first, then earlier ones: a later row that fails
+    # the manifest's rules must not shadow an earlier valid one.
+    by_key = {}
+    for key, value, _until, _reason in rows:
+        by_key.setdefault(key, []).insert(0, value)
+    candidates = [(key, key, values_) for key, values_ in by_key.items()]
     if env_floor:
-        candidates.append(("MEUTE_QUOTA_FLOOR", "quota_floor_percent", parse_value(env_floor)))
+        candidates.append(("MEUTE_QUOTA_FLOOR", "quota_floor_percent", [parse_value(env_floor)]))
     values, applied = {}, []
-    for label, key, value in candidates:
-        trial = {**values, key: value}
-        try:
-            effective_policy(data, trial)
-        except ManifestError as error:
-            sys.stderr.write(f"meute/manifest: policy override ignored: {label}: {error}\n")
-            ignored.append((label, str(error)))
-            continue
-        values = trial
-        applied = sorted(set(applied) | {key})
+    for label, key, options in candidates:
+        for value in options:
+            trial = {**values, key: value}
+            try:
+                effective_policy(data, trial)
+            except ManifestError as error:
+                sys.stderr.write(f"meute/manifest: policy override ignored: {label}: {error}\n")
+                ignored.append((label, str(error)))
+                continue
+            values = trial
+            applied = sorted(set(applied) | {key})
+            break
     policy = effective_policy(data, values) if values else merged_policy(data)
     return policy, applied, ignored
 

@@ -59,10 +59,13 @@ policy_override_show() {
   applied=" $(jq -r '.override // [] | join(" ")' <<< "$policy") "
   ignored="$(jq -r '.override_ignored // [] | .[]' <<< "$policy")"
   while IFS=$'\t' read -r key value until reason; do
-    if [[ "$applied" == *" $key "* ]]; then
+    why="$(awk -v k="${key}: " 'index($0, k) == 1 { print; exit }' <<< "$ignored")"
+    # A key given twice with one row refused: only the row whose value is the
+    # one in force is applied, the other is the refused one.
+    if [[ "$applied" == *" $key "* && ( -z "$why" || "$value" == "$(jq -r --arg k "$key" '.[$k]' <<< "$policy")" ) ]]; then
       printf '%s=%s  until %s%s\n' "$key" "$value" "$(hold_until_human "$until")" "${reason:+  — ${reason}}"
       found=0
-    elif why="$(awk -v k="${key}: " 'index($0, k) == 1 { print; exit }' <<< "$ignored")"; [[ -n "$why" ]]; then
+    elif [[ -n "$why" ]]; then
       printf '%s=%s  IGNORED (%s)\n' "$key" "$value" "${why#*: }"
     fi
   done < "$file"
