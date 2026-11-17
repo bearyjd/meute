@@ -6248,6 +6248,7 @@ test_plan_quarantine_manifest_broken
 test_p24_redact
 test_p24_report_and_umask
 test_p24_doctor
+test_p24_doctor_fail_closed
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

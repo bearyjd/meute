@@ -22,16 +22,32 @@ doctor_privacy() {
     fi
   done
 
-  local flagged=0
+  # Fail closed: a check that could not look must not say "clean".
+  local list rc flagged=0
+  # Two steps, each checked: a pipeline's status depends on the caller's
+  # pipefail, and doctor must not depend on that.
+  if ! list="$(python3 "$MANIFEST_PY" list-repos "$MANIFEST")" \
+     || ! list="$(printf '%s\n' "$list" | jq -r '[.name, .path] | @tsv')"; then
+    d_warn "could not list enrolled repositories; remote credentials not checked"
+    return 0
+  fi
   while IFS=$'\t' read -r name path; do
     [[ -n "$path" && -d "$path" ]] || continue
-    urls="$(git -C "$path" config --get-regexp '^remote\..*\.(url|pushurl)$' 2>/dev/null)" || continue
+    # Exit 1 is "no remote URLs"; anything else (a broken config, unsafe
+    # ownership) means the remotes went unread.
+    rc=0
+    urls="$(git -C "$path" config --get-regexp '^remote\..*\.(url|pushurl)$' 2>/dev/null)" || rc=$?
+    if (( rc > 1 )); then
+      d_warn "${name}: could not read git config; remote credentials not checked"
+      flagged=$(( flagged + 1 ))
+      continue
+    fi
     # The same filter that keeps credentials out of reports decides what a
     # credential is, so the two can never disagree.
     if [[ "$(printf '%s' "$urls" | python3 "${MEUTE_ROOT}/lib/redact.py")" != "$urls" ]]; then
       d_warn "${name}: a remote URL has credentials embedded - move them to a git credential helper"
       flagged=$(( flagged + 1 ))
     fi
-  done < <(python3 "$MANIFEST_PY" list-repos "$MANIFEST" 2>/dev/null | jq -r '[.name, .path] | @tsv' 2>/dev/null)
+  done <<< "$list"
   (( flagged > 0 )) || d_ok "no enrolled repository has a credential in a remote URL"
 }

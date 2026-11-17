@@ -762,6 +762,9 @@ test_p24_doctor() {
   chmod 700 "$FIXTURE/state"
   out="$(meute doctor 2>&1)"
   hasnt "p2.4 doctor: an owner-only state/ is not warned about" "$out" "state/ is readable by group or others"
+  chmod 750 "$FIXTURE/state"
+  has   "p2.4 doctor: a group-readable state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  chmod 700 "$FIXTURE/state"
   hasnt "p2.4 doctor: clean remotes raise no credential warning" "$out" "credentials embedded"
   git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
   git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
@@ -771,5 +774,30 @@ test_p24_doctor() {
   hasnt "p2.4 doctor: ...or the URL"                            "$out" "git.example.com"
   hasnt "p2.4 doctor: ...and only for that repository"          "$out" "beta: a remote URL has credentials embedded"
   git -C "$FIXTURE/git-alpha" remote remove p24
+  # Each key is checked on its own: a credential in url alone, then in
+  # pushurl alone, is still found.
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://git.example.com/a.git"
+  has "p2.4 doctor: a credential in url alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote set-url p24 "https://git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  has "p2.4 doctor: a credential in pushurl alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
   chmod "$st" "$FIXTURE/state"; chmod "$rp" "$FIXTURE/reports"
+}
+
+# The credential check fails closed: when it cannot look, it says so instead
+# of reporting every repository clean.
+test_p24_doctor_fail_closed() {
+  local out cfg="$FIXTURE/git-alpha/.git/config" saved
+  out="$(env MEUTE_ROOT="$FIXTURE" MANIFEST_PY=/nonexistent MANIFEST="$FIXTURE/repos.yaml" \
+         bash -c 'source "$1/lib/doctor.sh"; source "$1/lib/privacy.sh"; doctor_privacy' _ "$REPO" 2>&1)"
+  has   "p2.4 doctor: an unlistable manifest is warned about"   "$out" "could not list enrolled repositories"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
+  saved="$(cat "$cfg")"
+  printf '[[[ not a config\n' >> "$cfg"
+  out="$(meute doctor 2>&1)"
+  printf '%s\n' "$saved" > "$cfg"
+  has   "p2.4 doctor: an unreadable git config is warned about" "$out" "alpha: could not read git config"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
 }
