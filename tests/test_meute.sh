@@ -18,6 +18,8 @@ set -uo pipefail
 # tests read the REAL state/log instead of the fixture's, and five of them fail
 # with nothing to indicate why. Found exactly that way.
 unset MEUTE_ROOT
+# No test starts a real systemd scope; the P2.7 tests turn it on with a stub.
+export MEUTE_SCOPE=off
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0; FAILED=0
@@ -6253,6 +6255,7 @@ test_plan_quarantine_manifest_broken
 test_policy_override
 test_host_gate
 test_policy_override_hardening
+test_policy_override_bad_rows
 test_p24_redact
 test_p24_report_and_umask
 test_p24_doctor
@@ -6266,6 +6269,10 @@ test_p1_3_drain_stops
 test_p1_3_drain_lock_and_source
 test_p1_3_drain_until
 test_p1_3_drain_repo_cursor
+test_p2_7_scope_containment
+test_p2_7_scope_signals
+test_p2_7_scope_lib
+test_p2_7_scope_reaps_stragglers
 test_p1_3_drain_empty_repo
 test_p0_ci_workflow
 test_real_repo_untouched

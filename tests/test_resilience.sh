@@ -802,15 +802,15 @@ PY
   has   "policy override: a row past the 7-day cap is ignored" "$(tail -1 "$root/state/log")" "below floor 30%"
   hasnt "policy override: ...and the line is not marked" "$(tail -1 "$root/state/log")" "policy=override"
 
-  # A hand-edited non-finite cost is skipped like an expired row: the floor row
-  # beside it stays live, and `policy show` lists only what the run obeys.
+  # A hand-edited non-finite cost is skipped (and reported): the floor row
+  # beside it stays live, and `policy show` marks it IGNORED.
   printf 'quota_floor_percent\t1\t%s\thand edit\nweekly_cost_usd\tnan\t%s\thand edit\n' \
     "$(( now + 3600 ))" "$(( now + 3600 ))" > "$root/state/policy-override"
   out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
   has   "policy override: a hand-edited nan cost row is skipped, the floor row applies" "$(tail -1 "$root/state/log")" "status=ok"
   has   "policy override: ...and the line is marked" "$(tail -1 "$root/state/log")" "policy=override"
   out="$("${M[@]}" "$root/bin/meute" policy show 2>&1)"
-  hasnt "policy show: ...the nan row is not listed" "$out" "weekly_cost_usd"
+  has   "policy show: ...the nan row is marked IGNORED" "$out" "weekly_cost_usd=nan  IGNORED"
   has   "policy show: ...the floor row is" "$out" "quota_floor_percent=1"
   # The web inbox shows the floor a run obeys, not the manifest's.
   out="$(MEUTE_ROOT="$root" "${M[@]}" python3 "$root/lib/inbox.py" dump 2>/dev/null | jq -r .status.floor)"
@@ -1041,6 +1041,54 @@ test_policy_override_hardening() {
 
   is "gitignore: state/policy-override is ignored" \
      "$(git -C "$REPO" check-ignore -q -- state/policy-override; echo $?)" "0"
+  rm -f "$f" "$root/err"
+}
+
+# A bad row in a hand-edited override must never be a silent revert to the
+# looser manifest value: a short row, a nan/inf, and a later bad duplicate are
+# each reported, and an earlier valid row for the key is kept.
+test_policy_override_bad_rows() {
+  local root="$FIXTURE/polovrows" repo="$FIXTURE/polovrows/git-lk" now out err f
+  _runlock_fixture "$root" "$repo" tier2
+  now="$(date +%s)"; f="$root/state/policy-override"
+  local E=( env MEUTE_NOW="$now" python3 "$root/lib/manifest.py" policy-effective "$root/repos.yaml" "$f" )
+  local fut="$(( now + 3600 ))"
+
+  # (1) fewer than 3 fields: no until.
+  printf 'tier3_max_in_flight\t1\n' > "$f"
+  out="$("${E[@]}" 2>"$root/err")"; err="$(cat "$root/err")"
+  has "policy override: a row without an until is reported on stderr" "$err" "tier3_max_in_flight"
+  has "policy override: ...listed in override_ignored" "$(jq -c .override_ignored <<< "$out")" "tier3_max_in_flight"
+  out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+  has "policy show: ...marks it IGNORED" "$out" "tier3_max_in_flight=1  IGNORED"
+  env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_NOW="$now" "$root/bin/run.sh" daily >/dev/null 2>&1
+  has "policy override: ...and the run line names it" "$(tail -1 "$root/state/log")" "policy_ignored=tier3_max_in_flight"
+
+  # (2) nan / inf.
+  for bad in nan inf; do
+    printf 'community_share\t%s\t%s\tx\n' "$bad" "$fut" > "$f"
+    out="$("${E[@]}" 2>"$root/err")"; err="$(cat "$root/err")"
+    has "policy override: a $bad value is reported on stderr" "$err" "community_share"
+    has "policy override: ...listed in override_ignored" "$(jq -c .override_ignored <<< "$out")" "community_share"
+    out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+    has "policy show: ...a $bad row is marked IGNORED" "$out" "community_share=$bad  IGNORED"
+  done
+
+  # (3) an earlier valid tightening row survives a later bad duplicate.
+  { printf 'tier3_max_in_flight\t1\t%s\ttighten\n' "$fut"
+    printf 'tier3_max_in_flight\tabc\t%s\ttypo\n' "$fut"; } > "$f"
+  out="$("${E[@]}" 2>"$root/err")"; err="$(cat "$root/err")"
+  is  "policy override: a later bad duplicate does not shadow the valid row" "$(jq -r .tier3_max_in_flight <<< "$out")" "1"
+  has "policy override: ...the bad duplicate is reported" "$(jq -c .override_ignored <<< "$out")" "tier3_max_in_flight"
+  has "policy override: ...on stderr too" "$err" "tier3_max_in_flight"
+  is  "policy override: ...and the key still counts as applied" "$(jq -c .override <<< "$out")" '["tier3_max_in_flight"]'
+  out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+  has "policy show: ...the bad duplicate row is marked IGNORED" "$out" "tier3_max_in_flight=abc  IGNORED"
+  hasnt "policy show: ...and is not listed as applied" "$out" "tier3_max_in_flight=abc  until"
+  # A later valid duplicate still wins.
+  { printf 'tier3_max_in_flight\t1\t%s\ta\n' "$fut"
+    printf 'tier3_max_in_flight\t2\t%s\tb\n' "$fut"; } > "$f"
+  is  "policy override: a later valid duplicate still wins" "$(jq -r .tier3_max_in_flight <<< "$("${E[@]}" 2>/dev/null)")" "2"
   rm -f "$f" "$root/err"
 }
 
@@ -1885,6 +1933,152 @@ test_p1_3_drain_repo_cursor() {
   rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk2 --repo lk3 >/dev/null 2>&1 || rc=$?
   is "drain --repo: a narrowed rotation over two repos"      "$(_drain_ran "$root"):$rc" "lk2 lk3:0"
   is "drain --repo: ...still leaves the shared cursor on lk4" "$(grep -P '^cursor\.daily\t' "$root/state/cursor" | grep -c lk4)" "1"
+}
+
+# P2.7 (R14): drain starts each run.sh in a transient systemd scope when
+# systemd-run works, so an engine straggler dies with the scope; otherwise it
+# behaves as before. A stub systemd-run logs its argv and execs the command.
+_scope_stub() {
+  local root="$1"
+  cat > "$root/stub/systemd-run" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> '$root/scope.calls'
+# SCOPE_INT: a Ctrl-C on the run: the drain gets INT and its child dies of it.
+[[ -n "\${SCOPE_INT:-}" && "\${!#}" != true ]] && { kill -INT \$PPID; kill -INT \$\$; sleep 5; }
+[[ "\${!#}" == true && -n "\${SCOPE_PROBE_FAIL:-}" ]] && exit 1
+while [[ "\$1" == --* ]]; do shift; done
+exec "\$@"
+EOF
+  chmod +x "$root/stub/systemd-run"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$root/stop.calls" > "$root/stub/systemctl"
+  chmod +x "$root/stub/systemctl"
+}
+# run.sh invocations the stub launched (the probe line ends in "true").
+_scope_runs() { local n; n="$(grep -c 'bin/run.sh daily' "$1/scope.calls" 2>/dev/null)"; echo "${n:-0}"; }
+
+test_p2_7_scope_containment() {
+  local root="$FIXTURE/p27" rc
+  _drain_fixture "$root" 2
+  _scope_stub "$root"
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_SCOPE=on MEUTE_SYSTEMD_RUN="$root/stub/systemd-run" MEUTE_SYSTEMCTL="$root/stub/systemctl" )
+
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: the drain still completes and exits 0"          "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+  is  "scope: ...each run.sh went through systemd-run"        "$(_scope_runs "$root")" "2"
+  has "scope: ...as a user scope that is collected"           "$(grep 'bin/run.sh daily' "$root/scope.calls" | head -1)" "--user --scope --collect"
+  local started stopped
+  started="$(grep -o -- '--unit=meute-run-[0-9-]*' "$root/scope.calls" | cut -d= -f2 | sort | paste -sd' ')"
+  # The exact stop line: `--user stop <unit>.scope`. A wrong suffix or verb names no unit.
+  stopped="$(sed -n 's/^--user stop \(meute-run-[0-9-]*\)\.scope$/\1/p' "$root/stop.calls" 2>/dev/null | sort | paste -sd' ')"
+  is  "scope: ...and each named scope is stopped after its run.sh" "$(wc -w <<< "$started"):$stopped" "2:$started"
+
+  rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
+  rc=0; SCOPE_PROBE_FAIL=1 "${env[@]}" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: a failing systemd-run probe falls back, drain works" "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+  is  "scope: ...and no run.sh goes through it"               "$(_scope_runs "$root")" "0"
+
+  rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
+  rc=0; "${env[@]}" MEUTE_SYSTEMD_RUN="$root/stub/absent" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: no systemd-run at all falls back, drain works"  "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+
+  rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
+  rc=0; "${env[@]}" MEUTE_SCOPE=off "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: MEUTE_SCOPE=off never calls systemd-run"        "$rc:$(_scope_runs "$root"):$([[ -e $root/scope.calls ]] && echo called || echo none)" "0:0:none"
+}
+
+# An INT or TERM to the drain, mid run.sh, must still stop that run's scope and
+# then end the drain by that signal (a TERM aimed at the drain alone is deferred
+# by bash until run.sh returns, so the item in flight finishes; either way no
+# further fire starts).
+_scope_signal_case() {
+  local sig="$1" root="$FIXTURE/p27sig$1" rc started stopped
+  _drain_fixture "$root" 2
+  _scope_stub "$root"
+  sed -i "2a printf x >> '$root/engine.started'; while [[ ! -e '$root/release' ]]; do sleep 0.1; done" "$root/stub/claude"
+  rc=0
+  python3 - "$sig" "$root" <<'PY' || rc=$?
+import os, signal, subprocess, sys, time
+sig, root = getattr(signal, "SIG" + sys.argv[1]), sys.argv[2]
+env = dict(os.environ, SCOPE_INT="1" if sig == signal.SIGINT else "", PATH=f"{root}/stub:" + os.environ["PATH"], MEUTE_QUOTA_STUB="100", MEUTE_SCOPE="on",
+           MEUTE_SYSTEMD_RUN=f"{root}/stub/systemd-run", MEUTE_SYSTEMCTL=f"{root}/stub/systemctl")
+p = subprocess.Popen([f"{root}/bin/meute", "drain", "daily"], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))  # an ambient ignore would hide INT
+for _ in range(100):
+    if sig == signal.SIGINT or os.path.exists(f"{root}/engine.started"):
+        break
+    time.sleep(0.1)
+if sig == signal.SIGTERM:  # the web Stop: TERM to the drain alone, run.sh still going
+    os.kill(p.pid, sig)
+    open(f"{root}/release", "w").close()
+try:
+    sys.exit(abs(p.wait(timeout=30)) % 256)  # -N: ended by signal N
+except subprocess.TimeoutExpired:
+    p.kill(); sys.exit(99)
+PY
+  started="$(grep -o -- '--unit=meute-run-[0-9-]*' "$root/scope.calls" | cut -d= -f2 | sort | paste -sd' ')"
+  stopped="$(sed -n 's/^--user stop \(meute-run-[0-9-]*\)\.scope$/\1/p' "$root/stop.calls" 2>/dev/null | sort | paste -sd' ')"
+  is "scope $sig: the drain ends by the signal"  "$rc" "$(kill -l "$sig")"
+  is "scope $sig: ...the run in flight had its scope stopped" "$(wc -w <<< "$started"):$stopped" "1:$started"
+  is "scope $sig: ...and no second fire started"   "$(cat "$root/engine.started" 2>/dev/null | wc -c)" "$([[ $sig == TERM ]] && echo 1 || echo 0)"
+}
+test_p2_7_scope_signals() { _scope_signal_case TERM; _scope_signal_case INT; }
+
+# scope_run is library code a caller's shell shares: it must leave the caller's
+# own INT/TERM traps alone, keep ITS traps until the scope is stopped, and a
+# nested call must not clear the outer call's trap or unit.
+_scope_lib_case() {
+  local root="$FIXTURE/p27lib" out
+  mkdir -p "$root"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\nwhile [[ "$1" == --* ]]; do shift; done\nexec "$@"\n' "$root/run.calls" > "$root/systemd-run"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$root/stop.calls" > "$root/systemctl"
+  chmod +x "$root/systemd-run" "$root/systemctl"
+  out="$(MEUTE_SYSTEMD_RUN="$root/systemd-run" MEUTE_SYSTEMCTL="$root/systemctl" ROOT="$root" LIB="$REPO/lib/scope.sh" bash -c '
+    source "$LIB"; SCOPE_CMD=("$MEUTE_SYSTEMD_RUN" --user --scope)
+    trap "echo caller-int" INT; trap "echo caller-term" TERM
+    scope_run true
+    echo "after:$(trap -p INT | grep -c caller-int)$(trap -p TERM | grep -c caller-term)"
+    trap - INT TERM
+    scope_run true
+    echo "none:$(trap -p INT TERM | wc -l)"
+    scope_stop() { echo "during:$(trap -p TERM | grep -c scope_on_signal)"; }
+    scope_run true
+    source "$LIB"; SCOPE_CMD=("$MEUTE_SYSTEMD_RUN" --user --scope)
+    : > "$ROOT/run.calls"
+    trap "scope_on_signal TERM" TERM; SCOPE_UNIT=outer   # as if an outer scope_run were live
+    scope_run true
+    echo "outer-unit:$SCOPE_UNIT"
+    echo "outer-trap:$(trap -p TERM | grep -c scope_on_signal)"
+    echo "runs:$(grep -c -- --unit "$ROOT/run.calls")"
+  ' 2>&1)"
+  has "scope lib: a caller's INT/TERM traps survive scope_run" "$out" "after:11"
+  has "scope lib: no caller trap stays none after scope_run" "$out" "none:0"
+  has "scope lib: our traps are still set while the scope is stopped" "$out" "during:1"
+  has "scope lib: a nested scope_run keeps the outer unit" "$out" "outer-unit:outer"
+  has "scope lib: ...and the outer trap" "$out" "outer-trap:1"
+  has "scope lib: ...and starts no second scope" "$out" "runs:0"
+}
+test_p2_7_scope_lib() { _scope_lib_case; }
+
+# P2.7 for real: an engine straggler left by a drain run.sh must be gone once
+# that run.sh returns. A scope is not stopped when its main process exits, so
+# this needs a real transient unit; skipped where systemd-run --user is absent.
+test_p2_7_scope_reaps_stragglers() {
+  local root="$FIXTURE/p27real" rc pid alive=""
+  if ! timeout 20 systemd-run --user --scope --collect --quiet true >/dev/null 2>&1; then
+    skip "scope reaps: systemd-run --user --scope is not usable here" "real-unit test only"
+    return 0
+  fi
+  _drain_fixture "$root" 2
+  sed -i "3a setsid sleep 600 </dev/null >/dev/null 2>&1 & echo \$! >> '$root/stragglers'" "$root/stub/claude"
+  rc=0; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_SCOPE=on \
+    "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is "scope reaps: the drain completes with two fires"        "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+  is "scope reaps: ...each engine call left a straggler"      "$(wc -l < "$root/stragglers" 2>/dev/null)" "2"
+  sleep 1
+  while read -r pid; do kill -0 "$pid" 2>/dev/null && alive+="$pid "; done < "$root/stragglers"
+  is "scope reaps: ...and none outlives its run.sh"           "$alive" ""
+  for pid in $alive; do kill "$pid" 2>/dev/null; done
 }
 
 # An empty --repo value is a usage error (exit 2), not a drain that matches no
