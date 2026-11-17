@@ -46,7 +46,9 @@ hostcheck_gate() {
 
   if (( ! HOST_IGNORE_LOAD )); then
     local load ncpu
-    read -r load _ < "${MEUTE_LOADAVG:-/proc/loadavg}" 2>/dev/null || load=""
+    # The braces silence the redirection's own error: an unreadable loadavg
+    # is "unknown", not a line of noise on every fire.
+    { read -r load _ < "${MEUTE_LOADAVG:-/proc/loadavg}"; } 2>/dev/null || load=""
     ncpu="${MEUTE_NCPU:-$(nproc 2>/dev/null || echo 1)}"
     if [[ "$load" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
        && awk -v l="$load" -v c="$ncpu" -v m="$max_load" 'BEGIN { exit !(m > 0 && c > 0 && l / c > m) }'; then

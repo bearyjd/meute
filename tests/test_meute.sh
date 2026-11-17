@@ -3406,12 +3406,12 @@ test_web_bind_guard() {
 test_web_invariants() {
   local f bad rc out
   for f in "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" \
-           "$REPO/lib/inbox.py" "$REPO/lib/report.py"; do
+           "$REPO/lib/inbox.py" "$REPO/lib/report.py" "$REPO/lib/finding_status.py"; do
     bad="$(python3 - "$f" <<'PY2'
 import ast, sys
 std = sys.stdlib_module_names
 # the only sibling modules the web files may import (never serve/app/model)
-siblings = {"inbox", "report", "runctl", "runprogress"}
+siblings = {"inbox", "report", "finding_status", "runctl", "runprogress"}
 tree = ast.parse(open(sys.argv[1]).read())
 bad = []
 for n in ast.walk(tree):
@@ -6253,10 +6253,21 @@ test_plan_quarantine_manifest_broken
 test_policy_override
 test_host_gate
 test_startup_sweep
+test_p24_redact
+test_p24_report_and_umask
+test_p24_doctor
+test_p24_doctor_fail_closed
+test_p23_quota_age
+test_p1_3_source_manifest
+test_p1_4_once
+test_p1_3_wait_lock
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
 test_p0_5_single_process_reads
 test_p0_5_findings_failure_and_nonregular
+test_p1_7a_fingerprint_inherit
+test_p26_unknown_policy_keys
+test_kv_writes_locked
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

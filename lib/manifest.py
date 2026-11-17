@@ -74,6 +74,7 @@ OWNER_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*
 
 POLICY_DEFAULTS = {
     "quota_floor_percent": 30,
+    "quota_max_age_hours": None,
     "weekly_runs": None,
     "weekly_cost_usd": None,
     "community_share": 0.20,
@@ -124,6 +125,14 @@ def load(path: str) -> dict:
     return data
 
 
+def unknown_policy_keys(data: dict) -> list:
+    """Keys under policy: that nothing reads; a typo here silently falls back to the default."""
+    supplied = data.get("policy")
+    if not isinstance(supplied, dict):
+        return []
+    return sorted(str(key) for key in supplied if key not in POLICY_DEFAULTS)
+
+
 def merged_policy(data: dict) -> dict:
     policy = dict(POLICY_DEFAULTS)
     supplied = data.get("policy") or {}
@@ -133,6 +142,9 @@ def merged_policy(data: dict) -> dict:
     floor = policy["quota_floor_percent"]
     if not isinstance(floor, int) or not 0 <= floor <= 100:
         raise ManifestError("policy.quota_floor_percent: must be an integer 0-100")
+    max_age = policy["quota_max_age_hours"]
+    if max_age is not None and (isinstance(max_age, bool) or not isinstance(max_age, (int, float)) or max_age <= 0):
+        raise ManifestError("policy.quota_max_age_hours: must be a positive number")
     share = policy["community_share"]
     if not isinstance(share, (int, float)) or not 0.0 <= float(share) <= 1.0:
         raise ManifestError("policy.community_share: must be a number 0.0-1.0")
@@ -556,12 +568,20 @@ def cmd_validate(args: list) -> int:
     root = repo_root(manifest)
     data = load(manifest)
     merged_policy(data)
+    unknown = unknown_policy_keys(data)
+    if unknown:
+        sys.stderr.write(f"meute/manifest: warning: unknown policy key(s): {', '.join(unknown)}\n")
     entries = [entry for slot in VALID_SLOTS for entry in build_queue(data, slot, root)]
     # A stranded state/stages row is not a reason to refuse the manifest, but
     # validate is the one step that runs exactly once per fire, so this is
     # where the journal hears about it.
     warn_unconsumed_rows(load_stages(root), consumed_keys(entries))
     print(f"ok: {manifest}")
+    return 0
+
+
+def cmd_unknown_policy_keys(args: list) -> int:
+    print("\n".join(unknown_policy_keys(load(args[0]))))
     return 0
 
 
@@ -695,6 +715,7 @@ COMMANDS = {
     "policy": (cmd_policy, 1),
     "policy-effective": (cmd_policy_effective, 1),
     "policy-check": (cmd_policy_check, 3),
+    "unknown-policy-keys": (cmd_unknown_policy_keys, 1),
     "queue": (cmd_queue, 2),
     "plan-queue": (cmd_plan_queue, 3),
     "render": (cmd_render, 1),

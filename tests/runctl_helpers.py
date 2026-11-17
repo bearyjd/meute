@@ -124,6 +124,28 @@ class FakeFleet:
             return self.ok(argv[argv.index("--repo") + 1], argv[argv.index("--task") + 1])()
         return step
 
+    def skip_code(self, code):
+        def step():
+            argv = self.last_argv
+            self.log(f"{iso()}\tweek=2026-W46\tslot={argv[1]}\tstatus=skipped"
+                     f"\treason=r\trepo={argv[argv.index('--repo') + 1]}"
+                     f"\ttask={argv[argv.index('--task') + 1]}\tcode={code}\tdur=0s")
+            return 0, ""
+        return step
+
+    def already_done(self):
+        """A timer finished the forced item first; run.sh --once declines it."""
+        def step():
+            argv = self.last_argv
+            repo, task = argv[argv.index("--repo") + 1], argv[argv.index("--task") + 1]
+            with open(os.path.join(self.state, "plan-complete"), "a") as f:
+                f.write(f"plan/{repo}/{task}\t{iso()}\n")
+            self.log(f"{iso()}\tweek=2026-W46\tslot={argv[1]}\tstatus=skipped"
+                     f"\treason=staged plan item already attempted (--once)"
+                     f"\trepo={repo}\ttask={task}\tcode=already-done\tdur=0s")
+            return 0, ""
+        return step
+
     def die(self):
         return lambda: (1, "")
 
