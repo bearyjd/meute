@@ -6246,11 +6246,15 @@ test_unit_limits
 test_plan_quarantine
 test_plan_quarantine_manifest_broken
 test_p23_quota_age
+test_p1_3_source_manifest
+test_p1_4_once
+test_p1_3_wait_lock
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
 test_p0_5_single_process_reads
 test_p0_5_findings_failure_and_nonregular
+test_p26_unknown_policy_keys
 test_kv_writes_locked
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

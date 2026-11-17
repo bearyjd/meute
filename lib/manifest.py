@@ -121,6 +121,14 @@ def load(path: str) -> dict:
     return data
 
 
+def unknown_policy_keys(data: dict) -> list:
+    """Keys under policy: that nothing reads; a typo here silently falls back to the default."""
+    supplied = data.get("policy")
+    if not isinstance(supplied, dict):
+        return []
+    return sorted(str(key) for key in supplied if key not in POLICY_DEFAULTS)
+
+
 def merged_policy(data: dict) -> dict:
     policy = dict(POLICY_DEFAULTS)
     supplied = data.get("policy") or {}
@@ -550,12 +558,20 @@ def cmd_validate(args: list) -> int:
     root = repo_root(manifest)
     data = load(manifest)
     merged_policy(data)
+    unknown = unknown_policy_keys(data)
+    if unknown:
+        sys.stderr.write(f"meute/manifest: warning: unknown policy key(s): {', '.join(unknown)}\n")
     entries = [entry for slot in VALID_SLOTS for entry in build_queue(data, slot, root)]
     # A stranded state/stages row is not a reason to refuse the manifest, but
     # validate is the one step that runs exactly once per fire, so this is
     # where the journal hears about it.
     warn_unconsumed_rows(load_stages(root), consumed_keys(entries))
     print(f"ok: {manifest}")
+    return 0
+
+
+def cmd_unknown_policy_keys(args: list) -> int:
+    print("\n".join(unknown_policy_keys(load(args[0]))))
     return 0
 
 
@@ -686,6 +702,7 @@ from manifest_write import (  # noqa: E402
 COMMANDS = {
     "validate": (cmd_validate, 1),
     "policy": (cmd_policy, 1),
+    "unknown-policy-keys": (cmd_unknown_policy_keys, 1),
     "queue": (cmd_queue, 2),
     "plan-queue": (cmd_plan_queue, 3),
     "render": (cmd_render, 1),
