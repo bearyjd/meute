@@ -173,10 +173,10 @@ class LoopTests(RunCtlCase):
         status = self.run_to_end()
         a, b = name_for(ALPHA), name_for(BETA)
         self.assertEqual([c[1:] for c in self.fleet.run_calls()], [
-            ["daily", "--repo", a, "--task", "audit"],
-            ["daily", "--repo", b, "--task", "audit"],
-            ["weekly", "--repo", a, "--task", "drift"],
-            ["weekly", "--repo", b, "--task", "drift"]])
+            ["daily", "--repo", a, "--task", "audit", "--once"],
+            ["daily", "--repo", b, "--task", "audit", "--once"],
+            ["weekly", "--repo", a, "--task", "drift", "--once"],
+            ["weekly", "--repo", b, "--task", "drift", "--once"]])
         self.assertEqual(status["stopped_reason"], "staged plan finished")
         self.assertEqual((status["total"], status["done"], status["remaining"]), (4, 4, 0))
 
@@ -186,7 +186,28 @@ class LoopTests(RunCtlCase):
         self.run_to_end()
         call = self.fleet.run_calls()[0]
         self.assertTrue(call[0].endswith(os.path.join("bin", "run.sh")))
-        self.assertEqual(call[1:], ["daily", "--repo", name_for(ALPHA), "--task", "audit"])
+        self.assertEqual(call[1:], ["daily", "--repo", name_for(ALPHA), "--task", "audit", "--once"])
+
+    def test_item_finished_by_a_timer_first_is_stepped_over_not_a_stop(self):
+        # P1.4: run.sh --once declines an item another fire finished between the
+        # pending check and its lock; the loop moves on to the next item.
+        self.ctl.enqueue([ALPHA, BETA])
+        self.fleet.steps = [self.fleet.already_done(), self.fleet.forced()]
+        status = self.run_to_end()
+        a, b = name_for(ALPHA), name_for(BETA)
+        self.assertEqual([c[1:] for c in self.fleet.run_calls()], [
+            ["daily", "--repo", a, "--task", "audit", "--once"],
+            ["daily", "--repo", b, "--task", "audit", "--once"]])
+        self.assertEqual(status["stopped_reason"], "staged plan finished")
+
+    def test_already_done_for_an_item_still_pending_stops_the_loop(self):
+        # A run.sh that keeps declining an item the loop still sees as pending
+        # (the two disagree about plan-complete) must not spin.
+        self.ctl.enqueue([ALPHA])
+        self.fleet.steps = [self.fleet.skip_code("already-done"), self.fleet.skip_code("already-done")]
+        status = self.run_to_end()
+        self.assertEqual(len(self.fleet.run_calls()), 2)  # once to decline, once to confirm
+        self.assertIn("already attempted", status["stopped_reason"])
 
     def test_stop_during_pending_check_makes_no_run_call(self):
         self.ctl.enqueue([ALPHA])

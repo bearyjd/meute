@@ -5,8 +5,8 @@ the CLI or slip past a gate:
 
   plan()     bin/meute plan --json                       (read-only)
   enqueue()  bin/meute plan --enqueue --only <p>... -- <scan>
-  start()    one background loop of `bin/run.sh <slot> --repo <name> --task <task>`,
-             one staged item per call
+  start()    one background loop of `bin/run.sh <slot> --repo <name> --task <task> --once`,
+             one staged item per call (--once: an item a timer finished first is declined)
 
 run.sh applies the hold, the lock, the self-budget and the quota floor itself;
 this module only decides whether to call it again. It reads the outcome of each
@@ -237,7 +237,7 @@ class RunController:
             self._state, self._current, self._stopped_reason = "idle", None, reason
 
     def _drive(self) -> str:
-        errors = 0
+        errors, declined = 0, None
         while True:
             if self._stopping.is_set():
                 return "stopped"
@@ -248,19 +248,20 @@ class RunController:
                 return "staged plan finished"
             if self._queue_identity() != self._pinned:
                 return QUEUE_CHANGED
-            # Accepted trade-off: from the pending check above (a manifest.py
-            # subprocess) through run.sh's startup up to its flock -- tens to
-            # hundreds of milliseconds -- a scheduled timer can finish this same
-            # item, and run.sh then runs it a second time (one duplicate,
-            # read-only run). Closing the window needs run.sh to re-check
-            # plan-complete under its lock for forced items; this module only
-            # drives run.sh and cannot do that from outside.
             repo, task = pending[0]
             with self._lock:
                 if self._stopping.is_set():
                     return "stopped"
                 self._current = {"repo": repo, "task": task, "slot": slot}
             outcome = self._run_once(slot, repo, task)
+            # --once: a timer finished this item between the pending check and
+            # run.sh's lock. Step over it; the same item declined twice means
+            # run.sh and this loop disagree about plan-complete, so stop.
+            if outcome.get("code") == "already-done":
+                if declined == (repo, task):
+                    return f"stopped: {repo}/{task} is already attempted but still pending"
+                declined = (repo, task)
+                continue
             if outcome["status"] == "skipped":
                 return f"skipped: {outcome['reason'] or 'no reason given'}"
             staged = self._queue_identity()
@@ -277,7 +278,7 @@ class RunController:
         offset = rp.log_size(self.log_path)
         started = int(self.clock())
         out = os.path.join(self.state_dir, RUN_OUTPUT)
-        argv = [self.run_sh, slot, "--repo", repo, "--task", task]
+        argv = [self.run_sh, slot, "--repo", repo, "--task", task, "--once"]
         rc, _ = self.runner(argv, self.root, out_path=out)
         return rp.classify(rp.read_log(self.log_path, offset), rc, slot, started)
 

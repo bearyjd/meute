@@ -118,7 +118,7 @@ PATH=/home/you/.local/bin:/home/you/.npm-global/bin:/usr/bin:/bin
 ```
 
 Overlapping fires are safe: the runner takes a non-blocking `flock` and exits 0
-if another run holds it. Subscription auth works headless — credentials live in
+if another run holds it. `--wait-lock SECS` waits up to SECS for it instead. Subscription auth works headless — credentials live in
 `~/.claude/.credentials.json`, not a keychain agent that a cron job could not
 reach.
 
@@ -140,11 +140,12 @@ on `$?` alone:
 | 13 | quota (below the floor, or the probe failed) |
 | 14 | nothing eligible (or no queue) |
 | 15 | host not healthy (load, disk) |
+| 16 | already done: a forced staged item another fire finished (`--once`) |
 | 70 | the runner itself died |
 
 The `code=` field of the `state/log` line uses the same vocabulary (`hold`,
 `lock`, `budget`, `quota-floor`, `quota-unknown`, `nothing-eligible`,
-`no-queue`, `load`, `disk`, `ok`, `failed`, `died`).
+`no-queue`, `load`, `disk`, `already-done`, `ok`, `failed`, `died`).
 
 ## Subscription-only
 
