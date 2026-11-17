@@ -55,7 +55,15 @@ window.meuteShowTab = showTab;
 // ---- findings -------------------------------------------------------------
 const COLS = ["repo", "severity", "title", "location", "lens", "date", "state"];
 
-function isDecided(f) { return f.state !== "new" || Boolean(f.inherited); }
+// gone, superseded and claimed rows are hidden as decided ones are (D7);
+// `hidden` comes from lib/finding_status.py, the CLI's own rule.
+function isDecided(f) { return f.state !== "new" || Boolean(f.inherited) || Boolean(f.hidden); }
+
+function cell(f, c) {
+  if (c !== "state") return f[c];
+  const label = f.claimed ? "claimed" : f.state;
+  return f.verdict && f.verdict !== "current" && f.verdict !== "unknown" ? label + " / " + f.verdict : label;
+}
 
 function visibleRows() {
   const q = $("filter").value.trim().toLowerCase();
@@ -77,7 +85,7 @@ function renderFindings() {
   state.rows.forEach((f, i) => {
     const tr = el("tr", null, "finding" + (isDecided(f) ? " decided" : ""));
     COLS.forEach((c) => {
-      const td = el("td", f[c]);
+      const td = el("td", cell(f, c));
       if (c === "severity") td.className = "sev-" + String(f.severity).toLowerCase();
       tr.appendChild(td);
     });

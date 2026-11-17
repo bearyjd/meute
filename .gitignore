@@ -46,6 +46,9 @@ state/hold
 # Where each in-flight tier-3 ticket stands (PRP-004 §4.3): one row per
 # <repo>/<ticket> naming its stage, branch, base SHA and build report.
 state/stages
+# Verify verdicts and claims (P1.7 b): one row per <repo>/<report>#n, with PR URLs.
+state/finding-status
+state/finding-status.lock
 
 # The triage UI's own venv (uv-managed). The runner never touches it.
 tui/.venv/

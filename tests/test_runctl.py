@@ -2,10 +2,13 @@
 lib/manifest.py; nothing here runs the real fleet or touches the real state/."""
 import os
 import shutil
+import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runctl_helpers import ALPHA, BETA, SCAN, RunCtlCase, iso, name_for, runctl  # noqa: E402
@@ -57,7 +60,7 @@ class EnqueueTests(RunCtlCase):
     def test_enqueue_while_running_conflicts(self):
         self.ctl.enqueue([ALPHA])
         step, entered, release = self.blocking_step(name_for(ALPHA))
-        self.fleet.steps = [step]
+        self.fleet.drains = [lambda: step()[0]]
         self.ctl.start()
         self.assertTrue(entered.wait(5))
         try:
@@ -78,19 +81,23 @@ class StartTests(RunCtlCase):
         self.write_hold(int(time.time()) + 3600)
         with self.assertRaises(runctl.RunConflict):
             self.ctl.start()
-        self.assertEqual(self.fleet.run_calls(), [])
+        self.assertEqual(self.fleet.drain_calls(), [])
 
     def test_start_ignores_expired_hold(self):
         self.ctl.enqueue([ALPHA])
         self.write_hold(int(time.time()) - 60)
-        self.fleet.steps = [self.fleet.ok(name_for(ALPHA))]
         self.run_to_end()
-        self.assertEqual(len(self.fleet.run_calls()), 1)
+        self.assertEqual(len(self.fleet.drain_calls()), 2)
 
     def test_start_conflict_when_already_running(self):
         self.ctl.enqueue([ALPHA])
-        step, entered, release = self.blocking_step(name_for(ALPHA))
-        self.fleet.steps = [step]
+        entered, release = threading.Event(), threading.Event()
+
+        def step():
+            entered.set()
+            release.wait(5)
+            return 0
+        self.fleet.drains = [step]
         self.ctl.start()
         self.assertTrue(entered.wait(5))
         try:
@@ -99,135 +106,126 @@ class StartTests(RunCtlCase):
         finally:
             release.set()
             self.ctl.join(5)
-        self.assertEqual(len(self.fleet.run_calls()), 1)
 
     def test_start_with_nothing_staged_is_value_error(self):
         with self.assertRaises(ValueError):
             self.ctl.start()
 
-
-class LoopTests(RunCtlCase):
-    def test_loop_stops_on_skipped_and_reports_reason(self):
+    def test_start_rejects_an_unknown_source(self):
         self.ctl.enqueue([ALPHA])
-        self.fleet.steps = [self.fleet.skip("nothing eligible"), self.fleet.ok(name_for(ALPHA))]
-        status = self.run_to_end()
-        self.assertEqual(len(self.fleet.run_calls()), 1)
-        self.assertIn("nothing eligible", status["stopped_reason"])
+        with self.assertRaises(ValueError):
+            self.ctl.start("everything")
 
-    def test_loop_continues_on_ok_and_stops_after_queue_done(self):
+
+class DrainTests(RunCtlCase):
+    """The page starts `meute drain` and reads its exit status (P1.3, D1)."""
+
+    def drain_argv(self):
+        return [c[1:] for c in self.fleet.drain_calls()]
+
+    def test_plan_source_drains_daily_then_weekly(self):
         self.ctl.enqueue([ALPHA, BETA])
-        self.fleet.steps = [self.fleet.ok(name_for(ALPHA)), self.fleet.ok(name_for(BETA)),
-                            self.fleet.ok("never-run")]
+        self.fleet.drains = [self.fleet.drained(name_for(ALPHA), name_for(BETA))]
         status = self.run_to_end()
-        self.assertEqual(len(self.fleet.run_calls()), 2)
+        self.assertEqual(self.drain_argv(), [["drain", "daily", "--source", "plan"],
+                                             ["drain", "weekly", "--source", "plan"]])
+        self.assertEqual(self.fleet.run_calls(), [])  # the page never calls run.sh itself
         self.assertEqual((status["total"], status["done"], status["remaining"]), (2, 2, 0))
-        self.assertIn("finished", status["stopped_reason"])
+        self.assertEqual(status["stopped_reason"], "drain finished")
 
-    def test_loop_stops_after_three_consecutive_errors(self):
-        self.ctl.enqueue([ALPHA, BETA])
-        a, b = name_for(ALPHA), name_for(BETA)
-        # an ok resets the count; no new log line (any exit code) is an error
-        no_line = lambda: (0, "")  # noqa: E731
-        self.fleet.steps = [self.fleet.die(), self.fleet.ok(a), self.fleet.die(),
-                            no_line, self.fleet.die(), self.fleet.ok(b)]
-        status = self.run_to_end()
-        self.assertEqual(len(self.fleet.run_calls()), 5)
-        self.assertIn("3 consecutive errors", status["stopped_reason"])
-
-    def test_stop_lets_current_item_finish_then_idle(self):
-        self.ctl.enqueue([ALPHA, BETA])
-        step, entered, release = self.blocking_step(name_for(ALPHA))
-        self.fleet.steps = [step, self.fleet.ok(name_for(BETA))]
-        self.ctl.start()
-        self.assertTrue(entered.wait(5))
-        self.ctl.stop()
-        self.assertEqual(self.ctl.status()["state"], "stopping")
-        release.set()
+    def test_manifest_source_needs_no_staged_plan(self):
+        self.ctl.start("manifest")
         self.ctl.join(5)
-        status = self.ctl.status()
-        self.assertEqual(status["state"], "idle")
-        self.assertEqual(len(self.fleet.run_calls()), 1)
-        self.assertEqual(status["done"], 1)
-        self.assertEqual(status["stopped_reason"], "stopped")
+        self.assertEqual(self.drain_argv(), [["drain", "daily", "--source", "manifest"],
+                                             ["drain", "weekly", "--source", "manifest"]])
 
-    def test_loop_stops_when_runner_falls_back_to_manifest(self):
+    def test_default_source_is_the_staged_plan(self):
         self.ctl.enqueue([ALPHA])
-        self.fleet.steps = [self.fleet.ok("enrolled-repo"), self.fleet.ok(name_for(ALPHA))]
-        status = self.run_to_end()
-        self.assertEqual(len(self.fleet.run_calls()), 1)
-        self.assertIn("manifest", status["stopped_reason"])
-
-    def test_loop_runs_weekly_slot_when_only_weekly_items_are_staged(self):
-        self.fleet.tasks = ["drift"]
-        self.ctl.enqueue([ALPHA])
-        self.fleet.steps = [self.fleet.forced(), self.fleet.forced()]
-        status = self.run_to_end()
-        self.assertEqual([c[1] for c in self.fleet.run_calls()], ["weekly"])
-        self.assertEqual(status["stopped_reason"], "staged plan finished")
-        self.assertEqual((status["total"], status["done"], status["remaining"]), (1, 1, 0))
-
-    def test_mixed_queue_runs_daily_first_then_weekly_then_stops(self):
-        self.fleet.tasks = ["audit", "drift"]
-        self.ctl.enqueue([ALPHA, BETA])
-        self.fleet.steps = [self.fleet.forced() for _ in range(6)]
-        status = self.run_to_end()
-        a, b = name_for(ALPHA), name_for(BETA)
-        self.assertEqual([c[1:] for c in self.fleet.run_calls()], [
-            ["daily", "--repo", a, "--task", "audit", "--once"],
-            ["daily", "--repo", b, "--task", "audit", "--once"],
-            ["weekly", "--repo", a, "--task", "drift", "--once"],
-            ["weekly", "--repo", b, "--task", "drift", "--once"]])
-        self.assertEqual(status["stopped_reason"], "staged plan finished")
-        self.assertEqual((status["total"], status["done"], status["remaining"]), (4, 4, 0))
-
-    def test_run_names_the_staged_item_with_repo_and_task(self):
-        self.ctl.enqueue([ALPHA])
-        self.fleet.steps = [self.fleet.forced()]
         self.run_to_end()
-        call = self.fleet.run_calls()[0]
-        self.assertTrue(call[0].endswith(os.path.join("bin", "run.sh")))
-        self.assertEqual(call[1:], ["daily", "--repo", name_for(ALPHA), "--task", "audit", "--once"])
+        self.assertEqual(self.drain_argv()[0][-1], "plan")
 
-    def test_item_finished_by_a_timer_first_is_stepped_over_not_a_stop(self):
-        # P1.4: run.sh --once declines an item another fire finished between the
-        # pending check and its lock; the loop moves on to the next item.
-        self.ctl.enqueue([ALPHA, BETA])
-        self.fleet.steps = [self.fleet.already_done(), self.fleet.forced()]
-        status = self.run_to_end()
-        a, b = name_for(ALPHA), name_for(BETA)
-        self.assertEqual([c[1:] for c in self.fleet.run_calls()], [
-            ["daily", "--repo", a, "--task", "audit", "--once"],
-            ["daily", "--repo", b, "--task", "audit", "--once"]])
-        self.assertEqual(status["stopped_reason"], "staged plan finished")
-
-    def test_already_done_for_an_item_still_pending_stops_the_loop(self):
-        # A run.sh that keeps declining an item the loop still sees as pending
-        # (the two disagree about plan-complete) must not spin.
+    def test_a_stop_class_exit_ends_the_run_with_its_reason(self):
         self.ctl.enqueue([ALPHA])
-        self.fleet.steps = [self.fleet.skip_code("already-done"), self.fleet.skip_code("already-done")]
+        self.fleet.drains = [lambda: 12, lambda: 0]
         status = self.run_to_end()
-        self.assertEqual(len(self.fleet.run_calls()), 2)  # once to decline, once to confirm
-        self.assertIn("already attempted", status["stopped_reason"])
+        self.assertEqual(len(self.fleet.drain_calls()), 1)
+        self.assertIn("budget", status["stopped_reason"])
 
-    def test_stop_during_pending_check_makes_no_run_call(self):
+    def test_nothing_eligible_in_daily_still_runs_weekly(self):
         self.ctl.enqueue([ALPHA])
-        self.fleet.on_pending = self.ctl.stop
-        self.fleet.steps = [self.fleet.forced()]
+        self.fleet.drains = [lambda: 14, lambda: 0]
         status = self.run_to_end()
-        self.assertEqual(self.fleet.run_calls(), [])
-        self.assertEqual(status["stopped_reason"], "stopped")
+        self.assertEqual(len(self.fleet.drain_calls()), 2)
+        self.assertEqual(status["stopped_reason"], "drain finished")
 
-    def test_foreign_timer_line_after_own_line_is_not_credited(self):
-        self.ctl.enqueue([ALPHA, BETA])
+    def test_repeated_failures_are_reported(self):
+        self.ctl.enqueue([ALPHA])
+        self.fleet.drains = [lambda: 1]
+        status = self.run_to_end()
+        self.assertIn("failed", status["stopped_reason"])
+
+    def test_stop_signals_the_drain_not_the_item_and_skips_weekly(self):
+        self.ctl.enqueue([ALPHA])
+        entered, release = threading.Event(), threading.Event()
 
         def step():
-            self.fleet.forced()()
-            self.fleet.log(f"{iso()}\tslot=weekly\tstatus=skipped\treason=other timer")
-            return 0, ""
-        self.fleet.steps = [step, self.fleet.forced()]
-        status = self.run_to_end()
-        self.assertEqual(len(self.fleet.run_calls()), 2)
-        self.assertEqual(status["stopped_reason"], "staged plan finished")
+            entered.set()
+            release.wait(5)
+            return 143
+        self.fleet.drains = [step, lambda: 0]
+        killed = []
+        with mock.patch.object(runctl.os, "kill", lambda pid, sig: killed.append((pid, sig))):
+            self.ctl.start()
+            self.assertTrue(entered.wait(5))
+            self.ctl.stop()
+            self.assertEqual(self.ctl.status()["state"], "stopping")
+            release.set()
+            self.ctl.join(5)
+        self.assertEqual(killed, [(self.fleet.drain_pid, signal.SIGTERM)])
+        self.assertEqual(len(self.fleet.drain_calls()), 1)
+        self.assertEqual(self.ctl.status()["stopped_reason"], "stopped")
+
+    def test_stop_before_the_pid_is_known_signals_it_once_known(self):
+        self.ctl.enqueue([ALPHA])
+        self.fleet.drains = [lambda: 143]
+        self.fleet.before_drain_start = [self.ctl.stop]
+        killed = []
+        with mock.patch.object(runctl.os, "kill", lambda pid, sig: killed.append((pid, sig))):
+            self.ctl.start()
+            self.ctl.join(5)
+        self.assertEqual(killed, [(self.fleet.drain_pid, signal.SIGTERM)])
+
+    def test_stop_between_drains_never_signals_the_finished_drains_pid(self):
+        # daily's pid is gone by the time weekly starts: signalling it could hit
+        # a reused pid. Only weekly's own pid, once known, is signalled.
+        self.ctl.enqueue([ALPHA])
+        self.fleet.drains = [lambda: 0, lambda: 143]
+        self.fleet.before_drain_start = [lambda: None, self.ctl.stop]
+        killed = []
+        with mock.patch.object(runctl.os, "kill", lambda pid, sig: killed.append((pid, sig))):
+            self.ctl.start()
+            self.ctl.join(5)
+        self.assertEqual(killed, [(self.fleet.drain_pid, signal.SIGTERM)])
+
+    def test_stop_survives_a_drain_pid_owned_by_someone_else(self):
+        self.ctl.enqueue([ALPHA])
+        entered, release = threading.Event(), threading.Event()
+
+        def step():
+            entered.set()
+            release.wait(5)
+            return 143
+        self.fleet.drains = [step]
+
+        def deny(pid, sig):
+            raise PermissionError(1, "Operation not permitted")
+        with mock.patch.object(runctl.os, "kill", deny):
+            self.ctl.start()
+            self.assertTrue(entered.wait(5))
+            self.ctl.stop()  # must not raise
+            release.set()
+            self.ctl.join(5)
+        self.assertEqual(self.ctl.status()["state"], "idle")
 
 
 class StatusTests(RunCtlCase):

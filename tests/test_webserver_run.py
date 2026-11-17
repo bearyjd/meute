@@ -90,6 +90,16 @@ class RunEndpointTests(WebTestCase):
         self.assertEqual(json.loads(raw)["scan"], "/s")
         self.assertEqual([c[0] for c in self.run.calls], ["start", "stop", "status", "plan"])
 
+    def test_start_passes_the_source_and_defaults_to_plan(self):
+        self.request("POST", "/api/run/start", {"source": "manifest"})
+        self.request("POST", "/api/run/start", {})
+        self.assertEqual(self.run.calls, [("start", "manifest"), ("start", "plan")])
+
+    def test_start_source_must_be_a_string(self):
+        resp, _ = self.request("POST", "/api/run/start", {"source": 3})
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.run.calls, [])
+
     def test_runner_failure_is_502(self):
         def boom():
             raise webserver.runctl.RunnerFailed("meute plan --json failed (exit 1)")
@@ -208,6 +218,15 @@ process.stdout.write(JSON.stringify([pick(f({})), pick(f({pollFailed: true})), p
   pick(f({busy: true})), pick(f({anyChecked: false})), pick(f({staged: false}))]));""")
         self.assertEqual(r, [[True, True, False], [False, False, True], [False, False, True],
                              [False, False, False], [True, False, False], [False, True, False]])
+
+    @unittest.skipUnless(HAS_NODE, "node not installed")
+    def test_run_js_manifest_source_starts_without_a_staged_plan(self):
+        r = node_pure("""const f = (o) => buttonFlags(Object.assign({state: "idle", pollFailed: false,
+  busy: false, stopBusy: false, anyChecked: false, staged: false}, o));
+const sh = (x) => [x.start, x.hint];
+process.stdout.write(JSON.stringify([sh(f({})), sh(f({source: "plan"})), sh(f({source: "manifest"})),
+  sh(f({source: "manifest", state: "running"})), sh(f({source: "manifest", busy: true}))]));""")
+        self.assertEqual(r, [[False, True], [False, True], [True, False], [False, False], [False, False]])
 
     @unittest.skipUnless(HAS_NODE, "node not installed")
     def test_run_js_start_needs_something_staged(self):
