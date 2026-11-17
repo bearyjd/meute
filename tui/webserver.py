@@ -161,7 +161,11 @@ def post_enqueue(h: "Handler", query: dict) -> None:
 
 
 def post_run_start(h: "Handler", query: dict) -> None:
-    call_run(h, "start")
+    payload = h.read_json()
+    source = payload.get("source", "plan") if isinstance(payload, dict) else "plan"
+    if not isinstance(source, str):
+        raise BadRequest("source must be a string")
+    call_run(h, "start", source)
 
 
 def post_run_stop(h: "Handler", query: dict) -> None:
