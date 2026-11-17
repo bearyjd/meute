@@ -169,7 +169,7 @@ class RunPageTests(WebTestCase):
         self.assertIn("X-Meute-Token", web_file("run.js"))
 
     def test_index_loads_run_js(self):
-        resp, raw = self.request("GET", "/")
+        resp, raw = self.request("GET", "/", headers={"Cookie": f"meute_t_{self.port}={self.token}"})
         self.assertIn('<script src="/static/run.js" defer>', raw.decode())
         resp, raw = self.request("GET", "/static/run.js")
         self.assertEqual(resp.status, 200)
