@@ -904,6 +904,19 @@ test_host_gate() {
   "${R[@]}" MEUTE_DF="$root/df-low" "$root/bin/run.sh" daily >/dev/null 2>&1
   has   "host gate: min_free_mb: 50 lets 100 MB free run" "$(tail -1 "$root/state/log")" "status=ok"
   sed -i '/min_free_mb/d' "$root/repos.yaml"
+  # The run's temp directory is checked as well as state/: a df that is low
+  # only for $RUN_TMP (MEUTE_TMPDIR) still declines the fire as code=disk.
+  cat > "$root/df-tmplow" <<EOF
+#!/bin/sh
+case "\$2" in "$root/tmpdir"/*) a=100 ;; *) a=900 ;; esac
+printf 'Filesystem 1M-blocks Used Available Capacity Mounted\nfake 1000 0 %s 10%% /\n' "\$a"
+EOF
+  chmod +x "$root/df-tmplow"
+  out="$("${R[@]}" MEUTE_TMPDIR="$root/tmpdir" MEUTE_DF="$root/df-tmplow" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  line="$(tail -1 "$root/state/log")"
+  is    "host gate: low free space only in the run's temp dir exits 15" "$rc" "15"
+  has   "host gate: ...logged as code=disk" "$line" "code=disk"
+  has   "host gate: ...naming the temp dir" "$line" "$root/tmpdir/run."
 
   # a df that fails (odd mount, container permissions) is "unknown": the gate
   # passes and the fire runs, it does not die under set -e
