@@ -2128,6 +2128,25 @@ PY
     out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
     is "health: days of code=$benign skips are not a failure" "$rc:$out" "0:"
   done
+  # ...but only for a bounded time: two weeks of benign skips and nothing run
+  # is its own problem, or a budget that never refills goes unseen forever.
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 20 * 86400 )) ok
+  for i in 13 9 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped budget; done
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: 13 days of only benign skips is still healthy" "$rc:$out" "0:"
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 20 * 86400 )) ok
+  for i in 15 10 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped quota-floor; done
+  _hcase "15 days of only benign skips" "15 days of only benign skips, nothing ran"
+  hasnt "health: ...not also reported as no successful run" "$out" "no successful run"
+  _hreset; : > "$state/log"
+  for i in 16 10 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped no-queue; done
+  _hcase "16 days of only benign skips, nothing ever ran" "16 days of only benign skips, nothing ran"
+  _hreset; : > "$state/log"
+  for i in 15 10; do _health_log "$state/log" $(( now - i * 86400 )) skipped budget; done
+  _health_log "$state/log" $(( now - 6 * 86400 )) ok
+  for i in 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped budget; done
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a run inside the two weeks resets the count" "$rc:$out" "0:"
 
   _hreset; local i; for i in 3 2 1; do _health_log "$state/log" $(( now - i * 60 )) error died; done
   _hcase "three consecutive errors" "3 consecutive"
@@ -2231,6 +2250,32 @@ PY
   "${H[@]}" MEUTE_NOW=$(( now + 10800 )) "$root/bin/meute" health --alert >/dev/null 2>&1
   has "health --alert: a problem that cleared and came back alerts again" "$(cat "$root/alert.txt" 2>/dev/null)" "automatic hold"
   rm -f "$state/hold"
+  # The marker is replaced whole (written beside it, renamed into place), and a
+  # write that fails neither truncates it nor kills health under set -e.
+  local ino
+  _hreset; printf 'hold\t%s\tauto: provider rate limit\n' $(( now + 86400 )) > "$state/hold"
+  "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1
+  ino="$(stat -c %i "$state/health-alerted" 2>/dev/null)"
+  "${H[@]}" STUB_DF_FREE=100 "$root/bin/meute" health --alert >/dev/null 2>&1
+  [[ -n "$ino" && "$(stat -c %i "$state/health-alerted" 2>/dev/null)" != "$ino" ]] \
+    && ok "health --alert: the marker is replaced by a rename, not rewritten in place" \
+    || bad "health --alert: the marker is replaced by a rename, not rewritten in place" "inode $ino kept"
+  has "health --alert: ...and holds the new problem" "$(cat "$state/health-alerted")" "MB free"
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "health --alert: a marker that cannot be written" "running as root; chmod cannot block writes"
+  else
+    local before; before="$(cat "$state/health-alerted")"
+    rm -f "$root/alert.txt"
+    chmod 555 "$state"
+    out="$("${H[@]}" STUB_DF_FREE=100 STUB_TIMER=idle "$root/bin/meute" health --alert 2>&1)"; rc=$?
+    chmod 755 "$state"
+    is  "health --alert: an unwritable marker still exits 1 (problems), not an errexit" "$rc" "1"
+    has "health --alert: ...the alert was still sent" "$(cat "$root/alert.txt" 2>/dev/null)" "not armed"
+    has "health --alert: ...the failure is noted" "$out" "could not record"
+    is  "health --alert: ...the marker is untouched" "$(cat "$state/health-alerted")" "$before"
+    is  "health --alert: ...and no temp marker is left" "$(ls -A "$state" | grep -c '^health-alerted\.')" "0"
+  fi
+  rm -f "$state/hold" "$root/alert.txt"
   # A problem whose numbers grow each hour ("no run logged for 72h", "73h")
   # is still one problem.
   _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 4 * 86400 )) ok

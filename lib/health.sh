@@ -23,6 +23,7 @@
 # (hostcheck_free_mb) and lib/sweep.sh (sweep_stale, _sweep_live).
 
 HEALTH_OK_MAX_SECONDS=$(( 3 * 86400 ))   # no status=ok for this long is a problem
+HEALTH_BENIGN_MAX_SECONDS=$(( 14 * 86400 ))  # benign skips and nothing run, for this long
 HEALTH_MAX_ERRORS=3                      # this many status=error lines in a row
 HEALTH_QUOTA_MAX_SECONDS=86400           # the status-line snapshot older than this
 HEALTH_ALERT_TIMEOUT=60                  # seconds alert_cmd may take
@@ -47,7 +48,7 @@ health_cadence_seconds() {
 _health_epoch() { [[ -n "$1" ]] && date -d "$1" +%s 2>/dev/null || true; }
 
 health_check_log() {
-  local now cadence last first last_ok errors t armed
+  local now cadence last first last_ok errors t streak armed
   now="$(now_epoch)"
   cadence="$(health_cadence_seconds "${POLICY_DAILY_CALENDAR:-*-*-* 03:17:00}")"
   if [[ ! -s "$LOG_FILE" ]]; then
@@ -68,10 +69,19 @@ health_check_log() {
   # or after it ends; an automatic hold's skips are (health_check_hold). Nor is
   # a fire that declined by design: a spent budget, nothing eligible, no queue,
   # or a quota under the floor is the fleet working, not a fleet that stopped.
-  t="$(awk -F'\t' 'index($0, "\tstatus=ok\t") || (index($0, "\tcode=hold\t") && !index($0, "auto: ")) \
-                     || /\tcode=(budget|nothing-eligible|no-queue|quota-floor)\t/ { t = $1 }
-                   END { print t }' "$LOG_FILE")"
+  # For a bounded time only: `streak` is the first such skip since the last
+  # run (or owner pause), and two weeks of them with nothing run is its own
+  # problem, else a budget that never refills hides a dead fleet for good.
+  IFS=$'\t' read -r t streak <<< "$(awk -F'\t' '
+      index($0, "\tstatus=ok\t") || (index($0, "\tcode=hold\t") && !index($0, "auto: ")) { t = $1; s = ""; next }
+      /\tcode=(budget|nothing-eligible|no-queue|quota-floor)\t/ { t = $1; if (s == "") s = $1 }
+      END { printf "%s\t%s\n", t, s }' "$LOG_FILE")"
   last_ok="$(_health_epoch "$t")"
+  streak="$(_health_epoch "$streak")"
+  if [[ -n "$streak" ]] && (( now - streak > HEALTH_BENIGN_MAX_SECONDS )); then
+    printf '%s days of only benign skips, nothing ran (budget, nothing eligible, no queue or quota floor; see: meute status)\n' \
+      $(( (now - streak) / 86400 ))
+  fi
   first="$(_health_epoch "$(head -n 1 "$LOG_FILE" | cut -f1)")"
   if [[ -n "$last_ok" ]]; then
     (( now - last_ok <= HEALTH_OK_MAX_SECONDS )) \
@@ -204,10 +214,22 @@ health_alert_once() {
   keys="$(_health_keys <<< "$1")"
   seen="$(sort -u "$marker" 2>/dev/null)" || seen=""
   if (( $2 )) || [[ -n "$(comm -23 <(printf '%s\n' "$keys") <(printf '%s\n' "$seen"))" ]]; then
-    if health_alert "$1"; then printf '%s\n' "$keys" > "$marker"; return 0; fi
+    if health_alert "$1"; then _health_mark "$marker" "$keys"; return 0; fi
     keys="$(comm -12 <(printf '%s\n' "$keys") <(printf '%s\n' "$seen"))"
   fi
-  if [[ -n "$keys" ]]; then printf '%s\n' "$keys" > "$marker"; else rm -f "$marker"; fi
+  if [[ -n "$keys" ]]; then _health_mark "$marker" "$keys"
+  else rm -f -- "$marker" 2>/dev/null || note "health: could not remove ${marker}"; fi
+}
+
+# _health_mark <marker> <keys>: replace the marker whole, never in place. A
+# write that fails (full disk, read-only state/) leaves the old marker as it
+# was, removes its own temp file, and is noted: never an errexit.
+_health_mark() {
+  local tmp="$1.$$"
+  if { printf '%s\n' "$2" > "$tmp"; } 2>/dev/null && mv -f -- "$tmp" "$1" 2>/dev/null; then return 0; fi
+  rm -f -- "$tmp" 2>/dev/null || true
+  note "health: could not record the alerted problems in $1; they may be sent again"
+  return 0
 }
 
 cmd_health() {
