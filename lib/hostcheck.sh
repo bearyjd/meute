@@ -7,6 +7,8 @@
 # policy.max_load_per_cpu (default 2.0), skip code=disk when the state
 # filesystem or the run's temp directory has less than policy.min_free_mb
 # (default 512) free or cannot be written. 0 disables the respective check.
+# An unknown load (an unreadable or malformed /proc/loadavg) passes on purpose:
+# the load check fails open, so a host that hides it never stands the fleet down.
 #
 # Owner decision D6: on by default; a forced run obeys the load check unless
 # --ignore-load (HOST_IGNORE_LOAD=1), and always obeys the disk check.
