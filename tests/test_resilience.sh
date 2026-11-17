@@ -903,7 +903,22 @@ test_host_gate() {
     chmod 755 "$root/ro"
     MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/hostcheck.sh"; hostcheck_writable "$1"' _ "$root/ro" >/dev/null 2>&1; rc=$?
     is  "host gate: ...and accepts a writable one" "$rc" "0"
+    # End to end: a state directory that cannot take a new file declines the
+    # fire as code=disk, through run.sh, without dying.
+    mkdir -p "$root/state/tmp"; chmod 555 "$root/state"
+    out="$("${R[@]}" MEUTE_DF="$root/df-ok" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+    chmod 755 "$root/state"
+    line="$(tail -1 "$root/state/log")"
+    is    "host gate: an unwritable state dir declines the fire with exit 15" "$rc" "15"
+    has   "host gate: ...logged as code=disk" "$line" "code=disk"
+    has   "host gate: ...naming the directory it cannot write" "$line" "cannot write to $root/state"
+    hasnt "host gate: ...not code=died" "$line" "code=died"
   fi
+
+  # an unreadable load average is unknown: no error text, the fire runs
+  out="$("${R[@]}" MEUTE_LOADAVG="$root/no-such-loadavg" MEUTE_DF="$root/df-ok" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  is    "host gate: a missing load average is unknown, the fire runs (exit 0)" "$rc" "0"
+  hasnt "host gate: ...and prints no file error" "$out" "No such file"
 
   # manifest: the default (neither key) validates; bad values are refused
   out="$(validate "$root/repos.yaml" "$root")"
