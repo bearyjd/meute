@@ -695,6 +695,24 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
 
+# P2.6 (R20): a typo under policy: used to fall back to the default silently.
+# validate and doctor now name unknown keys; they stay a warning, never an error.
+test_p26_unknown_policy_keys() {
+  local root="$FIXTURE/p26" out rc
+  mkdir -p "$root/state"
+  cp "$REPO/repos.yaml" "$root/repos.yaml"
+  ln -s "$REPO/tasks" "$root/tasks"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" 2>&1)"
+  hasnt "p2.6 validate: known keys draw no warning" "$out" "unknown policy key"
+  sed -i 's/^  quota_floor_percent: 30.*/&\n  quota_flor_percent: 5/' "$root/repos.yaml"
+  rc=0; out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" 2>&1)" || rc=$?
+  is  "p2.6 validate: an unknown policy key is not an error" "$rc" "0"
+  has "p2.6 validate: ...it is named in a warning" "$out" "unknown policy key(s): quota_flor_percent"
+  has "p2.6 validate: ...and the manifest still validates" "$out" "ok: "
+  out="$(MEUTE_ROOT="$root" MEUTE_MANIFEST="$root/repos.yaml" "$REPO/bin/meute" doctor 2>&1)" || true
+  has "p2.6 doctor: names the unknown policy key" "$out" "unknown policy key(s): quota_flor_percent"
+}
+
 # P1.3 runner half (R11) and P1.4 (R15). A drain loop needs run.sh to wait for
 # the lock instead of skipping, to ignore a staged plan when it is draining the
 # manifest, and to refuse, under the lock, a forced staged item another fire

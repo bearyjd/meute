@@ -6253,6 +6253,7 @@ test_real_repo_untouched
 test_web_invariants
 test_p0_5_single_process_reads
 test_p0_5_findings_failure_and_nonregular
+test_p26_unknown_policy_keys
 test_kv_writes_locked
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))
