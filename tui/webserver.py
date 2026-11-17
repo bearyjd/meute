@@ -176,7 +176,34 @@ def get_run_status(h: "Handler", query: dict) -> None:
     call_run(h, "status")
 
 
+CLIENT_PAGES = ("inbox", "run")
+MAX_CLIENT_MSG = 300
+MAX_CLIENT_EVENTS = 1000  # beacons kept in memory; oldest dropped first
+
+
+def record_client(h: "Handler", kind: str, detail: str) -> None:
+    detail = detail[:MAX_CLIENT_MSG]
+    events = h.server.client_events
+    events.append((kind, detail))
+    del events[:-MAX_CLIENT_EVENTS]
+    sys.stderr.write(f"webserver: client-{kind} {detail!r}\n")
+    h.send_json(200, {"ok": True})
+
+
+def get_client_ready(h: "Handler", query: dict) -> None:
+    page = (query.get("page") or [""])[0]
+    if page not in CLIENT_PAGES:
+        raise BadRequest("bad page")
+    record_client(h, "ready", page)
+
+
+def get_client_error(h: "Handler", query: dict) -> None:
+    record_client(h, "error", (query.get("msg") or [""])[0])
+
+
 ROUTES = {
+    ("GET", "/api/client-ready"): get_client_ready,
+    ("GET", "/api/client-error"): get_client_error,
     ("GET", "/"): get_index,
     ("GET", "/api/inbox"): get_inbox,
     ("GET", "/api/finding"): get_finding,
@@ -290,6 +317,7 @@ def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None):
     server.daemon_threads = True
     server.token = secrets.token_urlsafe(32)
     server.bound_host = host
+    server.client_events = []  # (kind, detail) beacons from the page; see record_client
     server.inbox_mod = inbox_mod
     server.run_mod = run_mod if run_mod is not None else runctl.RunController(ROOT)
     return server, server.token
@@ -300,6 +328,9 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8642)
     args = ap.parse_args()
+    # Owner-only files on a shared host (P2.4): the run log and every run the
+    # server starts inherit this, also when it is launched without bin/meute.
+    os.umask(0o077)
     try:
         server, _ = make_server(args.host, args.port)
     except OSError as e:

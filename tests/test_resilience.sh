@@ -695,6 +695,309 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
 
+# P2.4 (R21): privacy on a shared host. Credentials in a report or a log line
+# are redacted before they reach disk; files meute creates are owner-only;
+# doctor names loose permissions and credential-bearing remotes (by repo name
+# only, never the URL).
+_P24_SECRET="hunter2-p24"
+_P24_TOKEN="ghp_$(printf 'Z%.0s' {1..36})"
+_P24_HEX="0123456789abcdef0123456789abcdef01234567"
+_P24_AZ="abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop"
+
+test_p24_redact() {
+  local red="$REPO/lib/redact.py" out long
+  out="$(printf 'clone https://alice:%s@git.example.com/x.git with %s\n' "$_P24_SECRET" "$_P24_TOKEN" \
+         | python3 "$red" 2>&1)"
+  hasnt "p2.4 redact: a URL password is removed"      "$out" "$_P24_SECRET"
+  hasnt "p2.4 redact: a GitHub token is removed"      "$out" "$_P24_TOKEN"
+  has   "p2.4 redact: ...the host is kept for triage" "$out" "@git.example.com/x.git"
+  out="$(printf 'sk-ant-api03-%s and glpat-%s and xoxb-1-%s\n' "$(printf 'q%.0s' {1..30})" \
+         "$(printf 'r%.0s' {1..20})" "$(printf 's%.0s' {1..20})" | python3 "$red")"
+  hasnt "p2.4 redact: an Anthropic key is removed" "$out" "qqqqqqqqqq"
+  hasnt "p2.4 redact: a GitLab token is removed"   "$out" "rrrrrrrrrr"
+  hasnt "p2.4 redact: a Slack token is removed"    "$out" "ssssssssss"
+  is    "p2.4 redact: ordinary text passes unchanged" \
+        "$(printf 'see https://example.com/a@b and task-sk-1\n' | python3 "$red")" \
+        "see https://example.com/a@b and task-sk-1"
+  # A token used as the bare username (legacy 40-hex GitHub PAT, Azure DevOps,
+  # Bitbucket) is a credential too; a short username such as git@ is not.
+  out="$(printf 'https://%s@github.com/o/x.git and https://%s@dev.azure.com/o/p\n' "$_P24_HEX" "$_P24_AZ" \
+         | python3 "$red")"
+  hasnt "p2.4 redact: a 40-hex token as the URL username is removed" "$out" "$_P24_HEX"
+  hasnt "p2.4 redact: an opaque token as the URL username is removed" "$out" "$_P24_AZ"
+  has   "p2.4 redact: ...the host is kept"                            "$out" "@github.com/o/x.git"
+  is    "p2.4 redact: a short URL username is left alone" \
+        "$(printf 'ssh://git@github.com/o/x.git\n' | python3 "$red")" "ssh://git@github.com/o/x.git"
+  # The password runs to the last @ of the authority, so an unencoded @ in it
+  # does not leave its tail behind.
+  hasnt "p2.4 redact: a password containing @ is removed whole" \
+        "$(printf 'https://u:p@ss-tail-p24@github.com/x\n' | python3 "$red")" "ss-tail-p24"
+  # ...but stops at a query or fragment, so an @ there does not swallow the host.
+  has   "p2.4 redact: a password stops before ? and #" \
+        "$(printf 'https://u:pw@host?a=b@c\n' | python3 "$red")" "@host?a=b@c"
+  out="$(bash -c 'source "$1"; engine_detail_clean "$2"' _ "$REPO/lib/engines.sh" \
+         "api 401: https://bob:${_P24_SECRET}@h.example/x")"
+  hasnt "p2.4 detail: engine_detail_clean redacts"       "$out" "$_P24_SECRET"
+  has   "p2.4 detail: ...and keeps the rest of the line" "$out" "api 401: https://bob:"
+  # The redaction runs before the 300-character cut, so a token the cut
+  # would split is still recognised whole.
+  long="$(printf 'x%.0s' {1..280}) ${_P24_TOKEN}"
+  out="$(bash -c 'source "$1"; engine_detail_clean "$2"' _ "$REPO/lib/engines.sh" "$long")"
+  hasnt "p2.4 detail: a token straddling the cut is still redacted" "$out" "ZZZZZZZZ"
+}
+
+test_p24_report_and_umask() {
+  local root="$FIXTURE/p24" repo="$FIXTURE/p24/git-lk" out report
+  _runlock_fixture "$root" "$repo" tier2
+  cat > "$root/stub/claude" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+jq -n '{is_error:false,result:"## Summary\nremote is https://alice:${_P24_SECRET}@git.example.com/x.git token ${_P24_TOKEN}",total_cost_usd:0.01,num_turns:1}'
+STUB
+  out="$( (umask 022; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo lk --task t) 2>&1)"
+  has "p2.4 report: the fixture run succeeds" "$out" "status=ok"
+  report="$(find "$root/reports" -name '*.md' -type f | head -1)"
+  [[ -n "$report" ]] && ok "p2.4 report: a report was written" || bad "p2.4 report: a report was written" "none under reports/"
+  hasnt "p2.4 report: write_report redacts a URL password" "$(cat "$report" 2>/dev/null)" "$_P24_SECRET"
+  hasnt "p2.4 report: write_report redacts a token"        "$(cat "$report" 2>/dev/null)" "$_P24_TOKEN"
+  has   "p2.4 report: ...and keeps the report body"        "$(cat "$report" 2>/dev/null)" "## Summary"
+  is "p2.4 umask: run.sh writes the report owner-only" "$(stat -c %a "$report" 2>/dev/null)" "600"
+  is "p2.4 umask: run.sh writes state/log owner-only"  "$(stat -c %a "$root/state/log" 2>/dev/null)" "600"
+  # mktemp is 0600 whatever the umask, so bin/meute is checked on a directory
+  # it creates: doctor makes .worktrees/ when it is missing.
+  rm -rf "$root/.worktrees"
+  (umask 022; "$root/bin/meute" doctor >/dev/null 2>&1)
+  is "p2.4 umask: bin/meute creates directories owner-only" "$(stat -c %a "$root/.worktrees" 2>/dev/null)" "700"
+}
+
+test_p24_doctor() {
+  local out st rp
+  st="$(stat -c %a "$FIXTURE/state")"; rp="$(stat -c %a "$FIXTURE/reports")"
+  chmod 755 "$FIXTURE/state"; chmod 700 "$FIXTURE/reports"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a world-readable state/ is warned about" "$out" "state/ is readable by group or others"
+  hasnt "p2.4 doctor: ...an owner-only reports/ is not"        "$out" "reports/ is readable by group or others"
+  chmod 700 "$FIXTURE/state"
+  out="$(meute doctor 2>&1)"
+  hasnt "p2.4 doctor: an owner-only state/ is not warned about" "$out" "state/ is readable by group or others"
+  chmod 750 "$FIXTURE/state"
+  has   "p2.4 doctor: a group-readable state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  local m
+  for m in 711 701 710 720 702 722; do
+    chmod "$m" "$FIXTURE/state"
+    has "p2.4 doctor: a ${m} state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  done
+  chmod 700 "$FIXTURE/state"
+  hasnt "p2.4 doctor: a 700 state/ is not warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  hasnt "p2.4 doctor: clean remotes raise no credential warning" "$out" "credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a credential in a remote URL is reported" "$out" "alpha: a remote URL has credentials embedded"
+  hasnt "p2.4 doctor: ...without printing the secret"           "$out" "$_P24_SECRET"
+  hasnt "p2.4 doctor: ...or the URL"                            "$out" "git.example.com"
+  hasnt "p2.4 doctor: ...and only for that repository"          "$out" "beta: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  # Each key is checked on its own: a credential in url alone, then in
+  # pushurl alone, is still found.
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://git.example.com/a.git"
+  has "p2.4 doctor: a credential in url alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote set-url p24 "https://git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  has "p2.4 doctor: a credential in pushurl alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://${_P24_HEX}@github.com/o/a.git"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a token as the URL username is reported" "$out" "alpha: a remote URL has credentials embedded"
+  hasnt "p2.4 doctor: ...without printing the token"           "$out" "$_P24_HEX"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  chmod "$st" "$FIXTURE/state"; chmod "$rp" "$FIXTURE/reports"
+}
+
+# The credential check fails closed: when it cannot look, it says so instead
+# of reporting every repository clean.
+test_p24_doctor_fail_closed() {
+  local out cfg="$FIXTURE/git-alpha/.git/config" saved
+  out="$(env MEUTE_ROOT="$FIXTURE" MANIFEST_PY=/nonexistent MANIFEST="$FIXTURE/repos.yaml" \
+         bash -c 'source "$1/lib/doctor.sh"; source "$1/lib/privacy.sh"; doctor_privacy' _ "$REPO" 2>&1)"
+  has   "p2.4 doctor: an unlistable manifest is warned about"   "$out" "could not list enrolled repositories"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
+  saved="$(cat "$cfg")"
+  printf '[[[ not a config\n' >> "$cfg"
+  out="$(meute doctor 2>&1)"
+  printf '%s\n' "$saved" > "$cfg"
+  has   "p2.4 doctor: an unreadable git config is warned about" "$out" "alpha: could not read git config"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
+}
+
+# P2.3 (R16): the gate must know how old the pool reading is. A snapshot is
+# only as true as its age; policy.quota_max_age_hours turns "old" into
+# code=quota-unknown, and `status` says which facts are measured.
+_quota_age_snapshot() {
+  # $1 root, $2 age in seconds. A window that resets far in the future.
+  printf '{"captured_at":%s,"five_hour":{"used_percentage":10,"resets_at":9999999999}}' \
+    "$(( $(date +%s) - $2 ))" > "$1/state/rate-limits.json"
+}
+test_p23_quota_age() {
+  local root="$FIXTURE/p23" repo="$FIXTURE/p23/git-lk" out log rc age
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+
+  # bin/quota.sh --age: seconds since the snapshot, "-" when the source has none.
+  _quota_age_snapshot "$root" 7200
+  age="$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)"
+  is "p2.3 quota.sh --age: reports the snapshot age in seconds" "$(( age >= 7200 && age < 7300 ))" "1"
+  is "p2.3 quota.sh --with-source: output shape is unchanged" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --with-source)" "90 quota-subscription.sh"
+  rm "$root/state/rate-limits.json"
+  is "p2.3 quota.sh --age: a stub has no age" \
+     "$(MEUTE_ROOT="$root" MEUTE_QUOTA_STUB=100 "$root/bin/quota.sh" --engine claude --age)" "-"
+
+  # Default (unset) keeps today's behaviour, and the run line records the age.
+  _quota_age_snapshot "$root" 7200
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 unset max age: an old snapshot still runs" "$(tail -1 "$log")" "status=ok"
+  has "p2.3 the run line carries quota_age=" "$(tail -1 "$log")" "quota_age=7"
+
+  # Set: an older snapshot is quota-unknown; a fresh one runs.
+  sed -i 's/^  quota_floor_percent: 30/&\n  quota_max_age_hours: 1/' "$root/repos.yaml"
+  rc=0; out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || rc=$?
+  has "p2.3 max age 1h, snapshot 2h old: declined as quota-unknown" "$(tail -1 "$log")" "code=quota-unknown"
+  has "p2.3 ...and the log says it was stale" "$(tail -1 "$log")" "stale"
+  _quota_age_snapshot "$root" 60
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 max age 1h, snapshot 1m old: runs" "$(tail -1 "$log")" "status=ok"
+
+  # A captured_at in the future must not count as fresh forever.
+  _quota_age_snapshot "$root" -3600
+  is "p2.3 quota.sh --age: a snapshot from the future is unknown, not 0s" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "unknown"
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 max age 1h, snapshot dated 1h ahead: declined as quota-unknown" "$(tail -1 "$log")" "code=quota-unknown"
+  _quota_age_snapshot "$root" -30
+  is "p2.3 quota.sh --age: 30s of clock skew is tolerated" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "0"
+  _quota_age_snapshot "$root" -3600
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+  sed -i 's/^  quota_floor_percent: 30/&\n  quota_max_age_hours: 1/' "$root/repos.yaml"
+  out="$("$root/bin/meute" status 2>&1)"
+  has "p2.3 status: a future snapshot is flagged as declined" "$out" "the runner declines"
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+
+  # status: three separate facts.
+  _quota_age_snapshot "$root" 7200
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+  out="$("$root/bin/meute" status 2>&1)"
+  has "p2.3 status: pool percentage with its age" "$out" "pool 90% remaining, snapshot 2h old"
+  has "p2.3 status: says others are not measured" "$out" "other consumers of this pool are not measured"
+
+  # Validation.
+  printf 'version: 1\npolicy:\n  quota_max_age_hours: -3\n' > "$root/bad.yaml"
+  is "p2.3 manifest: a negative max age is rejected" \
+     "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" policy "$root/bad.yaml" >/dev/null 2>&1; echo $?)" "2"
+}
+
+# P1.7 (a), R5, D7: a finding has an identity across reports. The fingerprint is
+# sha1(repo | file path from the location | title), both normalised, so a repeat
+# audit that words the location `./src/db.py:90` instead of `src/db.py:88` is
+# still the same finding. A dismissal on one occurrence is inherited by later
+# occurrences: `findings --new` stops re-raising it, `--all` shows it as
+# `dismissed (seen before)`. Only dismissals are inherited (D7), never backwards,
+# never across repos, and a finding's own decision always wins.
+test_p1_7a_fingerprint_inherit() {
+  local root="$FIXTURE/p17a" out py="$REPO/lib/report.py"
+  mkdir -p "$root/reports/alpha" "$root/reports/beta" "$root/state" "$root/tasks"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  cp "$FIXTURE/repos.yaml" "$root/repos.yaml"
+  _p17a_report() {  # repo id started finding-lines...
+    local repo="$1" id="$2" started="$3"; shift 3
+    { printf -- '---\nrepo: %s\ntask: audit-security\ntier: tier2\nstarted: %s\nstatus: ok\n---\n\n## Summary\nx\n\n## Findings\n\n' "$repo" "$started"
+      printf '%b\n' "$@"; } > "$root/reports/$repo/$id.md"
+  }
+  _p17a_report alpha audit-01 2026-09-01T04:00:00-04:00 \
+    '### [HIGH] SQL injection in query\n- **Location:** `src/db.py:88`\n' \
+    '### [LOW] Unused import\n- **Location:** `src/util.py:3`\n'
+  _p17a_report alpha audit-02 2026-09-08T04:00:00-04:00 \
+    '### [HIGH] SQL  Injection in query.\n- **Location:** `./src/db.py:90-94`\n' \
+    '### [MEDIUM] Missing timeout\n- **Location:** `src/net.py:12`\n' \
+    '### [LOW] Unused import\n- **Location:** src/util.py:4\n'
+  _p17a_report beta audit-01 2026-09-08T04:00:00-04:00 \
+    '### [HIGH] SQL injection in query\n- **Location:** `src/db.py:88`\n'
+
+  local fp1 fp2 fpb
+  fp1="$(python3 "$py" findings "$root/reports/alpha/audit-01.md" | jq -r '.[0].fingerprint')"
+  fp2="$(python3 "$py" findings "$root/reports/alpha/audit-02.md" | jq -r '.[0].fingerprint')"
+  fpb="$(python3 "$py" findings "$root/reports/beta/audit-01.md" | jq -r '.[0].fingerprint')"
+  is  "p1.7a: fingerprint is a sha1" "$(grep -cE '^[0-9a-f]{40}$' <<< "$fp1")" "1"
+  is  "p1.7a: same finding reworded and moved has the same fingerprint" "$fp2" "$fp1"
+  is  "p1.7a: another finding has another fingerprint" \
+      "$(python3 "$py" findings "$root/reports/alpha/audit-02.md" | jq -r '.[1].fingerprint' | grep -c "^${fp1}$")" "0"
+  is  "p1.7a: the same finding in another repo has another fingerprint" "$([[ ${#fpb} == 40 && $fpb != "$fp1" ]] && echo distinct)" "distinct"
+
+  # alpha/audit-01#1 dismissed, #2 actioned.
+  printf 'alpha/audit-01#1\tdismissed\t2026-09-02\tfalse-positive\nalpha/audit-01#2\tactioned\t2026-09-02\t\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7a: an inherited dismissal is hidden from --new" "$(grep -c 'alpha/audit-02#1' <<< "$out")" "0"
+  has "p1.7a: an unrelated new finding is still listed" "$out" "alpha/audit-02#2"
+  has "p1.7a: only dismissals are inherited (actioned is not)" "$out" "alpha/audit-02#3"
+  has "p1.7a: not across repos" "$out" "beta/audit-01#1"
+  out="$("$root/bin/meute" findings --all 2>&1)"
+  has "p1.7a: --all shows it as seen before" "$(grep 'alpha/audit-02#1' <<< "$out")" "dismissed (seen before)"
+  has "p1.7a: the original keeps its own state" "$(grep 'alpha/audit-01#1' <<< "$out")" "dismissed"
+  hasnt "p1.7a: ...not marked seen before" "$(grep 'alpha/audit-01#1' <<< "$out")" "seen before"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/inbox.py" dump 2>/dev/null)"
+  is  "p1.7a: the inbox dump carries the fingerprint" \
+      "$(jq -r '.findings[] | select(.report=="alpha/audit-02" and .n==1) | .fingerprint' <<< "$out")" "$fp1"
+  is  "p1.7a: ...and the inherited decision" \
+      "$(jq -r '.findings[] | select(.report=="alpha/audit-02" and .n==1) | .inherited' <<< "$out")" "dismissed"
+  is  "p1.7a: ...and nothing inherited elsewhere" \
+      "$(jq -r '[.findings[] | select(.inherited != "")] | length' <<< "$out")" "1"
+
+  # A finding's own decision wins over an inherited one.
+  printf 'alpha/audit-02#1\tactioned\t2026-09-09\t\n' >> "$root/state/reports"
+  out="$("$root/bin/meute" findings --all 2>&1)"
+  has   "p1.7a: an own decision wins" "$(grep 'alpha/audit-02#1' <<< "$out")" "actioned"
+  hasnt "p1.7a: ...over the inherited one" "$(grep 'alpha/audit-02#1' <<< "$out")" "seen before"
+
+  # Never backwards: a dismissal on the later report leaves the earlier one new.
+  printf 'alpha/audit-02#1\tdismissed\t2026-09-09\tfalse-positive\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7a: a later dismissal is not inherited by an earlier report" "$out" "alpha/audit-01#1"
+  is  "p1.7a: state/reports is never written by reading" \
+      "$(cat "$root/state/reports")" "$(printf 'alpha/audit-02#1\tdismissed\t2026-09-09\tfalse-positive')"
+
+  # The latest earlier decision wins: dismissed, then reversed (actioned), then
+  # raised again -- the third occurrence is live and stays new.
+  _p17a_report alpha audit-03 2026-09-15T04:00:00-04:00 \
+    '### [HIGH] SQL injection in query\n- **Location:** `src/db.py:91`\n'
+  printf 'alpha/audit-01#1\tdismissed\t2026-09-02\tfalse-positive\nalpha/audit-02#1\tactioned\t2026-09-09\t\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7a: a reversed dismissal is not inherited" "$out" "alpha/audit-03#1"
+  printf 'alpha/audit-01#1\tdismissed\t2026-09-02\tfalse-positive\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7a: an undecided middle occurrence does not break inheritance" "$(grep -c 'alpha/audit-0[23]#1' <<< "$out")" "0"
+}
+
+# P2.6 (R20): a typo under policy: used to fall back to the default silently.
+# validate and doctor now name unknown keys; they stay a warning, never an error.
+test_p26_unknown_policy_keys() {
+  local root="$FIXTURE/p26" out rc
+  mkdir -p "$root/state"
+  cp "$REPO/repos.yaml" "$root/repos.yaml"
+  ln -s "$REPO/tasks" "$root/tasks"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" 2>&1)"
+  hasnt "p2.6 validate: known keys draw no warning" "$out" "unknown policy key"
+  sed -i 's/^  quota_floor_percent: 30.*/&\n  quota_flor_percent: 5/' "$root/repos.yaml"
+  rc=0; out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/repos.yaml" 2>&1)" || rc=$?
+  is  "p2.6 validate: an unknown policy key is not an error" "$rc" "0"
+  has "p2.6 validate: ...it is named in a warning" "$out" "unknown policy key(s): quota_flor_percent"
+  has "p2.6 validate: ...and the manifest still validates" "$out" "ok: "
+  out="$(MEUTE_ROOT="$root" MEUTE_MANIFEST="$root/repos.yaml" "$REPO/bin/meute" doctor 2>&1)" || true
+  has "p2.6 doctor: names the unknown policy key" "$out" "unknown policy key(s): quota_flor_percent"
+}
+
 # P1.3 runner half (R11) and P1.4 (R15). A drain loop needs run.sh to wait for
 # the lock instead of skipping, to ignore a staged plan when it is draining the
 # manifest, and to refuse, under the lock, a forced staged item another fire
@@ -986,4 +1289,51 @@ test_p1_3_drain_repo_cursor() {
   rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk2 --repo lk3 >/dev/null 2>&1 || rc=$?
   is "drain --repo: a narrowed rotation over two repos"      "$(_drain_ran "$root"):$rc" "lk2 lk3:0"
   is "drain --repo: ...still leaves the shared cursor on lk4" "$(grep -P '^cursor\.daily\t' "$root/state/cursor" | grep -c lk4)" "1"
+}
+
+# An empty --repo value is a usage error (exit 2), not a drain that matches no
+# entry and exits 14 on every fire.
+test_p1_3_drain_empty_repo() {
+  local root="$FIXTURE/drain-emptyrepo" rc out
+  _drain_fixture "$root" 2
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 )
+  rc=0; out="$("${env[@]}" "$root/bin/meute" drain daily --repo "" 2>&1 >/dev/null)" || rc=$?
+  is "drain --repo '': usage error exit 2" "$rc" "2"
+  is "drain --repo '': names the empty value" "$(grep -c 'needs a non-empty' <<<"$out")" "1"
+  : > "$root/state/log"
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk1 --repo "" >/dev/null 2>&1 || rc=$?
+  is "drain --repo lk1 --repo '': also a usage error" "$rc:$(_drain_ran "$root")" "2:"
+}
+
+# P2.2 (R18): state/reports is a read-modify-write with no lock, and the web
+# server is threaded, so two triage decisions landing together kept only one.
+# Twenty parallel dismissals of different findings must leave twenty rows,
+# every round; kv_set and kv_del take the same lock as kv_set_row.
+test_kv_writes_locked() {
+  local root="$FIXTURE/kvlock" id="alpha/kvlock-2026-01-01" round n rows lost=0
+  mkdir -p "$root/state" "$root/reports/alpha"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"
+  printf '# kvlock\n' > "$root/reports/${id}.md"
+  for (( round = 1; round <= 10; round++ )); do
+    rm -f "$root/state/reports"
+    for (( n = 1; n <= 20; n++ )); do
+      "$root/bin/meute" dismiss "$id" -f "$n" -r other -m "round $round" >/dev/null 2>&1 &
+    done
+    wait
+    rows="$(grep -c "^${id}#" "$root/state/reports" 2>/dev/null || true)"
+    [[ "$rows" == 20 ]] || lost=$(( lost + 1 ))
+  done
+  is "p2.2 kv lock: 20 parallel dismissals keep 20 rows in each of 10 rounds" "$lost rounds lost rows" "0 rounds lost rows"
+
+  local f="$root/state/kv"
+  rm -f "$f"
+  for (( n = 1; n <= 20; n++ )); do ( source "$REPO/lib/state.sh"; kv_set "$f" "k$n" "v$n" ) & done
+  wait
+  is "p2.2 kv lock: 20 parallel kv_set calls keep 20 rows" "$(wc -l < "$f")" "20"
+  for (( n = 1; n <= 20; n++ )); do ( source "$REPO/lib/state.sh"; kv_del "$f" "k$n" ) & done
+  wait
+  is "p2.2 kv lock: 20 parallel kv_del calls leave no row" "$(wc -l < "$f")" "0"
+  is "p2.2 kv lock: no scratch file is left beside the store" "$(ls -A "$root/state" | grep -c '^\.kv\.')" "0"
+  is "p2.2 kv lock: the lock file never reaches the public harness" \
+     "$(git -C "$REPO" check-ignore -q -- state/reports.lock; echo $?)" "0"
 }
