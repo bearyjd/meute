@@ -697,11 +697,14 @@ from manifest_write import (  # noqa: E402
     cmd_mark_delivered,
     cmd_set_image_digest,
 )
+from policy_override import cmd_policy_check, cmd_policy_effective  # noqa: E402
 
 
 COMMANDS = {
     "validate": (cmd_validate, 1),
     "policy": (cmd_policy, 1),
+    "policy-effective": (cmd_policy_effective, 1),
+    "policy-check": (cmd_policy_check, 3),
     "unknown-policy-keys": (cmd_unknown_policy_keys, 1),
     "queue": (cmd_queue, 2),
     "plan-queue": (cmd_plan_queue, 3),

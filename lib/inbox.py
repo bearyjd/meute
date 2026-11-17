@@ -345,8 +345,10 @@ def load_status() -> dict:
         pass
     try:
         policy = json.loads(subprocess.run(
-            [SYSTEM_PYTHON, os.path.join(HERE, "manifest.py"), "policy",
-             os.environ.get("MEUTE_MANIFEST") or _manifest()],
+            # The policy a run obeys: the manifest's, with any override in force.
+            [SYSTEM_PYTHON, os.path.join(HERE, "manifest.py"), "policy-effective",
+             os.environ.get("MEUTE_MANIFEST") or _manifest(),
+             os.path.join(ROOT, "state", "policy-override")],
             capture_output=True, text=True, check=True).stdout)
         out["floor"] = policy.get("quota_floor_percent")
         out["ceiling"] = policy.get("weekly_cost_usd") or policy.get("weekly_runs")

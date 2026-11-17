@@ -364,6 +364,29 @@ calibrated on your smallest repo will trip mid-week. `meute status` shows the
 week's burn against the ceiling. The floor does not apply here: the ceiling is
 already meute's allocation, so exhausted means 0 and 0 is what stops it.
 
+### `meute policy` — an override that cannot be forgotten
+
+To lower the floor or cap for a night without editing the manifest (and
+remembering to put it back):
+
+```sh
+./bin/meute policy set quota_floor_percent=1 weekly_cost_usd=50 --for 8h -r "night run"
+./bin/meute policy show
+./bin/meute policy clear          # lift it early
+MEUTE_QUOTA_FLOOR=1 ./bin/run.sh daily   # one invocation, nothing written
+```
+
+The override lives in `state/policy-override`, is read after the manifest, and
+is checked by the manifest's own rules (a bad value is refused at `set`, judged
+against the rows already in force; a non-finite number such as `nan` or
+`inf` is refused, and a hand-edited one is ignored like an expired row). There is one weekly ceiling at a time:
+setting `weekly_runs` drops a `weekly_cost_usd` row, and the reverse.
+`--for` is mandatory and capped at 7 days; an expired row, or a hand-edited one
+past the cap, is ignored. Every run
+line carries `policy=override` while one is in force, and `status`/`doctor`
+say so first. Overridable: `quota_floor_percent`, `weekly_runs`,
+`weekly_cost_usd`, `community_share`, `tier3_max_in_flight`.
+
 ### `meute pause` — the gate cannot protect you from yourself
 
 The gates read what they can measure. The snapshot is only as fresh as your

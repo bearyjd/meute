@@ -47,7 +47,7 @@ set -Eeuo pipefail; umask 077  # owner-only state/ and reports/ on a shared host
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
-source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/quota_age.sh"
+source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/quota_age.sh"; source "${MEUTE_ROOT}/lib/policy_override.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"

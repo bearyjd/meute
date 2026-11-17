@@ -76,6 +76,8 @@ log_run() {
   line="$(printf '%s\tweek=%s\tslot=%s\tstatus=%s' "$STARTED_AT" "$THIS_WEEK" "${SLOT:-none}" "$status")"
   local field
   for field in "$@"; do line+="$(printf '\t%s' "$field")"; done
+  (( ! ${POLICY_OVERRIDE_ACTIVE:-0} )) || line+="$(printf '\tpolicy=override')"
+  [[ -z "${POLICY_OVERRIDE_IGNORED:-}" ]] || line+="$(printf '\tpolicy_ignored=%s' "$POLICY_OVERRIDE_IGNORED")"
   local code="$OUTCOME_CODE"
   [[ -n "$code" ]] || { [[ "$status" == "ok" ]] && code="ok" || code="failed"; }
   line+="$(printf '\tcode=%s\tdur=%ss' "$code" "$duration")"

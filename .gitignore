@@ -34,6 +34,7 @@ state/cursor
 state/reports
 state/tickets.yaml*
 state/quota-override
+state/policy-override
 # A staged portfolio plan lists every unconfigured repo on the machine by
 # absolute path; its archives and mktemp leftovers carry the same list.
 state/plan-queue.json
