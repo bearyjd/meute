@@ -701,6 +701,8 @@ test_plan_quarantine_manifest_broken() {
 # only, never the URL).
 _P24_SECRET="hunter2-p24"
 _P24_TOKEN="ghp_$(printf 'Z%.0s' {1..36})"
+_P24_HEX="0123456789abcdef0123456789abcdef01234567"
+_P24_AZ="abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop"
 
 test_p24_redact() {
   local red="$REPO/lib/redact.py" out long
@@ -717,6 +719,22 @@ test_p24_redact() {
   is    "p2.4 redact: ordinary text passes unchanged" \
         "$(printf 'see https://example.com/a@b and task-sk-1\n' | python3 "$red")" \
         "see https://example.com/a@b and task-sk-1"
+  # A token used as the bare username (legacy 40-hex GitHub PAT, Azure DevOps,
+  # Bitbucket) is a credential too; a short username such as git@ is not.
+  out="$(printf 'https://%s@github.com/o/x.git and https://%s@dev.azure.com/o/p\n' "$_P24_HEX" "$_P24_AZ" \
+         | python3 "$red")"
+  hasnt "p2.4 redact: a 40-hex token as the URL username is removed" "$out" "$_P24_HEX"
+  hasnt "p2.4 redact: an opaque token as the URL username is removed" "$out" "$_P24_AZ"
+  has   "p2.4 redact: ...the host is kept"                            "$out" "@github.com/o/x.git"
+  is    "p2.4 redact: a short URL username is left alone" \
+        "$(printf 'ssh://git@github.com/o/x.git\n' | python3 "$red")" "ssh://git@github.com/o/x.git"
+  # The password runs to the last @ of the authority, so an unencoded @ in it
+  # does not leave its tail behind.
+  hasnt "p2.4 redact: a password containing @ is removed whole" \
+        "$(printf 'https://u:p@ss-tail-p24@github.com/x\n' | python3 "$red")" "ss-tail-p24"
+  # ...but stops at a query or fragment, so an @ there does not swallow the host.
+  has   "p2.4 redact: a password stops before ? and #" \
+        "$(printf 'https://u:pw@host?a=b@c\n' | python3 "$red")" "@host?a=b@c"
   out="$(bash -c 'source "$1"; engine_detail_clean "$2"' _ "$REPO/lib/engines.sh" \
          "api 401: https://bob:${_P24_SECRET}@h.example/x")"
   hasnt "p2.4 detail: engine_detail_clean redacts"       "$out" "$_P24_SECRET"
@@ -782,6 +800,11 @@ test_p24_doctor() {
   git -C "$FIXTURE/git-alpha" remote set-url p24 "https://git.example.com/a.git"
   git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
   has "p2.4 doctor: a credential in pushurl alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://${_P24_HEX}@github.com/o/a.git"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a token as the URL username is reported" "$out" "alpha: a remote URL has credentials embedded"
+  hasnt "p2.4 doctor: ...without printing the token"           "$out" "$_P24_HEX"
   git -C "$FIXTURE/git-alpha" remote remove p24
   chmod "$st" "$FIXTURE/state"; chmod "$rp" "$FIXTURE/reports"
 }
