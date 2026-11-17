@@ -98,7 +98,8 @@ hold_active() {
 
 fleet_load_policy() {
   local policy
-  policy="$(python3 "$MANIFEST_PY" policy "$MANIFEST")" || return 1
+  policy="$(python3 "$MANIFEST_PY" policy-effective "$MANIFEST" "$(policy_override_file)")" || return 1
+  [[ "$(jq -r '.override // empty | length' <<< "$policy")" -gt 0 ]] && POLICY_OVERRIDE_ACTIVE=1 || POLICY_OVERRIDE_ACTIVE=0
   QUOTA_FLOOR="$(jq -r '.quota_floor_percent' <<< "$policy")"
   COMMUNITY_SHARE="$(jq -r '.community_share' <<< "$policy")"
   TIER3_CAP="$(jq -r '.tier3_max_in_flight' <<< "$policy")"

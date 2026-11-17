@@ -28,6 +28,11 @@
 #                                  uid, capabilities, /work, /out, the network
 #   pause [--for 3d] [-r why]     stand the fleet down; every slot declines until it expires
 #   resume                        lift the pause early
+#   policy set k=v... --for 8h [-r why]
+#                                 override quota_floor_percent, weekly_runs, weekly_cost_usd,
+#                                 community_share or tier3_max_in_flight until it expires (7d max)
+#   policy show | clear           what is overridden now | drop it early
+#                                 (one invocation only: MEUTE_QUOTA_FLOOR=1 bin/run.sh ...)
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
 #   plan [--enqueue [--only <repo>]...] [--allow-web] [--json] [dir]
@@ -94,6 +99,7 @@ source "${MEUTE_ROOT}/lib/unitlimits.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/tmp.sh"
+source "${MEUTE_ROOT}/lib/policy_override.sh"
 
 SCRUBBED=""
 AUTH_MODE=""
@@ -605,6 +611,16 @@ cmd_resume() {
   fi
 }
 
+cmd_policy() {
+  local sub="${1:-show}"; shift || true
+  case "$sub" in
+    set) policy_override_set "$@" ;;
+    show) policy_override_show || note "no policy override in force; the manifest's policy applies" ;;
+    clear) policy_override_clear; note "policy override cleared; the manifest's policy applies" ;;
+    *) die "unknown policy command: ${sub} (try: meute policy set|show|clear)" ;;
+  esac
+}
+
 # Inventory a directory tree without enrolling anything, and optionally stage
 # the result for the runner. The work lives in lib/plan.sh; this is the
 # command line.
@@ -727,6 +743,7 @@ main() {
     container) cmd_container "$@" ;;
     pause)    cmd_pause "$@" ;;
     resume)   cmd_resume "$@" ;;
+    policy)   cmd_policy "$@" ;;
     discover) cmd_discover "$@" ;;
     plan)     cmd_plan "$@" ;;
     tui)      cmd_tui "$@" ;;

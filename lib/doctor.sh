@@ -211,6 +211,10 @@ cmd_doctor() {
     esac
   fi
 
+  if (( POLICY_OVERRIDE_ACTIVE )); then
+    d_warn "a policy override is in force, not the manifest's policy (meute policy show; meute policy clear)"
+  fi
+
   if hold_active; then
     d_warn "the fleet is PAUSED until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
     d_warn "nothing will run until then; lift it with:  ./bin/meute resume"

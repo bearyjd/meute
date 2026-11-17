@@ -694,3 +694,78 @@ test_plan_quarantine_manifest_broken() {
     "$(compgen -G "$root/state/plan-queue.invalid-*" || echo none)" "none"
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
+
+# P1.1 (R6, owner decision D2): an expiring policy override in state/, read
+# after the manifest, so the floor can be lowered for a night without editing
+# the manifest and remembering to put it back.
+test_policy_override() {
+  local root="$FIXTURE/polov" repo="$FIXTURE/polov/git-lk" now out rc
+  _runlock_fixture "$root" "$repo" tier2
+  now="$(date +%s)"
+  local M=( env MEUTE_MANIFEST="$root/repos.yaml" MEUTE_NOW="$now" )
+  local R=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=20 )
+  local mtime; mtime="$(stat -c '%Y.%y' "$root/repos.yaml")"
+  local sum; sum="$(sha256sum < "$root/repos.yaml")"
+
+  out="$("${R[@]}" "$root/bin/run.sh" daily 2>&1)"
+  has "policy override: with none set, quota 20% is below the floor of 30" "$out\n$(tail -1 "$root/state/log")" "below floor 30%"
+
+  out="$("${M[@]}" "$root/bin/meute" policy set quota_floor_percent=1 --for 8h -r "night run" 2>&1)"; rc=$?
+  is  "policy set: exits 0" "$rc" "0"
+  has "policy set: says when it expires" "$out" "until"
+  out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
+  has "policy override: an override in force changes the gate" "$(tail -1 "$root/state/log")" "status=ok"
+  has "policy override: the run line says policy=override" "$(tail -1 "$root/state/log")" "policy=override"
+  is  "policy override: the manifest was not edited (content)" "$(sha256sum < "$root/repos.yaml")" "$sum"
+  is  "policy override: the manifest was not edited (mtime)" "$(stat -c '%Y.%y' "$root/repos.yaml")" "$mtime"
+
+  out="$("${M[@]}" "$root/bin/meute" policy show 2>&1)"
+  has "policy show: names the key and value" "$out" "quota_floor_percent=1"
+  has "policy show: names the reason"        "$out" "night run"
+  out="$(env MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" MEUTE_QUOTA_STUB=100 PATH="$root/stub:$PATH" "$root/bin/meute" status 2>&1)"
+  has "status: says a policy override is in force" "$out" "POLICY OVERRIDE"
+  out="$(env MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" doctor 2>&1)"
+  has "doctor: says a policy override is in force" "$out" "policy override"
+
+  # Expired: ignored without anyone clearing it.
+  out="$("${R[@]}" MEUTE_NOW=$(( now + 9 * 3600 )) "$root/bin/run.sh" daily 2>&1)"
+  has   "policy override: an expired row is ignored" "$(tail -1 "$root/state/log")" "below floor 30%"
+  hasnt "policy override: ...and the line is not marked" "$(tail -1 "$root/state/log")" "policy=override"
+  out="$(env MEUTE_MANIFEST="$root/repos.yaml" MEUTE_NOW=$(( now + 9 * 3600 )) "$root/bin/meute" policy show 2>&1)"
+  has "policy show: an expired override reads as none" "$out" "no policy override"
+
+  # Refused at set time, leaving what was there alone.
+  local before; before="$(cat "$root/state/policy-override")"
+  "${M[@]}" "$root/bin/meute" policy set quota_floor_percent=101 --for 1h >/dev/null 2>&1; rc=$?
+  [[ "$rc" != 0 ]] && ok "policy set: an out-of-range value is refused" || bad "policy set: an out-of-range value is refused" "exit 0"
+  "${M[@]}" "$root/bin/meute" policy set weekly_cost_usd=0 --for 1h >/dev/null 2>&1; rc=$?
+  [[ "$rc" != 0 ]] && ok "policy set: a non-positive cost is refused" || bad "policy set: a non-positive cost is refused" "exit 0"
+  "${M[@]}" "$root/bin/meute" policy set quota_floor_percent=5 --for 8d >/dev/null 2>&1; rc=$?
+  [[ "$rc" != 0 ]] && ok "policy set: more than 7 days is refused" || bad "policy set: more than 7 days is refused" "exit 0"
+  "${M[@]}" "$root/bin/meute" policy set quota_floor_percent=5 >/dev/null 2>&1; rc=$?
+  [[ "$rc" != 0 ]] && ok "policy set: an expiry is mandatory" || bad "policy set: an expiry is mandatory" "exit 0"
+  "${M[@]}" "$root/bin/meute" policy set branch_prefix=x --for 1h >/dev/null 2>&1; rc=$?
+  [[ "$rc" != 0 ]] && ok "policy set: a key that is not overridable is refused" || bad "policy set: a key that is not overridable is refused" "exit 0"
+  is "policy set: refusals left the file alone" "$(cat "$root/state/policy-override")" "$before"
+
+  # One invocation: the env var, nothing written.
+  rm -f "$root/state/policy-override"
+  out="$("${R[@]}" MEUTE_QUOTA_FLOOR=1 "$root/bin/run.sh" daily 2>&1)"
+  has "policy override: MEUTE_QUOTA_FLOOR lowers the gate for one run" "$(tail -1 "$root/state/log")" "status=ok"
+  has "policy override: ...and marks the line" "$(tail -1 "$root/state/log")" "policy=override"
+  [[ ! -e "$root/state/policy-override" ]] && ok "policy override: the env var writes nothing" \
+    || bad "policy override: the env var writes nothing" "state/policy-override exists"
+
+  # An override that sets the other ceiling replaces the manifest's, never
+  # trips the one-ceiling rule.
+  "${M[@]}" "$root/bin/meute" policy set weekly_cost_usd=50 --for 1h >/dev/null 2>&1
+  out="$("${R[@]}" MEUTE_NOW="$now" MEUTE_QUOTA_FLOOR=1 "$root/bin/run.sh" daily 2>&1)"
+  has "policy override: a cost ceiling override is accepted" "$(tail -1 "$root/state/log")" "status=ok"
+
+  # clear
+  out="$("${M[@]}" "$root/bin/meute" policy clear 2>&1)"
+  [[ ! -e "$root/state/policy-override" ]] && ok "policy clear: removes the file" \
+    || bad "policy clear: removes the file" "still there"
+  out="$("${R[@]}" "$root/bin/run.sh" daily 2>&1)"
+  has "policy clear: the manifest's floor applies again" "$(tail -1 "$root/state/log")" "below floor 30%"
+}

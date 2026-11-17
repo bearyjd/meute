@@ -22,6 +22,11 @@ cmd_status() {
   [[ "$source" == "stub" ]] && gate="UNMEASURED (stub) — run: meute install-statusline"
   # A hold overrides the gate, so it is the first thing said. A paused fleet
   # reading "quota 100% · ok" is how you conclude it is about to run.
+  if (( POLICY_OVERRIDE_ACTIVE )); then
+    printf 'POLICY OVERRIDE in force (the manifest is not what is applied):\n'
+    if policy_override_show >/dev/null; then policy_override_show | sed 's/^/  /'
+    else printf '  quota floor set for this invocation by MEUTE_QUOTA_FLOOR\n'; fi
+  fi
   if hold_active; then
     printf 'PAUSED until %s%s\n' "$(hold_until_human "$HOLD_UNTIL")" "${HOLD_REASON:+ — ${HOLD_REASON}}"
     printf '  every slot declines until then; lift it with: meute resume\n'
