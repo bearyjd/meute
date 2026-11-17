@@ -4,11 +4,20 @@
 A decision in state/reports is keyed by `report#n`, so a repeat audit that
 raises the same defect again starts as `new`. This module links occurrences by
 fingerprint (lib/report.py) and lets a later occurrence inherit an earlier
-decision. It only reads: state/reports stays the one authoritative record, so
-deleting this logic restores the old behaviour exactly.
+decision. It never writes state/reports, the one authoritative record of
+decisions: verify verdicts and claims live in state/finding-status alone, so
+deleting that file restores the old behaviour.
 """
 
 from __future__ import annotations
+
+import contextlib
+import fcntl
+import os
+import re
+import subprocess
+import sys
+import tempfile
 
 # D7: only a dismissal carries over. A promoted or resolved finding raised
 # again may mean the fix did not land, and that is worth seeing.
@@ -39,3 +48,192 @@ def inherited(occurrences: list[tuple[str, str, tuple]],
         if state in INHERITED_STATES:
             out[key] = state
     return out
+
+
+# ------------------------------------------------- P1.7 (b): verify, claim ---
+#
+# state/finding-status is the only file written here: one row per finding,
+# `report#n  verdict  head  checked_at  pr`. Deleting it undoes verify and
+# claim; state/reports is never touched.
+
+VERDICTS = ("gone", "changed", "current", "unknown")
+# D7: hidden from `findings --new`; `--all` still lists them.
+HIDDEN_VERDICTS = ("gone", "superseded")
+_PR_NOTE = re.compile(r"\bpr: (\S+)")
+# A recorded base sha is hex from `git rev-parse`; anything else (an option
+# such as `--output=<file>` above all) never reaches git.
+_SHA = re.compile(r"[0-9a-fA-F]{4,64}")
+
+
+def status_path(root: str) -> str:
+    return os.path.join(root, "state", "finding-status")
+
+
+def read_status(root: str) -> dict[str, list[str]]:
+    """{key: [verdict, head, checked_at, pr]}; missing fields are ""."""
+    rows: dict[str, list[str]] = {}
+    try:
+        with open(status_path(root), encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                rows.setdefault(parts[0], (parts[1:] + [""] * 4)[:4])
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def write_status(root: str, rows: dict[str, list[str]]) -> None:
+    """Atomic: a temp file beside it, then a rename, as lib/state.sh does."""
+    path = status_path(root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".kv.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for key in sorted(rows):
+                fh.write("\t".join([key, *rows[key]]) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+@contextlib.contextmanager
+def locked(root: str):
+    """Exclusive lock for a read-modify-write of state/finding-status, so a
+    claim landing while verify runs is not overwritten by verify's snapshot.
+    Callers re-read the file inside the lock."""
+    path = status_path(root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".lock", "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def claim(root: str, key: str, pr: str) -> None:
+    with locked(root):
+        rows = read_status(root)
+        row = rows.get(key, ["", "", "", ""])
+        rows[key] = [row[0], row[1], row[2], pr]
+        write_status(root, rows)
+
+
+def pr_of(status_row: list[str] | None, note: str) -> str:
+    """The PR covering a finding: a claim, else a `resolve --pr` note."""
+    if status_row and status_row[3]:
+        return status_row[3]
+    m = _PR_NOTE.search(note or "")
+    return m.group(1) if m else ""
+
+
+def _git(path: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", path, "-c", "core.quotePath=false", *args],
+                          capture_output=True, text=True, check=False)
+
+
+def verify_report(repo_path: str, base: str, files: list[str]) -> tuple[str, list[str]]:
+    """(head, verdict per file) for one report: its recorded `base: ref@sha`
+    against the ref's current commit. One diff per report, never per finding.
+    Reads the repository only: no fetch, no checkout."""
+    ref, _, sha = str(base).rpartition("@")
+    unknown = ("", ["unknown"] * len(files))
+    if (not _SHA.fullmatch(sha) or ref.startswith("-")
+            or not repo_path or not os.path.isdir(repo_path)):
+        return unknown
+    head = _git(repo_path, "rev-parse", "--verify", "-q", f"{ref or 'HEAD'}^{{commit}}")
+    if head.returncode != 0:
+        return unknown
+    head_sha = head.stdout.strip()
+    diff = _git(repo_path, "diff", "--name-status", "-M", "-z", "--end-of-options", sha, head_sha, "--")
+    if diff.returncode != 0:
+        return unknown
+    touched: dict[str, str] = {}
+    fields = diff.stdout.split("\0")
+    i = 0
+    added = False
+    while i < len(fields) - 1:
+        status = fields[i]
+        # A rename is changed, not gone: the defect may have moved with it.
+        if status[:1] in ("R", "C"):
+            touched[fields[i + 1]] = "changed"
+            i += 3
+            continue
+        touched[fields[i + 1]] = "gone" if status == "D" else "changed"
+        added = added or status == "A"
+        i += 2
+    # A rename rewritten below git's similarity threshold shows as delete + add:
+    # with anything added, a deletion may be that rename, so it is not gone.
+    if added:
+        touched = {f: "changed" if v == "gone" else v for f, v in touched.items()}
+    # A location outside the repository would make ls-tree fail for every
+    # path at once; it is unknown on its own instead.
+    inside = {f for f in files if f and not os.path.isabs(f) and ".." not in f.split("/")}
+    wanted = sorted(inside - touched.keys())
+    present: set[str] = set()
+    if wanted:
+        tree = _git(repo_path, "--literal-pathspecs", "ls-tree", "--name-only", "-z", head_sha, "--", *wanted)
+        present = set(tree.stdout.split("\0")) if tree.returncode == 0 else set()
+    verdicts = []
+    for f in files:
+        if f not in inside:
+            verdicts.append("unknown")
+        elif f in touched:
+            verdicts.append(touched[f])
+        elif any(t.startswith(f.rstrip("/") + "/") for t in touched):
+            verdicts.append("changed")
+        else:
+            # Untouched and present: current. In neither commit: the location
+            # names no real file, so nothing can be said.
+            verdicts.append("current" if f in present else "unknown")
+    return head_sha, verdicts
+
+
+def superseded(reports: list[dict]) -> set[str]:
+    """Keys of findings a newer audit of the same repo, task and lens no longer
+    raises. Only a report that ran (status ok) and has a Findings section
+    counts as newer: a crashed run must not supersede anything.
+
+    reports -- {"group", "order", "live", "findings": [(key, fp)]} per report
+               with a Findings section
+    """
+    newest: dict[tuple, dict] = {}
+    for r in reports:
+        cur = newest.get(r["group"])
+        if r["live"] and (cur is None or r["order"] > cur["order"]):
+            newest[r["group"]] = r
+    out: set[str] = set()
+    for r in reports:
+        latest = newest.get(r["group"])
+        if latest is None or r["order"] >= latest["order"]:
+            continue
+        fps = {fp for _, fp in latest["findings"]}
+        out.update(key for key, fp in r["findings"] if fp not in fps)
+    return out
+
+
+def view(own_state: str | None, inherited_state: str, verdict: str, pr: str) -> tuple[str, bool]:
+    """(label, hidden from --new). A finding's own decision wins, then an
+    inherited one, then a claim, then a verdict that hides (D7)."""
+    if own_state is not None and own_state != "new":
+        return own_state, True
+    if inherited_state:
+        return f"{inherited_state} (seen before)", True
+    if pr:
+        return "claimed", True
+    if verdict in HIDDEN_VERDICTS:
+        return verdict, True
+    if verdict == "changed":
+        return "changed", False
+    return "new", False
+
+
+def main(argv: list[str]) -> int:
+    root = os.environ.get("MEUTE_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if len(argv) == 4 and argv[1] == "claim":
+        claim(root, argv[2], argv[3])
+        return 0
+    sys.stderr.write("usage: finding_status.py claim <report#n> <pr-url>\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -209,9 +209,11 @@ test_p0_5_single_process_reads() {
   cp "$REPO"/tasks/*.md "$root/tasks/"
   cp "$FIXTURE/repos.yaml" "$root/repos.yaml"
   # 50 reports: 25 per repo, each with two findings of differing severity.
+  # Each its own lens, so no report supersedes another (P1.7 b): this fixture
+  # pins the read path and layout, not staleness.
   for i in $(seq 1 50); do
     local repo=alpha; (( i % 2 )) || repo=beta
-    printf -- '---\nrepo: %s\ntask: audit-security\ntier: tier2\nstarted: 2026-09-%02dT04:00:00-04:00\nstatus: ok\n---\n\n## Summary\nx\n\n## Findings\n\n### [%s] Title %s one\n- **Anchor:** `src/a.py:%s`\n\n### [LOW] Title %s two\n- **Anchor:** `src/b.py:%s`\n' \
+    printf -- '---\nrepo: %s\ntask: audit-security\ntier: tier2\nlens: l'"$i"'\nstarted: 2026-09-%02dT04:00:00-04:00\nstatus: ok\n---\n\n## Summary\nx\n\n## Findings\n\n### [%s] Title %s one\n- **Anchor:** `src/a.py:%s`\n\n### [LOW] Title %s two\n- **Anchor:** `src/b.py:%s`\n' \
       "$repo" "$(( i % 28 + 1 ))" "$( (( i % 3 )) && echo HIGH || echo CRITICAL )" "$i" "$i" "$i" "$i" \
       > "$root/reports/$repo/audit-$(printf '%02d' "$i").md"
   done
@@ -1122,6 +1124,253 @@ test_p1_7a_fingerprint_inherit() {
   is  "p1.7a: an undecided middle occurrence does not break inheritance" "$(grep -c 'alpha/audit-0[23]#1' <<< "$out")" "0"
 }
 
+# P1.7 (b): `findings verify` (gone/changed/current/unknown against the
+# repository's HEAD), superseded by a newer audit, `claim --pr`, `resolve --pr`
+# and `findings --json`. D7: hidden rows stay visible under --all.
+test_p1_7b_verify_claim() {
+  local root="$FIXTURE/p17b" out g="$FIXTURE/p17b/git/alpha" a b url
+  local gitc=(git -C "$g" -c user.name=t -c user.email=t@t)
+  mkdir -p "$root/reports/alpha" "$root/state" "$root/tasks" "$g/src"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  printf 'version: 1\nrepos:\n  - name: alpha\n    path: %s\n' "$g" > "$root/repos.yaml"
+  git init -q -b main "$g"
+  for f in db net old util; do printf '%s v1\n' "$f" > "$g/src/$f.py"; done
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm A; a="$(git -C "$g" rev-parse HEAD)"
+  "${gitc[@]}" rm -q src/old.py; printf 'net v2\n' > "$g/src/net.py"
+  "${gitc[@]}" mv src/util.py src/helpers.py
+  "${gitc[@]}" commit -qam B; b="$(git -C "$g" rev-parse HEAD)"
+
+  _p17b_report() {  # id started status lens base finding-lines...
+    local id="$1" started="$2" status="$3" lens="$4" base="$5"; shift 5
+    { printf -- '---\nrepo: alpha\ntask: audit-security\ntier: tier2\nlens: %s\nbase: %s\nstarted: %s\nstatus: %s\n---\n\n## Summary\nx\n\n' \
+        "$lens" "$base" "$started" "$status"
+      (( $# )) && printf '## Findings\n\n' && printf '%b\n' "$@"; } > "$root/reports/alpha/$id.md"
+  }
+  _p17b_report audit-01 2026-09-01T04:00:00-04:00 ok sec "main@$a" \
+    '### [HIGH] Hardcoded token\n- **Location:** `src/old.py:3`\n' \
+    '### [MEDIUM] Missing timeout\n- **Location:** `src/net.py:12`\n' \
+    '### [LOW] Unused import\n- **Location:** `src/db.py:1`\n' \
+    '### [LOW] Vague concern\n- **Severity:** low\n' \
+    '### [LOW] Shadowed name\n- **Location:** `src/util.py:2`\n' \
+    '### [LOW] Imaginary file\n- **Location:** `src/nope.py:2`\n'
+
+  MEUTE_ROOT="$root" "$root/bin/meute" findings verify > "$root/verify.out" 2>&1
+  is  "p1.7b verify: exits 0" "$?" "0"
+  local st="$root/state/finding-status"
+  is  "p1.7b verify: deleted file is gone"       "$(awk -F'\t' '$1=="alpha/audit-01#1"{print $2}' "$st")" "gone"
+  is  "p1.7b verify: touched file is changed"    "$(awk -F'\t' '$1=="alpha/audit-01#2"{print $2}' "$st")" "changed"
+  is  "p1.7b verify: untouched file is current"  "$(awk -F'\t' '$1=="alpha/audit-01#3"{print $2}' "$st")" "current"
+  is  "p1.7b verify: no location is unknown"     "$(awk -F'\t' '$1=="alpha/audit-01#4"{print $2}' "$st")" "unknown"
+  is  "p1.7b verify: a renamed file is changed, not gone" "$(awk -F'\t' '$1=="alpha/audit-01#5"{print $2}' "$st")" "changed"
+  is  "p1.7b verify: a file in neither commit is unknown" "$(awk -F'\t' '$1=="alpha/audit-01#6"{print $2}' "$st")" "unknown"
+  is  "p1.7b verify: records the head it checked against" "$(awk -F'\t' '$1=="alpha/audit-01#1"{print $3}' "$st")" "$b"
+  has "p1.7b verify: says what it found" "$(cat "$root/verify.out")" "gone=1"
+  [[ ! -e "$root/state/reports" ]] && ok "p1.7b verify: state/reports is not written" \
+    || bad "p1.7b verify: state/reports is not written" "it exists"
+
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7b --new: gone is hidden" "$(grep -c 'alpha/audit-01#1 ' <<< "$out")" "0"
+  has "p1.7b --new: changed is shown with its badge" "$(grep 'alpha/audit-01#2 ' <<< "$out")" "changed"
+  has "p1.7b --new: current stays NEW" "$(grep 'alpha/audit-01#3 ' <<< "$out")" "NEW"
+  has "p1.7b --new: unknown stays NEW" "$(grep 'alpha/audit-01#4 ' <<< "$out")" "NEW"
+  has "p1.7b --all: gone is listed with its verdict" "$(grep 'alpha/audit-01#1 ' <<< "$("$root/bin/meute" findings --all 2>&1)")" "gone"
+
+  # A failed run newer than the audit (no Findings section) supersedes nothing.
+  _p17b_report audit-02 2026-09-08T04:00:00-04:00 error sec "main@$b"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b superseded: a run with no findings supersedes nothing" "$out" "alpha/audit-01#2 "
+  # ...nor a run that failed after writing a partial Findings section.
+  _p17b_report audit-02b 2026-09-08T04:30:00-04:00 timeout sec "main@$b" \
+    '### [LOW] Partial\n- **Location:** `src/db.py:1`\n'
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b superseded: a failed run's partial findings supersede nothing" "$out" "alpha/audit-01#2 "
+  # Another lens supersedes nothing either.
+  _p17b_report audit-03 2026-09-08T05:00:00-04:00 ok quality "main@$b" \
+    '### [LOW] Style\n- **Location:** `src/db.py:1`\n'
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b superseded: another lens supersedes nothing" "$out" "alpha/audit-01#2 "
+  # A newer audit of the same task and lens that no longer raises #2 supersedes it.
+  _p17b_report audit-04 2026-09-15T04:00:00-04:00 ok sec "main@$b" \
+    '### [LOW] Unused import\n- **Location:** `src/db.py:1`\n' \
+    '### [LOW] Shadowed name\n- **Location:** `src/util.py:2`\n'
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7b superseded: hidden from --new" "$(grep -c 'alpha/audit-01#2 ' <<< "$out")" "0"
+  has "p1.7b superseded: a finding the newer audit repeats stays" "$out" "alpha/audit-01#3 "
+  has "p1.7b superseded: the newer audit's own finding is new" "$out" "alpha/audit-04#1 "
+  has "p1.7b superseded: --all shows it" "$(grep 'alpha/audit-01#2 ' <<< "$("$root/bin/meute" findings --all 2>&1)")" "superseded"
+
+  # claim: validated, hides the row, keeps the verdict; verify keeps the claim.
+  url="https://github.com/o/r/pull/7"
+  "$root/bin/meute" claim alpha/audit-01 -f 3 >/dev/null 2>&1
+  is  "p1.7b claim: --pr is required" "$?" "1"
+  "$root/bin/meute" claim alpha/audit-01 -f 3 --pr 'not a url' >/dev/null 2>&1
+  is  "p1.7b claim: --pr must be a URL" "$?" "1"
+  "$root/bin/meute" claim alpha/audit-01 -f 99 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b claim: the finding must exist" "$?" "1"
+  "$root/bin/meute" claim alpha/audit-01 -f 3 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b claim: exits 0" "$?" "0"
+  is  "p1.7b claim: recorded in finding-status" "$(awk -F'\t' '$1=="alpha/audit-01#3"{print $2"|"$5}' "$st")" "current|$url"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7b claim: hidden from --new" "$(grep -c 'alpha/audit-01#3 ' <<< "$out")" "0"
+  has "p1.7b claim: --all shows claimed" "$(grep 'alpha/audit-01#3 ' <<< "$("$root/bin/meute" findings --all 2>&1)")" "claimed"
+  "$root/bin/meute" findings verify >/dev/null 2>&1
+  is  "p1.7b claim: a later verify keeps the claim" "$(awk -F'\t' '$1=="alpha/audit-01#3"{print $5}' "$st")" "$url"
+  [[ ! -e "$root/state/reports" ]] && ok "p1.7b claim: state/reports is not written" \
+    || bad "p1.7b claim: state/reports is not written" "it exists"
+  "$root/bin/meute" dismiss alpha/audit-01 -f 6 -r false-positive >/dev/null 2>&1
+  "$root/bin/meute" claim alpha/audit-01 -f 6 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b claim: refuses a decided finding" "$?" "1"
+
+  # resolve --pr: no -m needed, the PR lands in the note.
+  "$root/bin/meute" resolve alpha/audit-01 -f 4 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b resolve --pr: exits 0 without -m" "$?" "0"
+  has "p1.7b resolve --pr: the PR is in the note" "$(grep 'alpha/audit-01#4' "$root/state/reports")" "pr: $url"
+
+  # --json: the contract external fix workflows read.
+  out="$("$root/bin/meute" findings --json 2>/dev/null)"
+  is  "p1.7b --json: valid JSON array" "$(jq -r 'type' <<< "$out")" "array"
+  is  "p1.7b --json: --new excludes hidden rows" "$(jq -r '[.[] | select(.id=="alpha/audit-01#1" or .id=="alpha/audit-01#3")] | length' <<< "$out")" "0"
+  is  "p1.7b --json: carries the contract fields" \
+      "$(jq -r '.[] | select(.id=="alpha/audit-04#1") | [(.fingerprint|length), .repo, .severity, .location, .base, .state] | join("|")' <<< "$out")" \
+      "40|alpha|LOW|src/db.py:1|$b|new"
+  out="$("$root/bin/meute" findings --json --all 2>/dev/null)"
+  is  "p1.7b --json --all: a claim carries its PR" "$(jq -r '.[] | select(.id=="alpha/audit-01#3") | .state + "|" + .verdict + "|" + .pr' <<< "$out")" "claimed|current|$url"
+  is  "p1.7b --json --all: verdicts" "$(jq -r '.[] | select(.id=="alpha/audit-01#1" or .id=="alpha/audit-01#2") | .verdict' <<< "$out" | paste -sd,)" "gone,superseded"
+  is  "p1.7b --json --all: a resolve --pr carries its PR" "$(jq -r '.[] | select(.id=="alpha/audit-01#4") | .pr' <<< "$out")" "$url"
+  local empty="$FIXTURE/p17b-empty"; mkdir -p "$empty/state"
+  ln -sfn "$REPO/bin" "$empty/bin"; ln -sfn "$REPO/lib" "$empty/lib"
+  is  "p1.7b --json: no findings is an empty array" "$("$empty/bin/meute" findings --json 2>/dev/null)" "[]"
+
+  # The web inbox joins the same verdicts.
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/inbox.py" dump 2>/dev/null)"
+  is  "p1.7b dump: verdict and hidden" \
+      "$(jq -r '.findings[] | select(.report=="alpha/audit-01" and (.n==1 or .n==2 or .n==3 or .n==5)) | "\(.n):\(.verdict):\(.hidden)"' <<< "$out" | sort | paste -sd,)" \
+      "1:gone:true,2:superseded:true,3:current:true,5:changed:false"
+
+  # A claim landing while verify is still diffing survives verify's write.
+  local slow="$root/slowgit" realgit mark="$root/slowgit/in-diff"
+  realgit="$(command -v git)"; mkdir -p "$slow"
+  printf '#!/usr/bin/env bash\nfor a in "$@"; do [[ $a == diff && ! -e %q ]] && { : > %q; sleep 3; break; }; done\nexec %q "$@"\n' \
+    "$mark" "$mark" "$realgit" > "$slow/git"; chmod +x "$slow/git"
+  PATH="$slow:$PATH" "$root/bin/meute" findings verify >/dev/null 2>&1 & local vpid=$!
+  for _ in $(seq 1 100); do [[ -e "$mark" ]] && break; sleep 0.1; done
+  "$root/bin/meute" claim alpha/audit-01 -f 5 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b race: claim during verify exits 0" "$?" "0"
+  wait "$vpid"
+  is  "p1.7b race: verify does not wipe a concurrent claim" "$(awk -F'\t' '$1=="alpha/audit-01#5"{print $5}' "$st")" "$url"
+  is  "p1.7b race: verify still records its verdict" "$(awk -F'\t' '$1=="alpha/audit-01#5"{print $2}' "$st")" "changed"
+  "$root/bin/meute" findings verify >/dev/null 2>&1
+  # The lock: a writer between its re-read and its write makes claim wait.
+  rm -f "$mark"
+  MEUTE_ROOT="$root" MARK="$mark" python3 - "$REPO/lib" <<'PY' & vpid=$!
+import os, sys, time
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+root = os.environ["MEUTE_ROOT"]
+with fs.locked(root):
+    rows = fs.read_status(root)
+    open(os.environ["MARK"], "w").close(); time.sleep(2)
+    rows["alpha/audit-04#1"] = ["current", "h", "t", ""]
+    fs.write_status(root, rows)
+PY
+  for _ in $(seq 1 100); do [[ -e "$mark" ]] && break; sleep 0.1; done
+  "$root/bin/meute" claim alpha/audit-04 -f 2 --pr "$url" >/dev/null 2>&1
+  wait "$vpid"
+  is  "p1.7b lock: a claim waits for a writer holding the lock" "$(awk -F'\t' '$1=="alpha/audit-04#2"{print $5}' "$st")" "$url"
+
+  # Rollback: deleting state/finding-status drops every verdict and claim.
+  rm -f "$st"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b rollback: claimed row returns" "$out" "alpha/audit-01#3 "
+  has "p1.7b rollback: a changed row loses its badge" "$(grep 'alpha/audit-01#5 ' <<< "$out")" "NEW"
+}
+
+# P1.7 (b): state/finding-status keys rows by <private-repo>/<report>#n and
+# its pr column holds PR URLs; the lock beside it shares the name. Both must
+# stay off the public harness like every other state/ file.
+test_p1_7b_status_ignored() {
+  local f
+  for f in state/finding-status state/finding-status.lock; do
+    is "p1.7b gitignore: ${f} never reaches the public harness" \
+      "$(git -C "$REPO" check-ignore -q -- "$f"; echo $?)" "0"
+  done
+}
+
+# P1.7 (b): verify_report must not let one finding's bad location, or a
+# report's front-matter, steer git. A location outside the repository is
+# unknown on its own and leaves its neighbours' verdicts intact; a base sha or
+# ref that git would parse as an option is never passed to git.
+test_p1_7b_verify_hardening() {
+  local g="$FIXTURE/p17bh/alpha" a trap="$FIXTURE/p17bh/clobbered" out
+  local gitc=(git -C "$g" -c user.name=t -c user.email=t@t)
+  mkdir -p "$g/src"; git init -q -b main "$g"
+  printf 'db v1\n' > "$g/src/db.py"
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm A; a="$(git -C "$g" rev-parse HEAD)"
+  out="$(python3 - "$REPO/lib" "$g" "$a" "$trap" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+g, a, trap = sys.argv[2:5]
+def v(base, files): return ",".join(fs.verify_report(g, base, files)[1])
+print("abs=" + v("main@" + a, ["src/db.py", "/etc/passwd"]))
+print("up=" + v("main@" + a, ["src/db.py", "../x.py"]))
+print("mid=" + v("main@" + a, ["src/db.py", "src/../../x.py"]))
+print("optsha=" + v("main@--output=" + trap, ["src/db.py"]))
+print("revsha=" + v("main@HEAD", ["src/db.py"]))
+print("optref=" + v("--output=" + trap + "@" + a, ["src/db.py"]))
+PY
+)"
+  is  "p1.7b hardening: an absolute location does not void its neighbours" "$(sed -n 's/^abs=//p' <<< "$out")" "current,unknown"
+  is  "p1.7b hardening: a ../ location does not void its neighbours" "$(sed -n 's/^up=//p' <<< "$out")" "current,unknown"
+  is  "p1.7b hardening: a .. component mid-path is unknown" "$(sed -n 's/^mid=//p' <<< "$out")" "current,unknown"
+  is  "p1.7b hardening: a base sha that is a git option is unknown" "$(sed -n 's/^optsha=//p' <<< "$out")" "unknown"
+  is  "p1.7b hardening: a base sha that is not hex is unknown" "$(sed -n 's/^revsha=//p' <<< "$out")" "unknown"
+  is  "p1.7b hardening: a base ref that is a git option is unknown" "$(sed -n 's/^optref=//p' <<< "$out")" "unknown"
+  [[ ! -e "$trap" ]] && ok "p1.7b hardening: base front-matter never reaches git as an option" \
+    || bad "p1.7b hardening: base front-matter never reaches git as an option" "$trap was written"
+
+  # A PR URL is one printable token: ESC and other control characters are out.
+  local u okv=""
+  for u in $'https://x/pull/1\e[31m' $'https://x/\x01y' $'https://x/\x7fy' $'https://x/a\rb' $'https://x/a b'; do
+    ( source "$REPO/lib/finding_cmds.sh"; valid_pr_url "$u" ) && okv="$okv accepted"
+  done
+  is  "p1.7b hardening: a PR URL with a control character is rejected" "$okv" ""
+  ( source "$REPO/lib/finding_cmds.sh"; valid_pr_url "https://github.com/o/r/pull/7" ) \
+    && ok "p1.7b hardening: a plain PR URL is still accepted" || bad "p1.7b hardening: a plain PR URL is still accepted" "rejected"
+}
+
+# A file renamed and heavily rewritten shows as delete + add (below git's
+# similarity threshold): it must not read as gone, or it is hidden.
+test_p1_7b_rewritten_rename() {
+  local g="$FIXTURE/p17br/alpha" a out
+  local gitc=(git -C "$g" -c user.name=t -c user.email=t@t)
+  mkdir -p "$g/src"; git init -q -b main "$g"
+  seq 1 40 | sed 's/^/old line /' > "$g/src/db.py"
+  seq 1 5 | sed 's/^/stay /' > "$g/src/keep.py"
+  seq 1 5 | sed 's/^/dies /' > "$g/src/dead.py"
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm A; a="$(git -C "$g" rev-parse HEAD)"
+  git -C "$g" rm -q src/db.py
+  seq 1 40 | sed 's/^/totally new /' > "$g/src/storage.py"
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm B
+  out="$(python3 - "$REPO/lib" "$g" "$a" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+g, a = sys.argv[2:4]
+print(",".join(fs.verify_report(g, "main@" + a, ["src/db.py", "src/keep.py"])[1]))
+PY
+)"
+  is  "p1.7b rename: a rewritten rename is not gone" "$out" "changed,current"
+  # A plain deletion with nothing added is still gone.
+  git -C "$g" rm -q src/dead.py; "${gitc[@]}" commit -qm C
+  a="$(git -C "$g" rev-parse HEAD~1)"
+  out="$(python3 - "$REPO/lib" "$g" "$a" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+print(",".join(fs.verify_report(sys.argv[2], "main@" + sys.argv[3], ["src/dead.py"])[1]))
+PY
+)"
+  is  "p1.7b rename: a plain deletion is still gone" "$out" "gone"
+}
+
 # P2.6 (R20): a typo under policy: used to fall back to the default silently.
 # validate and doctor now name unknown keys; they stay a warning, never an error.
 test_p26_unknown_policy_keys() {
@@ -1255,6 +1504,196 @@ test_p1_3_wait_lock() {
   is  "wait lock: a non-integer wait is a usage error (2)"  "$rc" "2"
   rc=0; "${run[@]}" --wait-lock 09 >/dev/null 2>&1 || rc=$?
   is  "wait lock: a zero-padded wait is a usage error, not an octal crash (2)" "$rc" "2"
+}
+
+# P1.3 CLI half (R11): `meute drain` loops run.sh unforced, so the cursor and
+# every gate still apply, and ends on a stop-class exit or after one rotation.
+# _drain_fixture <root> <n>: the P1.3 fixture with n manifest repos lk1..lkn.
+_drain_fixture() {
+  local root="$1" n="$2" i
+  _p13_fixture "$root" "$root/git-lk1"
+  for (( i = 2; i <= n; i++ )); do
+    mkdir -p "$root/git-lk$i"; git -C "$root/git-lk$i" init -q -b main
+    echo x > "$root/git-lk$i/f.txt"; git -C "$root/git-lk$i" add -A
+    git -C "$root/git-lk$i" -c user.email=t@t -c user.name=t commit -qm init
+  done
+  python3 - "$root" "$n" <<'PY'
+import sys, yaml
+root, n = sys.argv[1], int(sys.argv[2])
+p = f"{root}/repos.yaml"; d = yaml.safe_load(open(p))
+d["repos"] = [{"name": f"lk{i}", "path": f"{root}/git-lk{i}", "spec": "drain fixture", "tasks": ["t"]}
+              for i in range(1, n + 1)]
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
+}
+# The repos the fires ran, in order, from state/log.
+_drain_ran() { grep -o $'\trepo=[^\t]*' "$1/state/log" 2>/dev/null | cut -d= -f2 | paste -sd' ' -; }
+
+test_p1_3_drain_rotation() {
+  local root="$FIXTURE/drain-rot" rc key
+  _drain_fixture "$root" 3
+  local drain=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" drain daily )
+
+  rc=0; "${drain[@]}" >/dev/null 2>&1 || rc=$?
+  is "drain: a fresh three-entry fleet drains and exits 0"    "$rc" "0"
+  is "drain: ...exactly three engine calls, then it stops"    "$(_p13_calls "$root")" "3"
+  is "drain: ...one fire per entry, in rotation order"        "$(_drain_ran "$root")" "lk1 lk2 lk3"
+
+  # A rotation starts after the cursor and ends on the entry it named.
+  key="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" queue "$root/repos.yaml" daily | jq -r 'select(.repo == "lk1") | .key')"
+  printf 'cursor.daily\t%s\n' "$key" > "$root/state/cursor"; : > "$root/state/log"
+  rc=0; "${drain[@]}" >/dev/null 2>&1 || rc=$?
+  is "drain: from a cursor, one full rotation ending on it"   "$(_drain_ran "$root"):$rc" "lk2 lk3 lk1:0"
+
+  : > "$root/state/log"
+  rc=0; "${drain[@]}" --max 2 >/dev/null 2>&1 || rc=$?
+  is "drain: --max 2 stops after two fires"                   "$(_drain_ran "$root"):$rc" "lk2 lk3:0"
+
+  # The sentinel entry is stepped over (not a repository): the rotation still
+  # ends, at the first entry this drain already ran.
+  printf 'cursor.daily\t%s\n' "$key" > "$root/state/cursor"; : > "$root/state/log"
+  mv "$root/git-lk1/.git" "$root/git-lk1/.git.off"
+  rc=0; "${drain[@]}" >/dev/null 2>&1 || rc=$?
+  is "drain: a stepped-over sentinel still ends the rotation" "$(_drain_ran "$root"):$rc" "lk2 lk3 lk2:0"
+  mv "$root/git-lk1/.git.off" "$root/git-lk1/.git"
+}
+
+test_p1_3_drain_stops() {
+  local root="$FIXTURE/drain-stop" rc
+  _drain_fixture "$root" 4
+  local drain=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" drain daily )
+  cp "$root/repos.yaml" "$root/repos.yaml.good"
+
+  # A budget skip is a stop: the loop ends with the runner's status, 12.
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"]["weekly_runs"] = 2
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
+  rc=0; "${drain[@]}" >/dev/null 2>&1 || rc=$?
+  is  "drain: a budget skip ends the loop with exit 12"        "$rc" "12"
+  is  "drain: ...after the two runs the budget allowed"        "$(_p13_calls "$root")" "2"
+  has "drain: ...and the fire that declined logged code=budget" "$(tail -1 "$root/state/log")" $'\tcode=budget\t'
+  cp "$root/repos.yaml.good" "$root/repos.yaml"; : > "$root/state/log"; rm -f "$root/state/cursor"
+
+  # A hold is a stop too, before any engine call.
+  printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "drain test" > "$root/state/hold"
+  rc=0; "${drain[@]}" >/dev/null 2>&1 || rc=$?
+  is  "drain: a hold ends the loop with exit 10"               "$rc:$(_p13_calls "$root")" "10:2"
+  rm -f "$root/state/hold"
+
+  # --repo narrows the queue without forcing: the quota gate still applies.
+  : > "$root/state/log"
+  rc=0; "${drain[@]}" --repo lk3 >/dev/null 2>&1 || rc=$?
+  is  "drain: --repo lk3 runs only lk3"                        "$(_drain_ran "$root"):$rc" "lk3:0"
+  : > "$root/state/log"
+  rc=0; "${drain[@]}" --repo lk2 --repo lk4 >/dev/null 2>&1 || rc=$?
+  is  "drain: --repo is repeatable"                            "$(_drain_ran "$root"):$rc" "lk2 lk4:0"
+  local before; before="$(_p13_calls "$root")"
+  rc=0; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=10 "$root/bin/meute" drain daily --repo lk3 >/dev/null 2>&1 || rc=$?
+  is  "drain: --repo does not bypass the quota floor (14, no call)" "$rc:$(_p13_calls "$root")" "14:$before"
+  rc=0; "${drain[@]}" --repo nope >/dev/null 2>&1 || rc=$?
+  is  "drain: --repo naming no queue entry is a usage error (2)" "$rc:$(_p13_calls "$root")" "2:$before"
+
+  # Three failed fires in a row end the loop with 1, before the fourth entry.
+  sed -i 's/is_error:false/is_error:true/' "$root/stub/claude"
+  rm -f "$root/state/cursor"; : > "$root/state/log"
+  rc=0; "${drain[@]}" >/dev/null 2>&1 || rc=$?
+  is  "drain: three consecutive failures stop the loop (1)"    "$(_drain_ran "$root"):$rc" "lk1 lk2 lk3:1"
+  sed -i 's/is_error:true/is_error:false/' "$root/stub/claude"
+
+  local bad
+  for bad in "--max 0" "--max 09" "--max x" "--until 24:00" "--until 7:5" "--source bogus" "--bogus"; do
+    rc=0; "${drain[@]}" $bad >/dev/null 2>&1 || rc=$?
+    is "drain: '$bad' is a usage error (2)" "$rc" "2"
+  done
+  rc=0; env PATH="$root/stub:$PATH" "$root/bin/meute" drain hourly >/dev/null 2>&1 || rc=$?
+  is "drain: an unknown slot is a usage error (2)" "$rc" "2"
+}
+
+test_p1_3_drain_lock_and_source() {
+  local root="$FIXTURE/drain-src" rc plan
+  _drain_fixture "$root" 1
+  local drain=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/meute" drain daily )
+
+  # A held lock is waited for, not skipped.
+  _p13_hold_lock "$root/state/.lock" 4 "$root/ready" || bad "drain lock: holder took the lock" "no ready file"
+  rc=0; "${drain[@]}" --max 1 >/dev/null 2>&1 || rc=$?
+  is  "drain lock: a held lock is waited for (exit 0, one call)" "$rc:$(_p13_calls "$root")" "0:1"
+  hasnt "drain lock: ...no fire was skipped as code=lock"       "$(cat "$root/state/log")" $'\tcode=lock\t'
+  wait "$P13_HOLDER" 2>/dev/null
+
+  # --source manifest runs the manifest while a plan is staged, untouched.
+  _p13_stage "$root" "$root/git-lk1"; plan="$(cat "$root/state/plan-queue.json")"; : > "$root/state/log"
+  rc=0; "${drain[@]}" --source manifest >/dev/null 2>&1 || rc=$?
+  is  "drain source: --source manifest runs the manifest item"  "$(_drain_ran "$root"):$rc" "lk1:0"
+  is  "drain source: ...the staged plan is untouched"           "$(cat "$root/state/plan-queue.json")" "$plan"
+
+  # The default drains the staged plan, every item once, and stops there
+  # instead of falling back to the manifest when the plan retires.
+  : > "$root/state/log"
+  rc=0; "${drain[@]}" >/dev/null 2>&1 || rc=$?
+  is  "drain source: the plan drains, then the loop stops"      "$(_drain_ran "$root"):$rc" "plan-001-x plan-002-y:0"
+}
+
+# --until HH:MM: the next such wall-clock time, today or tomorrow.
+test_p1_3_drain_until() {
+  local probe='source "$1/bin/meute"; MEUTE_NOW="$2"; drain_deadline "$3"'
+  local noon; noon="$(TZ=UTC date -d '2026-11-16 12:00' +%s)"
+  is "drain until: a later time is today"      "$(TZ=UTC bash -c "$probe" _ "$REPO" "$noon" 13:30)" "$(( noon + 5400 ))"
+  is "drain until: an earlier time is tomorrow" "$(TZ=UTC bash -c "$probe" _ "$REPO" "$noon" 11:00)" "$(( noon + 82800 ))"
+  is "drain until: now itself is tomorrow"     "$(TZ=UTC bash -c "$probe" _ "$REPO" "$noon" 12:00)" "$(( noon + 86400 ))"
+
+  # The loop checks it before each fire: once the clock reaches it, no more.
+  local check='source "$1/bin/meute"; DRAIN_DEADLINE="$2"; MEUTE_NOW="$3"; drain_before_deadline'
+  local rc=0; bash -c "$check" _ "$REPO" "$noon" "$noon" || rc=$?
+  is "drain until: the deadline reached stops the loop"  "$rc" "1"
+  rc=0; bash -c "$check" _ "$REPO" "$noon" "$(( noon - 1 ))" || rc=$?
+  is "drain until: before the deadline the loop goes on" "$rc" "0"
+  rc=0; bash -c "$check" _ "$REPO" "" "$noon" || rc=$?
+  is "drain until: no --until never stops it"            "$rc" "0"
+}
+
+# A narrowed drain must not move the fleet-wide cursor the timers rotate on:
+# `drain --repo` keeps its own cursor, and the next timer fire resumes where
+# the timer left off (review of PR #55).
+test_p1_3_drain_repo_cursor() {
+  local root="$FIXTURE/drain-only" rc shared
+  _drain_fixture "$root" 4
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 )
+  for _ in 1 2 3; do "${env[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1 || true; done
+  is "drain --repo: three timer fires ran lk1 lk2 lk3" "$(_drain_ran "$root")" "lk1 lk2 lk3"
+  shared="$(grep -P '^cursor\.daily\t' "$root/state/cursor")"
+
+  : > "$root/state/log"
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk1 >/dev/null 2>&1 || rc=$?
+  is "drain --repo: the narrowed drain runs lk1 and exits 0" "$(_drain_ran "$root"):$rc" "lk1:0"
+  is "drain --repo: ...and leaves the shared cursor alone"   "$(grep -P '^cursor\.daily\t' "$root/state/cursor")" "$shared"
+
+  : > "$root/state/log"
+  "${env[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1 || true
+  is "drain --repo: the next timer fire resumes at lk4"      "$(_drain_ran "$root")" "lk4"
+
+  # The narrowed cursor is its own rotation: a second narrowed drain over two
+  # repos runs each once and stops.
+  : > "$root/state/log"
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk2 --repo lk3 >/dev/null 2>&1 || rc=$?
+  is "drain --repo: a narrowed rotation over two repos"      "$(_drain_ran "$root"):$rc" "lk2 lk3:0"
+  is "drain --repo: ...still leaves the shared cursor on lk4" "$(grep -P '^cursor\.daily\t' "$root/state/cursor" | grep -c lk4)" "1"
+}
+
+# An empty --repo value is a usage error (exit 2), not a drain that matches no
+# entry and exits 14 on every fire.
+test_p1_3_drain_empty_repo() {
+  local root="$FIXTURE/drain-emptyrepo" rc out
+  _drain_fixture "$root" 2
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 )
+  rc=0; out="$("${env[@]}" "$root/bin/meute" drain daily --repo "" 2>&1 >/dev/null)" || rc=$?
+  is "drain --repo '': usage error exit 2" "$rc" "2"
+  is "drain --repo '': names the empty value" "$(grep -c 'needs a non-empty' <<<"$out")" "1"
+  : > "$root/state/log"
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk1 --repo "" >/dev/null 2>&1 || rc=$?
+  is "drain --repo lk1 --repo '': also a usage error" "$rc:$(_drain_ran "$root")" "2:"
 }
 
 # P2.2 (R18): state/reports is a read-modify-write with no lock, and the web
