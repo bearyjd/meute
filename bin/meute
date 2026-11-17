@@ -11,12 +11,17 @@
 #                                  subscription windows reach the quota gate
 #   status                        quota, what runs next, this week's activity
 #   reports [--new|--all]         list reports with their triage state
-#   findings [--new|--all]        one row per finding — the actual unit of decision
+#   findings [--new|--all] [--json]
+#                                 one row per finding — the actual unit of decision;
+#                                  --new hides gone, superseded, claimed and inherited rows
+#   findings verify [--repo R]    is each new finding's file gone, changed or current
+#                                  at the repository's HEAD? (state/finding-status)
+#   claim <id> -f <n> --pr <url>  the finding is covered by an open PR
 #   show <id>                     print a report to stdout and mark it read
 #   promote <id> -f <n> [-t T]    turn finding <n> into a tier-3 specced ticket
-#   resolve <id> [-f <n>] -m <text>
+#   resolve <id> [-f <n>] -m <text> | --pr <url>
 #                                 record that a finding was already fixed directly
-#                                 (no ticket) -- -m is required, e.g. a PR link
+#                                 (no ticket) -- -m or --pr is required
 #   dismiss <id> [-f <n>] -r <reason> [-m <text>]
 #                                 record a decision; -r is required and is one of
 #                                 false-positive wont-fix out-of-scope duplicate too-large other
@@ -90,6 +95,7 @@ source "${MEUTE_ROOT}/lib/status.sh"
 source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
 source "${MEUTE_ROOT}/lib/timers.sh"
+source "${MEUTE_ROOT}/lib/finding_cmds.sh"
 source "${MEUTE_ROOT}/lib/unitlimits.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
@@ -176,7 +182,20 @@ mark_finding() {
 readonly DISMISS_REASONS="false-positive wont-fix out-of-scope duplicate too-large other"
 
 cmd_findings() {
-  local filter="${1:---new}"
+  [[ "${1:-}" == verify ]] && { shift; cmd_findings_verify "$@"; return; }
+  local filter="--new" json=0
+  while (( $# )); do
+    case "$1" in
+      --new|--all) filter="$1" ;;
+      --json) json=1 ;;
+      *) die "findings: unknown argument $1" ;;
+    esac
+    shift
+  done
+  if (( json )); then
+    python3 "$INBOX_PY" findings "$filter" --json || die "findings failed: lib/inbox.py exited with an error (see above)"
+    return 0
+  fi
   # Under state/tmp, not $TMPDIR, and gone however the command ends.
   tmp_init "$STATE_DIR"; trap tmp_cleanup EXIT
   local tmp; tmp="$(mktemp)"
@@ -231,17 +250,22 @@ cmd_show() {
 # would record the opposite of what happened.
 cmd_resolve() {
   local id="${1:-}"; shift || true
-  local number="" note_text=""
+  local number="" note_text="" pr=""
   while (( $# )); do
     case "$1" in
       -f|--finding) number="${2:?-f needs a finding number}"; shift ;;
       -m|--message) note_text="${2:?-m needs text}"; shift ;;
+      --pr) pr="${2:?--pr needs a URL}"; shift ;;
       *) die "resolve: unknown argument $1" ;;
     esac
     shift
   done
   require_report "$id"
-  [[ -n "$note_text" ]] || die "resolve: -m <text> is required (what was done, e.g. a PR link)"
+  if [[ -n "$pr" ]]; then
+    valid_pr_url "$pr" || die "resolve: --pr must be an http(s) URL with no spaces"
+    note_text="${note_text:+${note_text} }pr: ${pr}"
+  fi
+  [[ -n "$note_text" ]] || die "resolve: -m <text> or --pr <url> is required (what was done)"
 
   if [[ -n "$number" ]]; then
     [[ "$number" =~ ^[0-9]+$ ]] || die "resolve: -f takes a finding number"
@@ -721,6 +745,7 @@ main() {
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;
     resolve)  cmd_resolve "$@" ;;
+    claim)    cmd_claim "$@" ;;
     dismiss)  cmd_dismiss "$@" ;;
     branches) cmd_branches "$@" ;;
     image)    cmd_image "$@" ;;

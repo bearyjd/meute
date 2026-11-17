@@ -209,9 +209,11 @@ test_p0_5_single_process_reads() {
   cp "$REPO"/tasks/*.md "$root/tasks/"
   cp "$FIXTURE/repos.yaml" "$root/repos.yaml"
   # 50 reports: 25 per repo, each with two findings of differing severity.
+  # Each its own lens, so no report supersedes another (P1.7 b): this fixture
+  # pins the read path and layout, not staleness.
   for i in $(seq 1 50); do
     local repo=alpha; (( i % 2 )) || repo=beta
-    printf -- '---\nrepo: %s\ntask: audit-security\ntier: tier2\nstarted: 2026-09-%02dT04:00:00-04:00\nstatus: ok\n---\n\n## Summary\nx\n\n## Findings\n\n### [%s] Title %s one\n- **Anchor:** `src/a.py:%s`\n\n### [LOW] Title %s two\n- **Anchor:** `src/b.py:%s`\n' \
+    printf -- '---\nrepo: %s\ntask: audit-security\ntier: tier2\nlens: l'"$i"'\nstarted: 2026-09-%02dT04:00:00-04:00\nstatus: ok\n---\n\n## Summary\nx\n\n## Findings\n\n### [%s] Title %s one\n- **Anchor:** `src/a.py:%s`\n\n### [LOW] Title %s two\n- **Anchor:** `src/b.py:%s`\n' \
       "$repo" "$(( i % 28 + 1 ))" "$( (( i % 3 )) && echo HIGH || echo CRITICAL )" "$i" "$i" "$i" "$i" \
       > "$root/reports/$repo/audit-$(printf '%02d' "$i").md"
   done
@@ -775,4 +777,135 @@ test_p1_7a_fingerprint_inherit() {
   printf 'alpha/audit-01#1\tdismissed\t2026-09-02\tfalse-positive\n' > "$root/state/reports"
   out="$("$root/bin/meute" findings --new 2>&1)"
   is  "p1.7a: an undecided middle occurrence does not break inheritance" "$(grep -c 'alpha/audit-0[23]#1' <<< "$out")" "0"
+}
+
+# P1.7 (b): `findings verify` (gone/changed/current/unknown against the
+# repository's HEAD), superseded by a newer audit, `claim --pr`, `resolve --pr`
+# and `findings --json`. D7: hidden rows stay visible under --all.
+test_p1_7b_verify_claim() {
+  local root="$FIXTURE/p17b" out g="$FIXTURE/p17b/git/alpha" a b url
+  local gitc=(git -C "$g" -c user.name=t -c user.email=t@t)
+  mkdir -p "$root/reports/alpha" "$root/state" "$root/tasks" "$g/src"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  printf 'version: 1\nrepos:\n  - name: alpha\n    path: %s\n' "$g" > "$root/repos.yaml"
+  git init -q -b main "$g"
+  for f in db net old util; do printf '%s v1\n' "$f" > "$g/src/$f.py"; done
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm A; a="$(git -C "$g" rev-parse HEAD)"
+  "${gitc[@]}" rm -q src/old.py; printf 'net v2\n' > "$g/src/net.py"
+  "${gitc[@]}" mv src/util.py src/helpers.py
+  "${gitc[@]}" commit -qam B; b="$(git -C "$g" rev-parse HEAD)"
+
+  _p17b_report() {  # id started status lens base finding-lines...
+    local id="$1" started="$2" status="$3" lens="$4" base="$5"; shift 5
+    { printf -- '---\nrepo: alpha\ntask: audit-security\ntier: tier2\nlens: %s\nbase: %s\nstarted: %s\nstatus: %s\n---\n\n## Summary\nx\n\n' \
+        "$lens" "$base" "$started" "$status"
+      (( $# )) && printf '## Findings\n\n' && printf '%b\n' "$@"; } > "$root/reports/alpha/$id.md"
+  }
+  _p17b_report audit-01 2026-09-01T04:00:00-04:00 ok sec "main@$a" \
+    '### [HIGH] Hardcoded token\n- **Location:** `src/old.py:3`\n' \
+    '### [MEDIUM] Missing timeout\n- **Location:** `src/net.py:12`\n' \
+    '### [LOW] Unused import\n- **Location:** `src/db.py:1`\n' \
+    '### [LOW] Vague concern\n- **Severity:** low\n' \
+    '### [LOW] Shadowed name\n- **Location:** `src/util.py:2`\n' \
+    '### [LOW] Imaginary file\n- **Location:** `src/nope.py:2`\n'
+
+  MEUTE_ROOT="$root" "$root/bin/meute" findings verify > "$root/verify.out" 2>&1
+  is  "p1.7b verify: exits 0" "$?" "0"
+  local st="$root/state/finding-status"
+  is  "p1.7b verify: deleted file is gone"       "$(awk -F'\t' '$1=="alpha/audit-01#1"{print $2}' "$st")" "gone"
+  is  "p1.7b verify: touched file is changed"    "$(awk -F'\t' '$1=="alpha/audit-01#2"{print $2}' "$st")" "changed"
+  is  "p1.7b verify: untouched file is current"  "$(awk -F'\t' '$1=="alpha/audit-01#3"{print $2}' "$st")" "current"
+  is  "p1.7b verify: no location is unknown"     "$(awk -F'\t' '$1=="alpha/audit-01#4"{print $2}' "$st")" "unknown"
+  is  "p1.7b verify: a renamed file is changed, not gone" "$(awk -F'\t' '$1=="alpha/audit-01#5"{print $2}' "$st")" "changed"
+  is  "p1.7b verify: a file in neither commit is unknown" "$(awk -F'\t' '$1=="alpha/audit-01#6"{print $2}' "$st")" "unknown"
+  is  "p1.7b verify: records the head it checked against" "$(awk -F'\t' '$1=="alpha/audit-01#1"{print $3}' "$st")" "$b"
+  has "p1.7b verify: says what it found" "$(cat "$root/verify.out")" "gone=1"
+  [[ ! -e "$root/state/reports" ]] && ok "p1.7b verify: state/reports is not written" \
+    || bad "p1.7b verify: state/reports is not written" "it exists"
+
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7b --new: gone is hidden" "$(grep -c 'alpha/audit-01#1 ' <<< "$out")" "0"
+  has "p1.7b --new: changed is shown with its badge" "$(grep 'alpha/audit-01#2 ' <<< "$out")" "changed"
+  has "p1.7b --new: current stays NEW" "$(grep 'alpha/audit-01#3 ' <<< "$out")" "NEW"
+  has "p1.7b --new: unknown stays NEW" "$(grep 'alpha/audit-01#4 ' <<< "$out")" "NEW"
+  has "p1.7b --all: gone is listed with its verdict" "$(grep 'alpha/audit-01#1 ' <<< "$("$root/bin/meute" findings --all 2>&1)")" "gone"
+
+  # A failed run newer than the audit (no Findings section) supersedes nothing.
+  _p17b_report audit-02 2026-09-08T04:00:00-04:00 error sec "main@$b"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b superseded: a run with no findings supersedes nothing" "$out" "alpha/audit-01#2 "
+  # ...nor a run that failed after writing a partial Findings section.
+  _p17b_report audit-02b 2026-09-08T04:30:00-04:00 timeout sec "main@$b" \
+    '### [LOW] Partial\n- **Location:** `src/db.py:1`\n'
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b superseded: a failed run's partial findings supersede nothing" "$out" "alpha/audit-01#2 "
+  # Another lens supersedes nothing either.
+  _p17b_report audit-03 2026-09-08T05:00:00-04:00 ok quality "main@$b" \
+    '### [LOW] Style\n- **Location:** `src/db.py:1`\n'
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b superseded: another lens supersedes nothing" "$out" "alpha/audit-01#2 "
+  # A newer audit of the same task and lens that no longer raises #2 supersedes it.
+  _p17b_report audit-04 2026-09-15T04:00:00-04:00 ok sec "main@$b" \
+    '### [LOW] Unused import\n- **Location:** `src/db.py:1`\n' \
+    '### [LOW] Shadowed name\n- **Location:** `src/util.py:2`\n'
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7b superseded: hidden from --new" "$(grep -c 'alpha/audit-01#2 ' <<< "$out")" "0"
+  has "p1.7b superseded: a finding the newer audit repeats stays" "$out" "alpha/audit-01#3 "
+  has "p1.7b superseded: the newer audit's own finding is new" "$out" "alpha/audit-04#1 "
+  has "p1.7b superseded: --all shows it" "$(grep 'alpha/audit-01#2 ' <<< "$("$root/bin/meute" findings --all 2>&1)")" "superseded"
+
+  # claim: validated, hides the row, keeps the verdict; verify keeps the claim.
+  url="https://github.com/o/r/pull/7"
+  "$root/bin/meute" claim alpha/audit-01 -f 3 >/dev/null 2>&1
+  is  "p1.7b claim: --pr is required" "$?" "1"
+  "$root/bin/meute" claim alpha/audit-01 -f 3 --pr 'not a url' >/dev/null 2>&1
+  is  "p1.7b claim: --pr must be a URL" "$?" "1"
+  "$root/bin/meute" claim alpha/audit-01 -f 99 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b claim: the finding must exist" "$?" "1"
+  "$root/bin/meute" claim alpha/audit-01 -f 3 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b claim: exits 0" "$?" "0"
+  is  "p1.7b claim: recorded in finding-status" "$(awk -F'\t' '$1=="alpha/audit-01#3"{print $2"|"$5}' "$st")" "current|$url"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7b claim: hidden from --new" "$(grep -c 'alpha/audit-01#3 ' <<< "$out")" "0"
+  has "p1.7b claim: --all shows claimed" "$(grep 'alpha/audit-01#3 ' <<< "$("$root/bin/meute" findings --all 2>&1)")" "claimed"
+  "$root/bin/meute" findings verify >/dev/null 2>&1
+  is  "p1.7b claim: a later verify keeps the claim" "$(awk -F'\t' '$1=="alpha/audit-01#3"{print $5}' "$st")" "$url"
+  [[ ! -e "$root/state/reports" ]] && ok "p1.7b claim: state/reports is not written" \
+    || bad "p1.7b claim: state/reports is not written" "it exists"
+  "$root/bin/meute" dismiss alpha/audit-01 -f 6 -r false-positive >/dev/null 2>&1
+  "$root/bin/meute" claim alpha/audit-01 -f 6 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b claim: refuses a decided finding" "$?" "1"
+
+  # resolve --pr: no -m needed, the PR lands in the note.
+  "$root/bin/meute" resolve alpha/audit-01 -f 4 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b resolve --pr: exits 0 without -m" "$?" "0"
+  has "p1.7b resolve --pr: the PR is in the note" "$(grep 'alpha/audit-01#4' "$root/state/reports")" "pr: $url"
+
+  # --json: the contract external fix workflows read.
+  out="$("$root/bin/meute" findings --json 2>/dev/null)"
+  is  "p1.7b --json: valid JSON array" "$(jq -r 'type' <<< "$out")" "array"
+  is  "p1.7b --json: --new excludes hidden rows" "$(jq -r '[.[] | select(.id=="alpha/audit-01#1" or .id=="alpha/audit-01#3")] | length' <<< "$out")" "0"
+  is  "p1.7b --json: carries the contract fields" \
+      "$(jq -r '.[] | select(.id=="alpha/audit-04#1") | [(.fingerprint|length), .repo, .severity, .location, .base, .state] | join("|")' <<< "$out")" \
+      "40|alpha|LOW|src/db.py:1|$b|new"
+  out="$("$root/bin/meute" findings --json --all 2>/dev/null)"
+  is  "p1.7b --json --all: a claim carries its PR" "$(jq -r '.[] | select(.id=="alpha/audit-01#3") | .state + "|" + .verdict + "|" + .pr' <<< "$out")" "claimed|current|$url"
+  is  "p1.7b --json --all: verdicts" "$(jq -r '.[] | select(.id=="alpha/audit-01#1" or .id=="alpha/audit-01#2") | .verdict' <<< "$out" | paste -sd,)" "gone,superseded"
+  is  "p1.7b --json --all: a resolve --pr carries its PR" "$(jq -r '.[] | select(.id=="alpha/audit-01#4") | .pr' <<< "$out")" "$url"
+  local empty="$FIXTURE/p17b-empty"; mkdir -p "$empty/state"
+  ln -sfn "$REPO/bin" "$empty/bin"; ln -sfn "$REPO/lib" "$empty/lib"
+  is  "p1.7b --json: no findings is an empty array" "$("$empty/bin/meute" findings --json 2>/dev/null)" "[]"
+
+  # The web inbox joins the same verdicts.
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/inbox.py" dump 2>/dev/null)"
+  is  "p1.7b dump: verdict and hidden" \
+      "$(jq -r '.findings[] | select(.report=="alpha/audit-01" and (.n==1 or .n==2 or .n==3 or .n==5)) | "\(.n):\(.verdict):\(.hidden)"' <<< "$out" | sort | paste -sd,)" \
+      "1:gone:true,2:superseded:true,3:current:true,5:changed:false"
+
+  # Rollback: deleting state/finding-status drops every verdict and claim.
+  rm -f "$st"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7b rollback: claimed row returns" "$out" "alpha/audit-01#3 "
+  has "p1.7b rollback: a changed row loses its badge" "$(grep 'alpha/audit-01#5 ' <<< "$out")" "NEW"
 }
