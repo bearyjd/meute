@@ -33,6 +33,7 @@ ROOT = os.environ.get("MEUTE_ROOT") or os.path.dirname(HERE)
 SYSTEM_PYTHON = os.environ.get("MEUTE_PYTHON", "python3")
 sys.path.insert(0, HERE)
 import report as report_lib  # noqa: E402
+import finding_status  # noqa: E402
 
 SEVERITY_RANK = {s: i for i, s in enumerate(report_lib.SEVERITIES)}
 DISMISS_REASONS = ("false-positive", "wont-fix", "out-of-scope",
@@ -89,6 +90,11 @@ def report_path(rid: str) -> str:
     return os.path.join(ROOT, "reports", rid + ".md")
 
 
+def _order(meta: dict, rid: str) -> tuple:
+    """Oldest report first: by its start time, then its id."""
+    return (str(meta.get("started", "")), rid)
+
+
 # --------------------------------------------------------------- reports ---
 
 def load_reports() -> tuple[list[dict], list[dict]]:
@@ -96,6 +102,7 @@ def load_reports() -> tuple[list[dict], list[dict]]:
     rows = _state_rows()
     reports: list[dict] = []
     findings: list[dict] = []
+    occurrences: list[tuple[str, str, tuple]] = []
     for rid in _report_ids():
         try:
             meta, body = report_lib.read(report_path(rid))
@@ -119,8 +126,11 @@ def load_reports() -> tuple[list[dict], list[dict]]:
             "findings": 0,
         }
         if report_lib.has_findings_section(body):
+            repo = report_lib.report_repo(meta, report_path(rid))
             for f in report_lib.parse_findings(body):
                 fstate, fwhen, fnote = rows.get(f"{rid}#{f['n']}", ("new", "", ""))
+                fp = report_lib.fingerprint(repo, f["location"], f["title"])
+                occurrences.append((f"{rid}#{f['n']}", fp, _order(meta, rid)))
                 findings.append({
                     "report": rid,
                     "n": f["n"],
@@ -135,9 +145,13 @@ def load_reports() -> tuple[list[dict], list[dict]]:
                     "state": fstate,
                     "decided_at": fwhen,
                     "note": fnote,
+                    "fingerprint": fp,
                 })
                 entry["findings"] += 1
         reports.append(entry)
+    inherited = finding_status.inherited(occurrences, rows)
+    for f in findings:
+        f["inherited"] = inherited.get(f"{f['report']}#{f['n']}", "")
     findings.sort(key=lambda f: (f["repo"], f["rank"], f["report"], f["n"]))
     return reports, findings
 
@@ -154,7 +168,8 @@ def findings_tsv(only_new: bool) -> list[str]:
     the shape bin/meute's cmd_findings sorts and lays out. One process for every
     report, where the shell version spawned several per finding."""
     rows = _state_rows()
-    out: list[str] = []
+    found: list[tuple] = []
+    occurrences: list[tuple[str, str, tuple]] = []
     for rid in _report_ids():
         try:
             meta, body = report_lib.read(report_path(rid))
@@ -164,14 +179,23 @@ def findings_tsv(only_new: bool) -> list[str]:
         if not report_lib.has_findings_section(body):
             continue
         repo = meta.get("repo") or ("" if meta.get("repo") == "" else "?")
+        fp_repo = report_lib.report_repo(meta, report_path(rid))
         for f in report_lib.parse_findings(body):
-            state = rows.get(f"{rid}#{f['n']}", ("new",))[0]
-            if only_new and state != "new":
-                continue
-            out.append("\t".join((
-                repo, str(SEVERITY_RANK[f["severity"]]), f["severity"],
-                f"{rid}#{f['n']}", "NEW" if state == "new" else state,
-                f["title"].split("\t")[0])))
+            key = f"{rid}#{f['n']}"
+            fp = report_lib.fingerprint(fp_repo, f["location"], f["title"])
+            occurrences.append((key, fp, _order(meta, rid)))
+            found.append((repo, f, key, rows.get(key, ("new",))[0]))
+    inherited = finding_status.inherited(occurrences, rows)
+    out: list[str] = []
+    for repo, f, key, state in found:
+        if key in inherited:
+            state = f"{inherited[key]} (seen before)"
+        if only_new and state != "new":
+            continue
+        out.append("\t".join((
+            repo, str(SEVERITY_RANK[f["severity"]]), f["severity"],
+            key, "NEW" if state == "new" else state,
+            f["title"].split("\t")[0])))
     return out
 
 
@@ -219,8 +243,10 @@ def load_status() -> dict:
         pass
     try:
         policy = json.loads(subprocess.run(
-            [SYSTEM_PYTHON, os.path.join(HERE, "manifest.py"), "policy",
-             os.environ.get("MEUTE_MANIFEST") or _manifest()],
+            # The policy a run obeys: the manifest's, with any override in force.
+            [SYSTEM_PYTHON, os.path.join(HERE, "manifest.py"), "policy-effective",
+             os.environ.get("MEUTE_MANIFEST") or _manifest(),
+             os.path.join(ROOT, "state", "policy-override")],
             capture_output=True, text=True, check=True).stdout)
         out["floor"] = policy.get("quota_floor_percent")
         out["ceiling"] = policy.get("weekly_cost_usd") or policy.get("weekly_runs")

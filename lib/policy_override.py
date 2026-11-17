@@ -47,23 +47,41 @@ def read_rows(path: str, now: int) -> dict:
     """key -> (value, until, reason) for rows still in force."""
     rows = {}
     try:
-        handle = open(path, "r", encoding="utf-8")
+        with open(path, "rb") as handle:
+            raw = handle.read()
     except FileNotFoundError:
         return rows
-    with handle:
-        for line in handle:
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) < 3 or fields[0] not in OVERRIDABLE or not fields[2].isdigit():
-                continue
-            until = int(fields[2])
-            value = parse_value(fields[1])
-            # A hand-edited nan/inf is no value at all: skipped like an expired
-            # row, so the other rows stay live and `policy show` agrees.
-            if isinstance(value, float) and not math.isfinite(value):
-                continue
-            if now < until <= now + MAX_SECONDS:
-                rows[fields[0]] = (value, until, fields[3] if len(fields) > 3 else "")
+    except OSError as error:
+        # A hand-made mess (a directory, no permission) is no override: the
+        # manifest's policy applies, and the run goes on.
+        _skipped(f"{path}: {error.strerror or error}")
+        return rows
+    for number, raw_line in enumerate(raw.splitlines(), 1):
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            _skipped(f"{path}:{number}: not UTF-8")
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3 or fields[0] not in OVERRIDABLE:
+            continue
+        # str.isdigit() accepts '²', which int() refuses.
+        if not (fields[2].isascii() and fields[2].isdigit()):
+            _skipped(f"{path}:{number}: until {fields[2]!r} is not an epoch")
+            continue
+        until = int(fields[2])
+        value = parse_value(fields[1])
+        # A hand-edited nan/inf is no value at all: skipped like an expired
+        # row, so the other rows stay live and `policy show` agrees.
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        if now < until <= now + MAX_SECONDS:
+            rows[fields[0]] = (value, until, fields[3] if len(fields) > 3 else "")
     return rows
+
+
+def _skipped(why: str) -> None:
+    sys.stderr.write(f"meute/manifest: policy override: skipped {why}\n")
 
 
 def effective_policy(data: dict, values: dict) -> dict:

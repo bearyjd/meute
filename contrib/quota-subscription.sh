@@ -20,6 +20,9 @@
 # bin/run.sh is the backstop for a window that turns out to be fuller than
 # this assumed.
 #
+# With --age it prints the snapshot's age in seconds instead (or "unknown" when
+# the snapshot carries no captured_at), so the gate can refuse a stale reading.
+#
 # Output: one integer 0-100. Exit 1 when there is no usable snapshot; the
 # runner then declines rather than guess.
 
@@ -32,6 +35,12 @@ now="${MEUTE_NOW:-$(date +%s)}"
 
 [[ -f "$SNAPSHOT" ]] || { printf 'quota-subscription: no snapshot at %s\n' "$SNAPSHOT" >&2; exit 1; }
 command -v jq >/dev/null || { printf 'quota-subscription: jq is required\n' >&2; exit 1; }
+
+if [[ "${1:-}" == "--age" ]]; then
+  jq -r --argjson now "$now" 'if (.captured_at | type) != "number" or (.captured_at - $now) > 60 then "unknown" else ($now - .captured_at | floor | [., 0] | max) end' \
+    "$SNAPSHOT" 2>/dev/null || { printf 'quota-subscription: snapshot is not valid JSON\n' >&2; exit 1; }
+  exit 0
+fi
 
 remaining="$(jq -r --argjson now "$now" '
   def used(w):
