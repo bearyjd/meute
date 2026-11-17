@@ -4,7 +4,8 @@
 # ENGINE_OVERRIDE, RUNTIME_OVERRIDE, QUOTA_FLOOR, TIER3_CAP, CURSOR_FILE,
 # PLAN_DONE_FILE, MEUTE_ROOT, and note/skip (outcome.sh), refuse_entry,
 # state_get, kv_get/kv_set (state.sh), community_allowed, tier3_in_flight,
-# hold_active, hold_until_human, HOLD_UNTIL/HOLD_REASON (fleet.sh) and
+# hold_active, hold_until_human, HOLD_UNTIL/HOLD_REASON (fleet.sh),
+# quota_age_apply, quota_age_empty_code, QUOTA_STALE (quota_age.sh) and
 # container_ready (container.sh).
 
 # hold_gate: skip the fire as code=hold while a hold is in force. Called before
@@ -135,7 +136,7 @@ quota_for_engine() {
     QUOTA_BY_ENGINE[$engine]="$(timeout --kill-after=5 35 "${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source 9>&-)" \
       || QUOTA_BY_ENGINE[$engine]="fail"
   fi
-  QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"
+  QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"; quota_age_apply "$engine"
 }
 
 # Nothing was eligible. When a pool was the reason for any candidate, the
@@ -147,7 +148,7 @@ skip_nothing_eligible() {
   for engine in $(printf '%s\n' "${!QUOTA_BY_ENGINE[@]}" | LC_ALL=C sort); do
     probe="${QUOTA_BY_ENGINE[$engine]}"
     if [[ "$probe" == "fail" ]]; then
-      verdicts+=( "${engine} quota probe failed" ); quotas+=( "fail" )
+      verdicts+=( "${engine} quota probe failed${QUOTA_STALE[$engine]:+ (snapshot stale)}" ); quotas+=( "fail" )
     elif (( ${probe%% *} < QUOTA_FLOOR )); then
       verdicts+=( "${engine} quota ${probe%% *}% below floor ${QUOTA_FLOOR}%" )
       quotas+=( "${probe%% *}:${probe#* }" )
@@ -158,7 +159,7 @@ skip_nothing_eligible() {
   done
   (( ${#verdicts[@]} )) || skip nothing-eligible "no eligible entry for slot ${SLOT}"
   local why; why="$(printf '%s; ' "${verdicts[@]}")"
-  skip nothing-eligible "no eligible entry for slot ${SLOT} (${why%; })" \
+  skip "$(quota_age_empty_code)" "no eligible entry for slot ${SLOT} (${why%; })" \
     "quota=$(IFS=,; printf '%s' "${quotas[*]}")" "engine=$(IFS=,; printf '%s' "${engines[*]}")"
 }
 

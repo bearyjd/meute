@@ -695,6 +695,73 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
 
+# P2.3 (R16): the gate must know how old the pool reading is. A snapshot is
+# only as true as its age; policy.quota_max_age_hours turns "old" into
+# code=quota-unknown, and `status` says which facts are measured.
+_quota_age_snapshot() {
+  # $1 root, $2 age in seconds. A window that resets far in the future.
+  printf '{"captured_at":%s,"five_hour":{"used_percentage":10,"resets_at":9999999999}}' \
+    "$(( $(date +%s) - $2 ))" > "$1/state/rate-limits.json"
+}
+test_p23_quota_age() {
+  local root="$FIXTURE/p23" repo="$FIXTURE/p23/git-lk" out log rc age
+  _runlock_fixture "$root" "$repo" tier2
+  log="$root/state/log"
+
+  # bin/quota.sh --age: seconds since the snapshot, "-" when the source has none.
+  _quota_age_snapshot "$root" 7200
+  age="$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)"
+  is "p2.3 quota.sh --age: reports the snapshot age in seconds" "$(( age >= 7200 && age < 7300 ))" "1"
+  is "p2.3 quota.sh --with-source: output shape is unchanged" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --with-source)" "90 quota-subscription.sh"
+  rm "$root/state/rate-limits.json"
+  is "p2.3 quota.sh --age: a stub has no age" \
+     "$(MEUTE_ROOT="$root" MEUTE_QUOTA_STUB=100 "$root/bin/quota.sh" --engine claude --age)" "-"
+
+  # Default (unset) keeps today's behaviour, and the run line records the age.
+  _quota_age_snapshot "$root" 7200
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 unset max age: an old snapshot still runs" "$(tail -1 "$log")" "status=ok"
+  has "p2.3 the run line carries quota_age=" "$(tail -1 "$log")" "quota_age=7"
+
+  # Set: an older snapshot is quota-unknown; a fresh one runs.
+  sed -i 's/^  quota_floor_percent: 30/&\n  quota_max_age_hours: 1/' "$root/repos.yaml"
+  rc=0; out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || rc=$?
+  has "p2.3 max age 1h, snapshot 2h old: declined as quota-unknown" "$(tail -1 "$log")" "code=quota-unknown"
+  has "p2.3 ...and the log says it was stale" "$(tail -1 "$log")" "stale"
+  _quota_age_snapshot "$root" 60
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 max age 1h, snapshot 1m old: runs" "$(tail -1 "$log")" "status=ok"
+
+  # A captured_at in the future must not count as fresh forever.
+  _quota_age_snapshot "$root" -3600
+  is "p2.3 quota.sh --age: a snapshot from the future is unknown, not 0s" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "unknown"
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 max age 1h, snapshot dated 1h ahead: declined as quota-unknown" "$(tail -1 "$log")" "code=quota-unknown"
+  _quota_age_snapshot "$root" -30
+  is "p2.3 quota.sh --age: 30s of clock skew is tolerated" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "0"
+  _quota_age_snapshot "$root" -3600
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+  sed -i 's/^  quota_floor_percent: 30/&\n  quota_max_age_hours: 1/' "$root/repos.yaml"
+  out="$("$root/bin/meute" status 2>&1)"
+  has "p2.3 status: a future snapshot is flagged as declined" "$out" "the runner declines"
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+
+  # status: three separate facts.
+  _quota_age_snapshot "$root" 7200
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+  out="$("$root/bin/meute" status 2>&1)"
+  has "p2.3 status: pool percentage with its age" "$out" "pool 90% remaining, snapshot 2h old"
+  has "p2.3 status: says others are not measured" "$out" "other consumers of this pool are not measured"
+
+  # Validation.
+  printf 'version: 1\npolicy:\n  quota_max_age_hours: -3\n' > "$root/bad.yaml"
+  is "p2.3 manifest: a negative max age is rejected" \
+     "$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" policy "$root/bad.yaml" >/dev/null 2>&1; echo $?)" "2"
+}
+
 # P1.7 (a), R5, D7: a finding has an identity across reports. The fingerprint is
 # sha1(repo | file path from the location | title), both normalised, so a repeat
 # audit that words the location `./src/db.py:90` instead of `src/db.py:88` is

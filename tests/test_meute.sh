@@ -6245,6 +6245,7 @@ test_probe_shell_options
 test_unit_limits
 test_plan_quarantine
 test_plan_quarantine_manifest_broken
+test_p23_quota_age
 test_p1_3_source_manifest
 test_p1_4_once
 test_p1_3_wait_lock
