@@ -1659,6 +1659,9 @@ PY
   _hreset; printf 'hold\t%s\tauto: provider rate limit\n' $(( now + 86400 )) > "$state/hold"
   "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1
   has "health --alert: an automatic hold alerts" "$(cat "$root/alert.txt" 2>/dev/null)" "automatic hold"
+  is  "health --alert: the alerted marker is owner-only" "$(stat -c %a "$state/health-alerted" 2>/dev/null)" "600"
+  is  "health --alert: ...and never reaches the public harness" \
+      "$(git -C "$REPO" check-ignore -q -- state/health-alerted; echo $?)" "0"
   rm -f "$root/alert.txt"
   out="$("${H[@]}" MEUTE_NOW=$(( now + 3600 )) "$root/bin/meute" health --alert 2>/dev/null)"; rc=$?
   [[ ! -e "$root/alert.txt" ]] && ok "health --alert: the same hold an hour later is not sent again" \

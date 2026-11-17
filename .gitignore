@@ -43,6 +43,8 @@ state/.plan-*
 # The subscription windows, snapshotted by contrib/statusline-capture.sh.
 state/rate-limits.json
 state/hold
+# Which health problems were already alerted (lib/health.sh).
+state/health-alerted
 # Where each in-flight tier-3 ticket stands (PRP-004 §4.3): one row per
 # <repo>/<ticket> naming its stage, branch, base SHA and build report.
 state/stages
