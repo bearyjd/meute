@@ -37,7 +37,7 @@ now="${MEUTE_NOW:-$(date +%s)}"
 command -v jq >/dev/null || { printf 'quota-subscription: jq is required\n' >&2; exit 1; }
 
 if [[ "${1:-}" == "--age" ]]; then
-  jq -r --argjson now "$now" 'if (.captured_at | type) == "number" then ($now - .captured_at | floor | [., 0] | max) else "unknown" end' \
+  jq -r --argjson now "$now" 'if (.captured_at | type) != "number" or (.captured_at - $now) > 60 then "unknown" else ($now - .captured_at | floor | [., 0] | max) end' \
     "$SNAPSHOT" 2>/dev/null || { printf 'quota-subscription: snapshot is not valid JSON\n' >&2; exit 1; }
   exit 0
 fi

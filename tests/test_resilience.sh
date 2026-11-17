@@ -733,6 +733,22 @@ test_p23_quota_age() {
   out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
   has "p2.3 max age 1h, snapshot 1m old: runs" "$(tail -1 "$log")" "status=ok"
 
+  # A captured_at in the future must not count as fresh forever.
+  _quota_age_snapshot "$root" -3600
+  is "p2.3 quota.sh --age: a snapshot from the future is unknown, not 0s" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "unknown"
+  out="$(env PATH="$root/stub:$PATH" "$root/bin/run.sh" daily 2>&1)" || true
+  has "p2.3 max age 1h, snapshot dated 1h ahead: declined as quota-unknown" "$(tail -1 "$log")" "code=quota-unknown"
+  _quota_age_snapshot "$root" -30
+  is "p2.3 quota.sh --age: 30s of clock skew is tolerated" \
+     "$(MEUTE_ROOT="$root" "$root/bin/quota.sh" --engine claude --age)" "0"
+  _quota_age_snapshot "$root" -3600
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+  sed -i 's/^  quota_floor_percent: 30/&\n  quota_max_age_hours: 1/' "$root/repos.yaml"
+  out="$("$root/bin/meute" status 2>&1)"
+  has "p2.3 status: a future snapshot is flagged as declined" "$out" "the runner declines"
+  sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
+
   # status: three separate facts.
   _quota_age_snapshot "$root" 7200
   sed -i '/quota_max_age_hours/d' "$root/repos.yaml"
