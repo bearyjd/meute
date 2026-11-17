@@ -31,7 +31,7 @@
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
 #   plan [--enqueue [--append|--replace] [--only <repo>]... [--skip-invalid]] [--allow-web] [--json] [dir]
-#                                  read-only portfolio inventory and proposed audit plan;
+#                                  portfolio inventory and proposed audit plan (writes only the derived state/plan-cache);
 #                                  --enqueue stages only read-only work for the normal runner
 #                                  (each staged run still cuts a scratch branch and worktree
 #                                  in the repository); tasks that reach the web are left out
@@ -609,9 +609,9 @@ cmd_resume() {
   fi
 }
 
-# Inventory a directory tree without enrolling anything, and optionally stage
-# the result for the runner. The work lives in lib/plan.sh; this is the
-# command line.
+# Inventory a directory tree without enrolling anything (only the derived
+# state/plan-cache is written), and optionally stage the result for the
+# runner. The work lives in lib/plan.sh; this is the command line.
 cmd_plan() {
   local enqueue=0 allow_web=0 json=0 skip_invalid=0 mode="" requested="" scan_dir
   local -a only=()
@@ -632,7 +632,7 @@ cmd_plan() {
   done
   # Usage errors exit 2, apart from the runtime refusals that exit 1.
   (( ${#only[@]} == 0 || enqueue )) || { note "plan: --only requires --enqueue"; exit 2; }
-  (( ! json || ! enqueue )) || { note "plan: --json is read-only and cannot be combined with --enqueue"; exit 2; }
+  (( ! json || ! enqueue )) || { note "plan: --json only reports and cannot be combined with --enqueue"; exit 2; }
   [[ -z "$mode" ]] || (( enqueue )) || { note "plan: --${mode} requires --enqueue"; exit 2; }
   (( ! skip_invalid || ${#only[@]} )) || { note "plan: --skip-invalid requires --only"; exit 2; }
   (( ! enqueue )) || plan_queue_guard "$mode"
@@ -676,7 +676,7 @@ cmd_plan() {
     # 3: staged, but not everything that was asked for.
     (( ${#PLAN_REJECTED[@]} == 0 )) || exit 3
   else
-    printf '\nNo manifest, repository, or state files were changed. Stage this exact plan for the runner with: meute plan --enqueue %s (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).\n' "$scan_dir"
+    printf '\nNo manifest or repository was changed (state/plan-cache is derived and safe to delete). Stage this exact plan for the runner with: meute plan --enqueue %s (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).\n' "$scan_dir"
   fi
 }
 

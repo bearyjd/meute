@@ -1073,7 +1073,7 @@ PY
   # direct children; task priority remains security then architecture.
   has "plan: ranks security before architecture for a repo" "$out" $'1. repo-gamma               audit-security'
   has "plan: follows with architecture" "$out" $'2. repo-gamma               architecture-review'
-  has "plan: keeps planning read-only" "$out" "No manifest, repository, or state files were changed."
+  has "plan: changes no manifest or repository" "$out" "No manifest or repository was changed"
   has "plan: the preview says what staging will still create" "$out" "scratch branch and a worktree"
   out="$(MEUTE_PLAN_MAX_DEPTH=17 "$root/bin/meute" plan 2>&1; echo "rc=$?")"
   has "plan: a scan deeper than 16 is refused" "$out" "MEUTE_PLAN_MAX_DEPTH"
@@ -1387,7 +1387,7 @@ test_plan_dedup() {
   dedup_repo "$golden/enrolled-g" g
   out="$("$golden/meute-stand-in/bin/meute" plan "$golden" 2>/dev/null)"
   is "dedup: a tree without copies prints the same output as before" "$out" "$(sed "s|@U@|$golden|g" <<'GOLD'
-Portfolio inventory (read-only)
+Portfolio inventory
   scan: @U@ (max depth: 4)
   discovered: 3  configured: 1  unconfigured: 2
 
@@ -1401,7 +1401,7 @@ Proposed read-only analysis plan
     1. repo-two                 audit-security         security baseline
     2. repo-one                 audit-security         security baseline
 
-No manifest, repository, or state files were changed. Stage this exact plan for the runner with: meute plan --enqueue @U@ (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).
+No manifest or repository was changed (state/plan-cache is derived and safe to delete). Stage this exact plan for the runner with: meute plan --enqueue @U@ (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).
 GOLD
 )"
   hasnt "dedup: ...with no duplicates section" "$out" "Duplicates collapsed"
@@ -6249,6 +6249,7 @@ test_plan_quarantine_manifest_broken
 test_p15_enqueue_refuses_unfinished
 test_p15_only_checked_first
 test_p15_plan_identity_cache
+test_p15_only_refuses_own_checkout
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

@@ -803,3 +803,30 @@ test_p15_plan_identity_cache() {
   PATH="$shim:$PATH" "$root/bin/meute" plan --json "$u" >/dev/null 2>&1
   is  "p1.5 cache: a moved HEAD is walked again, once" "$(wc -l < "$shim/rev-list.calls")" "1"
 }
+
+# P1.5 (b): --only never stages a repository inside meute's own checkout,
+# whether named directly or through a symlink elsewhere under the scan root.
+# A plain plan says what it did write: the derived state/plan-cache.
+test_p15_only_refuses_own_checkout() {
+  local u="$FIXTURE/p15e" root="$FIXTURE/p15e/meute-stand-in" out rc arg
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  dedup_repo "$root/.worktrees/nested" "p15-nested" >/dev/null
+  ln -s "$root/.worktrees/nested" "$u/sneaky"
+  for arg in "$root/.worktrees/nested" "$u/sneaky"; do
+    rm -f "$queue" "$root/state/plan-complete" "$root/state/plan-cache"
+    rc=0; out="$("$root/bin/meute" plan --enqueue --only "$arg" "$u" 2>&1)" || rc=$?
+    is  "p1.5 own checkout: --only ${arg#"$u"/} is refused" "$rc" "1"
+    has "p1.5 own checkout: ...saying why" "$out" "inside meute's own checkout"
+    is  "p1.5 own checkout: ...staging nothing" "$(test -e "$queue"; echo $?)" "1"
+  done
+  # The cheap .git check answers before git is asked, and says so.
+  mkdir -p "$u/plain"; rm -f "$queue"
+  rc=0; out="$("$root/bin/meute" plan --enqueue --only "$u/plain" "$u" 2>&1)" || rc=$?
+  is  "p1.5 only: a directory without .git is refused" "$rc" "1"
+  has "p1.5 only: ...as not a Git repository" "$out" "not a Git repository"
+  out="$("$root/bin/meute" plan "$u" 2>&1)"
+  hasnt "p1.5 cache: plan no longer calls itself read-only" "$out" "inventory (read-only)"
+  hasnt "p1.5 cache: plan no longer claims state is untouched" "$out" "or state files were changed"
+  has   "p1.5 cache: plan names the derived cache it wrote" "$out" "state/plan-cache is derived and safe to delete"
+}

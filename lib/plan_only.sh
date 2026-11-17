@@ -33,7 +33,8 @@ plan_only_reject() {
 }
 
 # The cheap checks: no git, no walk. Sets PLAN_ONLY_ARGS (the arguments that
-# passed) and PLAN_ONLY_REAL (argument -> resolved path).
+# passed) and PLAN_ONLY_REAL (argument -> resolved path). The own-checkout
+# test walks the physical path: a symlink elsewhere must not hide it.
 plan_only_precheck() {
   local scan_dir="$1" arg real why; shift
   PLAN_ONLY_ARGS=(); PLAN_ONLY_REAL=()
@@ -42,7 +43,7 @@ plan_only_precheck() {
     if ! real="$(cd "$arg" 2>/dev/null && pwd)"; then why="no such directory"
     elif [[ ! -e "$real/.git" ]]; then why="not a Git repository"
     elif ! under_scan_root "$real" "$scan_dir"; then why="outside the scan root ${scan_dir}"
-    elif under_scan_root "$real" "$MEUTE_ROOT"; then why="inside meute's own checkout"
+    elif under_scan_root "$(cd "$real" && pwd -P)" "$MEUTE_ROOT"; then why="inside meute's own checkout"
     fi
     if [[ -n "$why" ]]; then
       plan_only_reject "$arg" "plan: --only ${arg}: not an unconfigured repository (${why})"

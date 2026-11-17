@@ -3,7 +3,7 @@
 Everything goes through meute's own commands, so the page cannot drift from
 the CLI or slip past a gate:
 
-  plan()     bin/meute plan --json                       (read-only)
+  plan()     bin/meute plan --json                       (writes only state/plan-cache)
   enqueue()  bin/meute plan --enqueue --append --skip-invalid --only <p>... [-- <scan>]
   start()    one background loop of `bin/run.sh <slot> --repo <name> --task <task>`,
              one staged item per call

@@ -248,7 +248,7 @@ plan_queue_guard() {
 # The inventory and the ranked proposal, with what was left out and why.
 plan_print() {
   local scan_dir="$1" max_depth="$2" real task reason rank=1
-  printf 'Portfolio inventory (read-only)\n'
+  printf 'Portfolio inventory\n'
   printf '  scan: %s (max depth: %s)\n' "$scan_dir" "$max_depth"
   printf '  discovered: %d  configured: %d  unconfigured: %d' \
     "${#PLAN_REPOS[@]}" "${#PLAN_CONFIGURED[@]}" "${#PLAN_UNCONFIGURED[@]}"
