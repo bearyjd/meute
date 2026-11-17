@@ -903,6 +903,36 @@ test_p1_7b_verify_claim() {
       "$(jq -r '.findings[] | select(.report=="alpha/audit-01" and (.n==1 or .n==2 or .n==3 or .n==5)) | "\(.n):\(.verdict):\(.hidden)"' <<< "$out" | sort | paste -sd,)" \
       "1:gone:true,2:superseded:true,3:current:true,5:changed:false"
 
+  # A claim landing while verify is still diffing survives verify's write.
+  local slow="$root/slowgit" realgit mark="$root/slowgit/in-diff"
+  realgit="$(command -v git)"; mkdir -p "$slow"
+  printf '#!/usr/bin/env bash\nfor a in "$@"; do [[ $a == diff && ! -e %q ]] && { : > %q; sleep 3; break; }; done\nexec %q "$@"\n' \
+    "$mark" "$mark" "$realgit" > "$slow/git"; chmod +x "$slow/git"
+  PATH="$slow:$PATH" "$root/bin/meute" findings verify >/dev/null 2>&1 & local vpid=$!
+  for _ in $(seq 1 100); do [[ -e "$mark" ]] && break; sleep 0.1; done
+  "$root/bin/meute" claim alpha/audit-01 -f 5 --pr "$url" >/dev/null 2>&1
+  is  "p1.7b race: claim during verify exits 0" "$?" "0"
+  wait "$vpid"
+  is  "p1.7b race: verify does not wipe a concurrent claim" "$(awk -F'\t' '$1=="alpha/audit-01#5"{print $5}' "$st")" "$url"
+  is  "p1.7b race: verify still records its verdict" "$(awk -F'\t' '$1=="alpha/audit-01#5"{print $2}' "$st")" "changed"
+  "$root/bin/meute" findings verify >/dev/null 2>&1
+  # The lock: a writer between its re-read and its write makes claim wait.
+  rm -f "$mark"
+  MEUTE_ROOT="$root" MARK="$mark" python3 - "$REPO/lib" <<'PY' & vpid=$!
+import os, sys, time
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+root = os.environ["MEUTE_ROOT"]
+with fs.locked(root):
+    rows = fs.read_status(root)
+    open(os.environ["MARK"], "w").close(); time.sleep(2)
+    rows["alpha/audit-04#1"] = ["current", "h", "t", ""]
+    fs.write_status(root, rows)
+PY
+  for _ in $(seq 1 100); do [[ -e "$mark" ]] && break; sleep 0.1; done
+  "$root/bin/meute" claim alpha/audit-04 -f 2 --pr "$url" >/dev/null 2>&1
+  wait "$vpid"
+  is  "p1.7b lock: a claim waits for a writer holding the lock" "$(awk -F'\t' '$1=="alpha/audit-04#2"{print $5}' "$st")" "$url"
+
   # Rollback: deleting state/finding-status drops every verdict and claim.
   rm -f "$st"
   out="$("$root/bin/meute" findings --new 2>&1)"

@@ -11,6 +11,8 @@ deleting that file restores the old behaviour.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
 import subprocess
@@ -92,11 +94,24 @@ def write_status(root: str, rows: dict[str, list[str]]) -> None:
         raise
 
 
+@contextlib.contextmanager
+def locked(root: str):
+    """Exclusive lock for a read-modify-write of state/finding-status, so a
+    claim landing while verify runs is not overwritten by verify's snapshot.
+    Callers re-read the file inside the lock."""
+    path = status_path(root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".lock", "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
 def claim(root: str, key: str, pr: str) -> None:
-    rows = read_status(root)
-    row = rows.get(key, ["", "", "", ""])
-    rows[key] = [row[0], row[1], row[2], pr]
-    write_status(root, rows)
+    with locked(root):
+        rows = read_status(root)
+        row = rows.get(key, ["", "", "", ""])
+        rows[key] = [row[0], row[1], row[2], pr]
+        write_status(root, rows)
 
 
 def pr_of(status_row: list[str] | None, note: str) -> str:

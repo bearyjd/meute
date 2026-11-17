@@ -268,7 +268,7 @@ def verify(repo_paths: dict[str, str], only_repo: str = "") -> dict[str, int]:
     """`meute findings verify`: a verdict for every undecided finding, written
     to state/finding-status (claims kept). Returns counts per verdict."""
     rows = _state_rows()
-    status = finding_status.read_status(ROOT)
+    results: dict[str, tuple[str, str]] = {}
     counts = {v: 0 for v in finding_status.VERDICTS}
     now = subprocess.run(["date", "--iso-8601=seconds"], capture_output=True,
                          text=True).stdout.strip()
@@ -288,11 +288,16 @@ def verify(repo_paths: dict[str, str], only_repo: str = "") -> dict[str, int]:
             repo_paths.get(repo, ""), meta.get("base", ""),
             [report_lib._norm_path(f["location"]) if f["location"] else "" for f in todo])
         for f, verdict in zip(todo, verdicts):
-            key = f"{rid}#{f['n']}"
+            results[f"{rid}#{f['n']}"] = (verdict, head)
+            counts[verdict] += 1
+    # Re-read under the lock: the git work above can take minutes, and a
+    # claim written meanwhile must keep its pr column.
+    with finding_status.locked(ROOT):
+        status = finding_status.read_status(ROOT)
+        for key, (verdict, head) in results.items():
             pr = status.get(key, ["", "", "", ""])[3]
             status[key] = [verdict, head, now, pr]
-            counts[verdict] += 1
-    finding_status.write_status(ROOT, status)
+        finding_status.write_status(ROOT, status)
     return counts
 
 
