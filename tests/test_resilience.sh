@@ -950,3 +950,36 @@ test_p1_7b_status_ignored() {
       "$(git -C "$REPO" check-ignore -q -- "$f"; echo $?)" "0"
   done
 }
+
+# P1.7 (b): verify_report must not let one finding's bad location, or a
+# report's front-matter, steer git. A location outside the repository is
+# unknown on its own and leaves its neighbours' verdicts intact; a base sha or
+# ref that git would parse as an option is never passed to git.
+test_p1_7b_verify_hardening() {
+  local g="$FIXTURE/p17bh/alpha" a trap="$FIXTURE/p17bh/clobbered" out
+  local gitc=(git -C "$g" -c user.name=t -c user.email=t@t)
+  mkdir -p "$g/src"; git init -q -b main "$g"
+  printf 'db v1\n' > "$g/src/db.py"
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm A; a="$(git -C "$g" rev-parse HEAD)"
+  out="$(python3 - "$REPO/lib" "$g" "$a" "$trap" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+g, a, trap = sys.argv[2:5]
+def v(base, files): return ",".join(fs.verify_report(g, base, files)[1])
+print("abs=" + v("main@" + a, ["src/db.py", "/etc/passwd"]))
+print("up=" + v("main@" + a, ["src/db.py", "../x.py"]))
+print("mid=" + v("main@" + a, ["src/db.py", "src/../../x.py"]))
+print("optsha=" + v("main@--output=" + trap, ["src/db.py"]))
+print("revsha=" + v("main@HEAD", ["src/db.py"]))
+print("optref=" + v("--output=" + trap + "@" + a, ["src/db.py"]))
+PY
+)"
+  is  "p1.7b hardening: an absolute location does not void its neighbours" "$(sed -n 's/^abs=//p' <<< "$out")" "current,unknown"
+  is  "p1.7b hardening: a ../ location does not void its neighbours" "$(sed -n 's/^up=//p' <<< "$out")" "current,unknown"
+  is  "p1.7b hardening: a .. component mid-path is unknown" "$(sed -n 's/^mid=//p' <<< "$out")" "current,unknown"
+  is  "p1.7b hardening: a base sha that is a git option is unknown" "$(sed -n 's/^optsha=//p' <<< "$out")" "unknown"
+  is  "p1.7b hardening: a base sha that is not hex is unknown" "$(sed -n 's/^revsha=//p' <<< "$out")" "unknown"
+  is  "p1.7b hardening: a base ref that is a git option is unknown" "$(sed -n 's/^optref=//p' <<< "$out")" "unknown"
+  [[ ! -e "$trap" ]] && ok "p1.7b hardening: base front-matter never reaches git as an option" \
+    || bad "p1.7b hardening: base front-matter never reaches git as an option" "$trap was written"
+}

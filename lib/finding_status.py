@@ -60,6 +60,9 @@ VERDICTS = ("gone", "changed", "current", "unknown")
 # D7: hidden from `findings --new`; `--all` still lists them.
 HIDDEN_VERDICTS = ("gone", "superseded")
 _PR_NOTE = re.compile(r"\bpr: (\S+)")
+# A recorded base sha is hex from `git rev-parse`; anything else (an option
+# such as `--output=<file>` above all) never reaches git.
+_SHA = re.compile(r"[0-9a-fA-F]{4,64}")
 
 
 def status_path(root: str) -> str:
@@ -133,13 +136,14 @@ def verify_report(repo_path: str, base: str, files: list[str]) -> tuple[str, lis
     Reads the repository only: no fetch, no checkout."""
     ref, _, sha = str(base).rpartition("@")
     unknown = ("", ["unknown"] * len(files))
-    if not sha or not repo_path or not os.path.isdir(repo_path):
+    if (not _SHA.fullmatch(sha) or ref.startswith("-")
+            or not repo_path or not os.path.isdir(repo_path)):
         return unknown
     head = _git(repo_path, "rev-parse", "--verify", "-q", f"{ref or 'HEAD'}^{{commit}}")
     if head.returncode != 0:
         return unknown
     head_sha = head.stdout.strip()
-    diff = _git(repo_path, "diff", "--name-status", "-M", "-z", sha, head_sha, "--")
+    diff = _git(repo_path, "diff", "--name-status", "-M", "-z", "--end-of-options", sha, head_sha, "--")
     if diff.returncode != 0:
         return unknown
     touched: dict[str, str] = {}
@@ -154,14 +158,17 @@ def verify_report(repo_path: str, base: str, files: list[str]) -> tuple[str, lis
             continue
         touched[fields[i + 1]] = "gone" if status == "D" else "changed"
         i += 2
-    wanted = sorted({f for f in files if f and f not in touched})
+    # A location outside the repository would make ls-tree fail for every
+    # path at once; it is unknown on its own instead.
+    inside = {f for f in files if f and not os.path.isabs(f) and ".." not in f.split("/")}
+    wanted = sorted(inside - touched.keys())
     present: set[str] = set()
     if wanted:
         tree = _git(repo_path, "--literal-pathspecs", "ls-tree", "--name-only", "-z", head_sha, "--", *wanted)
         present = set(tree.stdout.split("\0")) if tree.returncode == 0 else set()
     verdicts = []
     for f in files:
-        if not f:
+        if f not in inside:
             verdicts.append("unknown")
         elif f in touched:
             verdicts.append(touched[f])
