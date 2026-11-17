@@ -322,6 +322,13 @@ plan_stage() {
   # allowed one.
   local web_json=false; (( allow_web )) && web_json=true
   local staged="$(( ${#PLAN_UNCONFIGURED[@]} * ${#PLAN_TASKS[@]} ))" what="Staged" before
+  # From the read to the rename, a runner's retire must not archive the queue
+  # and clear its marks under us (lib/plan_queue_lock.sh). A die releases it.
+  plan_queue_lock || { rm -f "$entries_file" "$queue_tmp"
+    die "plan: ${STATE_DIR}/.plan-lock stayed busy (another enqueue or a run holds it); try again"; }
+  # D3 again, now that nothing can change the queue: it was checked before
+  # the scan, and an enqueue from the web may have appended to it since.
+  ( plan_queue_guard "$mode" ) || { rm -f "$entries_file" "$queue_tmp"; exit 1; }
   if [[ "$mode" == append && -f "$queue_file" ]]; then
     # An entry already staged keeps its place and its mark. allow_web is
     # either plan's: each entry was staged under a plan that allowed it.
@@ -344,6 +351,7 @@ plan_stage() {
     # silently suppress newly staged work.
     rm -f "${STATE_DIR}/plan-complete"
   fi
+  plan_queue_unlock
   rm -f "$entries_file"
   printf '\n%s %d read-only analysis item(s) in %s. The normal runner will prioritize this explicit queue; it cannot enroll repositories or run a writing tier, but each run still cuts a meute/<task>-<date> scratch branch and a worktree in the unenrolled repository (removed when the run ends; a killed run leaves them for git worktree prune).\n' \
     "$what" "$staged" "$queue_file"

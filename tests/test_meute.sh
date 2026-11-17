@@ -743,7 +743,7 @@ test_plan_state_ignored() {
            state/plan-queue.completed-20260918T000000.json \
            state/plan-queue.completed-20260918T000000.json.123 \
            state/.plan-entries.abc state/.plan-queue.abc state/.kv.abc123 \
-           state/plan-cache state/.plan-cache.abc; do
+           state/plan-cache state/.plan-cache.abc state/.plan-lock; do
     is "gitignore: ${f} never reaches the public harness" \
       "$(git -C "$REPO" check-ignore -q -- "$f"; echo $?)" "0"
   done
@@ -6251,6 +6251,9 @@ test_p15_only_checked_first
 test_p15_plan_identity_cache
 test_p15_only_refuses_own_checkout
 test_p15_only_one_spelling
+test_p15_append_vs_retire
+test_p15_retire_waits_for_lock
+test_p15_guard_rechecked_under_lock
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

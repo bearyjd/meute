@@ -853,3 +853,94 @@ test_p15_only_one_spelling() {
   is  "p1.5 spelling: --append of the other spelling adds no second entry" \
     "$(jq '.entries | length' "$queue" 2>/dev/null)" "1"
 }
+
+# P1.5 (a), R15: --append reads the queue, merges, and renames the result over
+# it. A retire that lands in between (the last item just finished) archives
+# the queue and clears plan-complete; the rename would then put every finished
+# entry back unmarked and the runner would run them all again. The append and
+# the retire share state/.plan-lock, so the retire waits. The jq shim
+# lets the merge read the queue, then retires the way the runner does, honouring
+# the same lock, before the merged queue is written.
+test_p15_append_vs_retire() {
+  local u="$FIXTURE/p15g" root="$FIXTURE/p15g/meute-stand-in" shim="$FIXTURE/p15g-shim" rc
+  local real_jq; real_jq="$(command -v jq)"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" done="$root/state/plan-complete"
+  local lock="$root/state/.plan-lock"
+  "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  mkdir -p "$shim"
+  cat > "$shim/jq" <<SHIM
+#!/usr/bin/env bash
+out="\$("$real_jq" "\$@")"; rc=\$?
+if [[ " \$* " == *" --slurpfile "* ]]; then
+  if flock -n "$lock" sh -c 'mv "$queue" "$queue.archived" && rm -f "$done"'; then
+    echo retired >> "$shim/calls"
+  else
+    echo deferred >> "$shim/calls"
+  fi
+fi
+printf '%s\n' "\$out"; exit \$rc
+SHIM
+  chmod +x "$shim/jq"
+  rc=0; PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --append --only "$u/b" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 race: --append over a finished queue succeeds" "$rc" "0"
+  is  "p1.5 race: a retire during the merge waits for the lock" "$(cat "$shim/calls" 2>/dev/null)" "deferred"
+  is  "p1.5 race: ...so the finished entry keeps its mark" "$(wc -l < "$done" 2>/dev/null || echo 0)" "1"
+  is  "p1.5 race: ...and the queue holds both entries" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue" 2>/dev/null)" "a,b"
+}
+
+# The runner's side of the same lock: while an enqueue holds it, a fire does
+# not retire the queue under it; once it is free, the next fire does.
+test_p15_retire_waits_for_lock() {
+  local u="$FIXTURE/p15h" root="$FIXTURE/p15h/meute-stand-in" out fd
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" lock="$root/state/.plan-lock"
+  "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$root/state/plan-complete"
+  mkdir -p "$root/stub"
+  printf '#!/bin/sh\n[ "$1" = auth ] && { echo %s; exit 0; }\nexit 1\n' \
+    "'{\"loggedIn\":true,\"subscriptionType\":\"max\",\"authMethod\":\"stub\"}'" > "$root/stub/claude"
+  chmod +x "$root/stub/claude"
+  exec {fd}>"$lock"; flock "$fd"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_PLAN_QUEUE_LOCK_WAIT=1 \
+    "$root/bin/run.sh" daily --dry-run 2>&1)"
+  exec {fd}>&-
+  hasnt "p1.5 race: a fire does not retire a queue an enqueue holds" "$out" "archived queue"
+  is    "p1.5 race: ...the queue stays put" "$([[ -f "$queue" ]] && echo staged || echo gone)" "staged"
+  has   "p1.5 race: ...and the fire says why" "$out" "plan queue is busy"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has   "p1.5 race: the next fire retires it" "$out" "archived queue"
+}
+
+# D3 is checked before the scan, but the queue can change during it: a web
+# Enqueue (--append) may stage unattempted work while a plain CLI enqueue is
+# still walking the tree. The write re-checks under the lock, so that work is
+# neither discarded nor its marks cleared. The find shim does the web's append,
+# taking the lock as it does, on the scan's first walk.
+test_p15_guard_rechecked_under_lock() {
+  local u="$FIXTURE/p15i" root="$FIXTURE/p15i/meute-stand-in" shim="$FIXTURE/p15i-shim" out rc after
+  local real_find real_jq; real_find="$(command -v find)"; real_jq="$(command -v jq)"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" done="$root/state/plan-complete"
+  local lock="$root/state/.plan-lock"
+  "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  mkdir -p "$shim"
+  cat > "$shim/find" <<SHIM
+#!/usr/bin/env bash
+if [[ ! -e "$shim/injected" ]]; then
+  touch "$shim/injected"
+  flock "$lock" sh -c '"$real_jq" ".entries += [{name:\"plan-web\",path:\"$u/b\",task:\"audit-security\",spec:\"web\"}]" "$queue" > "$queue.web" && mv "$queue.web" "$queue"'
+fi
+exec "$real_find" "\$@"
+SHIM
+  chmod +x "$shim/find"
+  rc=0; out="$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue "$u" 2>&1)" || rc=$?
+  after="$(jq -r '[.entries[].name] | join(",")' "$queue" 2>/dev/null)"
+  is  "p1.5 race: work appended during the scan refuses a plain enqueue" "$rc" "1"
+  has "p1.5 race: ...naming --append" "$out" "--append"
+  has "p1.5 race: ...keeping the appended entry" "$after" "plan-web"
+  is  "p1.5 race: ...and the completion marks" "$(wc -l < "$done" 2>/dev/null || echo 0)" "1"
+}
