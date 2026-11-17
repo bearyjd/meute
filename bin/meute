@@ -33,6 +33,11 @@
 #                                  uid, capabilities, /work, /out, the network
 #   pause [--for 3d] [-r why]     stand the fleet down; every slot declines until it expires
 #   resume                        lift the pause early
+#   drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...
+#                                  run the slot unforced, fire after fire (waiting up to
+#                                  900 s for the lock), until one full rotation is done,
+#                                  the staged plan is drained, or a fire is declined;
+#                                  exits with that fire's status (lib/drain.sh)
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
 #   plan [--enqueue [--only <repo>]...] [--allow-web] [--json] [dir]
@@ -105,6 +110,7 @@ source "${MEUTE_ROOT}/lib/unitlimits.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/tmp.sh"
+source "${MEUTE_ROOT}/lib/drain.sh"
 
 SCRUBBED=""
 AUTH_MODE=""
@@ -757,6 +763,7 @@ main() {
     container) cmd_container "$@" ;;
     pause)    cmd_pause "$@" ;;
     resume)   cmd_resume "$@" ;;
+    drain)    cmd_drain "$@" ;;
     discover) cmd_discover "$@" ;;
     plan)     cmd_plan "$@" ;;
     tui)      cmd_tui "$@" ;;
