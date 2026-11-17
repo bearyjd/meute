@@ -95,8 +95,8 @@ def read_log(path: str, offset: int = 0) -> list[dict]:
 
 # The code= tokens of lib/outcome.sh, and run.sh's --strict-exit statuses.
 _SKIP_CODES = frozenset({"hold", "lock", "budget", "quota-floor", "quota-unknown",
-                         "nothing-eligible", "no-queue", "load", "disk"})
-_SKIP_STATUSES = frozenset(range(10, 16))
+                         "nothing-eligible", "no-queue", "load", "disk", "already-done"})
+_SKIP_STATUSES = frozenset(range(10, 17))
 
 
 def classify(records: list[dict], returncode: int, slot: str, since: float) -> dict:
@@ -106,15 +106,15 @@ def classify(records: list[dict], returncode: int, slot: str, since: float) -> d
     a timer firing the other slot (or a late line from an older run) writes
     to the same log and is not this call's outcome. The line's code= decides
     when it has one; the free-text status is the fallback for older lines.
-    Without a line, a strict-exit status of 10-15 still says "skipped". That
+    Without a line, a strict-exit status of 10-16 still says "skipped". That
     holds regardless of strictness: a non-strict run could in theory exit
-    10-15 via `exit "$commit_rc"`, but that is very unlikely.
+    10-16 via `exit "$commit_rc"`, but that is very unlikely.
     """
     own = [rec for rec in records
            if rec.get("slot") == slot and _at_or_after(rec, since)]
     if not own:
         return {"status": "skipped" if returncode in _SKIP_STATUSES else "error",
-                "repo": None, "task": None,
+                "repo": None, "task": None, "code": None,
                 "reason": f"run.sh exited {returncode} without a log line"}
     last = own[-1]
     code = last.get("code")
@@ -126,7 +126,7 @@ def classify(records: list[dict], returncode: int, slot: str, since: float) -> d
     elif code in ("failed", "died"):
         status = "error"
     return {"status": status if status in ("ok", "skipped") else "error",
-            "repo": last.get("repo"), "task": last.get("task"),
+            "repo": last.get("repo"), "task": last.get("task"), "code": code,
             "reason": last.get("reason") or last.get("detail")}
 
 
