@@ -802,15 +802,15 @@ PY
   has   "policy override: a row past the 7-day cap is ignored" "$(tail -1 "$root/state/log")" "below floor 30%"
   hasnt "policy override: ...and the line is not marked" "$(tail -1 "$root/state/log")" "policy=override"
 
-  # A hand-edited non-finite cost is skipped like an expired row: the floor row
-  # beside it stays live, and `policy show` lists only what the run obeys.
+  # A hand-edited non-finite cost is skipped (and reported): the floor row
+  # beside it stays live, and `policy show` marks it IGNORED.
   printf 'quota_floor_percent\t1\t%s\thand edit\nweekly_cost_usd\tnan\t%s\thand edit\n' \
     "$(( now + 3600 ))" "$(( now + 3600 ))" > "$root/state/policy-override"
   out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
   has   "policy override: a hand-edited nan cost row is skipped, the floor row applies" "$(tail -1 "$root/state/log")" "status=ok"
   has   "policy override: ...and the line is marked" "$(tail -1 "$root/state/log")" "policy=override"
   out="$("${M[@]}" "$root/bin/meute" policy show 2>&1)"
-  hasnt "policy show: ...the nan row is not listed" "$out" "weekly_cost_usd"
+  has   "policy show: ...the nan row is marked IGNORED" "$out" "weekly_cost_usd=nan  IGNORED"
   has   "policy show: ...the floor row is" "$out" "quota_floor_percent=1"
   # The web inbox shows the floor a run obeys, not the manifest's.
   out="$(MEUTE_ROOT="$root" "${M[@]}" python3 "$root/lib/inbox.py" dump 2>/dev/null | jq -r .status.floor)"
@@ -914,6 +914,54 @@ test_policy_override_hardening() {
 
   is "gitignore: state/policy-override is ignored" \
      "$(git -C "$REPO" check-ignore -q -- state/policy-override; echo $?)" "0"
+  rm -f "$f" "$root/err"
+}
+
+# A bad row in a hand-edited override must never be a silent revert to the
+# looser manifest value: a short row, a nan/inf, and a later bad duplicate are
+# each reported, and an earlier valid row for the key is kept.
+test_policy_override_bad_rows() {
+  local root="$FIXTURE/polovrows" repo="$FIXTURE/polovrows/git-lk" now out err f
+  _runlock_fixture "$root" "$repo" tier2
+  now="$(date +%s)"; f="$root/state/policy-override"
+  local E=( env MEUTE_NOW="$now" python3 "$root/lib/manifest.py" policy-effective "$root/repos.yaml" "$f" )
+  local fut="$(( now + 3600 ))"
+
+  # (1) fewer than 3 fields: no until.
+  printf 'tier3_max_in_flight\t1\n' > "$f"
+  out="$("${E[@]}" 2>"$root/err")"; err="$(cat "$root/err")"
+  has "policy override: a row without an until is reported on stderr" "$err" "tier3_max_in_flight"
+  has "policy override: ...listed in override_ignored" "$(jq -c .override_ignored <<< "$out")" "tier3_max_in_flight"
+  out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+  has "policy show: ...marks it IGNORED" "$out" "tier3_max_in_flight=1  IGNORED"
+  env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_NOW="$now" "$root/bin/run.sh" daily >/dev/null 2>&1
+  has "policy override: ...and the run line names it" "$(tail -1 "$root/state/log")" "policy_ignored=tier3_max_in_flight"
+
+  # (2) nan / inf.
+  for bad in nan inf; do
+    printf 'community_share\t%s\t%s\tx\n' "$bad" "$fut" > "$f"
+    out="$("${E[@]}" 2>"$root/err")"; err="$(cat "$root/err")"
+    has "policy override: a $bad value is reported on stderr" "$err" "community_share"
+    has "policy override: ...listed in override_ignored" "$(jq -c .override_ignored <<< "$out")" "community_share"
+    out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+    has "policy show: ...a $bad row is marked IGNORED" "$out" "community_share=$bad  IGNORED"
+  done
+
+  # (3) an earlier valid tightening row survives a later bad duplicate.
+  { printf 'tier3_max_in_flight\t1\t%s\ttighten\n' "$fut"
+    printf 'tier3_max_in_flight\tabc\t%s\ttypo\n' "$fut"; } > "$f"
+  out="$("${E[@]}" 2>"$root/err")"; err="$(cat "$root/err")"
+  is  "policy override: a later bad duplicate does not shadow the valid row" "$(jq -r .tier3_max_in_flight <<< "$out")" "1"
+  has "policy override: ...the bad duplicate is reported" "$(jq -c .override_ignored <<< "$out")" "tier3_max_in_flight"
+  has "policy override: ...on stderr too" "$err" "tier3_max_in_flight"
+  is  "policy override: ...and the key still counts as applied" "$(jq -c .override <<< "$out")" '["tier3_max_in_flight"]'
+  out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+  has "policy show: ...the bad duplicate row is marked IGNORED" "$out" "tier3_max_in_flight=abc  IGNORED"
+  hasnt "policy show: ...and is not listed as applied" "$out" "tier3_max_in_flight=abc  until"
+  # A later valid duplicate still wins.
+  { printf 'tier3_max_in_flight\t1\t%s\ta\n' "$fut"
+    printf 'tier3_max_in_flight\t2\t%s\tb\n' "$fut"; } > "$f"
+  is  "policy override: a later valid duplicate still wins" "$(jq -r .tier3_max_in_flight <<< "$("${E[@]}" 2>/dev/null)")" "2"
   rm -f "$f" "$root/err"
 }
 

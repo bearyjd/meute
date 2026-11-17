@@ -6249,6 +6249,7 @@ test_plan_quarantine
 test_plan_quarantine_manifest_broken
 test_policy_override
 test_policy_override_hardening
+test_policy_override_bad_rows
 test_p24_redact
 test_p24_report_and_umask
 test_p24_doctor
