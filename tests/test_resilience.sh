@@ -987,3 +987,45 @@ test_p1_3_drain_repo_cursor() {
   is "drain --repo: a narrowed rotation over two repos"      "$(_drain_ran "$root"):$rc" "lk2 lk3:0"
   is "drain --repo: ...still leaves the shared cursor on lk4" "$(grep -P '^cursor\.daily\t' "$root/state/cursor" | grep -c lk4)" "1"
 }
+
+# P2.7 (R14): drain starts each run.sh in a transient systemd scope when
+# systemd-run works, so an engine straggler dies with the scope; otherwise it
+# behaves as before. A stub systemd-run logs its argv and execs the command.
+_scope_stub() {
+  local root="$1"
+  cat > "$root/stub/systemd-run" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> '$root/scope.calls'
+[[ "\${!#}" == true && -n "\${SCOPE_PROBE_FAIL:-}" ]] && exit 1
+while [[ "\$1" == --* ]]; do shift; done
+exec "\$@"
+EOF
+  chmod +x "$root/stub/systemd-run"
+}
+# run.sh invocations the stub launched (the probe line ends in "true").
+_scope_runs() { local n; n="$(grep -c 'bin/run.sh daily' "$1/scope.calls" 2>/dev/null)"; echo "${n:-0}"; }
+
+test_p2_7_scope_containment() {
+  local root="$FIXTURE/p27" rc
+  _drain_fixture "$root" 2
+  _scope_stub "$root"
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_SCOPE=on MEUTE_SYSTEMD_RUN="$root/stub/systemd-run" )
+
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: the drain still completes and exits 0"          "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+  is  "scope: ...each run.sh went through systemd-run"        "$(_scope_runs "$root")" "2"
+  has "scope: ...as a user scope that is collected"           "$(grep 'bin/run.sh daily' "$root/scope.calls" | head -1)" "--user --scope --collect"
+
+  rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
+  rc=0; SCOPE_PROBE_FAIL=1 "${env[@]}" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: a failing systemd-run probe falls back, drain works" "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+  is  "scope: ...and no run.sh goes through it"               "$(_scope_runs "$root")" "0"
+
+  rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
+  rc=0; "${env[@]}" MEUTE_SYSTEMD_RUN="$root/stub/absent" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: no systemd-run at all falls back, drain works"  "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+
+  rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
+  rc=0; "${env[@]}" MEUTE_SCOPE=off "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is  "scope: MEUTE_SCOPE=off never calls systemd-run"        "$rc:$(_scope_runs "$root"):$([[ -e $root/scope.calls ]] && echo called || echo none)" "0:0:none"
+}

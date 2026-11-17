@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -60,6 +61,21 @@ class RunConflict(Exception):
 
 class RunnerFailed(Exception):
     """A meute command failed; the message is safe to show."""
+
+
+def scope_prefix() -> list[str]:
+    """The systemd-run prefix that puts a run.sh in a transient user scope (so
+    engine stragglers die with it), or [] when unavailable (lib/scope.sh)."""
+    binary = os.environ.get("MEUTE_SYSTEMD_RUN", "systemd-run")
+    if os.environ.get("MEUTE_SCOPE", "on") == "off" or shutil.which(binary) is None:
+        return []
+    prefix = [binary, "--user", "--scope", "--collect", "--quiet"]
+    try:
+        probe = subprocess.run(prefix + ["true"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return prefix if probe.returncode == 0 else []
 
 
 def subprocess_runner(argv: list[str], cwd: str, out_path: str | None = None,
@@ -86,7 +102,7 @@ def subprocess_runner(argv: list[str], cwd: str, out_path: str | None = None,
             raise
         return proc.returncode, out
     with open(out_path, "ab") as out:
-        child = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
+        child = subprocess.Popen(scope_prefix() + argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
                                  stderr=out, start_new_session=True)
     return child.wait(), ""
 

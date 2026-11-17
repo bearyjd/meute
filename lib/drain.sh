@@ -101,12 +101,13 @@ cmd_drain() {
   grep -qxF "$start" < <(cut -f1 <<< "$keys") || sentinel="$(tail -n1 <<< "$keys" | cut -f1)"
   seen=$'\n'"${start}"$'\n'
 
+  scope_init
   while :; do
     if [[ "$mode" == plan ]] && ! drain_plan_pending "$slot" "$only"; then drain_stop 0 "the staged plan is drained"; fi
     drain_before_deadline || drain_stop 0 "reached --until ${until}"
     [[ -z "$max" ]] || (( DRAIN_FIRES < max )) || drain_stop 0 "reached --max ${max}"
     rc=0
-    MEUTE_ONLY_REPOS="$only" "${MEUTE_ROOT}/bin/run.sh" "$slot" --strict-exit \
+    MEUTE_ONLY_REPOS="$only" "${SCOPE_CMD[@]}" "${MEUTE_ROOT}/bin/run.sh" "$slot" --strict-exit \
       --wait-lock "$DRAIN_WAIT_LOCK" --source "$mode" --once || rc=$?
     (( rc <= 1 )) || drain_stop "$rc" "stopped on run.sh exit ${rc}"
     DRAIN_FIRES=$(( DRAIN_FIRES + 1 ))

@@ -2,10 +2,13 @@
 subprocess timeouts. A fake runner stands in for meute/run.sh/manifest.py;
 nothing here runs the real fleet or touches the real state/."""
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runctl_helpers import ALPHA, BETA, RunCtlCase, name_for, runctl  # noqa: E402
@@ -137,3 +140,46 @@ class SubprocessRunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScopeContainmentTests(unittest.TestCase):
+    """A run.sh item started by the web loop goes through a systemd user scope
+    when systemd-run works (P2.7, R14); otherwise it runs as before."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.stub = os.path.join(self.tmp, "systemd-run")
+        self.calls = os.path.join(self.tmp, "calls")
+        with open(self.stub, "w") as f:
+            f.write('#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "' + self.calls + '"\n'
+                    '[[ "${!#}" == true && -n "${SCOPE_PROBE_FAIL:-}" ]] && exit 1\n'
+                    'while [[ "$1" == --* ]]; do shift; done\nexec "$@"\n')
+        os.chmod(self.stub, 0o755)
+        self.out = os.path.join(self.tmp, "out")
+
+    def run_item(self, **env):
+        argv = [sys.executable, "-c", "print('ran')"]
+        with mock.patch.dict(os.environ, {"MEUTE_SCOPE": "on", "MEUTE_SYSTEMD_RUN": self.stub, **env}):
+            return runctl.subprocess_runner(argv, self.tmp, out_path=self.out)
+
+    def logged(self):
+        return open(self.calls).read() if os.path.exists(self.calls) else ""
+
+    def test_item_runs_in_a_collected_user_scope(self):
+        self.assertEqual(self.run_item()[0], 0)
+        self.assertIn("--user --scope --collect", self.logged().splitlines()[-1])
+        self.assertEqual(open(self.out).read(), "ran\n")
+
+    def test_failing_probe_falls_back_to_a_plain_run(self):
+        self.assertEqual(self.run_item(SCOPE_PROBE_FAIL="1")[0], 0)
+        self.assertNotIn("print", self.logged())
+        self.assertEqual(open(self.out).read(), "ran\n")
+
+    def test_missing_systemd_run_falls_back(self):
+        self.assertEqual(self.run_item(MEUTE_SYSTEMD_RUN=self.stub + "-absent")[0], 0)
+        self.assertEqual(open(self.out).read(), "ran\n")
+
+    def test_scope_off_never_calls_systemd_run(self):
+        self.assertEqual(self.run_item(MEUTE_SCOPE="off")[0], 0)
+        self.assertEqual(self.logged(), "")
