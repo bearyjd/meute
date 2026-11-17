@@ -368,7 +368,8 @@ MEUTE_QUOTA_FLOOR=1 ./bin/run.sh daily   # one invocation, nothing written
 
 The override lives in `state/policy-override`, is read after the manifest, and
 is checked by the manifest's own rules (a bad value is refused at `set`, judged
-against the rows already in force). There is one weekly ceiling at a time:
+against the rows already in force; a non-finite number such as `nan` or
+`inf` is refused, and a hand-edited one is ignored like an expired row). There is one weekly ceiling at a time:
 setting `weekly_runs` drops a `weekly_cost_usd` row, and the reverse.
 `--for` is mandatory and capped at 7 days; an expired row, or a hand-edited one
 past the cap, is ignored. Every run

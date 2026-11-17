@@ -746,6 +746,12 @@ test_policy_override() {
   [[ "$rc" != 0 ]] && ok "policy set: an expiry is mandatory" || bad "policy set: an expiry is mandatory" "exit 0"
   "${M[@]}" "$root/bin/meute" policy set branch_prefix=x --for 1h >/dev/null 2>&1; rc=$?
   [[ "$rc" != 0 ]] && ok "policy set: a key that is not overridable is refused" || bad "policy set: a key that is not overridable is refused" "exit 0"
+  # A non-finite cost reads as no ceiling downstream (jq turns NaN into null).
+  local bad_cost
+  for bad_cost in nan inf -inf 1e999; do
+    "${M[@]}" "$root/bin/meute" policy set weekly_cost_usd="$bad_cost" --for 1h >/dev/null 2>&1; rc=$?
+    [[ "$rc" != 0 ]] && ok "policy set: a non-finite cost ($bad_cost) is refused" || bad "policy set: a non-finite cost ($bad_cost) is refused" "exit 0"
+  done
   is "policy set: refusals left the file alone" "$(cat "$root/state/policy-override")" "$before"
 
   # One invocation: the env var, nothing written.
@@ -778,6 +784,17 @@ test_policy_override() {
   out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
   has   "policy override: a row past the 7-day cap is ignored" "$(tail -1 "$root/state/log")" "below floor 30%"
   hasnt "policy override: ...and the line is not marked" "$(tail -1 "$root/state/log")" "policy=override"
+
+  # A hand-edited non-finite cost is skipped like an expired row: the floor row
+  # beside it stays live, and `policy show` lists only what the run obeys.
+  printf 'quota_floor_percent\t1\t%s\thand edit\nweekly_cost_usd\tnan\t%s\thand edit\n' \
+    "$(( now + 3600 ))" "$(( now + 3600 ))" > "$root/state/policy-override"
+  out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
+  has   "policy override: a hand-edited nan cost row is skipped, the floor row applies" "$(tail -1 "$root/state/log")" "status=ok"
+  has   "policy override: ...and the line is marked" "$(tail -1 "$root/state/log")" "policy=override"
+  out="$("${M[@]}" "$root/bin/meute" policy show 2>&1)"
+  hasnt "policy show: ...the nan row is not listed" "$out" "weekly_cost_usd"
+  has   "policy show: ...the floor row is" "$out" "quota_floor_percent=1"
 
   # clear
   out="$("${M[@]}" "$root/bin/meute" policy clear 2>&1)"

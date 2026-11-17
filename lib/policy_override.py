@@ -11,6 +11,7 @@ MEUTE_QUOTA_FLOOR=<n> is the one-invocation form: nothing is written.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -55,9 +56,13 @@ def read_rows(path: str, now: int) -> dict:
             if len(fields) < 3 or fields[0] not in OVERRIDABLE or not fields[2].isdigit():
                 continue
             until = int(fields[2])
+            value = parse_value(fields[1])
+            # A hand-edited nan/inf is no value at all: skipped like an expired
+            # row, so the other rows stay live and `policy show` agrees.
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
             if now < until <= now + MAX_SECONDS:
-                rows[fields[0]] = (parse_value(fields[1]), until,
-                                   fields[3] if len(fields) > 3 else "")
+                rows[fields[0]] = (value, until, fields[3] if len(fields) > 3 else "")
     return rows
 
 
@@ -70,6 +75,11 @@ def effective_policy(data: dict, values: dict) -> dict:
             for other in CEILINGS:
                 if other != ceiling and other not in values:
                     base.pop(other, None)
+    for key, value in values.items():
+        # NaN passes merged_policy's `<= 0` test and jq prints it as null,
+        # which reads downstream as "no ceiling"; inf is no ceiling either.
+        if isinstance(value, float) and not math.isfinite(value):
+            _fail(f"policy override: {key}={value}: must be a finite number")
     base.update(values)
     patched["policy"] = base
     return merged_policy(patched)
