@@ -29,8 +29,12 @@ hostcheck_writable() {
 }
 
 # hostcheck_free_mb <dir>: whole MB available to us there; empty if unknown.
+# Always succeeds: a df that fails (odd mount, container permissions) is
+# "unknown", never an errexit that kills the fire under run.sh's set -e.
 hostcheck_free_mb() {
-  "${MEUTE_DF:-df}" -Pm "$1" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }'
+  local out
+  out="$("${MEUTE_DF:-df}" -Pm "$1" 2>/dev/null)" || return 0
+  awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }' <<< "$out"
 }
 
 hostcheck_gate() {

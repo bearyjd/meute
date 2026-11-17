@@ -885,6 +885,14 @@ test_host_gate() {
   has   "host gate: min_free_mb: 50 lets 100 MB free run" "$(tail -1 "$root/state/log")" "status=ok"
   sed -i '/min_free_mb/d' "$root/repos.yaml"
 
+  # a df that fails (odd mount, container permissions) is "unknown": the gate
+  # passes and the fire runs, it does not die under set -e
+  printf '#!/bin/sh\nexit 1\n' > "$root/df-fail"; chmod +x "$root/df-fail"
+  out="$("${R[@]}" MEUTE_DF="$root/df-fail" "$root/bin/run.sh" daily --strict-exit 2>&1)"; rc=$?
+  is    "host gate: a failing df is unknown, the fire runs (exit 0)" "$rc" "0"
+  has   "host gate: ...logged as status=ok" "$(tail -1 "$root/state/log")" "status=ok"
+  hasnt "host gate: ...not code=died" "$(tail -1 "$root/state/log")" "code=died"
+
   # a directory that cannot be written is the same verdict (root ignores modes)
   if [[ "$(id -u)" == 0 ]]; then
     skip "host gate: an unwritable directory is declined" "running as root; chmod cannot block writes"
