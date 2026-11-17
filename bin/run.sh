@@ -17,6 +17,9 @@
 #                            that opted into isolation is not a downgrade path
 #   --repo <name>            force a repo (bypasses the cursor and the share gates)
 #   --task <name>            force a task (bypasses the cursor and the share gates)
+#   --wait-lock <secs>       wait up to <secs> for another run's lock instead of skipping
+#   --source <plan|manifest> plan (default): a staged plan first; manifest: ignore it this fire
+#   --once                   a forced staged item already attempted exits code=already-done
 #   --dry-run                select and render, invoke nothing. Not a no-op on state/:
 #                            every skip before selection (hold, lock, budget, quota,
 #                            nothing eligible) still appends a status=skipped line to
@@ -98,7 +101,7 @@ ENGINE_OVERRIDE=""
 RUNTIME_OVERRIDE=""
 FORCE_REPO=""
 FORCE_TASK=""
-DRY_RUN=0
+DRY_RUN=0; WAIT_LOCK=0; SOURCE="plan"; ONCE=0; ONCE_DONE=0
 PLAN_MODE=0
 
 # Populated during a run; the EXIT trap reads them.
@@ -164,6 +167,9 @@ parse_args() {
       --repo)     FORCE_REPO="${2:?--repo needs a value}"; shift ;;
       --task)     FORCE_TASK="${2:?--task needs a value}"; shift ;;
       --dry-run)  DRY_RUN=1 ;;
+      --wait-lock) WAIT_LOCK="${2:?--wait-lock needs a value}"; shift ;;
+      --source)   SOURCE="${2:?--source needs a value}"; shift ;;
+      --once)     ONCE=1 ;;
       --strict-exit) ;;   # read by outcome_scan_args, before anything can fail
       --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;   # validate's own status, even under --strict-exit
       --help|-h)  usage; exit 0 ;;
@@ -174,6 +180,8 @@ parse_args() {
   [[ -n "$SLOT" ]] || usage_die "missing slot: expected 'daily' or 'weekly' (try --help)"
   [[ -z "$ENGINE_OVERRIDE" || "$ENGINE_OVERRIDE" =~ ^(claude|codex)$ ]] || usage_die "unknown engine: $ENGINE_OVERRIDE"
   [[ -z "$RUNTIME_OVERRIDE" || "$RUNTIME_OVERRIDE" =~ ^(host|container)$ ]] || usage_die "unknown runtime: $RUNTIME_OVERRIDE (expected host or container)"
+  [[ "$WAIT_LOCK" =~ ^(0|[1-9][0-9]*)$ ]] || usage_die "--wait-lock needs whole seconds: $WAIT_LOCK"
+  [[ "$SOURCE" =~ ^(plan|manifest)$ ]] || usage_die "unknown source: $SOURCE (expected plan or manifest)"
 }
 
 
@@ -205,6 +213,11 @@ retire_completed_plan() {
   note "all staged plan items were attempted; archived queue at ${archive}"
 }
 
+hold_gate() {
+  hold_active || return 0
+  skip hold "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
+}
+
 main() {
   outcome_scan_args "$@"; parse_args "$@"; trap 'outcome_on_exit tmp_cleanup' EXIT
   mkdir -p "$STATE_DIR" "$WORKTREE_DIR" "${MEUTE_ROOT}/reports"
@@ -215,12 +228,11 @@ main() {
   # Cheapest verdict first, and it depends on nothing: a fleet you have stood
   # down should decline without needing a lock, a valid manifest or a quota
   # probe. See lib/fleet.sh for why a manual hold exists at all.
-  if hold_active; then
-    skip hold "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
-  fi
-
+  hold_gate
   # One runner at a time. A slow run must not stack up under a tight timer.
-  runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip lock "another run holds the lock"
+  runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" "$WAIT_LOCK" \
+    || skip lock "another run holds the lock"
+  (( ! WAIT_LOCK )) || hold_gate   # a hold set while we waited for the lock
 
   python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "manifest failed validation"
 
@@ -244,10 +256,11 @@ main() {
   # A portfolio plan exists only after an explicit `meute plan --enqueue`.
   # It is independently re-expanded and refuses writing tiers in manifest.py;
   # then the ordinary timers prioritize it until every staged item is attempted.
-  if [[ -f "$PLAN_QUEUE_FILE" ]]; then
+  # --source manifest leaves it untouched: not read, retired or quarantined.
+  if [[ "$SOURCE" == plan && -f "$PLAN_QUEUE_FILE" ]]; then
     retire_completed_plan
   fi
-  if [[ -f "$PLAN_QUEUE_FILE" ]]; then
+  if [[ "$SOURCE" == plan && -f "$PLAN_QUEUE_FILE" ]]; then
     python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$SLOT" > "$queue_file" \
       || plan_quarantine "staged plan queue failed validation"
     if [[ -s "$queue_file" ]]; then
@@ -270,6 +283,7 @@ main() {
   # than skip every fire until the other slot retires the plan. Retire first:
   # a plan whose last item just went missing is complete now, not next fire.
   if [[ -z "$entry" ]] && (( PLAN_MODE )); then
+    (( ! ONCE_DONE )) || skip already-done "staged plan item already attempted (--once)" "repo=${FORCE_REPO:--}" "task=${FORCE_TASK:--}"
     note "no eligible staged plan item for slot ${SLOT}; falling back to the manifest queue"
     retire_completed_plan
     PLAN_MODE=0

@@ -1,6 +1,6 @@
 # Queue selection, sourced by bin/run.sh: the cursor, the per-candidate gates
 # (share, cap, pool, container readiness) and the round-robin walk. Expects
-# from the caller: SLOT, PLAN_MODE, FORCED, FORCE_REPO, FORCE_TASK,
+# from the caller: SLOT, PLAN_MODE, FORCED, ONCE, ONCE_DONE, FORCE_REPO, FORCE_TASK,
 # ENGINE_OVERRIDE, RUNTIME_OVERRIDE, QUOTA_FLOOR, TIER3_CAP, CURSOR_FILE,
 # PLAN_DONE_FILE, MEUTE_ROOT, and note/skip (outcome.sh), refuse_entry,
 # state_get, kv_get/kv_set (state.sh), community_allowed, tier3_in_flight
@@ -67,8 +67,16 @@ eligible() {
     note "skipping ${key}: ${CONTAINER_BLOCKED}"
     return 1
   fi
-  # That includes re-running a staged item already attempted.
-  (( FORCED )) && return 0
+  # That includes re-running a staged item already attempted -- unless --once
+  # (P1.4): then another fire finished it since the caller looked, and main
+  # ends this one as already-done instead of falling back to the manifest.
+  if (( FORCED )); then
+    if (( ONCE && PLAN_MODE )) && [[ -n "$(kv_get "$PLAN_DONE_FILE" "$key")" ]]; then
+      note "skipping ${key}: staged plan item already attempted (--once)"
+      ONCE_DONE=1; return 1
+    fi
+    return 0
+  fi
 
   if (( PLAN_MODE )) && [[ -n "$(kv_get "$PLAN_DONE_FILE" "$key")" ]]; then
     note "skipping ${key}: staged plan item already attempted"

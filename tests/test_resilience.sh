@@ -476,7 +476,7 @@ PY
   # are not wired yet) are pinned through the table itself.
   local code want
   for code in "hold 10" "lock 11" "budget 12" "quota-floor 13" "quota-unknown 13" \
-              "nothing-eligible 14" "no-queue 14" "load 15" "disk 15" "ok 0" "failed 1" "died 70"; do
+              "nothing-eligible 14" "no-queue 14" "load 15" "disk 15" "already-done 16" "ok 0" "failed 1" "died 70"; do
     want="${code#* }"; code="${code% *}"
     is "strict exit: table maps code=$code to $want" \
       "$(MEUTE_ROOT="$REPO" bash -c 'source "$MEUTE_ROOT/lib/outcome.sh"; outcome_exit_status "$1"' _ "$code")" "$want"
@@ -693,4 +693,120 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): nothing is quarantined" \
     "$(compgen -G "$root/state/plan-queue.invalid-*" || echo none)" "none"
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
+}
+
+# P1.3 runner half (R11) and P1.4 (R15). A drain loop needs run.sh to wait for
+# the lock instead of skipping, to ignore a staged plan when it is draining the
+# manifest, and to refuse, under the lock, a forced staged item another fire
+# has already finished. The stub engine counts its calls in engine.calls.
+_p13_fixture() {
+  local root="$1" repo="$2"
+  _runlock_fixture "$root" "$repo" tier2
+  sed -i "2a printf x >> '$root/engine.calls'" "$root/stub/claude"
+}
+_p13_calls() { [[ -f "$1/engine.calls" ]] && wc -c < "$1/engine.calls" || echo 0; }
+# Two staged items, so marking one done does not retire the plan at startup.
+_p13_stage() {
+  printf '{"version":1,"scan":"%s","allow_web":false,"entries":[%s,%s]}\n' "$1" \
+    "{\"name\":\"plan-001-x\",\"path\":\"$2\",\"task\":\"t\"}" \
+    "{\"name\":\"plan-002-y\",\"path\":\"$2\",\"task\":\"t\"}" > "$1/state/plan-queue.json"
+}
+
+test_p1_3_source_manifest() {
+  local root="$FIXTURE/p13src" repo="$FIXTURE/p13src/git-lk" log rc plan
+  _p13_fixture "$root" "$repo"
+  log="$root/state/log"
+  local run=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --strict-exit )
+  _p13_stage "$root" "$repo"; plan="$(cat "$root/state/plan-queue.json")"
+
+  rc=0; "${run[@]}" --source manifest >/dev/null 2>&1 || rc=$?
+  is  "source manifest: the fire runs and exits 0"          "$rc" "0"
+  has "source manifest: ...the manifest item, not the plan's" "$(tail -1 "$log")" $'\trepo=lk\t'
+  is  "source manifest: the staged plan is untouched"       "$(cat "$root/state/plan-queue.json" 2>/dev/null)" "$plan"
+  is  "source manifest: no plan-complete mark is written"   "$([[ -e "$root/state/plan-complete" ]] && echo present || echo absent)" "absent"
+  is  "source manifest: no plan cursor is written"          "$(grep -c '^plan-cursor' "$root/state/cursor")" "0"
+
+  rc=0; "${run[@]}" --source bogus >/dev/null 2>&1 || rc=$?
+  is  "source manifest: an unknown source is a usage error (2)" "$rc" "2"
+  rc=0; "${run[@]}" --source plan >/dev/null 2>&1 || rc=$?
+  is  "source manifest: --source plan is the default, the staged item runs" "$rc" "0"
+  has "source manifest: ...and it is the plan's"            "$(tail -1 "$log")" $'\trepo=plan-001-x\t'
+}
+
+test_p1_4_once() {
+  local root="$FIXTURE/p14" repo="$FIXTURE/p14/git-lk" log rc key before
+  _p13_fixture "$root" "$repo"
+  log="$root/state/log"
+  local force=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily
+                --repo plan-001-x --task t --strict-exit )
+  _p13_stage "$root" "$repo"
+  key="$(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.yaml" "$root/state/plan-queue.json" daily | jq -r 'select(.repo == "plan-001-x") | .key')"
+  is "once: the fixture's plan key is readable" "$([[ -n "$key" ]] && echo yes)" "yes"
+
+  # Another fire finished the item between the caller's check and this lock.
+  printf '%s\t%s\n' "$key" "2026-11-16T00:00:00+00:00" > "$root/state/plan-complete"
+  before="$(_p13_calls "$root")"
+  rc=0; "${force[@]}" --once >/dev/null 2>&1 || rc=$?
+  is  "once: a finished staged item exits 16 (already-done)" "$rc" "16"
+  is  "once: ...without calling the engine"                 "$(_p13_calls "$root")" "$before"
+  has "once: ...and logs code=already-done"                 "$(tail -1 "$log")" $'\tcode=already-done\t'
+  is  "once: ...the plan is left staged"                    "$([[ -f "$root/state/plan-queue.json" ]] && echo staged)" "staged"
+  rc=0; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo plan-001-x --task t --once >/dev/null 2>&1 || rc=$?
+  is  "once: ...and exits 0 without --strict-exit (D1)"      "$rc" "0"
+
+  # Default unchanged: a forced run without --once re-runs the item.
+  rc=0; "${force[@]}" >/dev/null 2>&1 || rc=$?
+  is  "once: without --once a forced finished item still runs" "$rc" "0"
+  is  "once: ...through the engine"                         "$(_p13_calls "$root")" "$(( before + 1 ))"
+
+  # An unfinished staged item runs under --once.
+  _p13_stage "$root" "$repo"; rm -f "$root/state/plan-complete"
+  rc=0; "${force[@]}" --once >/dev/null 2>&1 || rc=$?
+  is  "once: an unfinished staged item runs under --once"   "$rc" "0"
+  is  "once: ...through the engine"                         "$(_p13_calls "$root")" "$(( before + 2 ))"
+  has "once: ...and logs it"                                "$(tail -1 "$log")" $'\trepo=plan-001-x\t'
+}
+
+# _p13_hold_lock <lock-file> <seconds> <ready-file>: hold the lock in the
+# background (the sleep does not inherit it, so killing the holder frees it).
+_p13_hold_lock() {
+  ( exec 8>"$1"; flock 8; : > "$3"; sleep "$2" 8>&- ) &
+  P13_HOLDER=$!
+  local i; for (( i = 0; i < 100; i++ )); do [[ -e "$3" ]] && return 0; sleep 0.2; done
+  return 1
+}
+
+test_p1_3_wait_lock() {
+  local root="$FIXTURE/p13wl" repo="$FIXTURE/p13wl/git-lk" log rc i
+  _p13_fixture "$root" "$repo"
+  log="$root/state/log"
+  local run=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --strict-exit )
+
+  # A holder that lets go within the wait: the fire waits, then runs.
+  _p13_hold_lock "$root/state/.lock" 4 "$root/ready1" || bad "wait lock: holder 1 took the lock" "no ready file"
+  rc=0; "${run[@]}" --wait-lock 120 >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a lock released within the wait is waited for (exit 0)" "$rc" "0"
+  has "wait lock: ...and the item runs"                    "$(tail -1 "$log")" $'\tstatus=ok\t'
+  wait "$P13_HOLDER" 2>/dev/null
+
+  # A holder that outlives the wait: skipped as lock, 11.
+  _p13_hold_lock "$root/state/.lock" 120 "$root/ready2" || bad "wait lock: holder 2 took the lock" "no ready file"
+  rc=0; "${run[@]}" --wait-lock 1 >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a lock held past the wait is skipped (11)" "$rc" "11"
+  has "wait lock: ...as code=lock"                         "$(tail -1 "$log")" $'\tcode=lock\t'
+
+  # A hold set while the fire waits is honoured once the lock is taken.
+  ( "${run[@]}" --wait-lock 137 >/dev/null 2>&1; echo $? > "$root/held.rc" ) &
+  local waiter=$!
+  for (( i = 0; i < 100; i++ )); do ps -eo args | grep -q '[f]lock -w 137' && break; sleep 0.2; done
+  printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "set during the wait" > "$root/state/hold"
+  kill "$P13_HOLDER" 2>/dev/null; wait "$P13_HOLDER" 2>/dev/null
+  wait "$waiter"
+  is  "wait lock: a hold set during the wait still stops the fire (10)" "$(cat "$root/held.rc")" "10"
+  rm -f "$root/state/hold"
+
+  rc=0; "${run[@]}" --wait-lock soon >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a non-integer wait is a usage error (2)"  "$rc" "2"
+  rc=0; "${run[@]}" --wait-lock 09 >/dev/null 2>&1 || rc=$?
+  is  "wait lock: a zero-padded wait is a usage error, not an octal crash (2)" "$rc" "2"
 }

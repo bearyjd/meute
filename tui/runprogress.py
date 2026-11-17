@@ -95,8 +95,8 @@ def read_log(path: str, offset: int = 0) -> list[dict]:
 
 # The code= tokens of lib/outcome.sh, and run.sh's --strict-exit statuses.
 _SKIP_CODES = frozenset({"hold", "lock", "budget", "quota-floor", "quota-unknown",
-                         "nothing-eligible", "no-queue", "load", "disk"})
-_SKIP_STATUSES = frozenset(range(10, 16))
+                         "nothing-eligible", "no-queue", "load", "disk", "already-done"})
+_SKIP_STATUSES = frozenset(range(10, 17))
 
 
 def classify(records: list[dict], returncode: int, slot: str, since: float) -> dict:
@@ -114,7 +114,7 @@ def classify(records: list[dict], returncode: int, slot: str, since: float) -> d
            if rec.get("slot") == slot and _at_or_after(rec, since)]
     if not own:
         return {"status": "skipped" if returncode in _SKIP_STATUSES else "error",
-                "repo": None, "task": None,
+                "repo": None, "task": None, "code": None,
                 "reason": f"run.sh exited {returncode} without a log line"}
     last = own[-1]
     code = last.get("code")
@@ -126,7 +126,7 @@ def classify(records: list[dict], returncode: int, slot: str, since: float) -> d
     elif code in ("failed", "died"):
         status = "error"
     return {"status": status if status in ("ok", "skipped") else "error",
-            "repo": last.get("repo"), "task": last.get("task"),
+            "repo": last.get("repo"), "task": last.get("task"), "code": code,
             "reason": last.get("reason") or last.get("detail")}
 
 
