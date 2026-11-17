@@ -959,3 +959,31 @@ test_p1_3_drain_until() {
   rc=0; bash -c "$check" _ "$REPO" "" "$noon" || rc=$?
   is "drain until: no --until never stops it"            "$rc" "0"
 }
+
+# A narrowed drain must not move the fleet-wide cursor the timers rotate on:
+# `drain --repo` keeps its own cursor, and the next timer fire resumes where
+# the timer left off (review of PR #55).
+test_p1_3_drain_repo_cursor() {
+  local root="$FIXTURE/drain-only" rc shared
+  _drain_fixture "$root" 4
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 )
+  for _ in 1 2 3; do "${env[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1 || true; done
+  is "drain --repo: three timer fires ran lk1 lk2 lk3" "$(_drain_ran "$root")" "lk1 lk2 lk3"
+  shared="$(grep -P '^cursor\.daily\t' "$root/state/cursor")"
+
+  : > "$root/state/log"
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk1 >/dev/null 2>&1 || rc=$?
+  is "drain --repo: the narrowed drain runs lk1 and exits 0" "$(_drain_ran "$root"):$rc" "lk1:0"
+  is "drain --repo: ...and leaves the shared cursor alone"   "$(grep -P '^cursor\.daily\t' "$root/state/cursor")" "$shared"
+
+  : > "$root/state/log"
+  "${env[@]}" "$root/bin/run.sh" daily >/dev/null 2>&1 || true
+  is "drain --repo: the next timer fire resumes at lk4"      "$(_drain_ran "$root")" "lk4"
+
+  # The narrowed cursor is its own rotation: a second narrowed drain over two
+  # repos runs each once and stops.
+  : > "$root/state/log"
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk2 --repo lk3 >/dev/null 2>&1 || rc=$?
+  is "drain --repo: a narrowed rotation over two repos"      "$(_drain_ran "$root"):$rc" "lk2 lk3:0"
+  is "drain --repo: ...still leaves the shared cursor on lk4" "$(grep -P '^cursor\.daily\t' "$root/state/cursor" | grep -c lk4)" "1"
+}

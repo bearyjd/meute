@@ -150,7 +150,8 @@ The `code=` field of the `state/log` line uses the same vocabulary (`hold`,
 `meute drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...`
 is that loop, written once. It runs the slot unforced, one fire after another
 (each waits up to 900 s for the lock), so the cursor, the community share, the
-tier-3 cap and the pool still apply; `--repo` narrows the queue without forcing.
+tier-3 cap and the pool still apply; `--repo` narrows the queue without forcing,
+on a cursor of its own, so the timers' rotation is not moved.
 It ends with 0 after one full rotation, when the staged plan is drained, or at
 `--max`/`--until`; with 1 after three failed fires in a row; and otherwise
 with the status of the fire that declined (10-15, 2, 70).

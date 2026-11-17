@@ -17,9 +17,12 @@ hold_gate() {
 
 # A staged plan rotates on its own cursor. Sharing one would leave the
 # manifest cursor pointing at a plan key once the plan retires -- a key no
-# manifest entry has -- and restart the manifest rotation at 0.
+# manifest entry has -- and restart the manifest rotation at 0. A narrowed
+# fire (MEUTE_ONLY_REPOS) rotates on its own too (lib/cursor.sh).
+source "${MEUTE_ROOT}/lib/cursor.sh"
 cursor_key() {
-  if (( PLAN_MODE )); then printf 'plan-cursor.%s\n' "$SLOT"; else printf 'cursor.%s\n' "$SLOT"; fi
+  local mode=manifest; (( PLAN_MODE )) && mode=plan
+  cursor_name "$SLOT" "$mode" "${MEUTE_ONLY_REPOS:-}"
 }
 
 # Would this entry be dispatched into a container, and is there a pin to

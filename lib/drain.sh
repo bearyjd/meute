@@ -6,7 +6,8 @@
 # Each fire is `run.sh <slot> --strict-exit --wait-lock 900 --source <mode>`,
 # never forced, so the cursor, the community share, the tier-3 cap and the
 # pool all still apply. --repo narrows the queue through MEUTE_ONLY_REPOS
-# (lib/select.sh), which filters without forcing. The loop reads run.sh's exit
+# (lib/select.sh), which filters without forcing and rotates on a cursor of
+# its own (lib/cursor.sh), so the timers' fleet-wide cursor is left alone. The loop reads run.sh's exit
 # status only (D1, --strict-exit), never the log text:
 #   0, 1     the fire ran an entry; go on (three failures in a row end it, 1)
 #   other    a stop-class status (hold 10, lock 11, budget 12, quota 13,
@@ -19,6 +20,8 @@
 #
 # Expects from the caller: MEUTE_ROOT, MANIFEST, MANIFEST_PY, CURSOR_FILE,
 # PLAN_QUEUE_FILE, PLAN_DONE_FILE, kv_get (state.sh), now_epoch (fleet.sh).
+
+source "${MEUTE_ROOT}/lib/cursor.sh"
 
 readonly DRAIN_WAIT_LOCK=900
 readonly DRAIN_MAX_ERRORS=3
@@ -65,7 +68,7 @@ drain_plan_pending() {
 }
 
 cmd_drain() {
-  local slot="" source=plan max="" until="" only="" mode cursor_name keys start sentinel cursor seen rc errors=0
+  local slot="" source=plan max="" until="" only="" mode ckey keys start sentinel cursor seen rc errors=0
   DRAIN_FIRES=0
   while (( $# )); do
     case "$1" in
@@ -89,10 +92,10 @@ cmd_drain() {
   # A staged plan is drained only while one is staged; --source manifest, or
   # no plan, drains the manifest and keeps a plan staged mid-drain out of it.
   mode=manifest; [[ "$source" == plan && -f "$PLAN_QUEUE_FILE" ]] && mode=plan
-  if [[ "$mode" == plan ]]; then cursor_name="plan-cursor.${slot}"; else cursor_name="cursor.${slot}"; fi
+  ckey="$(cursor_name "$slot" "$mode" "$only")"
   keys="$(drain_keys "$mode" "$slot" "$only")" || drain_usage "cannot read the ${slot} ${mode} queue"
   [[ -z "$only" || -n "$keys" ]] || drain_usage "--repo matches no entry in the ${slot} ${mode} queue"
-  start="$(kv_get "$CURSOR_FILE" "$cursor_name")"
+  start="$(kv_get "$CURSOR_FILE" "$ckey")"
   # An unknown cursor makes run.sh start at the head, so the rotation ends on the tail.
   sentinel="$start"
   grep -qxF "$start" < <(cut -f1 <<< "$keys") || sentinel="$(tail -n1 <<< "$keys" | cut -f1)"
@@ -109,7 +112,7 @@ cmd_drain() {
     DRAIN_FIRES=$(( DRAIN_FIRES + 1 ))
     if (( rc )); then errors=$(( errors + 1 )); else errors=0; fi
     (( errors < DRAIN_MAX_ERRORS )) || drain_stop 1 "${DRAIN_MAX_ERRORS} failed fires in a row"
-    cursor="$(kv_get "$CURSOR_FILE" "$cursor_name")"
+    cursor="$(kv_get "$CURSOR_FILE" "$ckey")"
     [[ "$mode" == plan || "$cursor" != "$sentinel" ]] || drain_stop 0 "one full rotation done"
     [[ -n "$cursor" && "$seen" != *$'\n'"${cursor}"$'\n'* ]] \
       || drain_stop 0 "the cursor is not on a new entry (the rotation wrapped, or the plan fell back to the manifest)"
