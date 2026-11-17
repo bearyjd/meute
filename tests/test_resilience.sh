@@ -971,4 +971,34 @@ test_startup_sweep() {
     || bad "sweep: .kv strays older than an hour go, a fresh one stays" "$(ls -A "$root/state")"
   is "sweep: one note per removal" "$(grep -c "sweep: removed" <<< "$out")" "7"
   has "sweep: the fire itself still ran" "$(tail -1 "$root/state/log")" "status=ok"
+
+  # A removal that fails is reported as a failure, never as "removed".
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "sweep: a failed removal is reported" "running as root; chmod cannot block rm"
+  else
+    mkdir -p "$root/state/tmp/run.4999994.CCCCCC/locked"; : > "$root/state/tmp/run.4999994.CCCCCC/locked/f"
+    chmod 555 "$root/state/tmp/run.4999994.CCCCCC/locked"
+    out="$("${R[@]}" "$root/bin/run.sh" daily 2>&1)"
+    chmod 755 "$root/state/tmp/run.4999994.CCCCCC/locked"
+    hasnt "sweep: a temp dir rm could not remove is not reported removed" "$out" "removed temp dir $root/state/tmp/run.4999994"
+    has   "sweep: ...it is reported as a failure" "$out" "sweep: could not remove temp dir $root/state/tmp/run.4999994"
+    has   "sweep: ...and the fire still ran" "$(tail -1 "$root/state/log")" "status=ok"
+    rm -rf "$root/state/tmp/run.4999994.CCCCCC"
+  fi
+
+  # Only this user's directories are swept (MEUTE_SWEEP_UID stands in for
+  # another owner), and a shared temp parent (world-writable, like /tmp) is
+  # not swept at all: run.<digits>.* there may be another tool's.
+  mkdir -p "$root/state/tmp/run.4999995.DDDDDD"
+  out="$("${R[@]}" MEUTE_SWEEP_UID=4999999 "$root/bin/run.sh" daily 2>&1)"
+  [[ -d "$root/state/tmp/run.4999995.DDDDDD" ]] && ok "sweep: a dead-looking dir owned by someone else stays" \
+    || bad "sweep: a dead-looking dir owned by someone else stays" "removed"
+  rmdir "$root/state/tmp/run.4999995.DDDDDD"
+  mkdir -p "$root/shared/run.4999996.EEEEEE"; chmod 1777 "$root/shared"
+  out="$("${R[@]}" MEUTE_TMPDIR="$root/shared" "$root/bin/run.sh" daily 2>&1)"
+  [[ -d "$root/shared/run.4999996.EEEEEE" ]] && ok "sweep: a shared MEUTE_TMPDIR is not swept" \
+    || bad "sweep: a shared MEUTE_TMPDIR is not swept" "removed"
+  has   "sweep: ...and says why" "$out" "not sweeping shared temp dir $root/shared"
+  has   "sweep: ...the fire still ran" "$(tail -1 "$root/state/log")" "status=ok"
+  chmod 755 "$root/shared"
 }

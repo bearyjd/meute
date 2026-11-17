@@ -13,6 +13,11 @@
 # The scratch branch goes only while it still sits where it was cut (its
 # first reflog entry): a branch that holds a commit is a draft and stays.
 #
+# Only this user's directories are swept (MEUTE_SWEEP_UID replaces id -u in
+# tests), and a world-writable temp parent (MEUTE_TMPDIR=/tmp) is not swept at
+# all: a run.<digits>.* there may belong to another tool. Each removal is
+# reported after it succeeds; one that fails is reported as a failure.
+#
 # Expects STATE_DIR (default <root>/state), WORKTREE_DIR (default
 # <root>/.worktrees) and note() from the caller. Never fails the caller.
 
@@ -21,6 +26,17 @@ _sweep_dry=0
 _sweep_say() {
   if (( _sweep_dry )); then printf 'would remove %s\n' "$*"
   else note "sweep: removed $*"; fi
+}
+
+# _sweep_done <what> <path>: after a removal, say whether it happened.
+_sweep_done() {
+  if [[ -e "$2" || -L "$2" ]]; then note "sweep: could not remove $1 $2"; return 1; fi
+  _sweep_say "$1 $2"
+}
+
+# _sweep_mine <path>: owned by the user this runner is.
+_sweep_mine() {
+  [[ "$(stat -c %u -- "$1" 2>/dev/null)" == "${MEUTE_SWEEP_UID:-$(id -u)}" ]]
 }
 
 # _sweep_live <pid>
@@ -44,17 +60,18 @@ _sweep_worktree() {
       first="$(git --git-dir="$common" reflog show --format=%H "refs/heads/${branch}" 2>/dev/null | tail -n 1)" || first=""
     fi
   fi
-  _sweep_say "worktree ${dir}"
-  (( _sweep_dry )) && return 0
+  if (( _sweep_dry )); then _sweep_say "worktree ${dir}"; return 0; fi
   if [[ -n "$common" ]]; then
-    git --git-dir="$common" worktree remove --force "$dir" >/dev/null 2>&1 || rm -rf "$dir"
+    git --git-dir="$common" worktree remove --force "$dir" >/dev/null 2>&1 || rm -rf "$dir" 2>/dev/null
     git --git-dir="$common" worktree prune >/dev/null 2>&1 || true
+    _sweep_done worktree "$dir" || return 0
     if [[ -n "$tip" && "$tip" == "$first" ]] \
        && git --git-dir="$common" branch -q -D "$branch" >/dev/null 2>&1; then
       _sweep_say "branch ${branch}"
     fi
   else
-    rm -rf "$dir"
+    rm -rf "$dir" 2>/dev/null
+    _sweep_done worktree "$dir" || return 0
   fi
 }
 
@@ -67,21 +84,28 @@ sweep_stale() {
   for d in "$wtd"/*; do
     [[ -d "$d" && ! -L "$d" && "$d" =~ \.([0-9]+)$ ]] || continue
     pid="${BASH_REMATCH[1]}"
+    _sweep_mine "$d" || continue
     _sweep_live "$pid" || _sweep_worktree "$d"
   done
 
-  for d in "$tmpd"/run.*; do
-    [[ -d "$d" && ! -L "$d" && "${d##*/}" =~ ^run\.([0-9]+)\. ]] || continue
-    pid="${BASH_REMATCH[1]}"
-    if ! _sweep_live "$pid"; then
-      _sweep_say "temp dir ${d}"
-      (( _sweep_dry )) || rm -rf "$d"
-    fi
-  done
+  if [[ -d "$tmpd" && -n "$(find "$tmpd" -maxdepth 0 -perm -o+w 2>/dev/null)" ]]; then
+    (( _sweep_dry )) || note "sweep: not sweeping shared temp dir ${tmpd} (world-writable)"
+  else
+    for d in "$tmpd"/run.*; do
+      [[ -d "$d" && ! -L "$d" && "${d##*/}" =~ ^run\.([0-9]+)\. ]] || continue
+      pid="${BASH_REMATCH[1]}"
+      _sweep_mine "$d" || continue
+      _sweep_live "$pid" && continue
+      if (( _sweep_dry )); then _sweep_say "temp dir ${d}"; continue; fi
+      rm -rf "$d" 2>/dev/null
+      _sweep_done "temp dir" "$d" || true
+    done
+  fi
 
   while IFS= read -r -d '' f; do
-    _sweep_say "stale ${f}"
-    (( _sweep_dry )) || rm -f "$f"
+    if (( _sweep_dry )); then _sweep_say "stale ${f}"; continue; fi
+    rm -f "$f" 2>/dev/null
+    _sweep_done stale "$f" || true
   done < <(find "$state" -maxdepth 1 -type f -name '.kv.*' -mmin +60 -print0 2>/dev/null)
   return 0
 }
