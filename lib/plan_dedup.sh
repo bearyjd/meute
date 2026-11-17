@@ -127,13 +127,14 @@ plan_dedup() {
   # An enrolled repository anchors its group. Several enrolled copies: the
   # first by path. One with unreadable history anchors nothing and stays
   # configured.
+  # Identity comes through lib/plan_cache.sh: one rev-parse when unchanged.
   for real in "${PLAN_CONFIGURED[@]}"; do
-    key="$(plan_root_commit "$real")" || continue
-    [[ -n "${anchor[$key]+present}" ]] || anchor["$key"]="$real"
+    plan_identity "$real" || continue
+    [[ -n "${anchor[$PLAN_ID]+present}" ]] || anchor["$PLAN_ID"]="$real"
   done
   for real in "${PLAN_UNCONFIGURED[@]}"; do
-    if key="$(plan_root_commit "$real")"; then
-      lines+=( "$(plan_rank_line "$key" "$real" "$scan_dir")" )
+    if plan_identity "$real"; then
+      lines+=( "$(plan_rank_line "$PLAN_ID" "$real" "$scan_dir")" )
     else
       PLAN_SKIPPED+=( "$real" )
     fi
@@ -162,23 +163,28 @@ plan_dedup() {
   PLAN_UNCONFIGURED=( "${kept[@]}" )
 }
 
-# Refuse an --only path the dedup set aside, naming what to pass instead.
-# Compared by identity, like plan_restrict_to.
-plan_refuse_collapsed() {
+# Why the dedup set $1 aside, as the --only refusal, on stdout; status 1 when
+# it did not. Compared by identity, like the scan.
+plan_collapsed_reason() {
   local path="$1" id real of
   id="$(dir_id "$path")"
   for real in "${PLAN_DUPLICATES[@]}"; do
     [[ "$(dir_id "$real")" == "$id" ]] || continue
     of="${PLAN_DUP_OF[$real]}"
-    [[ "${PLAN_DUP_REASON[$real]}" == "duplicate of "* ]] \
-      && die "plan: --only ${path} is a duplicate of ${of}; pass ${of} instead, or enroll ${path} in repos.local.yaml to audit it separately"
-    die "plan: --only ${path} is a duplicate of ${of} (${PLAN_DUP_REASON[$real]}); it is not staged"
+    if [[ "${PLAN_DUP_REASON[$real]}" == "duplicate of "* ]]; then
+      printf 'plan: --only %s is a duplicate of %s; pass %s instead, or enroll %s in repos.local.yaml to audit it separately' \
+        "$path" "$of" "$of" "$path"
+    else
+      printf 'plan: --only %s is a duplicate of %s (%s); it is not staged' "$path" "$of" "${PLAN_DUP_REASON[$real]}"
+    fi
+    return 0
   done
   for real in "${PLAN_SKIPPED[@]}"; do
-    [[ "$(dir_id "$real")" == "$id" ]] \
-      && die "plan: --only ${path}: skipped, no readable history"
+    [[ "$(dir_id "$real")" == "$id" ]] || continue
+    printf 'plan: --only %s: skipped, no readable history' "$path"
+    return 0
   done
-  return 0
+  return 1
 }
 
 # The human sections, printed only when there is something to say, so a tree

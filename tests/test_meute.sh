@@ -742,7 +742,8 @@ test_plan_state_ignored() {
   for f in state/plan-queue.json state/plan-complete \
            state/plan-queue.completed-20260918T000000.json \
            state/plan-queue.completed-20260918T000000.json.123 \
-           state/.plan-entries.abc state/.plan-queue.abc state/.kv.abc123; do
+           state/.plan-entries.abc state/.plan-queue.abc state/.kv.abc123 \
+           state/plan-cache state/.plan-cache.abc; do
     is "gitignore: ${f} never reaches the public harness" \
       "$(git -C "$REPO" check-ignore -q -- "$f"; echo $?)" "0"
   done
@@ -921,8 +922,8 @@ PY2
   # keys as one staged through the real path.
   staged_name() { jq -r '.entries[] | select(.path | endswith("/repo-alpha")) | .name' "$root/state/plan-queue.json" | sort -u; }
   local real_name link_name
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1; real_name="$(staged_name)"
-  "$root/bin/meute" plan --enqueue "$link" >/dev/null 2>&1;     link_name="$(staged_name)"
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1; real_name="$(staged_name)"
+  "$root/bin/meute" plan --enqueue --replace "$link" >/dev/null 2>&1;     link_name="$(staged_name)"
   is "identity: a symlinked spelling stages the same synthetic name" "$link_name" "$real_name"
   is "identity: ...and it is a plan-<stem>-<hash> name" "$(grep -cE '^plan-repo-alpha-[0-9a-f]{6}$' <<< "$real_name")" "1"
 
@@ -936,7 +937,7 @@ PY2
     has   "identity: bind-mount spelling still matches the manifest"  "$out" "configured    already-configured"
     hasnt "identity: bind-mount spelling still excludes own checkout" "$out" "meute-stand-in"
     has   "identity: bind-mount spelling counts one configured repo"  "$out" "configured: 1"
-    unshare -Urm bash -c 'mount --bind "$1" "$2" && exec "$2/meute-stand-in/bin/meute" plan --enqueue "$2"' \
+    unshare -Urm bash -c 'mount --bind "$1" "$2" && exec "$2/meute-stand-in/bin/meute" plan --enqueue --replace "$2"' \
       _ "$universe" "$alias" >/dev/null 2>&1
     is "identity: a bind-mounted spelling stages the same synthetic name" "$(staged_name)" "$real_name"
 
@@ -1129,7 +1130,7 @@ PY3
   # bookkeeping alone.
   mkdir -p "$FIXTURE/plan-nothing"
   printf 'sentinel\tattempted\n' > "$root/state/plan-complete"
-  out="$("$root/bin/meute" plan --enqueue "$FIXTURE/plan-nothing" 2>&1; echo "rc=$?")"
+  out="$("$root/bin/meute" plan --enqueue --replace "$FIXTURE/plan-nothing" 2>&1; echo "rc=$?")"
   has "plan: --enqueue with no candidates refuses" "$out" "plan: nothing to stage"
   has "plan: ...as an error"                       "$out" "rc=1"
   is  "plan: ...and leaves the previous plan's marks alone" "$(cat "$root/state/plan-complete")" $'sentinel\tattempted'
@@ -1202,7 +1203,7 @@ STUB
   # A plan's daily items drain in days while its weekly items take weeks.
   # In between, a daily slot that finds nothing eligible in the plan must
   # fall through to the manifest rather than skip until the plan retires.
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   while IFS= read -r r; do
     printf '%s\tattempted\n' "$r" >> "$root/state/plan-complete"
   done < <(MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" plan-queue "$root/repos.local.yaml" "$root/state/plan-queue.json" daily | jq -r .key)
@@ -1216,7 +1217,7 @@ STUB
   # between staging and its turn) can never be attempted. Left unmarked it
   # would hold the plan open forever; marked missing, the plan can retire.
   # Destructive to the universe, so it is the last thing this test does.
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   rm -rf "$universe/repo-alpha"
   while IFS= read -r r; do
     printf '%s\tattempted\n' "$r" >> "$root/state/plan-complete"
@@ -1311,29 +1312,29 @@ PY
   has "plan only: ...that says so" "$out" "--only requires --enqueue"
   is  "plan only: ...and stages nothing" "$(test -e "$queue"; echo $?)" "1"
 
-  "$root/bin/meute" plan --enqueue --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
   is  "plan only: one repo, both tasks staged" "$(jq '.entries | length' "$queue")" "2"
   is  "plan only: entries are for that repo only" "$(jq -r '[.entries[].path] | unique | .[]' "$queue")" "$universe/repo-alpha"
-  "$root/bin/meute" plan --enqueue --only "$universe/repo with space" --only "$universe/repo-gamma" "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace --only "$universe/repo with space" --only "$universe/repo-gamma" "$universe" >/dev/null 2>&1
   is  "plan only: repeatable, spaces survive" "$(jq -r '[.entries[].path] | unique | join("|")' "$queue")" \
     "$universe/repo with space|$universe/repo-gamma"
   is  "plan only: a spelled-differently path matches by identity" \
-    "$("$root/bin/meute" plan --enqueue --only "$universe/repo-alpha/../repo-alpha/" "$universe" >/dev/null 2>&1; echo $?)" "0"
+    "$("$root/bin/meute" plan --enqueue --replace --only "$universe/repo-alpha/../repo-alpha/" "$universe" >/dev/null 2>&1; echo $?)" "0"
 
   local before after
-  "$root/bin/meute" plan --enqueue --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace --only "$universe/repo-alpha" "$universe" >/dev/null 2>&1
   before="$(md5sum "$queue" | cut -d' ' -f1)"
   for r in "/nonexistent/nope" "$universe/already-configured" "$root" "$universe"; do
-    out="$("$root/bin/meute" plan --enqueue --only "$r" "$universe" 2>&1; echo "rc=$?")"
+    out="$("$root/bin/meute" plan --enqueue --replace --only "$r" "$universe" 2>&1; echo "rc=$?")"
     hasnt "plan only: refuses '$r'" "$out" "rc=0"
     has   "plan only: '$r' names the problem" "$out" "not an unconfigured repository"
   done
-  out="$("$root/bin/meute" plan --enqueue --only "$universe/repo-gamma" --only "/nonexistent" "$universe" 2>&1; echo "rc=$?")"
+  out="$("$root/bin/meute" plan --enqueue --replace --only "$universe/repo-gamma" --only "/nonexistent" "$universe" 2>&1; echo "rc=$?")"
   hasnt "plan only: one bad path among good ones refuses" "$out" "rc=0"
   after="$(md5sum "$queue" | cut -d' ' -f1)"
   is  "plan only: a refused --only leaves the queue byte-identical" "$after" "$before"
   rm -f "$queue"
-  "$root/bin/meute" plan --enqueue --only /nonexistent "$universe" >/dev/null 2>&1 || true
+  "$root/bin/meute" plan --enqueue --replace --only /nonexistent "$universe" >/dev/null 2>&1 || true
   is  "plan only: a refused --only creates no queue" "$(test -e "$queue"; echo $?)" "1"
 }
 
@@ -1539,7 +1540,7 @@ GOLD
     "$(jq -c '[.duplicates, .items]' <<< "$json")"
 
   # The queue itself: one set of entries per canonical copy, none for a copy.
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   is  "dedup stage: entries cover the canonical copies only" "$(jq '[.entries[].path] | unique | length' "$queue")" "12"
   is  "dedup stage: I2 the diverged copy is staged" \
     "$(jq --arg p "$universe/output/ahead" '[.entries[] | select(.path == $p)] | length' "$queue")" "1"
@@ -1547,17 +1548,17 @@ GOLD
     "$(jq --argjson j "$json" '[$j.duplicates[].path, $j.skipped[].path] as $d | [.entries[] | select(.path as $p | $d | index($p))] | length' "$queue")" "0"
 
   # (g) --only: a duplicate is refused and names the copy to pass instead.
-  "$root/bin/meute" plan --enqueue --only "$universe/a/b/orig" "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace --only "$universe/a/b/orig" "$universe" >/dev/null 2>&1
   is  "dedup only: the canonical copy stages only itself" "$(jq -r '[.entries[].path] | unique | join("|")' "$queue")" "$universe/a/b/orig"
   before="$(md5sum "$queue" | cut -d' ' -f1)"
-  out="$("$root/bin/meute" plan --enqueue --only "$universe/output/x" "$universe" 2>&1; echo "rc=$?")"
+  out="$("$root/bin/meute" plan --enqueue --replace --only "$universe/output/x" "$universe" 2>&1; echo "rc=$?")"
   hasnt "dedup only: a duplicate is refused" "$out" "rc=0"
   has   "dedup only: ...naming the canonical path" "$out" \
     "$universe/output/x is a duplicate of $universe/a/b/orig; pass $universe/a/b/orig instead, or enroll $universe/output/x in repos.local.yaml to audit it separately"
-  out="$("$root/bin/meute" plan --enqueue --only "$universe/lone-x" --only "$universe/copies/c-clone" "$universe" 2>&1; echo "rc=$?")"
+  out="$("$root/bin/meute" plan --enqueue --replace --only "$universe/lone-x" --only "$universe/copies/c-clone" "$universe" 2>&1; echo "rc=$?")"
   hasnt "dedup only: a copy of an enrolled repo is refused" "$out" "rc=0"
   has   "dedup only: ...naming the enrolled repo" "$out" "already enrolled as enrolled-c"
-  out="$("$root/bin/meute" plan --enqueue --only "$universe/broken" "$universe" 2>&1; echo "rc=$?")"
+  out="$("$root/bin/meute" plan --enqueue --replace --only "$universe/broken" "$universe" 2>&1; echo "rc=$?")"
   hasnt "dedup only: a skipped repo is refused" "$out" "rc=0"
   has   "dedup only: ...saying why" "$out" "no readable history"
   is  "dedup only: refusals leave the queue byte-identical" "$(md5sum "$queue" | cut -d' ' -f1)" "$before"
@@ -1646,7 +1647,7 @@ STUB
   # the list, so a plan re-staged after another repo appears keeps the same
   # name -- and the same plan-complete key -- for repo-alpha.
   local out alpha_name alpha_again aaa_name
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   alpha_name="$(jq -r '.entries[] | select(.path | endswith("/repo-alpha")) | .name' "$root/state/plan-queue.json" | sort -u)"
   is "plan run: a synthetic name is plan-<stem>-<6 hex>" \
     "$(grep -cE '^plan-repo-alpha-[0-9a-f]{6}$' <<< "$alpha_name")" "1"
@@ -1654,7 +1655,7 @@ STUB
   git -C "$universe/repo-aaa" init -q -b main
   echo repo-aaa > "$universe/repo-aaa/f.txt"; git -C "$universe/repo-aaa" add -A
   git -C "$universe/repo-aaa" -c user.email=t@t -c user.name=t commit -qm init
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   alpha_again="$(jq -r '.entries[] | select(.path | endswith("/repo-alpha")) | .name' "$root/state/plan-queue.json" | sort -u)"
   is "plan run: the name survives a change in the unconfigured set" "$alpha_again" "$alpha_name"
   aaa_name="$(jq -r '.entries[] | select(.path | endswith("/repo-aaa")) | .name' "$root/state/plan-queue.json" | sort -u)"
@@ -1726,11 +1727,11 @@ STUB
   # The name follows the repository, not its path: a fresh clone dropped in
   # at the same spelling is a different repository and gets a different name,
   # so nothing attempted against the old one is mistaken for it.
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   alpha_name="$(jq -r '.entries[] | select(.path | endswith("/repo-alpha")) | .name' "$root/state/plan-queue.json" | sort -u)"
   git clone -q "$universe/repo-alpha" "$universe/repo-alpha.fresh"
   rm -rf "$universe/repo-alpha"; mv "$universe/repo-alpha.fresh" "$universe/repo-alpha"
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   alpha_again="$(jq -r '.entries[] | select(.path | endswith("/repo-alpha")) | .name' "$root/state/plan-queue.json" | sort -u)"
   is "plan run: a fresh clone at the same path is a new name" "$([[ "$alpha_again" != "$alpha_name" ]] && echo differs || echo same)" "differs"
   is "plan run: ...of the same shape" "$(grep -cE '^plan-repo-alpha-[0-9a-f]{6}$' <<< "$alpha_again")" "1"
@@ -5885,7 +5886,7 @@ yaml.safe_dump({
     "repos": [], "community": [],
 }, open(root / "repos.local.yaml", "w"), sort_keys=False)
 PY
-  "$root/bin/meute" plan --enqueue "$universe" >/dev/null 2>&1
+  "$root/bin/meute" plan --enqueue --replace "$universe" >/dev/null 2>&1
   local key; key="$(jq -r '.entries[] | select(.path | endswith("/repo-one")) | .name' "$root/state/plan-queue.json" | head -1)"
   [[ -n "$key" ]] || { bad "retryable: the plan staged an item to force" "nothing staged"; return 0; }
 
@@ -6245,6 +6246,9 @@ test_probe_shell_options
 test_unit_limits
 test_plan_quarantine
 test_plan_quarantine_manifest_broken
+test_p15_enqueue_refuses_unfinished
+test_p15_only_checked_first
+test_p15_plan_identity_cache
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

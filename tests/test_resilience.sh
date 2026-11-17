@@ -694,3 +694,112 @@ test_plan_quarantine_manifest_broken() {
     "$(compgen -G "$root/state/plan-queue.invalid-*" || echo none)" "none"
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
+
+# P1.5 (R10, R15): a fixture universe for the enqueue tests: three unenrolled
+# repositories, one enrolled one, one task. Prints the queue path.
+_p15_universe() {
+  local u="$1" r
+  dedup_universe "$u" "enr=enrolled" >/dev/null
+  for r in a b c enrolled; do dedup_repo "$u/$r" "p15-$r" >/dev/null; done
+}
+
+# P1.5 (a), decision D3: re-enqueueing over a queue with unattempted items is
+# refused unless --append (merge, keep plan-complete) or --replace is given.
+test_p15_enqueue_refuses_unfinished() {
+  local u="$FIXTURE/p15a" root="$FIXTURE/p15a/meute-stand-in" out rc before
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" done="$root/state/plan-complete"
+  "$root/bin/meute" plan --enqueue --only "$u/a" --only "$u/b" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  before="$(md5sum "$queue" | cut -d' ' -f1)"
+  rc=0; out="$("$root/bin/meute" plan --enqueue --only "$u/c" "$u" 2>&1)" || rc=$?
+  is  "p1.5 enqueue: over a half-finished queue is refused" "$rc" "1"
+  has "p1.5 enqueue: ...naming --append" "$out" "--append"
+  has "p1.5 enqueue: ...and --replace" "$out" "--replace"
+  is  "p1.5 enqueue: ...leaving the queue byte-identical" "$(md5sum "$queue" | cut -d' ' -f1)" "$before"
+  is  "p1.5 enqueue: ...and the completion marks" "$(wc -l < "$done")" "1"
+
+  rc=0; "$root/bin/meute" plan --enqueue --append --only "$u/c" --only "$u/a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 enqueue: --append succeeds" "$rc" "0"
+  is  "p1.5 enqueue: --append merges, one entry per repo" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue")" "a,b,c"
+  is  "p1.5 enqueue: --append keeps plan-complete" "$(wc -l < "$done" 2>/dev/null)" "1"
+
+  rc=0; out="$("$root/bin/meute" plan --enqueue --append --replace --only "$u/c" "$u" 2>&1)" || rc=$?
+  is  "p1.5 enqueue: --append with --replace is a usage error" "$rc" "2"
+  rc=0; out="$("$root/bin/meute" plan --append "$u" 2>&1)" || rc=$?
+  is  "p1.5 enqueue: --append without --enqueue is a usage error" "$rc" "2"
+
+  rc=0; "$root/bin/meute" plan --enqueue --replace --only "$u/c" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 enqueue: --replace succeeds" "$rc" "0"
+  is  "p1.5 enqueue: --replace discards the old entries" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue")" "c"
+  is  "p1.5 enqueue: --replace clears plan-complete" "$(test -e "$done"; echo $?)" "1"
+
+  # A queue whose every item was attempted is finished: no flag needed.
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  rc=0; "$root/bin/meute" plan --enqueue --only "$u/b" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 enqueue: over a finished queue needs no flag" "$rc" "0"
+}
+
+# P1.5 (b), (c): --only paths are checked before anything else, all bad ones
+# reported together, without walking the tree; --skip-invalid stages the
+# good ones and exits 3.
+test_p15_only_checked_first() {
+  local u="$FIXTURE/p15b" root="$FIXTURE/p15b/meute-stand-in" out rc shim="$FIXTURE/p15b-shim"
+  local real_find; real_find="$(command -v find)"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\necho x >> "%s/find.calls"\nexec "%s" "$@"\n' "$shim" "$real_find" > "$shim/find"
+  chmod +x "$shim/find"
+
+  : > "$shim/find.calls"
+  rc=0; out="$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --only "$u/a" --only "$u/nope" \
+    --only "$u/enrolled" "$u" 2>&1)" || rc=$?
+  is  "p1.5 only: a bad path refuses the request" "$rc" "1"
+  has "p1.5 only: ...naming the missing path" "$out" "$u/nope"
+  has "p1.5 only: ...and the enrolled one, in the same run" "$out" "$u/enrolled"
+  is  "p1.5 only: ...staging nothing" "$(test -e "$queue"; echo $?)" "1"
+  is  "p1.5 only: ...without walking the tree" "$(wc -l < "$shim/find.calls")" "0"
+
+  : > "$shim/find.calls"
+  rc=0; out="$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --skip-invalid --only "$u/a" \
+    --only "$u/nope" --only "$u/b" "$u" 2>&1)" || rc=$?
+  is  "p1.5 only: --skip-invalid with one bad path exits 3" "$rc" "3"
+  is  "p1.5 only: --skip-invalid stages the two good ones" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue")" "a,b"
+  has "p1.5 only: --skip-invalid names the bad one on stdout" \
+    "$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --replace --skip-invalid --only "$u/a" --only "$u/nope" "$u" 2>/dev/null)" \
+    $'rejected\t'"$u/nope"$'\t'
+  is  "p1.5 only: a targeted enqueue never walks the tree" "$(wc -l < "$shim/find.calls")" "0"
+}
+
+# P1.5 (d): root-commit identity is cached in state/plan-cache by path and
+# HEAD, so a second scan of an unchanged tree walks no history.
+test_p15_plan_identity_cache() {
+  local u="$FIXTURE/p15d" root="$FIXTURE/p15d/meute-stand-in" shim="$FIXTURE/p15d-shim"
+  local real_git; real_git="$(command -v git)"
+  _p15_universe "$u"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\n[ "$3" = rev-list ] && echo x >> "%s/rev-list.calls"\nexec "%s" "$@"\n' \
+    "$shim" "$real_git" > "$shim/git"
+  chmod +x "$shim/git"
+  : > "$shim/rev-list.calls"
+  PATH="$shim:$PATH" "$root/bin/meute" plan --json "$u" >/dev/null 2>&1
+  is  "p1.5 cache: the first scan walks history" "$(( $(wc -l < "$shim/rev-list.calls") > 0 ))" "1"
+  [[ -s "$root/state/plan-cache" ]] && ok "p1.5 cache: the first scan writes state/plan-cache" \
+    || bad "p1.5 cache: the first scan writes state/plan-cache" "missing or empty"
+  : > "$shim/rev-list.calls"
+  local first second
+  first="$(PATH="$shim:$PATH" "$root/bin/meute" plan --json "$u" 2>/dev/null)"
+  is  "p1.5 cache: a second scan performs zero rev-list calls" "$(wc -l < "$shim/rev-list.calls")" "0"
+  rm -f "$root/state/plan-cache"
+  second="$("$root/bin/meute" plan --json "$u" 2>/dev/null)"
+  is  "p1.5 cache: the cached plan equals an uncached one" "$first" "$second"
+  # A new commit is a new HEAD: that repository is walked again.
+  dedup_repo "$u/a" "p15-a-more" >/dev/null
+  : > "$shim/rev-list.calls"
+  PATH="$shim:$PATH" "$root/bin/meute" plan --json "$u" >/dev/null 2>&1
+  is  "p1.5 cache: a moved HEAD is walked again, once" "$(wc -l < "$shim/rev-list.calls")" "1"
+}

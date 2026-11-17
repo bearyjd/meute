@@ -57,9 +57,17 @@ class FakeFleet:
         if base == "meute" and "--enqueue" in argv:
             if self.enqueue_rc:
                 return self.enqueue_rc, ""
+            # Like the CLI with --skip-invalid: refuse what it would not
+            # stage, one `rejected` line each, stage the rest, exit 3 (or 1
+            # when nothing is left).
             only = [argv[i + 1] for i, a in enumerate(argv) if a == "--only"]
-            self.write_queue(only)
-            return 0, "Staged"
+            good = [p for p in only if p in self.paths]
+            out = "".join(f"rejected\t{p}\tplan: --only {p}: not an unconfigured repository\n"
+                          for p in only if p not in good)
+            if not good:
+                return 1, out
+            self.write_queue(good)
+            return (3 if out else 0), out + "Staged"
         if "plan-queue" in argv:
             if self.on_pending:
                 self.on_pending()

@@ -1,5 +1,6 @@
 """Tests for tui/runctl.py. A fake runner stands in for bin/meute, bin/run.sh and
 lib/manifest.py; nothing here runs the real fleet or touches the real state/."""
+import json
 import os
 import shutil
 import sys
@@ -16,22 +17,28 @@ class EnqueueTests(RunCtlCase):
             self.ctl.enqueue([])
         self.assertEqual(self.fleet.calls, [])
 
-    def test_enqueue_rejects_path_not_in_fresh_plan(self):
-        with self.assertRaises(ValueError):
-            self.ctl.enqueue([ALPHA, "/scan root/projects/private-docs"])
-        self.assertTrue(any("--json" in c for c in self.fleet.calls), "plan must be re-run")
-        self.assertFalse(any("--enqueue" in c for c in self.fleet.calls))
-        self.assertFalse(os.path.exists(self.path("plan-queue.json")))
+    def test_enqueue_does_not_scan_first(self):
+        """P1.5: the CLI checks the named paths itself; no plan --json scan."""
+        self.ctl.enqueue([ALPHA])
+        self.assertFalse(any("--json" in c for c in self.fleet.calls))
 
-    def test_enqueue_rejects_a_collapsed_duplicate(self):
-        """meute plan lists a copy of a repository under `duplicates`, never under
-        `items`: the fresh-plan check alone must refuse it."""
+    def test_enqueue_stages_good_paths_and_names_the_rest(self):
+        bad = "/scan root/projects/private-docs"
+        result = self.ctl.enqueue([ALPHA, bad])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["staged"], 1)
+        self.assertEqual([r["path"] for r in result["rejected"]], [bad])
+        self.assertIn(bad, result["message"])
+        with open(self.path("plan-queue.json")) as f:
+            self.assertEqual([e["name"] for e in json.load(f)["entries"]], [name_for(ALPHA)])
+
+    def test_enqueue_all_rejected_is_value_error(self):
+        """Every path refused (a collapsed copy, a missing path): a ValueError
+        (-> 400) naming one, and nothing staged."""
         dup = "/scan root/projects/output/alpha copy"
-        self.fleet.duplicates = [{"path": dup, "of": ALPHA, "reason": "duplicate of " + ALPHA}]
         with self.assertRaises(ValueError) as cm:
-            self.ctl.enqueue([ALPHA, dup])
+            self.ctl.enqueue([dup, "/scan root/projects/private-docs"])
         self.assertIn(dup, str(cm.exception))
-        self.assertFalse(any("--enqueue" in c for c in self.fleet.calls))
         self.assertFalse(os.path.exists(self.path("plan-queue.json")))
 
     def test_enqueue_rejects_non_string_and_relative_paths(self):
@@ -44,9 +51,18 @@ class EnqueueTests(RunCtlCase):
         result = self.ctl.enqueue([ALPHA, BETA, ALPHA])
         enq = [c for c in self.fleet.calls if "--enqueue" in c]
         self.assertEqual(len(enq), 1)
-        self.assertEqual(enq[0][1:], ["plan", "--enqueue", "--only", ALPHA, "--only", BETA, "--", SCAN])
+        # --append is decision D3: the web page adds to a staged queue.
+        self.assertEqual(enq[0][1:], ["plan", "--enqueue", "--append", "--skip-invalid",
+                                      "--only", ALPHA, "--only", BETA])
         self.assertTrue(enq[0][0].endswith(os.path.join("bin", "meute")))
-        self.assertEqual(result, {"ok": True, "message": result["message"], "staged": 2})
+        self.assertEqual(result, {"ok": True, "message": result["message"], "staged": 2,
+                                  "rejected": []})
+
+    def test_enqueue_passes_the_scan_dir_when_set(self):
+        ctl = runctl.RunController(self.root, runner=self.fleet, scan_dir=SCAN)
+        ctl.enqueue([ALPHA])
+        enq = [c for c in self.fleet.calls if "--enqueue" in c]
+        self.assertEqual(enq[0][-2:], ["--", SCAN])
 
     def test_enqueue_failure_reports_not_ok(self):
         self.fleet.enqueue_rc = 1

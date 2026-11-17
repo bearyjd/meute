@@ -29,6 +29,7 @@
 # canonical copy per root commit; everything below plans only those.
 
 declare -A PLAN_KNOWN_NAME=()
+PLAN_KNOWN_PATHS=()
 
 # A repository's identity that survives a reboot, for naming. dir_id's
 # st_dev is not that: on btrfs a subvolume's device number is anonymous and
@@ -92,13 +93,13 @@ plan_collect_tasks() {
 # directory.  This checkout counts as known under the name "meute".
 plan_known_repos() {
   local line path name
-  PLAN_KNOWN_NAME=()
+  PLAN_KNOWN_NAME=(); PLAN_KNOWN_PATHS=()
   PLAN_KNOWN_NAME["$(dir_id "$MEUTE_ROOT")"]="meute"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     path="$(jq -r '.path' <<< "$line")"
     name="$(jq -r '.name // ""' <<< "$line")"
-    PLAN_KNOWN_NAME["$(dir_id "$path")"]="$name"
+    PLAN_KNOWN_NAME["$(dir_id "$path")"]="$name"; PLAN_KNOWN_PATHS+=( "$path" )
   done < <(python3 "$MANIFEST_PY" list-repos "$MANIFEST")
 }
 
@@ -215,26 +216,33 @@ plan_print_json() {
       items:$items, excluded:{web:$web, other:$other}, duplicates:$duplicates, skipped:$skipped, diverged:$diverged}'
 }
 
-# Narrow PLAN_UNCONFIGURED to the paths named with --only. Compared by
-# identity (dir_id), like the scan. A path that is not an unconfigured
-# repository the scan found -- or one dedup set aside -- refuses the whole
-# request before anything is staged.
-plan_restrict_to() {
-  local -A want=()
-  local -a kept=()
-  local path real id
-  for path in "$@"; do
-    plan_refuse_collapsed "$path"
-    id="$(dir_id "$path")"
-    for real in "${PLAN_UNCONFIGURED[@]}"; do
-      [[ "$(dir_id "$real")" == "$id" ]] && { want["$id"]=1; break; }
-    done
-    [[ -n "${want[$id]+present}" ]] || die "plan: --only ${path}: not an unconfigured repository found by the scan"
-  done
-  for real in "${PLAN_UNCONFIGURED[@]}"; do
-    [[ -n "${want[$(dir_id "$real")]+present}" ]] && kept+=( "$real" )
-  done
-  PLAN_UNCONFIGURED=( "${kept[@]}" )
+# How many staged entries have no completion mark, or "?" when the queue
+# cannot be read. Keys are the runner's: plan/<name>/<task>.
+plan_unattempted() {
+  local queue="${STATE_DIR}/plan-queue.json" done_file="${STATE_DIR}/plan-complete" keys k n=0
+  local -A done=()
+  [[ -f "$queue" ]] || { echo 0; return 0; }
+  keys="$(jq -r '.entries[] | "plan/\(.name)/\(.task)"' "$queue" 2>/dev/null)" || { echo "?"; return 0; }
+  if [[ -f "$done_file" ]]; then
+    while IFS=$'\t' read -r k _; do done["$k"]=1; done < "$done_file"
+  fi
+  while IFS= read -r k; do
+    if [[ -n "$k" && -z "${done[$k]+present}" ]]; then n=$(( n + 1 )); fi
+  done <<< "$keys"
+  echo "$n"
+}
+
+# Decision D3: staging over a queue that still has unattempted items would
+# throw that work away and, with plan-complete cleared, re-run what finished.
+# Refuse unless the operator says which: $1 is "", append or replace.
+plan_queue_guard() {
+  local mode="$1" n
+  [[ "$mode" != replace ]] || return 0
+  n="$(plan_unattempted)"
+  [[ "$n" != "?" ]] \
+    || die "plan: ${STATE_DIR}/plan-queue.json cannot be read; pass --replace to discard it"
+  [[ "$mode" != append && "$n" != 0 ]] || return 0
+  die "plan: the staged queue still has ${n} unattempted item(s); pass --append to add to it, or --replace to discard it and its completion marks"
 }
 
 # The inventory and the ranked proposal, with what was left out and why.
@@ -285,8 +293,10 @@ plan_print() {
 
 # Write state/plan-queue.json: one entry per (unconfigured repo, task), under
 # a synthetic name the runner can use as a repo name.
+# $3 append merges into an existing queue and keeps its completion marks;
+# anything else replaces both (plan_queue_guard has already said yes).
 plan_stage() {
-  local scan_dir="$1" allow_web="$2" real task stem safe_name
+  local scan_dir="$1" allow_web="$2" mode="${3:-}" real task stem safe_name
   (( ${#PLAN_UNCONFIGURED[@]} && ${#PLAN_TASKS[@]} )) || die "plan: nothing to stage"
   mkdir -p "$STATE_DIR"
   local entries_file queue_tmp queue_file
@@ -311,16 +321,30 @@ plan_stage() {
   # so a hand-edited plan cannot smuggle a web tier past a plan that never
   # allowed one.
   local web_json=false; (( allow_web )) && web_json=true
-  jq -s . "$entries_file" | jq -n --arg scan "$scan_dir" --argjson entries "$(cat)" \
-    --argjson web "$web_json" \
-    '{version:1, scan:$scan, allow_web:$web, entries:$entries}' > "$queue_tmp" \
-    || { rm -f "$entries_file" "$queue_tmp"; die "plan: could not stage plan queue"; }
-  mv -f "$queue_tmp" "$queue_file"
-  # Completion markers belong to the previous explicit plan.  The next plan
-  # may reuse synthetic names and task names, so never let stale attempts
-  # silently suppress newly staged work.
-  rm -f "${STATE_DIR}/plan-complete"
+  local staged="$(( ${#PLAN_UNCONFIGURED[@]} * ${#PLAN_TASKS[@]} ))" what="Staged" before
+  if [[ "$mode" == append && -f "$queue_file" ]]; then
+    # An entry already staged keeps its place and its mark. allow_web is
+    # either plan's: each entry was staged under a plan that allowed it.
+    before="$(jq '.entries | length' "$queue_file" 2>/dev/null)" \
+      && jq --slurpfile new "$entries_file" --argjson web "$web_json" \
+        '.entries as $old | .allow_web = ((.allow_web == true) or $web)
+         | .entries = $old + [$new[] | select(. as $n | $old | any(.name == $n.name and .task == $n.task) | not)]' \
+        "$queue_file" > "$queue_tmp" \
+      || { rm -f "$entries_file" "$queue_tmp"; die "plan: could not append to plan queue"; }
+    staged="$(( $(jq '.entries | length' "$queue_tmp") - before ))"; what="Appended"
+    mv -f "$queue_tmp" "$queue_file"
+  else
+    jq -s . "$entries_file" | jq -n --arg scan "$scan_dir" --argjson entries "$(cat)" \
+      --argjson web "$web_json" \
+      '{version:1, scan:$scan, allow_web:$web, entries:$entries}' > "$queue_tmp" \
+      || { rm -f "$entries_file" "$queue_tmp"; die "plan: could not stage plan queue"; }
+    mv -f "$queue_tmp" "$queue_file"
+    # Completion markers belong to the previous explicit plan.  The next plan
+    # may reuse synthetic names and task names, so never let stale attempts
+    # silently suppress newly staged work.
+    rm -f "${STATE_DIR}/plan-complete"
+  fi
   rm -f "$entries_file"
-  printf '\nStaged %d read-only analysis item(s) in %s. The normal runner will prioritize this explicit queue; it cannot enroll repositories or run a writing tier, but each run still cuts a meute/<task>-<date> scratch branch and a worktree in the unenrolled repository (removed when the run ends; a killed run leaves them for git worktree prune).\n' \
-    "$(( ${#PLAN_UNCONFIGURED[@]} * ${#PLAN_TASKS[@]} ))" "$queue_file"
+  printf '\n%s %d read-only analysis item(s) in %s. The normal runner will prioritize this explicit queue; it cannot enroll repositories or run a writing tier, but each run still cuts a meute/<task>-<date> scratch branch and a worktree in the unenrolled repository (removed when the run ends; a killed run leaves them for git worktree prune).\n' \
+    "$what" "$staged" "$queue_file"
 }
