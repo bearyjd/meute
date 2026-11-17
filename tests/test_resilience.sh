@@ -782,7 +782,13 @@ test_p24_doctor() {
   hasnt "p2.4 doctor: an owner-only state/ is not warned about" "$out" "state/ is readable by group or others"
   chmod 750 "$FIXTURE/state"
   has   "p2.4 doctor: a group-readable state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  local m
+  for m in 711 701 710 720 702 722; do
+    chmod "$m" "$FIXTURE/state"
+    has "p2.4 doctor: a ${m} state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  done
   chmod 700 "$FIXTURE/state"
+  hasnt "p2.4 doctor: a 700 state/ is not warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
   hasnt "p2.4 doctor: clean remotes raise no credential warning" "$out" "credentials embedded"
   git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
   git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"

@@ -15,7 +15,7 @@ doctor_privacy() {
   for dir in state reports; do
     [[ -d "${MEUTE_ROOT}/${dir}" ]] || continue
     mode="$(stat -c %a "${MEUTE_ROOT}/${dir}" 2>/dev/null)" || continue
-    if (( (8#$mode & 8#055) != 0 )); then
+    if (( (8#$mode & 8#077) != 0 )); then
       d_warn "${dir}/ is readable by group or others (mode ${mode}) - run: chmod -R go-rwx ${dir}"
     else
       d_ok "${dir}/ is owner-only"
