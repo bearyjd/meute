@@ -6259,6 +6259,10 @@ test_web_invariants
 test_p0_5_single_process_reads
 test_p0_5_findings_failure_and_nonregular
 test_p1_7a_fingerprint_inherit
+test_p1_7b_verify_claim
+test_p1_7b_status_ignored
+test_p1_7b_verify_hardening
+test_p1_7b_rewritten_rename
 test_p26_unknown_policy_keys
 test_kv_writes_locked
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
