@@ -1005,7 +1005,7 @@ SH
   local H=( env PATH="$st:$PATH" XDG_CONFIG_HOME="$root/cfg" MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml"
             MEUTE_DF="$st/df" MEUTE_PROC="$root/proc" )
   _hreset() {
-    rm -rf "$state/log" "$state/hold" "$state/lock-info" "$state/rate-limits.json" "$state/policy-override" "$root/.worktrees" "$root/alert.txt"
+    rm -rf "$state/log" "$state/hold" "$state/lock-info" "$state/rate-limits.json" "$state/policy-override" "$root/.worktrees" "$root/alert.txt" "$state/health-alerted"
     _health_log "$state/log" $(( now - 3600 )) ok
   }
   _hcase() {   # <name> <expected substring> [env...] -- the fixture is already crafted
@@ -1049,8 +1049,17 @@ yaml.safe_dump(d, open(p, "w"), sort_keys=False)
 PY
 
   _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
-  _health_log "$state/log" $(( now - 600 )) skipped quota
+  _health_log "$state/log" $(( now - 600 )) skipped quota-unknown
   _hcase "a last status=ok older than the threshold" "no successful run"
+  # Declining by design is not failing: a spent budget, nothing eligible, or a
+  # quota under the floor is the fleet working, not a fleet that stopped.
+  local benign
+  for benign in budget nothing-eligible no-queue quota-floor; do
+    _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
+    for i in 4 3 2 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped "$benign"; done
+    out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+    is "health: days of code=$benign skips are not a failure" "$rc:$out" "0:"
+  done
 
   _hreset; local i; for i in 3 2 1; do _health_log "$state/log" $(( now - i * 60 )) error died; done
   _hcase "three consecutive errors" "3 consecutive"
@@ -1130,6 +1139,25 @@ PY
   has "health --alert --failed: a failed run unit alerts even on a healthy fleet" "$(cat "$root/alert.txt" 2>/dev/null)" "meute run failed"
   [[ "$rc" != 0 ]] && ok "health --alert --failed: exits non-zero" || bad "health --alert --failed: exits non-zero" "exit 0"
   hasnt "health --alert: the alert names no repository (D4)" "$(cat "$root/alert.txt" 2>/dev/null)" "zorblax"
+  # One alert per problem, not one an hour: a 24 h automatic hold alerts once.
+  _hreset; printf 'hold\t%s\tauto: provider rate limit\n' $(( now + 86400 )) > "$state/hold"
+  "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: an automatic hold alerts" "$(cat "$root/alert.txt" 2>/dev/null)" "automatic hold"
+  rm -f "$root/alert.txt"
+  out="$("${H[@]}" MEUTE_NOW=$(( now + 3600 )) "$root/bin/meute" health --alert 2>/dev/null)"; rc=$?
+  [[ ! -e "$root/alert.txt" ]] && ok "health --alert: the same hold an hour later is not sent again" \
+    || bad "health --alert: the same hold an hour later is not sent again" "$(cat "$root/alert.txt")"
+  [[ "$rc" != 0 ]] && ok "health --alert: ...it is still reported, exit non-zero" || bad "health --alert: ...it is still reported, exit non-zero" "exit 0"
+  has "health --alert: ...and printed" "$out" "automatic hold"
+  "${H[@]}" MEUTE_NOW=$(( now + 7200 )) STUB_DF_FREE=100 "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: a new problem beside it is sent" "$(cat "$root/alert.txt" 2>/dev/null)" "MB free"
+  rm -f "$root/alert.txt" "$state/hold"
+  "${H[@]}" MEUTE_NOW=$(( now + 7200 )) "$root/bin/meute" health --alert >/dev/null 2>&1; rc=$?
+  is "health --alert: once healthy again, exit 0" "$rc" "0"
+  printf 'hold\t%s\tauto: provider rate limit\n' $(( now + 86400 )) > "$state/hold"
+  "${H[@]}" MEUTE_NOW=$(( now + 10800 )) "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: a problem that cleared and came back alerts again" "$(cat "$root/alert.txt" 2>/dev/null)" "automatic hold"
+  rm -f "$state/hold"
   local v
   v="$(python3 - "$root/repos.yaml" "$root/bad.yaml" <<'PY'
 import sys, yaml

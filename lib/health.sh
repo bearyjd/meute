@@ -65,8 +65,11 @@ health_check_log() {
       $(( (now - last) / 3600 )) $(( 2 * cadence / 3600 ))
   fi
   # A fire skipped by a pause the owner set is not a failure, during the pause
-  # or after it ends; an automatic hold's skips are (health_check_hold).
-  t="$(awk -F'\t' 'index($0, "\tstatus=ok\t") || (index($0, "\tcode=hold\t") && !index($0, "auto: ")) { t = $1 }
+  # or after it ends; an automatic hold's skips are (health_check_hold). Nor is
+  # a fire that declined by design: a spent budget, nothing eligible, no queue,
+  # or a quota under the floor is the fleet working, not a fleet that stopped.
+  t="$(awk -F'\t' 'index($0, "\tstatus=ok\t") || (index($0, "\tcode=hold\t") && !index($0, "auto: ")) \
+                     || /\tcode=(budget|nothing-eligible|no-queue|quota-floor)\t/ { t = $1 }
                    END { print t }' "$LOG_FILE")"
   last_ok="$(_health_epoch "$t")"
   first="$(_health_epoch "$(head -n 1 "$LOG_FILE" | cut -f1)")"
@@ -174,15 +177,37 @@ print(v if isinstance(v, str) else "")' "$MANIFEST" 2>/dev/null || true
 }
 
 # health_alert <text>: the text on alert_cmd's stdin, bounded in time.
+# Returns 1 when nothing was delivered (no alert_cmd, or it failed).
 health_alert() {
   local cmd rc=0
   cmd="$(health_alert_cmd)"
   if [[ -z "$cmd" ]]; then
     note "health: policy.alert_cmd is not set; nothing was sent"
-    return 0
+    return 1
   fi
   printf '%s\n' "$1" | timeout "$HEALTH_ALERT_TIMEOUT" bash -c "$cmd" >/dev/null 2>&1 || rc=$?
-  (( rc == 0 )) || note "health: policy.alert_cmd failed (exit ${rc})"
+  (( rc == 0 )) && return 0
+  note "health: policy.alert_cmd failed (exit ${rc})"
+  return 1
+}
+
+# One alert per problem, not one per hourly check: state/health-alerted holds
+# the problems already sent, one key per line (the line with its numbers
+# blanked, so "held for 61m" and "held for 121m" are one problem). --alert
+# sends only when a problem is not in it; a problem that clears drops out, so
+# its return is news again. A delivery that fails records nothing new.
+_health_keys() { sed 's/[0-9][0-9]*/#/g' | sort -u; }
+
+# health_alert_once <text> <always>
+health_alert_once() {
+  local marker="${STATE_DIR}/health-alerted" keys seen
+  keys="$(_health_keys <<< "$1")"
+  seen="$(sort -u "$marker" 2>/dev/null)" || seen=""
+  if (( $2 )) || [[ -n "$(comm -23 <(printf '%s\n' "$keys") <(printf '%s\n' "$seen"))" ]]; then
+    if health_alert "$1"; then printf '%s\n' "$keys" > "$marker"; return 0; fi
+    keys="$(comm -12 <(printf '%s\n' "$keys") <(printf '%s\n' "$seen"))"
+  fi
+  if [[ -n "$keys" ]]; then printf '%s\n' "$keys" > "$marker"; else rm -f "$marker"; fi
 }
 
 cmd_health() {
@@ -198,8 +223,11 @@ cmd_health() {
   text="$(health_problems)"
   (( ! failed )) \
     || text="a scheduled meute run failed; see: journalctl --user -u meute-daily -u meute-weekly${text:+$'\n'${text}}"
-  [[ -n "$text" ]] || return 0
+  if [[ -z "$text" ]]; then
+    (( ! alert )) || rm -f "${STATE_DIR}/health-alerted"
+    return 0
+  fi
   printf '%s\n' "$text"
-  (( ! alert )) || health_alert "$text"
+  (( ! alert )) || health_alert_once "$text" "$failed"
   return 1
 }
