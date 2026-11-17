@@ -811,3 +811,36 @@ test_p1_3_wait_lock() {
   rc=0; "${run[@]}" --wait-lock 09 >/dev/null 2>&1 || rc=$?
   is  "wait lock: a zero-padded wait is a usage error, not an octal crash (2)" "$rc" "2"
 }
+
+# P2.2 (R18): state/reports is a read-modify-write with no lock, and the web
+# server is threaded, so two triage decisions landing together kept only one.
+# Twenty parallel dismissals of different findings must leave twenty rows,
+# every round; kv_set and kv_del take the same lock as kv_set_row.
+test_kv_writes_locked() {
+  local root="$FIXTURE/kvlock" id="alpha/kvlock-2026-01-01" round n rows lost=0
+  mkdir -p "$root/state" "$root/reports/alpha"
+  ln -sfn "$REPO/lib" "$root/lib"; ln -sfn "$REPO/bin" "$root/bin"
+  printf '# kvlock\n' > "$root/reports/${id}.md"
+  for (( round = 1; round <= 10; round++ )); do
+    rm -f "$root/state/reports"
+    for (( n = 1; n <= 20; n++ )); do
+      "$root/bin/meute" dismiss "$id" -f "$n" -r other -m "round $round" >/dev/null 2>&1 &
+    done
+    wait
+    rows="$(grep -c "^${id}#" "$root/state/reports" 2>/dev/null || true)"
+    [[ "$rows" == 20 ]] || lost=$(( lost + 1 ))
+  done
+  is "p2.2 kv lock: 20 parallel dismissals keep 20 rows in each of 10 rounds" "$lost rounds lost rows" "0 rounds lost rows"
+
+  local f="$root/state/kv"
+  rm -f "$f"
+  for (( n = 1; n <= 20; n++ )); do ( source "$REPO/lib/state.sh"; kv_set "$f" "k$n" "v$n" ) & done
+  wait
+  is "p2.2 kv lock: 20 parallel kv_set calls keep 20 rows" "$(wc -l < "$f")" "20"
+  for (( n = 1; n <= 20; n++ )); do ( source "$REPO/lib/state.sh"; kv_del "$f" "k$n" ) & done
+  wait
+  is "p2.2 kv lock: 20 parallel kv_del calls leave no row" "$(wc -l < "$f")" "0"
+  is "p2.2 kv lock: no scratch file is left beside the store" "$(ls -A "$root/state" | grep -c '^\.kv\.')" "0"
+  is "p2.2 kv lock: the lock file never reaches the public harness" \
+     "$(git -C "$REPO" check-ignore -q -- state/reports.lock; echo $?)" "0"
+}
