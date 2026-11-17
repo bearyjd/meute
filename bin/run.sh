@@ -24,6 +24,7 @@
 #                            and stepped over, and plan bookkeeping still happens (a
 #                            vanished staged repo is marked missing, a finished plan
 #                            is archived)
+#   --ignore-load            skip the host load check, for a forced run (lib/hostcheck.sh; disk is always checked)
 #   --strict-exit            exit status names the outcome (also MEUTE_STRICT_EXIT=1); table in lib/outcome.sh
 #   --validate               validate the manifest and exit
 #   --help
@@ -44,7 +45,7 @@ set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
-source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/policy_override.sh"
+source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/policy_override.sh"; source "${MEUTE_ROOT}/lib/hostcheck.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
@@ -164,6 +165,7 @@ parse_args() {
       --repo)     FORCE_REPO="${2:?--repo needs a value}"; shift ;;
       --task)     FORCE_TASK="${2:?--task needs a value}"; shift ;;
       --dry-run)  DRY_RUN=1 ;;
+      --ignore-load) HOST_IGNORE_LOAD=1 ;;
       --strict-exit) ;;   # read by outcome_scan_args, before anything can fail
       --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;   # validate's own status, even under --strict-exit
       --help|-h)  usage; exit 0 ;;
@@ -390,6 +392,8 @@ main() {
   if hold_active; then
     skip hold "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
   fi
+
+  hostcheck_gate   # lib/hostcheck.sh: load and disk, before the lock
 
   # One runner at a time. A slow run must not stack up under a tight timer.
   runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip lock "another run holds the lock"

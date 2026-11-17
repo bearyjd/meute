@@ -36,6 +36,7 @@ command that writes repos.local.yaml or state/tickets.yaml.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -78,6 +79,9 @@ POLICY_DEFAULTS = {
     "community_share": 0.20,
     "tier3_max_in_flight": 3,
     "branch_prefix": "meute",
+    # Host-health gate (lib/hostcheck.sh). 0 disables either check.
+    "max_load_per_cpu": 2.0,
+    "min_free_mb": 512,
     # systemd OnCalendar strings. One item runs per fire, so cadence is the
     # lever that turns "fleet coverage" into "how often each repo is seen".
     "daily_calendar": "*-*-* 03:17:00",
@@ -144,6 +148,12 @@ def merged_policy(data: dict) -> dict:
         raise ManifestError("policy.weekly_runs: must be a positive integer")
     if cost is not None and (not isinstance(cost, (int, float)) or float(cost) <= 0):
         raise ManifestError("policy.weekly_cost_usd: must be a positive number")
+    load = policy["max_load_per_cpu"]
+    if isinstance(load, bool) or not isinstance(load, (int, float)) or not math.isfinite(load) or load < 0:
+        raise ManifestError("policy.max_load_per_cpu: must be a number >= 0 (0 disables the load check)")
+    free = policy["min_free_mb"]
+    if isinstance(free, bool) or not isinstance(free, int) or free < 0:
+        raise ManifestError("policy.min_free_mb: must be an integer >= 0 (0 disables the disk check)")
     if not SAFE_NAME.match(str(policy["branch_prefix"])):
         raise ManifestError("policy.branch_prefix: must be a safe identifier")
     for key in ("daily_calendar", "weekly_calendar"):
