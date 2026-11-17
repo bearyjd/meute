@@ -50,7 +50,7 @@ window.meuteShowTab = showTab;
 // ---- findings -------------------------------------------------------------
 const COLS = ["repo", "severity", "title", "location", "lens", "date", "state"];
 
-function isDecided(f) { return f.state !== "new"; }
+function isDecided(f) { return f.state !== "new" || Boolean(f.inherited); }
 
 function visibleRows() {
   const q = $("filter").value.trim().toLowerCase();
