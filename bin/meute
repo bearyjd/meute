@@ -117,6 +117,7 @@ source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/tmp.sh"
 source "${MEUTE_ROOT}/lib/sweep.sh"
 source "${MEUTE_ROOT}/lib/policy_override.sh"
+source "${MEUTE_ROOT}/lib/scope.sh"
 source "${MEUTE_ROOT}/lib/drain.sh"
 
 SCRUBBED=""

@@ -2,10 +2,14 @@
 subprocess timeouts. A fake runner stands in for meute/run.sh/manifest.py;
 nothing here runs the real fleet or touches the real state/."""
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runctl_helpers import ALPHA, BETA, RunCtlCase, name_for, runctl  # noqa: E402
@@ -95,3 +99,83 @@ class SubprocessRunnerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScopeContainmentTests(unittest.TestCase):
+    """A run.sh item started by the web loop goes through a systemd user scope
+    when systemd-run works (P2.7, R14); otherwise it runs as before."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.stub = os.path.join(self.tmp, "systemd-run")
+        self.calls = os.path.join(self.tmp, "calls")
+        with open(self.stub, "w") as f:
+            f.write('#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "' + self.calls + '"\n'
+                    '[[ "${!#}" == true && -n "${SCOPE_PROBE_FAIL:-}" ]] && exit 1\n'
+                    'while [[ "$1" == --* ]]; do shift; done\nexec "$@"\n')
+        os.chmod(self.stub, 0o755)
+        self.out = os.path.join(self.tmp, "out")
+        self.stops = os.path.join(self.tmp, "stops")
+        self.systemctl = os.path.join(self.tmp, "systemctl")
+        with open(self.systemctl, "w") as f:
+            f.write('#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "' + self.stops + '"\n')
+        os.chmod(self.systemctl, 0o755)
+
+    def run_item(self, **env):
+        argv = [sys.executable, "-c", "print('ran')"]
+        with mock.patch.dict(os.environ, {"MEUTE_SCOPE": "on", "MEUTE_SYSTEMD_RUN": self.stub,
+                                          "MEUTE_SYSTEMCTL": self.systemctl, **env}):
+            return runctl.subprocess_runner(argv, self.tmp, out_path=self.out)
+
+    def logged(self):
+        return open(self.calls).read() if os.path.exists(self.calls) else ""
+
+    def test_item_runs_in_a_collected_user_scope(self):
+        self.assertEqual(self.run_item()[0], 0)
+        self.assertIn("--user --scope --collect", self.logged().splitlines()[-1])
+        self.assertEqual(open(self.out).read(), "ran\n")
+        unit = self.logged().splitlines()[-1].split("--unit=")[1].split()[0]
+        self.assertEqual(open(self.stops).read(), f"--user stop {unit}.scope\n")
+
+    def test_failing_probe_falls_back_to_a_plain_run(self):
+        self.assertEqual(self.run_item(SCOPE_PROBE_FAIL="1")[0], 0)
+        self.assertNotIn("print", self.logged())
+        self.assertEqual(open(self.out).read(), "ran\n")
+
+    def test_missing_systemd_run_falls_back(self):
+        self.assertEqual(self.run_item(MEUTE_SYSTEMD_RUN=self.stub + "-absent")[0], 0)
+        self.assertEqual(open(self.out).read(), "ran\n")
+
+    def test_scope_off_never_calls_systemd_run(self):
+        self.assertEqual(self.run_item(MEUTE_SCOPE="off")[0], 0)
+        self.assertEqual(self.logged(), "")
+
+
+def _real_scope_works() -> bool:
+    try:
+        return subprocess.run(["systemd-run", "--user", "--scope", "--collect", "--quiet", "true"],
+                              stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@unittest.skipUnless(_real_scope_works(), "systemd-run --user --scope is not usable here")
+class RealScopeReapTests(unittest.TestCase):
+    """A straggler a web-loop run.sh item leaves behind is gone once the item
+    returns: a scope outlives its main process, so it must be stopped (P2.7)."""
+
+    def test_straggler_does_not_outlive_the_item(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        pidfile = os.path.join(tmp, "pid")
+        argv = ["bash", "-c", f"setsid sleep 600 </dev/null >/dev/null 2>&1 & echo $! > {pidfile}"]
+        with mock.patch.dict(os.environ, {"MEUTE_SCOPE": "on"}):
+            os.environ.pop("MEUTE_SYSTEMD_RUN", None)
+            rc, _ = runctl.subprocess_runner(argv, tmp, out_path=os.path.join(tmp, "out"))
+        self.assertEqual(rc, 0)
+        pid = int(open(pidfile).read())
+        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        time.sleep(1)
+        self.assertFalse(os.path.exists(f"/proc/{pid}"), "straggler outlived its run.sh item")
