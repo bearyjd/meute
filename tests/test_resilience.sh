@@ -1227,6 +1227,8 @@ print(",".join(fs.verify_report(sys.argv[2], "main@" + sys.argv[3], ["src/dead.p
 PY
 )"
   is  "p1.7b rename: a plain deletion is still gone" "$out" "gone"
+}
+
 # P2.6 (R20): a typo under policy: used to fall back to the default silently.
 # validate and doctor now name unknown keys; they stay a warning, never an error.
 test_p26_unknown_policy_keys() {
