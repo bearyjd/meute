@@ -982,4 +982,46 @@ PY
   is  "p1.7b hardening: a base ref that is a git option is unknown" "$(sed -n 's/^optref=//p' <<< "$out")" "unknown"
   [[ ! -e "$trap" ]] && ok "p1.7b hardening: base front-matter never reaches git as an option" \
     || bad "p1.7b hardening: base front-matter never reaches git as an option" "$trap was written"
+
+  # A PR URL is one printable token: ESC and other control characters are out.
+  local u okv=""
+  for u in $'https://x/pull/1\e[31m' $'https://x/\x01y' $'https://x/\x7fy' $'https://x/a\rb' $'https://x/a b'; do
+    ( source "$REPO/lib/finding_cmds.sh"; valid_pr_url "$u" ) && okv="$okv accepted"
+  done
+  is  "p1.7b hardening: a PR URL with a control character is rejected" "$okv" ""
+  ( source "$REPO/lib/finding_cmds.sh"; valid_pr_url "https://github.com/o/r/pull/7" ) \
+    && ok "p1.7b hardening: a plain PR URL is still accepted" || bad "p1.7b hardening: a plain PR URL is still accepted" "rejected"
+}
+
+# A file renamed and heavily rewritten shows as delete + add (below git's
+# similarity threshold): it must not read as gone, or it is hidden.
+test_p1_7b_rewritten_rename() {
+  local g="$FIXTURE/p17br/alpha" a out
+  local gitc=(git -C "$g" -c user.name=t -c user.email=t@t)
+  mkdir -p "$g/src"; git init -q -b main "$g"
+  seq 1 40 | sed 's/^/old line /' > "$g/src/db.py"
+  seq 1 5 | sed 's/^/stay /' > "$g/src/keep.py"
+  seq 1 5 | sed 's/^/dies /' > "$g/src/dead.py"
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm A; a="$(git -C "$g" rev-parse HEAD)"
+  git -C "$g" rm -q src/db.py
+  seq 1 40 | sed 's/^/totally new /' > "$g/src/storage.py"
+  "${gitc[@]}" add -A; "${gitc[@]}" commit -qm B
+  out="$(python3 - "$REPO/lib" "$g" "$a" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+g, a = sys.argv[2:4]
+print(",".join(fs.verify_report(g, "main@" + a, ["src/db.py", "src/keep.py"])[1]))
+PY
+)"
+  is  "p1.7b rename: a rewritten rename is not gone" "$out" "changed,current"
+  # A plain deletion with nothing added is still gone.
+  git -C "$g" rm -q src/dead.py; "${gitc[@]}" commit -qm C
+  a="$(git -C "$g" rev-parse HEAD~1)"
+  out="$(python3 - "$REPO/lib" "$g" "$a" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1]); import finding_status as fs
+print(",".join(fs.verify_report(sys.argv[2], "main@" + sys.argv[3], ["src/dead.py"])[1]))
+PY
+)"
+  is  "p1.7b rename: a plain deletion is still gone" "$out" "gone"
 }

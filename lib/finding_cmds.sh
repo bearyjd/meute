@@ -24,8 +24,9 @@ cmd_findings_verify() {
   note "verified${repo:+ ${repo}}: ${counts}"
 }
 
-# A PR's URL as the kv store can hold it: one token, http(s), no tabs/newlines.
-valid_pr_url() { [[ "$1" =~ ^https?://[^[:space:]]+$ ]]; }
+# A PR's URL as the kv store can hold it: one token, http(s), no whitespace or
+# other control characters (an ESC would reach the terminal).
+valid_pr_url() { [[ "$1" =~ ^https?://[^[:space:][:cntrl:]]+$ ]]; }
 
 # "Covered by an open PR": hides the finding from `findings --new` until the
 # PR lands (then `meute resolve --pr`) or the claim file is deleted.

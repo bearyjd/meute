@@ -149,6 +149,7 @@ def verify_report(repo_path: str, base: str, files: list[str]) -> tuple[str, lis
     touched: dict[str, str] = {}
     fields = diff.stdout.split("\0")
     i = 0
+    added = False
     while i < len(fields) - 1:
         status = fields[i]
         # A rename is changed, not gone: the defect may have moved with it.
@@ -157,7 +158,12 @@ def verify_report(repo_path: str, base: str, files: list[str]) -> tuple[str, lis
             i += 3
             continue
         touched[fields[i + 1]] = "gone" if status == "D" else "changed"
+        added = added or status == "A"
         i += 2
+    # A rename rewritten below git's similarity threshold shows as delete + add:
+    # with anything added, a deletion may be that rename, so it is not gone.
+    if added:
+        touched = {f: "changed" if v == "gone" else v for f, v in touched.items()}
     # A location outside the repository would make ls-tree fail for every
     # path at once; it is unknown on its own instead.
     inside = {f for f in files if f and not os.path.isabs(f) and ".." not in f.split("/")}
