@@ -39,16 +39,22 @@ scope_on_signal() {
 }
 
 # scope_run CMD...: run CMD in its own scope (if scope_init found one), then
-# stop that scope so no straggler survives. Returns CMD's exit status.
+# stop that scope so no straggler survives. Returns CMD's exit status. The
+# caller's own INT/TERM traps are restored afterwards, and only once the scope
+# is stopped, so a signal in between still reaches scope_on_signal. A call made
+# while another scope_run is live just runs CMD (it is already in that scope).
 scope_run() {
   (( ${#SCOPE_CMD[@]} )) || { "$@"; return; }
-  local unit="meute-run-$$-$(( ++SCOPE_SEQ ))-${RANDOM}" rc=0
+  [[ -z "${SCOPE_UNIT:-}" ]] || { "$@"; return; }
+  local unit="meute-run-$$-$(( ++SCOPE_SEQ ))-${RANDOM}" rc=0 saved
+  saved="$(trap -p INT TERM)"
   SCOPE_UNIT="$unit"
   trap 'scope_on_signal INT' INT
   trap 'scope_on_signal TERM' TERM
   "${SCOPE_CMD[@]}" --unit="$unit" "$@" || rc=$?
-  trap - INT TERM
-  SCOPE_UNIT=""
   scope_stop "$unit"
+  SCOPE_UNIT=""
+  trap - INT TERM
+  [[ -z "$saved" ]] || eval "$saved"
   return "$rc"
 }

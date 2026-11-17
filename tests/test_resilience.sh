@@ -1629,6 +1629,42 @@ PY
 }
 test_p2_7_scope_signals() { _scope_signal_case TERM; _scope_signal_case INT; }
 
+# scope_run is library code a caller's shell shares: it must leave the caller's
+# own INT/TERM traps alone, keep ITS traps until the scope is stopped, and a
+# nested call must not clear the outer call's trap or unit.
+_scope_lib_case() {
+  local root="$FIXTURE/p27lib" out
+  mkdir -p "$root"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\nwhile [[ "$1" == --* ]]; do shift; done\nexec "$@"\n' "$root/run.calls" > "$root/systemd-run"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$root/stop.calls" > "$root/systemctl"
+  chmod +x "$root/systemd-run" "$root/systemctl"
+  out="$(MEUTE_SYSTEMD_RUN="$root/systemd-run" MEUTE_SYSTEMCTL="$root/systemctl" ROOT="$root" LIB="$REPO/lib/scope.sh" bash -c '
+    source "$LIB"; SCOPE_CMD=("$MEUTE_SYSTEMD_RUN" --user --scope)
+    trap "echo caller-int" INT; trap "echo caller-term" TERM
+    scope_run true
+    echo "after:$(trap -p INT | grep -c caller-int)$(trap -p TERM | grep -c caller-term)"
+    trap - INT TERM
+    scope_run true
+    echo "none:$(trap -p INT TERM | wc -l)"
+    scope_stop() { echo "during:$(trap -p TERM | grep -c scope_on_signal)"; }
+    scope_run true
+    source "$LIB"; SCOPE_CMD=("$MEUTE_SYSTEMD_RUN" --user --scope)
+    : > "$ROOT/run.calls"
+    trap "scope_on_signal TERM" TERM; SCOPE_UNIT=outer   # as if an outer scope_run were live
+    scope_run true
+    echo "outer-unit:$SCOPE_UNIT"
+    echo "outer-trap:$(trap -p TERM | grep -c scope_on_signal)"
+    echo "runs:$(grep -c -- --unit "$ROOT/run.calls")"
+  ' 2>&1)"
+  has "scope lib: a caller's INT/TERM traps survive scope_run" "$out" "after:11"
+  has "scope lib: no caller trap stays none after scope_run" "$out" "none:0"
+  has "scope lib: our traps are still set while the scope is stopped" "$out" "during:1"
+  has "scope lib: a nested scope_run keeps the outer unit" "$out" "outer-unit:outer"
+  has "scope lib: ...and the outer trap" "$out" "outer-trap:1"
+  has "scope lib: ...and starts no second scope" "$out" "runs:0"
+}
+test_p2_7_scope_lib() { _scope_lib_case; }
+
 # P2.7 for real: an engine straggler left by a drain run.sh must be gone once
 # that run.sh returns. A scope is not stopped when its main process exits, so
 # this needs a real transient unit; skipped where systemd-run --user is absent.

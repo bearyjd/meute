@@ -6262,6 +6262,7 @@ test_p1_3_drain_until
 test_p1_3_drain_repo_cursor
 test_p2_7_scope_containment
 test_p2_7_scope_signals
+test_p2_7_scope_lib
 test_p2_7_scope_reaps_stragglers
 test_p1_3_drain_empty_repo
 test_p0_ci_workflow
