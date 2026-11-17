@@ -214,6 +214,7 @@ cmd_doctor() {
       *) d_ok "manifest lives outside the harness (${real})" ;;
     esac
   fi
+  doctor_privacy
 
   if hold_active; then
     d_warn "the fleet is PAUSED until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"

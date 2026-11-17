@@ -324,6 +324,9 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8642)
     args = ap.parse_args()
+    # Owner-only files on a shared host (P2.4): the run log and every run the
+    # server starts inherit this, also when it is launched without bin/meute.
+    os.umask(0o077)
     try:
         server, _ = make_server(args.host, args.port)
     except OSError as e:

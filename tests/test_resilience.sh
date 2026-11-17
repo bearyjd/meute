@@ -695,6 +695,142 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
 
+# P2.4 (R21): privacy on a shared host. Credentials in a report or a log line
+# are redacted before they reach disk; files meute creates are owner-only;
+# doctor names loose permissions and credential-bearing remotes (by repo name
+# only, never the URL).
+_P24_SECRET="hunter2-p24"
+_P24_TOKEN="ghp_$(printf 'Z%.0s' {1..36})"
+_P24_HEX="0123456789abcdef0123456789abcdef01234567"
+_P24_AZ="abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop"
+
+test_p24_redact() {
+  local red="$REPO/lib/redact.py" out long
+  out="$(printf 'clone https://alice:%s@git.example.com/x.git with %s\n' "$_P24_SECRET" "$_P24_TOKEN" \
+         | python3 "$red" 2>&1)"
+  hasnt "p2.4 redact: a URL password is removed"      "$out" "$_P24_SECRET"
+  hasnt "p2.4 redact: a GitHub token is removed"      "$out" "$_P24_TOKEN"
+  has   "p2.4 redact: ...the host is kept for triage" "$out" "@git.example.com/x.git"
+  out="$(printf 'sk-ant-api03-%s and glpat-%s and xoxb-1-%s\n' "$(printf 'q%.0s' {1..30})" \
+         "$(printf 'r%.0s' {1..20})" "$(printf 's%.0s' {1..20})" | python3 "$red")"
+  hasnt "p2.4 redact: an Anthropic key is removed" "$out" "qqqqqqqqqq"
+  hasnt "p2.4 redact: a GitLab token is removed"   "$out" "rrrrrrrrrr"
+  hasnt "p2.4 redact: a Slack token is removed"    "$out" "ssssssssss"
+  is    "p2.4 redact: ordinary text passes unchanged" \
+        "$(printf 'see https://example.com/a@b and task-sk-1\n' | python3 "$red")" \
+        "see https://example.com/a@b and task-sk-1"
+  # A token used as the bare username (legacy 40-hex GitHub PAT, Azure DevOps,
+  # Bitbucket) is a credential too; a short username such as git@ is not.
+  out="$(printf 'https://%s@github.com/o/x.git and https://%s@dev.azure.com/o/p\n' "$_P24_HEX" "$_P24_AZ" \
+         | python3 "$red")"
+  hasnt "p2.4 redact: a 40-hex token as the URL username is removed" "$out" "$_P24_HEX"
+  hasnt "p2.4 redact: an opaque token as the URL username is removed" "$out" "$_P24_AZ"
+  has   "p2.4 redact: ...the host is kept"                            "$out" "@github.com/o/x.git"
+  is    "p2.4 redact: a short URL username is left alone" \
+        "$(printf 'ssh://git@github.com/o/x.git\n' | python3 "$red")" "ssh://git@github.com/o/x.git"
+  # The password runs to the last @ of the authority, so an unencoded @ in it
+  # does not leave its tail behind.
+  hasnt "p2.4 redact: a password containing @ is removed whole" \
+        "$(printf 'https://u:p@ss-tail-p24@github.com/x\n' | python3 "$red")" "ss-tail-p24"
+  # ...but stops at a query or fragment, so an @ there does not swallow the host.
+  has   "p2.4 redact: a password stops before ? and #" \
+        "$(printf 'https://u:pw@host?a=b@c\n' | python3 "$red")" "@host?a=b@c"
+  out="$(bash -c 'source "$1"; engine_detail_clean "$2"' _ "$REPO/lib/engines.sh" \
+         "api 401: https://bob:${_P24_SECRET}@h.example/x")"
+  hasnt "p2.4 detail: engine_detail_clean redacts"       "$out" "$_P24_SECRET"
+  has   "p2.4 detail: ...and keeps the rest of the line" "$out" "api 401: https://bob:"
+  # The redaction runs before the 300-character cut, so a token the cut
+  # would split is still recognised whole.
+  long="$(printf 'x%.0s' {1..280}) ${_P24_TOKEN}"
+  out="$(bash -c 'source "$1"; engine_detail_clean "$2"' _ "$REPO/lib/engines.sh" "$long")"
+  hasnt "p2.4 detail: a token straddling the cut is still redacted" "$out" "ZZZZZZZZ"
+}
+
+test_p24_report_and_umask() {
+  local root="$FIXTURE/p24" repo="$FIXTURE/p24/git-lk" out report
+  _runlock_fixture "$root" "$repo" tier2
+  cat > "$root/stub/claude" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "auth" ]]; then printf '{"loggedIn":true,"subscriptionType":"max","authMethod":"stub"}\n'; exit 0; fi
+jq -n '{is_error:false,result:"## Summary\nremote is https://alice:${_P24_SECRET}@git.example.com/x.git token ${_P24_TOKEN}",total_cost_usd:0.01,num_turns:1}'
+STUB
+  out="$( (umask 022; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --repo lk --task t) 2>&1)"
+  has "p2.4 report: the fixture run succeeds" "$out" "status=ok"
+  report="$(find "$root/reports" -name '*.md' -type f | head -1)"
+  [[ -n "$report" ]] && ok "p2.4 report: a report was written" || bad "p2.4 report: a report was written" "none under reports/"
+  hasnt "p2.4 report: write_report redacts a URL password" "$(cat "$report" 2>/dev/null)" "$_P24_SECRET"
+  hasnt "p2.4 report: write_report redacts a token"        "$(cat "$report" 2>/dev/null)" "$_P24_TOKEN"
+  has   "p2.4 report: ...and keeps the report body"        "$(cat "$report" 2>/dev/null)" "## Summary"
+  is "p2.4 umask: run.sh writes the report owner-only" "$(stat -c %a "$report" 2>/dev/null)" "600"
+  is "p2.4 umask: run.sh writes state/log owner-only"  "$(stat -c %a "$root/state/log" 2>/dev/null)" "600"
+  # mktemp is 0600 whatever the umask, so bin/meute is checked on a directory
+  # it creates: doctor makes .worktrees/ when it is missing.
+  rm -rf "$root/.worktrees"
+  (umask 022; "$root/bin/meute" doctor >/dev/null 2>&1)
+  is "p2.4 umask: bin/meute creates directories owner-only" "$(stat -c %a "$root/.worktrees" 2>/dev/null)" "700"
+}
+
+test_p24_doctor() {
+  local out st rp
+  st="$(stat -c %a "$FIXTURE/state")"; rp="$(stat -c %a "$FIXTURE/reports")"
+  chmod 755 "$FIXTURE/state"; chmod 700 "$FIXTURE/reports"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a world-readable state/ is warned about" "$out" "state/ is readable by group or others"
+  hasnt "p2.4 doctor: ...an owner-only reports/ is not"        "$out" "reports/ is readable by group or others"
+  chmod 700 "$FIXTURE/state"
+  out="$(meute doctor 2>&1)"
+  hasnt "p2.4 doctor: an owner-only state/ is not warned about" "$out" "state/ is readable by group or others"
+  chmod 750 "$FIXTURE/state"
+  has   "p2.4 doctor: a group-readable state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  local m
+  for m in 711 701 710 720 702 722; do
+    chmod "$m" "$FIXTURE/state"
+    has "p2.4 doctor: a ${m} state/ is warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  done
+  chmod 700 "$FIXTURE/state"
+  hasnt "p2.4 doctor: a 700 state/ is not warned about" "$(meute doctor 2>&1)" "state/ is readable by group or others"
+  hasnt "p2.4 doctor: clean remotes raise no credential warning" "$out" "credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a credential in a remote URL is reported" "$out" "alpha: a remote URL has credentials embedded"
+  hasnt "p2.4 doctor: ...without printing the secret"           "$out" "$_P24_SECRET"
+  hasnt "p2.4 doctor: ...or the URL"                            "$out" "git.example.com"
+  hasnt "p2.4 doctor: ...and only for that repository"          "$out" "beta: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  # Each key is checked on its own: a credential in url alone, then in
+  # pushurl alone, is still found.
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://git.example.com/a.git"
+  has "p2.4 doctor: a credential in url alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote set-url p24 "https://git.example.com/a.git"
+  git -C "$FIXTURE/git-alpha" remote set-url --push p24 "https://alice:${_P24_SECRET}@git.example.com/a.git"
+  has "p2.4 doctor: a credential in pushurl alone is reported" "$(meute doctor 2>&1)" "alpha: a remote URL has credentials embedded"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  git -C "$FIXTURE/git-alpha" remote add p24 "https://${_P24_HEX}@github.com/o/a.git"
+  out="$(meute doctor 2>&1)"
+  has   "p2.4 doctor: a token as the URL username is reported" "$out" "alpha: a remote URL has credentials embedded"
+  hasnt "p2.4 doctor: ...without printing the token"           "$out" "$_P24_HEX"
+  git -C "$FIXTURE/git-alpha" remote remove p24
+  chmod "$st" "$FIXTURE/state"; chmod "$rp" "$FIXTURE/reports"
+}
+
+# The credential check fails closed: when it cannot look, it says so instead
+# of reporting every repository clean.
+test_p24_doctor_fail_closed() {
+  local out cfg="$FIXTURE/git-alpha/.git/config" saved
+  out="$(env MEUTE_ROOT="$FIXTURE" MANIFEST_PY=/nonexistent MANIFEST="$FIXTURE/repos.yaml" \
+         bash -c 'source "$1/lib/doctor.sh"; source "$1/lib/privacy.sh"; doctor_privacy' _ "$REPO" 2>&1)"
+  has   "p2.4 doctor: an unlistable manifest is warned about"   "$out" "could not list enrolled repositories"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
+  saved="$(cat "$cfg")"
+  printf '[[[ not a config\n' >> "$cfg"
+  out="$(meute doctor 2>&1)"
+  printf '%s\n' "$saved" > "$cfg"
+  has   "p2.4 doctor: an unreadable git config is warned about" "$out" "alpha: could not read git config"
+  hasnt "p2.4 doctor: ...and is not reported clean"             "$out" "no enrolled repository has a credential"
+}
+
 # P2.3 (R16): the gate must know how old the pool reading is. A snapshot is
 # only as true as its age; policy.quota_max_age_hours turns "old" into
 # code=quota-unknown, and `status` says which facts are measured.
