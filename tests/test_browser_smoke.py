@@ -12,7 +12,7 @@ import tempfile
 import time
 import unittest
 
-from webtest_helpers import FakeRun, WebTestCase
+from webtest_helpers import FakeRun, WebTestCase, webserver
 
 BROWSER_WAIT = 30
 
@@ -46,6 +46,16 @@ class BeaconEndpoints(WebTestCase):
         (kind, msg), = self.server.client_events
         self.assertEqual(kind, "error")
         self.assertLessEqual(len(msg), 300)
+
+    def test_client_events_are_bounded_dropping_oldest(self):
+        cap = webserver.MAX_CLIENT_EVENTS
+        for i in range(cap + 50):
+            resp, _ = self.request("GET", f"/api/client-error?msg=m{i}")
+            self.assertEqual(resp.status, 200)
+        events = self.server.client_events
+        self.assertEqual(len(events), cap)
+        self.assertEqual(events[0], ("error", "m50"))
+        self.assertEqual(events[-1], ("error", f"m{cap + 49}"))
 
     def test_unknown_ready_page_is_rejected(self):
         resp, _ = self.request("GET", "/api/client-ready?page=evil")

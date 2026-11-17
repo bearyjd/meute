@@ -174,11 +174,14 @@ def get_run_status(h: "Handler", query: dict) -> None:
 
 CLIENT_PAGES = ("inbox", "run")
 MAX_CLIENT_MSG = 300
+MAX_CLIENT_EVENTS = 1000  # beacons kept in memory; oldest dropped first
 
 
 def record_client(h: "Handler", kind: str, detail: str) -> None:
     detail = detail[:MAX_CLIENT_MSG]
-    h.server.client_events.append((kind, detail))
+    events = h.server.client_events
+    events.append((kind, detail))
+    del events[:-MAX_CLIENT_EVENTS]
     sys.stderr.write(f"webserver: client-{kind} {detail!r}\n")
     h.send_json(200, {"ok": True})
 
