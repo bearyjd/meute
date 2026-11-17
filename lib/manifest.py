@@ -82,6 +82,9 @@ POLICY_DEFAULTS = {
     # Host-health gate (lib/hostcheck.sh). 0 disables either check.
     "max_load_per_cpu": 2.0,
     "min_free_mb": 512,
+    # `meute health --alert` pipes its text to this command line (D4); empty
+    # means nothing is sent. Not overridable: lib/policy_override.py.
+    "alert_cmd": "",
     # systemd OnCalendar strings. One item runs per fire, so cadence is the
     # lever that turns "fleet coverage" into "how often each repo is seen".
     "daily_calendar": "*-*-* 03:17:00",
@@ -154,6 +157,9 @@ def merged_policy(data: dict) -> dict:
     free = policy["min_free_mb"]
     if isinstance(free, bool) or not isinstance(free, int) or free < 0:
         raise ManifestError("policy.min_free_mb: must be an integer >= 0 (0 disables the disk check)")
+    alert = policy["alert_cmd"]
+    if not isinstance(alert, str) or "\n" in alert:
+        raise ManifestError("policy.alert_cmd: must be a one-line command string (empty sends nothing)")
     if not SAFE_NAME.match(str(policy["branch_prefix"])):
         raise ManifestError("policy.branch_prefix: must be a safe identifier")
     for key in ("daily_calendar", "weekly_calendar"):

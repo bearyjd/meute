@@ -80,6 +80,25 @@ warn  arm it with:  systemctl --user start meute-daily.timer
 That state self-heals at your next login, when `systemd --user` restarts and
 pulls `timers.target.wants` in. Until then the slot is dead.
 
+**Being told when it stops.** `./bin/meute health` prints one line per reason
+the fleet may have stopped and exits 1 if there is any: no `state/log` line
+within twice the daily cadence, no `status=ok` for 3 days, 3 errors in a row,
+an automatic (rate-limit) hold, the run lock held by a live run past the unit's
+timeout, a timer not armed or lingering off, `state/` under `policy.min_free_mb`,
+leftovers of killed runs, a quota snapshot over a day old, a policy override in
+force. A healthy fleet prints nothing. `install-timers` also writes
+`meute-health.timer` (hourly, `meute health --alert`) and adds
+`OnFailure=meute-alert.service` to both run units. Under `--alert` the text goes
+on stdin to `policy.alert_cmd`, a command line you choose; empty (the default)
+sends nothing. The text never names a repository. For example:
+
+```yaml
+policy:
+  alert_cmd: "notify-send 'meute' \"$(cat)\""     # or: curl -s --data-binary @- https://ntfy.sh/<topic>
+```
+
+Turn it off with `systemctl --user disable --now meute-health.timer`.
+
 **If you run meute from inside a container** (toolbox, distrobox, devcontainer),
 the *user* bus is usually reachable while the *system* bus is not — so
 `systemctl --user` works and `loginctl` fails with `Host is down`. The units then

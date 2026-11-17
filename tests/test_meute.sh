@@ -6253,6 +6253,7 @@ test_plan_quarantine_manifest_broken
 test_policy_override
 test_host_gate
 test_startup_sweep
+test_health
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

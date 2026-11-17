@@ -972,3 +972,137 @@ test_startup_sweep() {
   is "sweep: one note per removal" "$(grep -c "sweep: removed" <<< "$out")" "7"
   has "sweep: the fire itself still ran" "$(tail -1 "$root/state/log")" "status=ok"
 }
+
+# P1.8 (R8): a fleet that stops silently must be noticed. `meute health`
+# prints one line per problem and exits non-zero; with --alert the same text
+# goes to policy.alert_cmd on stdin. Owner decision D4: the text names no
+# repository, so the fixture's repo is called something greppable.
+_health_log() {   # <file> <epoch> <status> [code]
+  printf '%s\tweek=x\tslot=daily\tstatus=%s\trepo=zorblax-secret\tcode=%s\tdur=1s\n' \
+    "$(date -d "@$2" --iso-8601=seconds)" "$3" "${4:-ok}" >> "$1"
+}
+test_health() {
+  local root="$FIXTURE/health" repo="$FIXTURE/health/git-zorblax" now=1800000000 out rc all=""
+  _runlock_fixture "$root" "$repo" tier2
+  sed -i 's/name: lk$/name: zorblax-secret/' "$root/repos.yaml"
+  local st="$root/hstub" state="$root/state"
+  mkdir -p "$st" "$root/proc/4242" "$root/cfg"
+  cat > "$st/systemctl" <<'SH'
+#!/usr/bin/env bash
+[[ "$*" == *show* ]] || exit 0
+if [[ "${STUB_TIMER:-armed}" == idle ]]; then printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nNextElapseUSecRealtime=\n'
+else printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nNextElapseUSecRealtime=Sun 2027-01-17 03:17:00 EST\n'; fi
+SH
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "${STUB_LINGER:-yes}"\n' > "$st/loginctl"
+  cat > "$st/df" <<'SH'
+#!/usr/bin/env bash
+printf 'Filesystem 1M-blocks Used Available Capacity Mounted\n/dev/x 100000 1 %s 1%% /\n' "${STUB_DF_FREE:-99999}"
+SH
+  chmod +x "$st"/*
+  printf 'bash\0%s/bin/run.sh\0daily\0' "$root" > "$root/proc/4242/cmdline"
+  local H=( env PATH="$st:$PATH" XDG_CONFIG_HOME="$root/cfg" MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml"
+            MEUTE_DF="$st/df" MEUTE_PROC="$root/proc" )
+  _hreset() {
+    rm -rf "$state/log" "$state/hold" "$state/lock-info" "$state/rate-limits.json" "$state/policy-override" "$root/.worktrees" "$root/alert.txt"
+    _health_log "$state/log" $(( now - 3600 )) ok
+  }
+  _hcase() {   # <name> <expected substring> [env...] -- the fixture is already crafted
+    local name="$1" want="$2"; shift 2
+    out="$("${H[@]}" "$@" "$root/bin/meute" health 2>/dev/null)"; rc=$?
+    all+="$out"$'\n'
+    [[ "$rc" != 0 ]] && ok "health: $name exits non-zero" || bad "health: $name exits non-zero" "exit 0, output [$out]"
+    has "health: $name is reported" "$out" "$want"
+  }
+
+  _hreset
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a healthy fleet exits 0" "$rc" "0"
+  is "health: ...and prints nothing" "$out" ""
+
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 3 * 86400 )) ok
+  _hcase "no log line within twice the daily cadence" "no run logged"
+
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
+  _health_log "$state/log" $(( now - 600 )) skipped quota
+  _hcase "a last status=ok older than the threshold" "no successful run"
+
+  _hreset; local i; for i in 3 2 1; do _health_log "$state/log" $(( now - i * 60 )) error died; done
+  _hcase "three consecutive errors" "3 consecutive"
+  _hreset; _health_log "$state/log" $(( now - 120 )) error died; _health_log "$state/log" $(( now - 60 )) error died
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: two errors are not yet a problem" "$rc" "0"
+
+  _hreset; printf 'hold\t%s\tauto: provider rate limit — zorblax-secret said 429\n' $(( now + 3600 )) > "$state/hold"
+  _hcase "an automatic hold in force" "automatic hold"
+  _hreset; printf 'hold\t%s\towner pause\n' $(( now + 3600 )) > "$state/hold"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: a pause the owner set is not a problem" "$rc" "0"
+
+  _hreset; printf 'pid=4242 started=%s slot=daily key=zorblax-secret/t\n' "$(date -d "@$(( now - 3000 ))" --iso-8601=seconds)" > "$state/lock-info"
+  _hcase "a lock held longer than the largest timeout" "lock held"
+  _hreset; printf 'pid=4999991 started=%s slot=daily key=zorblax-secret/t\n' "$(date -d "@$(( now - 3000 ))" --iso-8601=seconds)" > "$state/lock-info"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: lock-info of a dead runner is not a held lock" "$rc" "0"
+  _hreset; printf 'pid=4242 started=%s slot=daily key=zorblax-secret/t\n' "$(date -d "@$(( now - 60 ))" --iso-8601=seconds)" > "$state/lock-info"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: a lock held for a minute is not a problem" "$rc" "0"
+
+  _hreset; _hcase "a timer that is not armed" "not armed" STUB_TIMER=idle
+  _hreset; _hcase "linger off" "linger" STUB_LINGER=no
+  _hreset; "${H[@]}" STUB_LINGER=unknown "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: linger unknown (no system bus) is not a problem" "$rc" "0"
+
+  _hreset; _hcase "a state filesystem low on space" "MB free" STUB_DF_FREE=100
+
+  _hreset; mkdir -p "$root/.worktrees/zorblax-secret-t-2026-01-01.4999991"
+  _hcase "a leftover of a killed run" "leftover"
+
+  _hreset; printf '{"captured_at": %s}\n' $(( now - 2 * 86400 )) > "$state/rate-limits.json"
+  _hcase "a quota snapshot older than a day" "quota snapshot"
+  _hreset; printf '{"captured_at": %s}\n' $(( now - 600 )) > "$state/rate-limits.json"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: a fresh quota snapshot is not a problem" "$rc" "0"
+
+  _hreset; printf 'quota_floor_percent\t1\t%s\tnight\n' $(( now + 3600 )) > "$state/policy-override"
+  _hcase "a policy override in force" "policy override"
+
+  hasnt "health: no line names a repository (D4)" "$all" "zorblax"
+
+  # alert_cmd: the text arrives on stdin under --alert, and only when there is a problem.
+  python3 - "$root/repos.yaml" "$root/alert.txt" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1])); d["policy"]["alert_cmd"] = f"tee {sys.argv[2]}"
+yaml.safe_dump(d, open(sys.argv[1], "w"), sort_keys=False)
+PY
+  _hreset; "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1; rc=$?
+  is "health --alert: healthy exits 0" "$rc" "0"
+  [[ ! -e "$root/alert.txt" ]] && ok "health --alert: healthy sends nothing" || bad "health --alert: healthy sends nothing" "$(cat "$root/alert.txt")"
+  _hreset; "${H[@]}" STUB_TIMER=idle "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: alert_cmd receives the text on stdin" "$(cat "$root/alert.txt" 2>/dev/null)" "not armed"
+  _hreset; "${H[@]}" "$root/bin/meute" health --alert --failed >/dev/null 2>&1; rc=$?
+  has "health --alert --failed: a failed run unit alerts even on a healthy fleet" "$(cat "$root/alert.txt" 2>/dev/null)" "meute run failed"
+  [[ "$rc" != 0 ]] && ok "health --alert --failed: exits non-zero" || bad "health --alert --failed: exits non-zero" "exit 0"
+  hasnt "health --alert: the alert names no repository (D4)" "$(cat "$root/alert.txt" 2>/dev/null)" "zorblax"
+  local v
+  v="$(python3 - "$root/repos.yaml" "$root/bad.yaml" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1])); d["policy"]["alert_cmd"] = ["tee", "x"]
+yaml.safe_dump(d, open(sys.argv[2], "w"), sort_keys=False)
+PY
+  MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/bad.yaml" 2>&1)"
+  has "health: a non-string alert_cmd is refused by validate" "$v" "policy.alert_cmd"
+  "${H[@]}" "$root/bin/meute" policy set alert_cmd=x --for 1h >/dev/null 2>&1; rc=$?
+  [[ "$rc" != 0 ]] && ok "health: alert_cmd cannot be set by a policy override" || bad "health: alert_cmd cannot be set by a policy override" "exit 0"
+  rm -f "$state/policy-override"
+
+  # install-timers: the hourly health timer, the alert unit, OnFailure on both run units.
+  local unit="$root/cfg/systemd/user"
+  "${H[@]}" "$root/bin/meute" install-timers >/dev/null 2>&1
+  has "install-timers: writes an hourly meute-health.timer" "$(cat "$unit/meute-health.timer" 2>/dev/null)" "OnCalendar=hourly"
+  has "install-timers: meute-health.service runs health --alert" "$(cat "$unit/meute-health.service" 2>/dev/null)" "bin/meute health --alert"
+  has "install-timers: meute-alert.service runs health --alert --failed" "$(cat "$unit/meute-alert.service" 2>/dev/null)" "bin/meute health --alert --failed"
+  for v in daily weekly; do
+    is "install-timers: meute-${v}.service has OnFailure in [Unit]" \
+       "$(awk '/^\[/{s=$0} /^OnFailure=/{print s "|" $0}' "$unit/meute-${v}.service" 2>/dev/null)" "[Unit]|OnFailure=meute-alert.service"
+  done
+}
