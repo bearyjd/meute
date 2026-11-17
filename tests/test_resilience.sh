@@ -939,3 +939,14 @@ PY
   has "p1.7b rollback: claimed row returns" "$out" "alpha/audit-01#3 "
   has "p1.7b rollback: a changed row loses its badge" "$(grep 'alpha/audit-01#5 ' <<< "$out")" "NEW"
 }
+
+# P1.7 (b): state/finding-status keys rows by <private-repo>/<report>#n and
+# its pr column holds PR URLs; the lock beside it shares the name. Both must
+# stay off the public harness like every other state/ file.
+test_p1_7b_status_ignored() {
+  local f
+  for f in state/finding-status state/finding-status.lock; do
+    is "p1.7b gitignore: ${f} never reaches the public harness" \
+      "$(git -C "$REPO" check-ignore -q -- "$f"; echo $?)" "0"
+  done
+}
