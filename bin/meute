@@ -99,6 +99,7 @@ source "${MEUTE_ROOT}/lib/unitlimits.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/tmp.sh"
+source "${MEUTE_ROOT}/lib/sweep.sh"
 source "${MEUTE_ROOT}/lib/policy_override.sh"
 
 SCRUBBED=""

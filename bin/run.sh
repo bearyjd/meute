@@ -45,7 +45,7 @@ set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
-source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/policy_override.sh"; source "${MEUTE_ROOT}/lib/hostcheck.sh"
+source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/policy_override.sh"; source "${MEUTE_ROOT}/lib/hostcheck.sh"; source "${MEUTE_ROOT}/lib/sweep.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
@@ -397,6 +397,7 @@ main() {
 
   # One runner at a time. A slow run must not stack up under a tight timer.
   runlock_acquire "$LOCK_FILE" "${STATE_DIR}/lock-info" "$SLOT" "${FORCE_REPO}${FORCE_TASK:+/$FORCE_TASK}" || skip lock "another run holds the lock"
+  sweep_stale || true   # lib/sweep.sh: what a killed run left behind
 
   python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null || die "manifest failed validation"
 

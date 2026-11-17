@@ -7,6 +7,9 @@
 # a full or unwritable /tmp (a tmpfs on most hosts) no longer ends a fire.
 # MEUTE_TMPDIR=/tmp restores the old location without a revert.
 #
+# The name carries the runner's PID (run.<pid>.<random>) so lib/sweep.sh can
+# tell a dead run's directory from a live one's.
+#
 # The caller supplies die(). The directory is mode 700 (mktemp -d).
 
 RUN_TMP=""
@@ -14,7 +17,7 @@ RUN_TMP=""
 # tmp_init <state-dir>: create the run's directory and point TMPDIR at it.
 tmp_init() {
   local parent="${MEUTE_TMPDIR:-$1/tmp}"
-  mkdir -p "$parent" && RUN_TMP="$(mktemp -d "${parent}/run.XXXXXX")" \
+  mkdir -p "$parent" && RUN_TMP="$(mktemp -d "${parent}/run.$$.XXXXXX")" \
     || die "cannot create a temp directory under ${parent}"
   export TMPDIR="$RUN_TMP"
 }
