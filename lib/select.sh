@@ -18,9 +18,12 @@ hold_gate() {
 
 # A staged plan rotates on its own cursor. Sharing one would leave the
 # manifest cursor pointing at a plan key once the plan retires -- a key no
-# manifest entry has -- and restart the manifest rotation at 0.
+# manifest entry has -- and restart the manifest rotation at 0. A narrowed
+# fire (MEUTE_ONLY_REPOS) rotates on its own too (lib/cursor.sh).
+source "${MEUTE_ROOT}/lib/cursor.sh"
 cursor_key() {
-  if (( PLAN_MODE )); then printf 'plan-cursor.%s\n' "$SLOT"; else printf 'cursor.%s\n' "$SLOT"; fi
+  local mode=manifest; (( PLAN_MODE )) && mode=plan
+  cursor_name "$SLOT" "$mode" "${MEUTE_ONLY_REPOS:-}"
 }
 
 # Would this entry be dispatched into a container, and is there a pin to
@@ -164,11 +167,17 @@ skip_nothing_eligible() {
 }
 
 # A forced --repo/--task names one entry; nothing else is a candidate.
+# MEUTE_ONLY_REPOS (newline-separated names, set by `meute drain --repo`)
+# narrows an unforced queue instead: the cursor and every gate still apply.
 load_queue() {
   local queue_file="$1"
   if (( FORCED )); then
     jq -c --arg r "$FORCE_REPO" --arg t "$FORCE_TASK" \
        'select(($r == "" or .repo == $r) and ($t == "" or .task == $t))' \
+       "$queue_file" > "${queue_file}.f"
+    mv "${queue_file}.f" "$queue_file"
+  elif [[ -n "${MEUTE_ONLY_REPOS:-}" ]]; then
+    jq -c --arg o "$MEUTE_ONLY_REPOS" '($o | split("\n")) as $l | select(.repo as $r | any($l[]; . == $r))' \
        "$queue_file" > "${queue_file}.f"
     mv "${queue_file}.f" "$queue_file"
   fi
