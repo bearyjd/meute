@@ -27,6 +27,7 @@ cmd_status() {
     printf '  every slot declines until then; lift it with: meute resume\n'
   fi
   printf 'Claude quota %s%%  ·  %s\n' "$quota" "$gate"
+  quota_pool_line "$quota" "$("${MEUTE_ROOT}/bin/quota.sh" --engine claude --age 2>/dev/null || echo -)"
   if codex_probe="$("${MEUTE_ROOT}/bin/quota.sh" --engine codex --with-source 2>/dev/null)"; then
     printf 'Codex quota %s%%  ·  configured (%s)\n' "${codex_probe%% *}" "${codex_probe#* }"
   else
@@ -53,6 +54,7 @@ cmd_status() {
   [[ -n "${MEUTE_WEEKLY_RUNS:-}" ]] && ceiling=" (ceiling ${MEUTE_WEEKLY_RUNS} runs)"
   printf '  week %s   %s runs (%s personal · %s community) · $%s%s\n' \
     "$THIS_WEEK" "$total" "$(( total - community ))" "$community" "$cost" "$ceiling"
+  printf '  other consumers of this pool are not measured\n'
 
   local in_flight=0
   if fleet_load_scope 2>/dev/null; then in_flight="$(tier3_in_flight 2>/dev/null || echo 0)"; fi
