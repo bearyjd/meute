@@ -30,10 +30,17 @@ policy_override_set() {
   [[ -n "$spec" ]] || die "policy set: --for is required; an override must expire (45m, 6h, 3d, up to 7d)"
   secs="$(hold_duration_seconds "$spec")" || die "bad duration: ${spec} — use 45m, 6h or 3d"
   (( secs <= POLICY_OVERRIDE_MAX_SECONDS )) || die "policy set: an override lasts at most 7 days (${spec} is longer)"
-  python3 "$MANIFEST_PY" policy-check "$MANIFEST" "${pairs[@]}" || die "policy set: refused; nothing was written"
+  python3 "$MANIFEST_PY" policy-check "$MANIFEST" "$(policy_override_file)" "${pairs[@]}" \
+    || die "policy set: refused; nothing was written"
   until=$(( $(now_epoch) + secs ))
   reason="${reason//$'\t'/ }"; reason="${reason//$'\n'/ }"
   for key in "${pairs[@]}"; do
+    # One ceiling at a time: setting one drops the other's row (policy-check
+    # validated the file as it will be after this).
+    case "${key%%=*}" in
+      weekly_runs) kv_del "$(policy_override_file)" weekly_cost_usd ;;
+      weekly_cost_usd) kv_del "$(policy_override_file)" weekly_runs ;;
+    esac
     kv_set_row "$(policy_override_file)" "${key%%=*}" "${key#*=}" "$until" "$reason"
   done
   note "policy override until $(hold_until_human "$until")${reason:+ — ${reason}}: ${pairs[*]}"

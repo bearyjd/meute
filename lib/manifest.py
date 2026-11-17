@@ -684,7 +684,7 @@ COMMANDS = {
     "validate": (cmd_validate, 1),
     "policy": (cmd_policy, 1),
     "policy-effective": (cmd_policy_effective, 1),
-    "policy-check": (cmd_policy_check, 2),
+    "policy-check": (cmd_policy_check, 3),
     "queue": (cmd_queue, 2),
     "plan-queue": (cmd_plan_queue, 3),
     "render": (cmd_render, 1),

@@ -367,8 +367,11 @@ MEUTE_QUOTA_FLOOR=1 ./bin/run.sh daily   # one invocation, nothing written
 ```
 
 The override lives in `state/policy-override`, is read after the manifest, and
-is checked by the manifest's own rules (a bad value is refused at `set`).
-`--for` is mandatory and capped at 7 days; an expired row is ignored. Every run
+is checked by the manifest's own rules (a bad value is refused at `set`, judged
+against the rows already in force). There is one weekly ceiling at a time:
+setting `weekly_runs` drops a `weekly_cost_usd` row, and the reverse.
+`--for` is mandatory and capped at 7 days; an expired row, or a hand-edited one
+past the cap, is ignored. Every run
 line carries `policy=override` while one is in force, and `status`/`doctor`
 say so first. Overridable: `quota_floor_percent`, `weekly_runs`,
 `weekly_cost_usd`, `community_share`, `tier3_max_in_flight`.

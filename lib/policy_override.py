@@ -102,14 +102,25 @@ def cmd_policy_effective(args: list) -> int:
 
 
 def cmd_policy_check(args: list) -> int:
-    """policy-check MANIFEST key=value...: refuse what `policy set` must not store."""
+    """policy-check MANIFEST OVERRIDE_FILE key=value...: refuse what `policy set` must not store.
+
+    Checks what the file will hold after the write, not the new pairs alone:
+    the rows still in force, minus the other ceiling when a ceiling is set
+    (policy_override_set deletes that row), plus the new pairs.
+    """
     from manifest import load
     data = load(args[0])
-    values = {}
-    for assignment in args[1:]:
+    new = {}
+    for assignment in args[2:]:
         key, sep, text = assignment.partition("=")
         if not sep or key not in OVERRIDABLE:
             _fail(f"policy set: {assignment!r}: expected key=value with key one of {', '.join(OVERRIDABLE)}")
-        values[key] = parse_value(text)
+        new[key] = parse_value(text)
+    if not new:
+        _fail("policy set: give at least one key=value")
+    evicted = {other for key in new if key in CEILINGS for other in CEILINGS if other not in new}
+    values = {key: row[0] for key, row in read_rows(args[1], now_epoch()).items()
+              if key not in evicted}
+    values.update(new)
     effective_policy(data, values)
     return 0

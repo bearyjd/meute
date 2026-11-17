@@ -762,6 +762,23 @@ test_policy_override() {
   out="$("${R[@]}" MEUTE_NOW="$now" MEUTE_QUOTA_FLOOR=1 "$root/bin/run.sh" daily 2>&1)"
   has "policy override: a cost ceiling override is accepted" "$(tail -1 "$root/state/log")" "status=ok"
 
+  # Two separate sets of the two ceilings: the later one evicts the earlier,
+  # so the file never holds an incoherent pair and the floor row stays live.
+  "${M[@]}" "$root/bin/meute" policy set quota_floor_percent=1 --for 8h >/dev/null 2>&1
+  "${M[@]}" "$root/bin/meute" policy set weekly_runs=100 --for 1d >/dev/null 2>&1; rc=$?
+  is    "policy set: the other ceiling in a second call is accepted" "$rc" "0"
+  hasnt "policy set: ...and evicts the earlier ceiling row" "$(cut -f1 "$root/state/policy-override")" "weekly_cost_usd"
+  hasnt "policy show: ...which is no longer listed" "$("${M[@]}" "$root/bin/meute" policy show 2>&1)" "weekly_cost_usd"
+  out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
+  has "policy override: the floor row still applies after the ceiling swap" "$(tail -1 "$root/state/log")" "status=ok"
+  has "policy override: ...and the line is marked" "$(tail -1 "$root/state/log")" "policy=override"
+
+  # A hand-edited row past the 7-day cap is ignored like an expired one.
+  printf 'quota_floor_percent\t1\t%s\thand edit\n' "$(( now + 8 * 86400 ))" > "$root/state/policy-override"
+  out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
+  has   "policy override: a row past the 7-day cap is ignored" "$(tail -1 "$root/state/log")" "below floor 30%"
+  hasnt "policy override: ...and the line is not marked" "$(tail -1 "$root/state/log")" "policy=override"
+
   # clear
   out="$("${M[@]}" "$root/bin/meute" policy clear 2>&1)"
   [[ ! -e "$root/state/policy-override" ]] && ok "policy clear: removes the file" \
