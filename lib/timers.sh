@@ -28,13 +28,16 @@
 timer_state() {
   local unit="$1" out
   out="$(systemctl --user show "$unit" \
-           -p LoadState -p UnitFileState -p ActiveState -p NextElapseUSecRealtime \
+           -p LoadState -p UnitFileState -p ActiveState -p SubState -p NextElapseUSecRealtime \
            2>/dev/null)" || { printf 'nobus\t\n'; return 0; }
   local load file next
   load="$(sed -n 's/^LoadState=//p'             <<<"$out")"
   file="$(sed -n 's/^UnitFileState=//p'         <<<"$out")"
   next="$(sed -n 's/^NextElapseUSecRealtime=//p' <<<"$out")"
   if [[ "$load" == "not-found" || -z "$load" ]]; then printf 'absent\t\n'; return 0; fi
+  # While its service runs a timer is SubState=running with no next elapse; it
+  # re-arms when the run ends, so it is armed, not inert.
+  [[ "$(sed -n 's/^SubState=//p' <<<"$out")" == running ]] && { printf 'armed\tnow (a run is in progress)\n'; return 0; }
   # systemd 258 leaves this empty for an inert timer; other versions answer "0"
   # or "n/a". Reading any of them as a time is the false positive this exists
   # to prevent, so all three mean the same thing: nothing is scheduled.

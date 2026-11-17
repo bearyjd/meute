@@ -991,6 +991,8 @@ test_health() {
 #!/usr/bin/env bash
 [[ "$*" == *show* ]] || exit 0
 if [[ "${STUB_TIMER:-armed}" == idle ]]; then printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nNextElapseUSecRealtime=\n'
+# systemd 258 while the timer's service runs: active/running, no next elapse
+elif [[ "$STUB_TIMER" == running ]]; then printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=running\nNextElapseUSecRealtime=\n'
 else printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nNextElapseUSecRealtime=Sun 2027-01-17 03:17:00 EST\n'; fi
 SH
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "${STUB_LINGER:-yes}"\n' > "$st/loginctl"
@@ -1089,6 +1091,10 @@ PY
   is "health: a lock held for a minute is not a problem" "$rc" "0"
 
   _hreset; _hcase "a timer that is not armed" "not armed" STUB_TIMER=idle
+  # The hourly health run sees its own timer in SubState=running (empty next
+  # elapse); counting that as idle alerted every hour on a healthy fleet.
+  _hreset; out="$("${H[@]}" STUB_TIMER=running "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a timer whose run is in progress counts as armed" "$rc:$out" "0:"
   _hreset; _hcase "linger off" "linger" STUB_LINGER=no
   _hreset; "${H[@]}" STUB_LINGER=unknown "$root/bin/meute" health >/dev/null 2>&1; rc=$?
   is "health: linger unknown (no system bus) is not a problem" "$rc" "0"
