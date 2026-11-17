@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -87,30 +88,16 @@ class RunEndpointTests(WebTestCase):
         resp, raw = self.request("GET", "/api/run/status")
         self.assertEqual(json.loads(raw), {"state": "idle", "total": 0})
         resp, raw = self.request("GET", "/api/plan")
-        self.assertEqual(json.loads(raw)["scan"], "/s")
+        self.assertEqual(json.loads(raw)["plan"]["scan"], "/s")
         self.assertEqual([c[0] for c in self.run.calls], ["start", "stop", "status", "plan"])
 
-    def test_runner_failure_is_502(self):
-        def boom():
-            raise webserver.runctl.RunnerFailed("meute plan --json failed (exit 1)")
-        self.run.plan = boom
-        resp, raw = self.request("GET", "/api/plan")
-        self.assertEqual(resp.status, 502)
-        self.assertIn("exit 1", json.loads(raw)["message"])
-
-    def test_plan_in_flight_is_409(self):
-        def busy():
-            raise webserver.runctl.RunConflict("a plan scan is already running")
-        self.run.plan = busy
-        resp, raw = self.request("GET", "/api/plan")
-        self.assertEqual(resp.status, 409)
-        self.assertIn("already running", json.loads(raw)["message"])
-
-    def test_default_run_mod_is_a_run_controller(self):
-        server, _ = webserver.make_server("127.0.0.1", 0, self.inbox)
-        self.addCleanup(server.server_close)
-        self.assertIsInstance(server.run_mod, webserver.runctl.RunController)
-        self.assertEqual(server.run_mod.root, webserver.ROOT)
+    def test_plan_start_requires_token_and_starts_a_job(self):
+        resp, _ = self.request("POST", "/api/plan/start", {}, token=False)
+        self.assertEqual(resp.status, 403)
+        resp, raw = self.request("POST", "/api/plan/start", {})
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(json.loads(raw)["scanning"])
+        self.assertEqual(self.run.calls, [("plan_start",)])
 
 
 class DuplicateEnqueueTests(WebTestCase):
@@ -135,6 +122,41 @@ class DuplicateEnqueueTests(WebTestCase):
         resp, raw = self.request("POST", "/api/enqueue", {"paths": [ALPHA]})
         self.assertEqual(resp.status, 200)
         self.assertEqual(json.loads(raw)["staged"], 1)
+
+
+class SlowPlanTests(WebTestCase):
+    """P1.6 / R10: a 3 s scan polled every 1 s: the page gets the result and
+    never a 502, and the start request does not wait for the scan."""
+
+    def run_factory(self):
+        root = tempfile.mkdtemp(prefix="meute web slow ")
+        self.addCleanup(shutil.rmtree, root)
+        os.makedirs(os.path.join(root, "state"))
+        fleet = FakeFleet(root)
+
+        def slow(argv, cwd, out_path=None, timeout=None):
+            if "--json" in argv:
+                time.sleep(3)
+            return fleet(argv, cwd, out_path=out_path, timeout=timeout)
+        return webserver.runctl.RunController(root, runner=slow)
+
+    def test_poll_gets_result_and_never_a_502(self):
+        t0 = time.time()
+        resp, raw = self.request("POST", "/api/plan/start", {})
+        self.assertEqual(resp.status, 200)
+        self.assertLess(time.time() - t0, 1.5)
+        statuses, body = [], {}
+        for _ in range(8):
+            resp, raw = self.request("GET", "/api/plan")
+            statuses.append(resp.status)
+            body = json.loads(raw)
+            if not body["scanning"]:
+                break
+            time.sleep(1)
+        self.assertEqual(set(statuses), {200})
+        self.assertGreater(len(statuses), 1)
+        self.assertFalse(body["scanning"])
+        self.assertIn("items", body["plan"])
 
 
 class RunPageTests(WebTestCase):

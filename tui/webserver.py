@@ -5,8 +5,8 @@
 Every state change goes through inbox.act (-> bin/meute), so the page cannot
 drift from the CLI. Every request needs an exact Host match and is refused
 when the browser marks it cross-site or same-site (Sec-Fetch-Site): another
-site's <img> or no-cors fetch sends the right Host, and GET /api/plan runs a
-full scan. POSTs also need a per-process token and (when sent) an exact Origin
+site's <img> or no-cors fetch sends the right Host, and POST /api/plan/start
+runs a full scan. POSTs also need a per-process token and (when sent) an exact Origin
 match. Report text is untrusted: this module only ever serves it as text/plain
 or inside JSON.
 """
@@ -149,7 +149,11 @@ def call_run(h: "Handler", method: str, *args) -> None:
 
 
 def get_plan(h: "Handler", query: dict) -> None:
-    call_run(h, "plan")
+    call_run(h, "plan_state")
+
+
+def post_plan_start(h: "Handler", query: dict) -> None:
+    call_run(h, "plan_start")
 
 
 def post_enqueue(h: "Handler", query: dict) -> None:
@@ -178,6 +182,7 @@ ROUTES = {
     ("GET", "/api/finding"): get_finding,
     ("POST", "/api/act"): post_act,
     ("GET", "/api/plan"): get_plan,
+    ("POST", "/api/plan/start"): post_plan_start,
     ("POST", "/api/enqueue"): post_enqueue,
     ("POST", "/api/run/start"): post_run_start,
     ("POST", "/api/run/stop"): post_run_stop,

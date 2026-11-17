@@ -48,10 +48,19 @@ import time
 import runprogress as rp
 
 MAX_ERRORS = 3
-PLAN_TIMEOUT = 120    # seconds for `meute plan --json` and `meute plan --enqueue`
+DEFAULT_PLAN_TIMEOUT = 900  # seconds for `meute plan --json` and `--enqueue`; MEUTE_PLAN_TIMEOUT overrides
 PENDING_TIMEOUT = 30  # seconds for the lib/manifest.py plan-queue check
 QUEUE_CHANGED = "staged queue changed outside this page"
 RUN_OUTPUT = ".plan-web-run.log"  # under state/; matches the .gitignore'd state/.plan-*
+
+
+def plan_timeout() -> float:
+    """MEUTE_PLAN_TIMEOUT if it is a positive number, else the default."""
+    try:
+        value = float(os.environ.get("MEUTE_PLAN_TIMEOUT", ""))
+    except ValueError:
+        return DEFAULT_PLAN_TIMEOUT
+    return value if value > 0 else DEFAULT_PLAN_TIMEOUT
 
 
 class RunConflict(Exception):
@@ -136,6 +145,9 @@ class RunController:
         self._state = "idle"
         self._enqueuing = False
         self._planning = False
+        self._plan_result: dict | None = None
+        self._plan_at: float | None = None
+        self._plan_error: str | None = None
         self._pinned: frozenset | None = None
         self._current: dict | None = None
         self._stopped_reason: str | None = None
@@ -149,21 +161,40 @@ class RunController:
         except subprocess.TimeoutExpired:
             raise RunnerFailed(f"{what} timed out after {timeout}s") from None
 
-    def plan(self) -> dict:
-        """One scan at a time: a second caller gets RunConflict (-> 409)."""
+    def plan_start(self) -> dict:
+        """Start a scan in a thread and return at once; one at a time (a
+        second start while one runs is a no-op)."""
         with self._lock:
-            if self._planning:
-                raise RunConflict("a plan scan is already running; try again when it finishes")
-            self._planning = True
+            if not self._planning:
+                self._planning = True
+                threading.Thread(target=self._plan_job, daemon=True).start()
+        return self.plan_state()
+
+    def plan_state(self) -> dict:
+        """The last scan's result (memory only) with its age, and whether a
+        scan is running now. A failed scan keeps the last good result."""
+        with self._lock:
+            at = self._plan_at
+            return {"scanning": self._planning,
+                    "age": None if at is None else max(int(self.clock() - at), 0),
+                    "error": self._plan_error, "plan": self._plan_result}
+
+    def _plan_job(self) -> None:
         try:
-            return self._plan()
-        finally:
-            with self._lock:
-                self._planning = False
+            result, error = self._plan(), None
+        except RunnerFailed as e:
+            result, error = None, str(e)
+        except Exception as e:  # a thread must never die without clearing the flag
+            result, error = None, f"plan scan crashed: {e}"
+        with self._lock:
+            if result is not None:
+                self._plan_result, self._plan_at = result, self.clock()
+            self._plan_error = error
+            self._planning = False
 
     def _plan(self) -> dict:
         argv = [self.meute, "plan", "--json"] + (["--", self.scan_dir] if self.scan_dir else [])
-        rc, out = self._call(argv, PLAN_TIMEOUT, "meute plan --json")
+        rc, out = self._call(argv, plan_timeout(), "meute plan --json")
         if rc != 0:
             raise RunnerFailed(f"meute plan --json failed (exit {rc})")
         try:
@@ -200,7 +231,7 @@ class RunController:
         entries, archived, _ = rp.load_queue(self.state_dir)
         before = 0 if archived else len(entries)
         started = int(self.clock())
-        rc, out = self._call(argv, PLAN_TIMEOUT, "meute plan --enqueue")
+        rc, out = self._call(argv, plan_timeout(), "meute plan --enqueue")
         rejected = _rejected(out, wanted)
         if rc not in (0, 3):
             if rejected and len(rejected) == len(wanted):
