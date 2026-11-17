@@ -1158,6 +1158,15 @@ PY
   "${H[@]}" MEUTE_NOW=$(( now + 10800 )) "$root/bin/meute" health --alert >/dev/null 2>&1
   has "health --alert: a problem that cleared and came back alerts again" "$(cat "$root/alert.txt" 2>/dev/null)" "automatic hold"
   rm -f "$state/hold"
+  # A problem whose numbers grow each hour ("no run logged for 72h", "73h")
+  # is still one problem.
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 4 * 86400 )) ok
+  "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: silence alerts" "$(cat "$root/alert.txt" 2>/dev/null)" "no run logged for 96h"
+  rm -f "$root/alert.txt"
+  "${H[@]}" MEUTE_NOW=$(( now + 3600 )) "$root/bin/meute" health --alert >/dev/null 2>&1
+  [[ ! -e "$root/alert.txt" ]] && ok "health --alert: the same silence an hour longer is not sent again" \
+    || bad "health --alert: the same silence an hour longer is not sent again" "$(cat "$root/alert.txt")"
   local v
   v="$(python3 - "$root/repos.yaml" "$root/bad.yaml" <<'PY'
 import sys, yaml
