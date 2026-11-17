@@ -28,14 +28,17 @@ HEALTH_QUOTA_MAX_SECONDS=86400           # the status-line snapshot older than t
 HEALTH_ALERT_TIMEOUT=60                  # seconds alert_cmd may take
 
 # The longest gap between two daily-slot firings (weekend gaps included), from
-# systemd itself; one day when systemd-analyze cannot say.
+# systemd itself; one day when systemd-analyze cannot say. It runs with TZ=UTC
+# so the elapse lines are UTC and no "(in UTC)" lines exist, on any host: a
+# host already in UTC prints only those, so parsing "(in UTC)" found nothing.
 health_cadence_seconds() {
   local cal="$1" t prev="" gap max=0
   while IFS= read -r t; do
     t="$(date -d "$t" +%s 2>/dev/null)" || continue
     [[ -z "$prev" ]] || { gap=$(( t - prev )); (( gap <= max )) || max="$gap"; }
     prev="$t"
-  done < <(systemd-analyze calendar --iterations=8 "$cal" 2>/dev/null | sed -n 's/^ *(in UTC): //p')
+  done < <(TZ=UTC systemd-analyze calendar --iterations=8 "$cal" 2>/dev/null \
+             | sed -En 's/^ *(Next elapse|Iteration #[0-9]+): //p')
   (( max > 0 )) || max=86400
   printf '%s\n' "$max"
 }

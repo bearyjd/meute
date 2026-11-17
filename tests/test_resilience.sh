@@ -1021,6 +1021,21 @@ SH
 
   _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 3 * 86400 )) ok
   _hcase "no log line within twice the daily cadence" "no run logged"
+  # On a UTC host systemd-analyze prints no "(in UTC)" lines; the weekend gap
+  # of a Mon..Fri calendar must still widen the silence threshold.
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"]["daily_calendar"] = "Mon..Fri *-*-* 03:17:00"
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 43200 )) ok
+  out="$("${H[@]}" TZ=UTC "$root/bin/meute" health 2>&1)"
+  hasnt "health: on a UTC host a Mon..Fri calendar's weekend gap is not silence" "$out" "no run logged"
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"].pop("daily_calendar", None)
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
 
   _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
   _health_log "$state/log" $(( now - 600 )) skipped quota
