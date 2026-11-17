@@ -6,7 +6,10 @@
 #
 # Commands:
 #   doctor                        is this fleet deployable? checks the real scheduling environment
-#   install-timers                write and enable systemd user timers for both slots
+#   health [--alert]              one line per reason the fleet may have stopped; exits 1 if any.
+#                                  --alert also pipes the text to policy.alert_cmd (hourly timer)
+#   install-timers                write and enable systemd user timers for both slots, the
+#                                  hourly health check, and OnFailure alerts for both run units
 #   install-statusline            wrap Claude Code's status line so the real 5h/7d
 #                                  subscription windows reach the quota gate
 #   status                        quota, what runs next, this week's activity
@@ -117,6 +120,8 @@ source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/tmp.sh"
 source "${MEUTE_ROOT}/lib/sweep.sh"
 source "${MEUTE_ROOT}/lib/policy_override.sh"
+source "${MEUTE_ROOT}/lib/hostcheck.sh"
+source "${MEUTE_ROOT}/lib/health.sh"
 source "${MEUTE_ROOT}/lib/scope.sh"
 source "${MEUTE_ROOT}/lib/drain.sh"
 
@@ -767,6 +772,7 @@ main() {
   case "$command" in
     status)   cmd_status "$@" ;;
     doctor)   cmd_doctor "$@" ;;
+    health)   cmd_health "$@" ;;
     install-timers) cmd_install_timers "$@" ;;
     install-statusline) cmd_install_statusline "$@" ;;
     reports)  cmd_reports "$@" ;;

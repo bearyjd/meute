@@ -2234,3 +2234,271 @@ test_kv_writes_locked() {
   is "p2.2 kv lock: the lock file never reaches the public harness" \
      "$(git -C "$REPO" check-ignore -q -- state/reports.lock; echo $?)" "0"
 }
+
+# P1.8 (R8): a fleet that stops silently must be noticed. `meute health`
+# prints one line per problem and exits non-zero; with --alert the same text
+# goes to policy.alert_cmd on stdin. Owner decision D4: the text names no
+# repository, so the fixture's repo is called something greppable.
+_health_log() {   # <file> <epoch> <status> [code]
+  printf '%s\tweek=x\tslot=daily\tstatus=%s\trepo=zorblax-secret\tcode=%s\tdur=1s\n' \
+    "$(date -d "@$2" --iso-8601=seconds)" "$3" "${4:-ok}" >> "$1"
+}
+test_health() {
+  local root="$FIXTURE/health" repo="$FIXTURE/health/git-zorblax" now=1800000000 out rc all=""
+  _runlock_fixture "$root" "$repo" tier2
+  sed -i 's/name: lk$/name: zorblax-secret/' "$root/repos.yaml"
+  local st="$root/hstub" state="$root/state"
+  mkdir -p "$st" "$root/proc/4242" "$root/cfg"
+  cat > "$st/systemctl" <<'SH'
+#!/usr/bin/env bash
+[[ "$*" == *show* ]] || exit 0
+if [[ "${STUB_TIMER:-armed}" == idle ]]; then printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=inactive\nNextElapseUSecRealtime=\n'
+# systemd 258 while the timer's service runs: active/running, no next elapse
+elif [[ "$STUB_TIMER" == running ]]; then printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nSubState=running\nNextElapseUSecRealtime=\n'
+else printf 'LoadState=loaded\nUnitFileState=enabled\nActiveState=active\nNextElapseUSecRealtime=Sun 2027-01-17 03:17:00 EST\n'; fi
+SH
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "${STUB_LINGER:-yes}"\n' > "$st/loginctl"
+  cat > "$st/df" <<'SH'
+#!/usr/bin/env bash
+printf 'Filesystem 1M-blocks Used Available Capacity Mounted\n/dev/x 100000 1 %s 1%% /\n' "${STUB_DF_FREE:-99999}"
+SH
+  chmod +x "$st"/*
+  printf 'bash\0%s/bin/run.sh\0daily\0' "$root" > "$root/proc/4242/cmdline"
+  local H=( env PATH="$st:$PATH" XDG_CONFIG_HOME="$root/cfg" MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml"
+            MEUTE_DF="$st/df" MEUTE_PROC="$root/proc" )
+  _hreset() {
+    rm -rf "$state/log" "$state/hold" "$state/lock-info" "$state/rate-limits.json" "$state/policy-override" "$root/.worktrees" "$root/alert.txt" "$state/health-alerted"
+    _health_log "$state/log" $(( now - 3600 )) ok
+  }
+  _hcase() {   # <name> <expected substring> [env...] -- the fixture is already crafted
+    local name="$1" want="$2"; shift 2
+    out="$("${H[@]}" "$@" "$root/bin/meute" health 2>/dev/null)"; rc=$?
+    all+="$out"$'\n'
+    [[ "$rc" != 0 ]] && ok "health: $name exits non-zero" || bad "health: $name exits non-zero" "exit 0, output [$out]"
+    has "health: $name is reported" "$out" "$want"
+  }
+
+  _hreset
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a healthy fleet exits 0" "$rc" "0"
+  is "health: ...and prints nothing" "$out" ""
+
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 3 * 86400 )) ok
+  _hcase "no log line within twice the daily cadence" "no run logged"
+  # An empty log is news only once the daily timer has had twice the cadence
+  # to fire: right after install-timers it is not.
+  local dtimer="$root/cfg/systemd/user/meute-daily.timer"; mkdir -p "${dtimer%/*}"
+  _hreset; : > "$state/log"; : > "$dtimer"; touch -d "@$(( now - 3600 ))" "$dtimer"
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: an empty log an hour after install-timers is not a problem" "$rc:$out" "0:"
+  _hreset; : > "$state/log"; touch -d "@$(( now - 3 * 86400 ))" "$dtimer"
+  _hcase "an empty log three days after install-timers" "no run has been logged yet"
+  rm -f "$dtimer"
+  # On a UTC host systemd-analyze prints no "(in UTC)" lines; the weekend gap
+  # of a Mon..Fri calendar must still widen the silence threshold.
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"]["daily_calendar"] = "Mon..Fri *-*-* 03:17:00"
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 43200 )) ok
+  out="$("${H[@]}" TZ=UTC "$root/bin/meute" health 2>&1)"
+  hasnt "health: on a UTC host a Mon..Fri calendar's weekend gap is not silence" "$out" "no run logged"
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"].pop("daily_calendar", None)
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
+
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
+  _health_log "$state/log" $(( now - 600 )) skipped quota-unknown
+  _hcase "a last status=ok older than the threshold" "no successful run"
+  # Declining by design is not failing: a spent budget, nothing eligible, or a
+  # quota under the floor is the fleet working, not a fleet that stopped.
+  local benign
+  for benign in budget nothing-eligible no-queue quota-floor; do
+    _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
+    for i in 4 3 2 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped "$benign"; done
+    out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+    is "health: days of code=$benign skips are not a failure" "$rc:$out" "0:"
+  done
+  # ...but only for a bounded time: two weeks of benign skips and nothing run
+  # is its own problem, or a budget that never refills goes unseen forever.
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 20 * 86400 )) ok
+  for i in 13 9 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped budget; done
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: 13 days of only benign skips is still healthy" "$rc:$out" "0:"
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 20 * 86400 )) ok
+  for i in 15 10 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped quota-floor; done
+  _hcase "15 days of only benign skips" "15 days of only benign skips, nothing ran"
+  hasnt "health: ...not also reported as no successful run" "$out" "no successful run"
+  _hreset; : > "$state/log"
+  for i in 16 10 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped no-queue; done
+  _hcase "16 days of only benign skips, nothing ever ran" "16 days of only benign skips, nothing ran"
+  _hreset; : > "$state/log"
+  for i in 15 10; do _health_log "$state/log" $(( now - i * 86400 )) skipped budget; done
+  _health_log "$state/log" $(( now - 6 * 86400 )) ok
+  for i in 5 1; do _health_log "$state/log" $(( now - i * 86400 )) skipped budget; done
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a run inside the two weeks resets the count" "$rc:$out" "0:"
+
+  _hreset; local i; for i in 3 2 1; do _health_log "$state/log" $(( now - i * 60 )) error died; done
+  _hcase "three consecutive errors" "3 consecutive"
+  _hreset; _health_log "$state/log" $(( now - 120 )) error died; _health_log "$state/log" $(( now - 60 )) error died
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: two errors are not yet a problem" "$rc" "0"
+
+  _hreset; printf 'hold\t%s\tauto: provider rate limit — zorblax-secret said 429\n' $(( now + 3600 )) > "$state/hold"
+  _hcase "an automatic hold in force" "automatic hold"
+  _hreset; printf 'hold\t%s\towner pause\n' $(( now + 3600 )) > "$state/hold"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: a pause the owner set is not a problem" "$rc" "0"
+  # Every fire of a long owner pause logs skipped code=hold; those are not
+  # failures, during the pause or after it ends, so no hourly false alarm.
+  _hlog_paused() {   # <hold reason prefix>: ok 5 days ago, then a hold skip each day
+    : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
+    for i in 4 3 2 1; do
+      printf '%s\tweek=x\tslot=daily\tstatus=skipped\treason=paused until x — %spause\tcode=hold\tdur=0s\n' \
+        "$(date -d "@$(( now - i * 86400 ))" --iso-8601=seconds)" "$1" >> "$state/log"
+    done
+  }
+  _hreset; _hlog_paused ""; printf 'hold\t%s\towner pause\n' $(( now + 3 * 86400 )) > "$state/hold"
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a long owner pause raises nothing" "$rc:$out" "0:"
+  _hreset; _hlog_paused ""; printf 'hold\t%s\towner pause\n' $(( now - 3600 )) > "$state/hold"
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: ...nor the hours after it ends, before the next fire" "$rc:$out" "0:"
+  _hreset; _hlog_paused "auto: provider rate limit "
+  _hcase "days of automatic-hold skips with no success" "no successful run"
+
+  _hreset; printf 'pid=4242 started=%s slot=daily key=zorblax-secret/t\n' "$(date -d "@$(( now - 3000 ))" --iso-8601=seconds)" > "$state/lock-info"
+  _hcase "a lock held longer than the largest timeout" "lock held"
+  _hreset; printf 'pid=4999991 started=%s slot=daily key=zorblax-secret/t\n' "$(date -d "@$(( now - 3000 ))" --iso-8601=seconds)" > "$state/lock-info"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: lock-info of a dead runner is not a held lock" "$rc" "0"
+  _hreset; printf 'pid=4242 started=%s slot=daily key=zorblax-secret/t\n' "$(date -d "@$(( now - 60 ))" --iso-8601=seconds)" > "$state/lock-info"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: a lock held for a minute is not a problem" "$rc" "0"
+
+  _hreset; _hcase "a timer that is not armed" "not armed" STUB_TIMER=idle
+  # The hourly health run sees its own timer in SubState=running (empty next
+  # elapse); counting that as idle alerted every hour on a healthy fleet.
+  _hreset; out="$("${H[@]}" STUB_TIMER=running "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a timer whose run is in progress counts as armed" "$rc:$out" "0:"
+  _hreset; _hcase "linger off" "linger" STUB_LINGER=no
+  _hreset; "${H[@]}" STUB_LINGER=unknown "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: linger unknown (no system bus) is not a problem" "$rc" "0"
+
+  _hreset; _hcase "a state filesystem low on space" "MB free" STUB_DF_FREE=100
+
+  # A killed run's tree is a checkout (the sweep leaves anything else alone).
+  _hreset; mkdir -p "$root/.worktrees/zorblax-secret-t-2026-01-01.4999991"
+  : > "$root/.worktrees/zorblax-secret-t-2026-01-01.4999991/.git"
+  _hcase "a leftover of a killed run" "leftover"
+
+  _hreset; printf '{"captured_at": %s}\n' $(( now - 2 * 86400 )) > "$state/rate-limits.json"
+  _hcase "a quota snapshot older than a day" "quota snapshot"
+  _hreset; printf '{"captured_at": %s}\n' $(( now - 600 )) > "$state/rate-limits.json"
+  "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
+  is "health: a fresh quota snapshot is not a problem" "$rc" "0"
+
+  _hreset; printf 'quota_floor_percent\t1\t%s\tnight\n' $(( now + 3600 )) > "$state/policy-override"
+  _hcase "a policy override in force" "policy override"
+
+  hasnt "health: no line names a repository (D4)" "$all" "zorblax"
+
+  # alert_cmd: the text arrives on stdin under --alert, and only when there is a problem.
+  python3 - "$root/repos.yaml" "$root/alert.txt" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1])); d["policy"]["alert_cmd"] = f"tee {sys.argv[2]}"
+yaml.safe_dump(d, open(sys.argv[1], "w"), sort_keys=False)
+PY
+  _hreset; "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1; rc=$?
+  is "health --alert: healthy exits 0" "$rc" "0"
+  [[ ! -e "$root/alert.txt" ]] && ok "health --alert: healthy sends nothing" || bad "health --alert: healthy sends nothing" "$(cat "$root/alert.txt")"
+  _hreset; "${H[@]}" STUB_TIMER=idle "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: alert_cmd receives the text on stdin" "$(cat "$root/alert.txt" 2>/dev/null)" "not armed"
+  _hreset; "${H[@]}" "$root/bin/meute" health --alert --failed >/dev/null 2>&1; rc=$?
+  has "health --alert --failed: a failed run unit alerts even on a healthy fleet" "$(cat "$root/alert.txt" 2>/dev/null)" "meute run failed"
+  [[ "$rc" != 0 ]] && ok "health --alert --failed: exits non-zero" || bad "health --alert --failed: exits non-zero" "exit 0"
+  hasnt "health --alert: the alert names no repository (D4)" "$(cat "$root/alert.txt" 2>/dev/null)" "zorblax"
+  # One alert per problem, not one an hour: a 24 h automatic hold alerts once.
+  _hreset; printf 'hold\t%s\tauto: provider rate limit\n' $(( now + 86400 )) > "$state/hold"
+  "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: an automatic hold alerts" "$(cat "$root/alert.txt" 2>/dev/null)" "automatic hold"
+  is  "health --alert: the alerted marker is owner-only" "$(stat -c %a "$state/health-alerted" 2>/dev/null)" "600"
+  is  "health --alert: ...and never reaches the public harness" \
+      "$(git -C "$REPO" check-ignore -q -- state/health-alerted; echo $?)" "0"
+  rm -f "$root/alert.txt"
+  out="$("${H[@]}" MEUTE_NOW=$(( now + 3600 )) "$root/bin/meute" health --alert 2>/dev/null)"; rc=$?
+  [[ ! -e "$root/alert.txt" ]] && ok "health --alert: the same hold an hour later is not sent again" \
+    || bad "health --alert: the same hold an hour later is not sent again" "$(cat "$root/alert.txt")"
+  [[ "$rc" != 0 ]] && ok "health --alert: ...it is still reported, exit non-zero" || bad "health --alert: ...it is still reported, exit non-zero" "exit 0"
+  has "health --alert: ...and printed" "$out" "automatic hold"
+  "${H[@]}" MEUTE_NOW=$(( now + 7200 )) STUB_DF_FREE=100 "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: a new problem beside it is sent" "$(cat "$root/alert.txt" 2>/dev/null)" "MB free"
+  rm -f "$root/alert.txt" "$state/hold"
+  "${H[@]}" MEUTE_NOW=$(( now + 7200 )) "$root/bin/meute" health --alert >/dev/null 2>&1; rc=$?
+  is "health --alert: once healthy again, exit 0" "$rc" "0"
+  printf 'hold\t%s\tauto: provider rate limit\n' $(( now + 86400 )) > "$state/hold"
+  "${H[@]}" MEUTE_NOW=$(( now + 10800 )) "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: a problem that cleared and came back alerts again" "$(cat "$root/alert.txt" 2>/dev/null)" "automatic hold"
+  rm -f "$state/hold"
+  # The marker is replaced whole (written beside it, renamed into place), and a
+  # write that fails neither truncates it nor kills health under set -e.
+  local ino
+  _hreset; printf 'hold\t%s\tauto: provider rate limit\n' $(( now + 86400 )) > "$state/hold"
+  "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1
+  ino="$(stat -c %i "$state/health-alerted" 2>/dev/null)"
+  "${H[@]}" STUB_DF_FREE=100 "$root/bin/meute" health --alert >/dev/null 2>&1
+  [[ -n "$ino" && "$(stat -c %i "$state/health-alerted" 2>/dev/null)" != "$ino" ]] \
+    && ok "health --alert: the marker is replaced by a rename, not rewritten in place" \
+    || bad "health --alert: the marker is replaced by a rename, not rewritten in place" "inode $ino kept"
+  has "health --alert: ...and holds the new problem" "$(cat "$state/health-alerted")" "MB free"
+  if [[ "$(id -u)" == 0 ]]; then
+    skip "health --alert: a marker that cannot be written" "running as root; chmod cannot block writes"
+  else
+    local before; before="$(cat "$state/health-alerted")"
+    rm -f "$root/alert.txt"
+    chmod 555 "$state"
+    out="$("${H[@]}" STUB_DF_FREE=100 STUB_TIMER=idle "$root/bin/meute" health --alert 2>&1)"; rc=$?
+    chmod 755 "$state"
+    is  "health --alert: an unwritable marker still exits 1 (problems), not an errexit" "$rc" "1"
+    has "health --alert: ...the alert was still sent" "$(cat "$root/alert.txt" 2>/dev/null)" "not armed"
+    has "health --alert: ...the failure is noted" "$out" "could not record"
+    is  "health --alert: ...the marker is untouched" "$(cat "$state/health-alerted")" "$before"
+    is  "health --alert: ...and no temp marker is left" "$(ls -A "$state" | grep -c '^health-alerted\.')" "0"
+  fi
+  rm -f "$state/hold" "$root/alert.txt"
+  # A problem whose numbers grow each hour ("no run logged for 72h", "73h")
+  # is still one problem.
+  _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 4 * 86400 )) ok
+  "${H[@]}" "$root/bin/meute" health --alert >/dev/null 2>&1
+  has "health --alert: silence alerts" "$(cat "$root/alert.txt" 2>/dev/null)" "no run logged for 96h"
+  rm -f "$root/alert.txt"
+  "${H[@]}" MEUTE_NOW=$(( now + 3600 )) "$root/bin/meute" health --alert >/dev/null 2>&1
+  [[ ! -e "$root/alert.txt" ]] && ok "health --alert: the same silence an hour longer is not sent again" \
+    || bad "health --alert: the same silence an hour longer is not sent again" "$(cat "$root/alert.txt")"
+  local v
+  v="$(python3 - "$root/repos.yaml" "$root/bad.yaml" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1])); d["policy"]["alert_cmd"] = ["tee", "x"]
+yaml.safe_dump(d, open(sys.argv[2], "w"), sort_keys=False)
+PY
+  MEUTE_ROOT="$root" python3 "$REPO/lib/manifest.py" validate "$root/bad.yaml" 2>&1)"
+  has "health: a non-string alert_cmd is refused by validate" "$v" "policy.alert_cmd"
+  "${H[@]}" "$root/bin/meute" policy set alert_cmd=x --for 1h >/dev/null 2>&1; rc=$?
+  [[ "$rc" != 0 ]] && ok "health: alert_cmd cannot be set by a policy override" || bad "health: alert_cmd cannot be set by a policy override" "exit 0"
+  rm -f "$state/policy-override"
+
+  # install-timers: the hourly health timer, the alert unit, OnFailure on both run units.
+  local unit="$root/cfg/systemd/user"
+  "${H[@]}" "$root/bin/meute" install-timers >/dev/null 2>&1
+  has "install-timers: writes an hourly meute-health.timer" "$(cat "$unit/meute-health.timer" 2>/dev/null)" "OnCalendar=hourly"
+  has "install-timers: meute-health.service runs health --alert" "$(cat "$unit/meute-health.service" 2>/dev/null)" "bin/meute health --alert"
+  has "install-timers: meute-alert.service runs health --alert --failed" "$(cat "$unit/meute-alert.service" 2>/dev/null)" "bin/meute health --alert --failed"
+  for v in daily weekly; do
+    is "install-timers: meute-${v}.service has OnFailure in [Unit]" \
+       "$(awk '/^\[/{s=$0} /^OnFailure=/{print s "|" $0}' "$unit/meute-${v}.service" 2>/dev/null)" "[Unit]|OnFailure=meute-alert.service"
+  done
+}
