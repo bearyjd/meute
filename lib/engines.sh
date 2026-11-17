@@ -68,9 +68,17 @@ engine_argv_claude() {
 # Where it is missing the cut is by bytes, and iconv -c drops the split
 # sequence it leaves -- or python3, which meute already requires, where
 # iconv is absent.
+#
+# Credentials are redacted first (lib/redact.py, P2.4), before the cut, so a
+# token the cut would split is still recognised whole. A filter that fails
+# withholds the detail rather than writing it unredacted. The path is found
+# without dirname: a caller may run this with only python3 on PATH.
 engine_detail_clean() {
   local LC_ALL="${ENGINE_DETAIL_LOCALE:-C.UTF-8}"
-  local s="${1//[[:cntrl:]]/ }" v
+  local s v
+  s="$(printf '%s' "$1" | python3 "${BASH_SOURCE[0]%/*}/redact.py")" \
+    || s="(detail withheld: redaction failed)"
+  s="${s//[[:cntrl:]]/ }"
   (( ${#s} <= 300 )) || s="${s:0:297}..."
   if command -v iconv >/dev/null 2>&1; then
     # -c exits 1 when it dropped anything, which is the case it is here for.
