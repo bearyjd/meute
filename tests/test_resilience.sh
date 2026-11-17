@@ -2178,7 +2178,9 @@ PY
 
   _hreset; _hcase "a state filesystem low on space" "MB free" STUB_DF_FREE=100
 
+  # A killed run's tree is a checkout (the sweep leaves anything else alone).
   _hreset; mkdir -p "$root/.worktrees/zorblax-secret-t-2026-01-01.4999991"
+  : > "$root/.worktrees/zorblax-secret-t-2026-01-01.4999991/.git"
   _hcase "a leftover of a killed run" "leftover"
 
   _hreset; printf '{"captured_at": %s}\n' $(( now - 2 * 86400 )) > "$state/rate-limits.json"
