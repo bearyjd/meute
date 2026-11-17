@@ -810,6 +810,24 @@ PY
   out="$("${M[@]}" "$root/bin/meute" policy show 2>&1)"
   hasnt "policy show: ...the nan row is not listed" "$out" "weekly_cost_usd"
   has   "policy show: ...the floor row is" "$out" "quota_floor_percent=1"
+  # The web inbox shows the floor a run obeys, not the manifest's.
+  out="$(MEUTE_ROOT="$root" "${M[@]}" python3 "$root/lib/inbox.py" dump 2>/dev/null | jq -r .status.floor)"
+  is    "inbox: the floor shown is the override's" "$out" "1"
+
+  # A hand edit that is not UTF-8, or an until with a non-ASCII digit, is a
+  # bad row, skipped and logged: the run goes on and the good row applies.
+  printf 'quota_floor_percent\t1\t%s\thand edit\nweekly_runs\t5\t\xc2\xb2\tsuperscript\ncommunity_share\t0.1\t%s\t\xff\xfe\n' \
+    "$(( now + 3600 ))" "$(( now + 3600 ))" > "$root/state/policy-override"
+  out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
+  hasnt "policy override: a non-UTF-8 or unicode-digit row does not kill the run" "$out" "could not read policy"
+  has   "policy override: ...the good floor row still applies" "$(tail -1 "$root/state/log")" "status=ok"
+  has   "policy override: ...and the bad rows are reported" "$out" "policy override: skipped"
+  # An unreadable override file (a directory) is no override, not a dead run.
+  rm -f "$root/state/policy-override"; mkdir "$root/state/policy-override"
+  out="$("${R[@]}" MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
+  hasnt "policy override: an unreadable override file does not kill the run" "$out" "could not read policy"
+  has   "policy override: ...the manifest's floor applies" "$(tail -1 "$root/state/log")" "below floor 30%"
+  rmdir "$root/state/policy-override"
 
   # clear
   out="$("${M[@]}" "$root/bin/meute" policy clear 2>&1)"
