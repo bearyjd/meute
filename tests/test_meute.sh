@@ -6250,6 +6250,7 @@ test_p15_enqueue_refuses_unfinished
 test_p15_only_checked_first
 test_p15_plan_identity_cache
 test_p15_only_refuses_own_checkout
+test_p15_only_one_spelling
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

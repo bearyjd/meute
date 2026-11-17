@@ -830,3 +830,26 @@ test_p15_only_refuses_own_checkout() {
   hasnt "p1.5 cache: plan no longer claims state is untouched" "$out" "or state files were changed"
   has   "p1.5 cache: plan names the derived cache it wrote" "$out" "state/plan-cache is derived and safe to delete"
 }
+
+# P1.5 (b): a named path is staged under the spelling a scan would give it,
+# so a symlinked spelling is the same repository under the same name, and a
+# second spelling of the named directory in state/plan-cache is not a peer.
+test_p15_only_one_spelling() {
+  local u="$FIXTURE/p15f" root="$FIXTURE/p15f/meute-stand-in" rc name
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  ln -s "$u" "$FIXTURE/p15f-alias"; ln -s a "$u/alias-a"
+  "$root/bin/meute" plan "$FIXTURE/p15f-alias" >/dev/null 2>&1
+  rc=0; "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: a cached alias of the named path is not its duplicate" "$rc" "0"
+  name="$(jq -r '.entries[0].name // "none"' "$queue" 2>/dev/null || echo none)"
+  rc=0; "$root/bin/meute" plan --enqueue --replace --only "$u/alias-a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: --only through an in-root symlink succeeds" "$rc" "0"
+  is  "p1.5 spelling: ...under the same synthetic name" "$(jq -r '.entries[0].name // "missing"' "$queue" 2>/dev/null)" "$name"
+  is  "p1.5 spelling: ...and the scan's spelling" "$(jq -r '.entries[0].path' "$queue" 2>/dev/null)" "$u/a"
+  rc=0; "$root/bin/meute" plan --enqueue --replace --only "$u/a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: the real spelling still succeeds after the alias" "$rc" "0"
+  rc=0; "$root/bin/meute" plan --enqueue --append --only "$u/alias-a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: --append of the other spelling adds no second entry" \
+    "$(jq '.entries | length' "$queue" 2>/dev/null)" "1"
+}

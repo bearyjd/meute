@@ -32,18 +32,35 @@ plan_only_reject() {
   PLAN_REJECTED+=( "$1" ); PLAN_REJECT_WHY["$1"]="$2"
 }
 
+# The spelling a scan of scan_dir gives a physical path: the scan root as
+# spelled, then the rest of the path below whichever ancestor is the root by
+# identity (a bind mount has no common prefix). find follows no symlink
+# inside the tree, so this is the one spelling of each directory: the synthetic
+# name and the dedup see one repository, however the operator typed it.
+plan_only_spell() {
+  local phys="$1" scan_dir="$2" dir root_id; root_id="$(dir_id "$scan_dir")"
+  dir="$phys"
+  while [[ "$(dir_id "$dir")" != "$root_id" ]]; do
+    [[ "$dir" != "/" ]] || return 1
+    dir="$(dirname "$dir")"
+  done
+  dir="${scan_dir%/}${phys#"${dir%/}"}"
+  printf '%s\n' "${dir:-/}"
+}
+
 # The cheap checks: no git, no walk. Sets PLAN_ONLY_ARGS (the arguments that
-# passed) and PLAN_ONLY_REAL (argument -> resolved path). The own-checkout
-# test walks the physical path: a symlink elsewhere must not hide it.
+# passed) and PLAN_ONLY_REAL (argument -> the scan's spelling of it). Both
+# containment tests walk the physical path: a symlink must not hide where it
+# leads.
 plan_only_precheck() {
-  local scan_dir="$1" arg real why; shift
+  local scan_dir="$1" arg phys real why; shift
   PLAN_ONLY_ARGS=(); PLAN_ONLY_REAL=()
   for arg in "$@"; do
     why=""
-    if ! real="$(cd "$arg" 2>/dev/null && pwd)"; then why="no such directory"
-    elif [[ ! -e "$real/.git" ]]; then why="not a Git repository"
-    elif ! under_scan_root "$real" "$scan_dir"; then why="outside the scan root ${scan_dir}"
-    elif under_scan_root "$(cd "$real" && pwd -P)" "$MEUTE_ROOT"; then why="inside meute's own checkout"
+    if ! phys="$(cd "$arg" 2>/dev/null && pwd -P)"; then why="no such directory"
+    elif [[ ! -e "$phys/.git" ]]; then why="not a Git repository"
+    elif ! real="$(plan_only_spell "$phys" "$scan_dir")"; then why="outside the scan root ${scan_dir}"
+    elif under_scan_root "$phys" "$MEUTE_ROOT"; then why="inside meute's own checkout"
     fi
     if [[ -n "$why" ]]; then
       plan_only_reject "$arg" "plan: --only ${arg}: not an unconfigured repository (${why})"
@@ -54,20 +71,28 @@ plan_only_precheck() {
 }
 
 # Same-key copies a previous scan recorded, as candidates for canonical, in
-# PLAN_ONLY_PEERS. Run in this shell, not a subshell, so the identities it
+# PLAN_ONLY_PEERS: one per directory, by identity, so another spelling of a
+# named or enrolled directory (a symlinked root, /home for /var/home) is not
+# a copy of it. Run in this shell, not a subshell, so the identities it
 # computes stay in the cache for plan_dedup.
 plan_only_peers() {
-  local scan_dir="$1" path; shift
-  local -A keys=() named=()
+  local scan_dir="$1" path id; shift
+  local -A keys=() seen=()
+  local -a cached=()
   PLAN_ONLY_PEERS=()
   for path in "$@"; do
-    named["$path"]=1
+    seen["$(dir_id "$path")"]=1
     plan_identity "$path" && keys["$PLAN_ID"]=1
   done
-  for path in "${!PLAN_CACHE_KEY[@]}"; do
-    [[ -n "${keys[${PLAN_CACHE_KEY[$path]}]+present}" && -z "${named[$path]+present}" ]] || continue
-    [[ -e "$path/.git" && -z "${PLAN_KNOWN_NAME[$(dir_id "$path")]+present}" ]] || continue
+  # Sorted, so which spelling of a peer is kept does not vary run to run.
+  (( ${#PLAN_CACHE_KEY[@]} == 0 )) \
+    || mapfile -t cached < <(printf '%s\n' "${!PLAN_CACHE_KEY[@]}" | LC_ALL=C sort)
+  for path in "${cached[@]}"; do
+    [[ -n "${keys[${PLAN_CACHE_KEY[$path]}]+present}" && -e "$path/.git" ]] || continue
+    id="$(dir_id "$path")"
+    [[ -z "${seen[$id]+present}" && -z "${PLAN_KNOWN_NAME[$id]+present}" ]] || continue
     plan_classify "$path/.git" "$scan_dir" >/dev/null 2>&1 || continue
+    seen["$id"]=1
     PLAN_ONLY_PEERS+=( "$path" )
   done
   return 0
