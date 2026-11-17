@@ -1001,6 +1001,8 @@ while [[ "\$1" == --* ]]; do shift; done
 exec "\$@"
 EOF
   chmod +x "$root/stub/systemd-run"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\n' "$root/stop.calls" > "$root/stub/systemctl"
+  chmod +x "$root/stub/systemctl"
 }
 # run.sh invocations the stub launched (the probe line ends in "true").
 _scope_runs() { local n; n="$(grep -c 'bin/run.sh daily' "$1/scope.calls" 2>/dev/null)"; echo "${n:-0}"; }
@@ -1009,12 +1011,16 @@ test_p2_7_scope_containment() {
   local root="$FIXTURE/p27" rc
   _drain_fixture "$root" 2
   _scope_stub "$root"
-  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_SCOPE=on MEUTE_SYSTEMD_RUN="$root/stub/systemd-run" )
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_SCOPE=on MEUTE_SYSTEMD_RUN="$root/stub/systemd-run" MEUTE_SYSTEMCTL="$root/stub/systemctl" )
 
   rc=0; "${env[@]}" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
   is  "scope: the drain still completes and exits 0"          "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
   is  "scope: ...each run.sh went through systemd-run"        "$(_scope_runs "$root")" "2"
   has "scope: ...as a user scope that is collected"           "$(grep 'bin/run.sh daily' "$root/scope.calls" | head -1)" "--user --scope --collect"
+  local started stopped
+  started="$(grep -o -- '--unit=meute-run-[0-9-]*' "$root/scope.calls" | cut -d= -f2 | sort | paste -sd' ')"
+  stopped="$(grep -o 'meute-run-[0-9-]*' "$root/stop.calls" 2>/dev/null | sort | paste -sd' ')"
+  is  "scope: ...and each named scope is stopped after its run.sh" "$(wc -w <<< "$started"):$stopped" "2:$started"
 
   rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
   rc=0; SCOPE_PROBE_FAIL=1 "${env[@]}" "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
@@ -1028,4 +1034,25 @@ test_p2_7_scope_containment() {
   rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
   rc=0; "${env[@]}" MEUTE_SCOPE=off "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
   is  "scope: MEUTE_SCOPE=off never calls systemd-run"        "$rc:$(_scope_runs "$root"):$([[ -e $root/scope.calls ]] && echo called || echo none)" "0:0:none"
+}
+
+# P2.7 for real: an engine straggler left by a drain run.sh must be gone once
+# that run.sh returns. A scope is not stopped when its main process exits, so
+# this needs a real transient unit; skipped where systemd-run --user is absent.
+test_p2_7_scope_reaps_stragglers() {
+  local root="$FIXTURE/p27real" rc pid alive=""
+  if ! timeout 20 systemd-run --user --scope --collect --quiet true >/dev/null 2>&1; then
+    skip "scope reaps: systemd-run --user --scope is not usable here" "real-unit test only"
+    return 0
+  fi
+  _drain_fixture "$root" 2
+  sed -i "3a setsid sleep 600 </dev/null >/dev/null 2>&1 & echo \$! >> '$root/stragglers'" "$root/stub/claude"
+  rc=0; env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_SCOPE=on \
+    "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
+  is "scope reaps: the drain completes with two fires"        "$rc:$(_drain_ran "$root")" "0:lk1 lk2"
+  is "scope reaps: ...each engine call left a straggler"      "$(wc -l < "$root/stragglers" 2>/dev/null)" "2"
+  sleep 1
+  while read -r pid; do kill -0 "$pid" 2>/dev/null && alive+="$pid "; done < "$root/stragglers"
+  is "scope reaps: ...and none outlives its run.sh"           "$alive" ""
+  for pid in $alive; do kill "$pid" 2>/dev/null; done
 }
