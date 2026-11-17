@@ -763,10 +763,25 @@ test_policy_override() {
     || bad "policy override: the env var writes nothing" "state/policy-override exists"
 
   # An override that sets the other ceiling replaces the manifest's, never
-  # trips the one-ceiling rule.
-  "${M[@]}" "$root/bin/meute" policy set weekly_cost_usd=50 --for 1h >/dev/null 2>&1
+  # trips the one-ceiling rule. The manifest carries weekly_runs=1, already
+  # spent by the runs above, so only the cost ceiling lets this run through.
+  cp "$root/repos.yaml" "$root/repos.yaml.noceiling"
+  python3 - "$root/repos.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["policy"]["weekly_runs"] = 1
+yaml.safe_dump(d, open(p, "w"), sort_keys=False)
+PY
   out="$("${R[@]}" MEUTE_NOW="$now" MEUTE_QUOTA_FLOOR=1 "$root/bin/run.sh" daily 2>&1)"
-  has "policy override: a cost ceiling override is accepted" "$(tail -1 "$root/state/log")" "status=ok"
+  has "policy override: the manifest's weekly_runs=1 is spent before the cost override" \
+    "$(tail -1 "$root/state/log")" "ceiling is spent"
+  "${M[@]}" "$root/bin/meute" policy set weekly_cost_usd=50 --for 1h >/dev/null 2>&1; rc=$?
+  is  "policy set: a cost ceiling over a manifest weekly_runs is accepted" "$rc" "0"
+  out="$("${M[@]}" python3 "$root/lib/manifest.py" policy-effective "$root/repos.yaml" "$root/state/policy-override" 2>&1)"
+  has "policy-effective: the cost override replaces the manifest's weekly_runs" "$out" '"weekly_runs": null'
+  out="$("${R[@]}" MEUTE_NOW="$now" MEUTE_QUOTA_FLOOR=1 "$root/bin/run.sh" daily 2>&1)"
+  has   "policy override: a cost ceiling override is accepted" "$(tail -1 "$root/state/log")" "status=ok"
+  hasnt "policy override: ...and the manifest's weekly_runs no longer gates" "$(tail -1 "$root/state/log")" "ceiling is spent"
+  mv "$root/repos.yaml.noceiling" "$root/repos.yaml"
 
   # Two separate sets of the two ceilings: the later one evicts the earlier,
   # so the file never holds an incoherent pair and the floor row stays live.
