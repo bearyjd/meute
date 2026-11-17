@@ -738,9 +738,9 @@ cmd_web() {
   [[ "$host" != *:* ]] || die "web: IPv6 host ${host} is not supported; use an IPv4 address (127.0.0.1 is the default)"
   if [[ "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
     (( insecure_public )) || die "web: refusing non-loopback host ${host}; pass --insecure-public to acknowledge the unauthenticated inbox"
-    note "WARNING: binding ${host} -- there is no login; anyone who can reach it can triage findings AND start fleet runs that spend your Claude/Codex quota. Browse to exactly http://${host}:${port}/ (the Host check only accepts the bound host:port)"
+    note "WARNING: binding ${host} -- there is no login; anyone who can reach it can triage findings AND start fleet runs that spend your Claude/Codex quota. Open the link printed below, with the address exactly as shown (the Host check only accepts the bound host:port)"
   fi
-  note "inbox at http://${host}:${port}/  (Ctrl-C to stop)"
+  note "starting the inbox: open the link printed below, it carries the access token (Ctrl-C to stop)"
   exec python3 "${MEUTE_ROOT}/tui/webserver.py" --host "$host" --port "$port"
 }
 

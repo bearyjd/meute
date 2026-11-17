@@ -78,7 +78,7 @@ class BrowserSmoke(WebTestCase):
         profile = tempfile.mkdtemp(prefix="meute-smoke-")
         self.addCleanup(shutil.rmtree, profile, True)
         proc = subprocess.Popen(
-            browser_cmd(name, path, profile, f"http://127.0.0.1:{self.port}/"),
+            browser_cmd(name, path, profile, f"http://127.0.0.1:{self.port}/?t={self.token}"),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         self.addCleanup(self._kill, proc)
         deadline = time.monotonic() + BROWSER_WAIT

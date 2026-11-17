@@ -3369,6 +3369,13 @@ test_web_bind_guard() {
   out="$(web --host 192.0.2.10 --insecure-public)"
   has "web: explicit insecure opt-in permits non-loopback" "$out" "webserver.py --host 192.0.2.10"
   has "web: warning says fleet runs spend quota" "$out" "start fleet runs"
+  # Any bare URL the CLI prints leads to the 403 "open the link" page: the
+  # only usable link is the token-bearing one the server prints at startup.
+  out="$(web --host 127.0.0.1 --port 8123)"
+  hasnt "web: CLI prints no tokenless URL (loopback)" "$(grep -E 'http://[0-9.]+:[0-9]+/($|[^?])' <<< "$out")" "http://"
+  has   "web: CLI points at the startup link" "$out" "link printed"
+  out="$(web --host 192.0.2.10 --insecure-public)"
+  hasnt "web: CLI prints no tokenless URL (non-loopback)" "$(grep -E 'http://[0-9.]+:[0-9]+/($|[^?])' <<< "$out")" "http://"
   # The Host check accepts only the bound host:port, and no browser sends
   # Host 0.0.0.0, so a wildcard bind could only ever answer 403.
   local wild
