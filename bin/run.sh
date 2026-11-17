@@ -40,7 +40,7 @@
 #                          per-engine subscription probes; see bin/quota.sh
 #   MEUTE_QUOTA_CMD        legacy alias for MEUTE_CLAUDE_QUOTA_CMD
 #
-set -Eeuo pipefail
+set -Eeuo pipefail; umask 077  # owner-only state/ and reports/ on a shared host (P2.4)
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
@@ -943,7 +943,7 @@ write_report() {
       printf '# Run produced no report\n\n**Status:** %s — %s\n\n' "$ENGINE_STATUS" "${ENGINE_DETAIL:-no detail}"
       printf 'Last 40 lines of engine stderr:\n\n```\n%s\n```\n' "$(tail -n 40 "$err")"
     fi
-  } > "$dest"
+  } | python3 "${MEUTE_ROOT}/lib/redact.py" > "$dest"  # credentials never reach disk (P2.4)
 }
 
 # Commits whatever the write tier left in the worktree, onto the scratch branch

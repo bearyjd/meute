@@ -55,6 +55,9 @@
 # add-repo and set-image-digest both refuse to touch it.
 #
 set -Eeuo pipefail
+# Owner-only files on a shared host: state/ and reports/ name private repos
+# and carry unfixed findings (P2.4). Inherited by `meute web` and its runs.
+umask 077
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
@@ -89,6 +92,7 @@ source "${MEUTE_ROOT}/lib/plan_dedup.sh"
 source "${MEUTE_ROOT}/lib/status.sh"
 source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
+source "${MEUTE_ROOT}/lib/privacy.sh"
 source "${MEUTE_ROOT}/lib/timers.sh"
 source "${MEUTE_ROOT}/lib/unitlimits.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
