@@ -47,20 +47,25 @@ policy_override_set() {
   note "lift it early with:  meute policy clear"
 }
 
-# Prints one line per override in force; returns 1 when there is none.
+# Prints one line per override row in force, and marks the rows the manifest's
+# rules refused (IGNORED: why). Returns 1 when no row applies.
 policy_override_show() {
-  local file live found=1 key value until reason
+  local file policy applied ignored found=1 key value until reason why
   file="$(policy_override_file)"
-  if [[ -f "$file" ]]; then
-    # The keys a run obeys, from the same reader (expiry, 7-day cap, non-finite).
-    live="$(MEUTE_NOW="$(now_epoch)" python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import policy_override as p; print(" ".join(p.read_rows(sys.argv[2], p.now_epoch())))' \
-      "$(dirname "$MANIFEST_PY")" "$file")" || return 1
-    while IFS=$'\t' read -r key value until reason; do
-      [[ " $live " == *" $key "* ]] || continue
+  [[ -f "$file" ]] || return 1
+  # The keys a run obeys and the ones it ignored, from the same resolver
+  # (expiry, 7-day cap, the manifest's rules), without this shell's env floor.
+  policy="$(env -u MEUTE_QUOTA_FLOOR MEUTE_NOW="$(now_epoch)" python3 "$MANIFEST_PY" policy-effective "$MANIFEST" "$file" 2>/dev/null)" || return 1
+  applied=" $(jq -r '.override // [] | join(" ")' <<< "$policy") "
+  ignored="$(jq -r '.override_ignored // [] | .[]' <<< "$policy")"
+  while IFS=$'\t' read -r key value until reason; do
+    if [[ "$applied" == *" $key "* ]]; then
       printf '%s=%s  until %s%s\n' "$key" "$value" "$(hold_until_human "$until")" "${reason:+  — ${reason}}"
       found=0
-    done < "$file"
-  fi
+    elif why="$(awk -v k="${key}: " 'index($0, k) == 1 { print; exit }' <<< "$ignored")"; [[ -n "$why" ]]; then
+      printf '%s=%s  IGNORED (%s)\n' "$key" "$value" "${why#*: }"
+    fi
+  done < "$file"
   return "$found"
 }
 

@@ -839,6 +839,84 @@ PY
   has "policy clear: the manifest's floor applies again" "$(tail -1 "$root/state/log")" "below floor 30%"
 }
 
+# Review findings on P1.1: a hand-edited or special override file must never
+# stop the fleet or hang it, and one bad row must cost that row only, loudly.
+test_policy_override_hardening() {
+  local root="$FIXTURE/polovh" repo="$FIXTURE/polovh/git-lk" now out err rc f
+  _runlock_fixture "$root" "$repo" tier2
+  now="$(date +%s)"; f="$root/state/policy-override"
+  local E=( env MEUTE_NOW="$now" python3 "$root/lib/manifest.py" policy-effective "$root/repos.yaml" "$f" )
+
+  # An until of thousands of digits trips Python's int-string limit: that row
+  # is skipped and logged, the run's policy is still computed.
+  { printf 'quota_floor_percent\t1\t%s\tgood\n' "$(( now + 3600 ))"
+    printf 'tier3_max_in_flight\t1\t%s\thuge\n' "$(printf '9%.0s' {1..5000})"; } > "$f"
+  out="$("${E[@]}" 2>"$root/err")"; rc=$?; err="$(cat "$root/err")"
+  is    "policy override: a 5000-digit until does not fail policy-effective" "$rc" "0"
+  hasnt "policy override: ...no traceback" "$err" "Traceback"
+  has   "policy override: ...the row is reported skipped" "$err" "skipped"
+  is    "policy override: ...the good row still applies" "$(jq -r .quota_floor_percent <<< "$out")" "1"
+  out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+  has   "policy show: a 5000-digit until does not break show" "$out" "quota_floor_percent=1"
+
+  # Special files: a FIFO would block forever, /dev/zero would read forever.
+  rm -f "$f"; mkfifo "$f"
+  out="$(timeout 10 "${E[@]}" 2>"$root/err")"; rc=$?; err="$(cat "$root/err")"
+  is  "policy override: a FIFO does not hang policy-effective" "$rc" "0"
+  is  "policy override: ...the manifest's floor applies" "$(jq -r .quota_floor_percent <<< "$out" 2>/dev/null)" "30"
+  has "policy override: ...and it says why" "$err" "not a regular file"
+  rm -f "$f"; ln -s /dev/zero "$f"
+  out="$( (ulimit -v 2000000; timeout 10 "${E[@]}") 2>"$root/err")"; rc=$?; err="$(cat "$root/err")"
+  is  "policy override: a symlink to /dev/zero is refused, not read" "$rc" "0"
+  is  "policy override: ...the manifest's floor applies" "$(jq -r .quota_floor_percent <<< "$out" 2>/dev/null)" "30"
+  has "policy override: ...and it says why" "$err" "not a regular file"
+  rm -f "$f"
+  { printf 'quota_floor_percent\t1\t%s\tgood\n' "$(( now + 3600 ))"; head -c 1100000 /dev/zero | tr '\0' 'x'; echo; } > "$f"
+  out="$("${E[@]}" 2>"$root/err")"; rc=$?; err="$(cat "$root/err")"
+  is  "policy override: a file over 1 MiB is refused" "$(jq -r .quota_floor_percent <<< "$out" 2>/dev/null)" "30"
+  has "policy override: ...and it says why" "$err" "too large"
+
+  # One row failing the manifest rules costs that row only, and is said so:
+  # the tightening rows beside it still apply.
+  { printf 'weekly_cost_usd\tabc\t%s\ttypo\n' "$(( now + 3600 ))"
+    printf 'tier3_max_in_flight\t1\t%s\ttighten\n' "$(( now + 3600 ))"
+    printf 'community_share\t0.05\t%s\ttighten\n' "$(( now + 3600 ))"; } > "$f"
+  out="$("${E[@]}" 2>"$root/err")"; err="$(cat "$root/err")"
+  is  "policy override: a bad row does not void the tightening rows (tier3)" "$(jq -r .tier3_max_in_flight <<< "$out")" "1"
+  is  "policy override: ...(community_share)" "$(jq -r .community_share <<< "$out")" "0.05"
+  is  "policy override: ...override lists only the applied keys" "$(jq -c .override <<< "$out")" '["community_share","tier3_max_in_flight"]'
+  has "policy override: ...the ignored row is named" "$(jq -c .override_ignored <<< "$out")" "weekly_cost_usd"
+  has "policy override: ...and reported on stderr" "$err" "weekly_cost_usd"
+  out="$(env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_NOW="$now" "$root/bin/run.sh" daily 2>&1)"
+  has "policy override: the run line names the ignored row" "$(tail -1 "$root/state/log")" "policy_ignored=weekly_cost_usd"
+  has "policy override: ...and is still marked overridden" "$(tail -1 "$root/state/log")" "policy=override"
+  out="$(MEUTE_NOW="$now" MEUTE_MANIFEST="$root/repos.yaml" "$root/bin/meute" policy show 2>&1)"
+  has "policy show: marks the ignored row" "$out" "weekly_cost_usd=abc  IGNORED"
+  has "policy show: ...and lists the applied ones" "$out" "tier3_max_in_flight=1"
+  # A tightening cost ceiling survives a bad row beside it.
+  { printf 'community_share\tabc\t%s\ttypo\n' "$(( now + 3600 ))"
+    printf 'weekly_cost_usd\t5\t%s\ttighten\n' "$(( now + 3600 ))"; } > "$f"
+  is  "policy override: a tightening cost ceiling survives a bad row" "$(jq -r .weekly_cost_usd <<< "$("${E[@]}" 2>/dev/null)")" "5"
+  # Both ceilings by hand: the first applies, the second is ignored.
+  { printf 'weekly_runs\t5\t%s\tx\n' "$(( now + 3600 ))"
+    printf 'weekly_cost_usd\t10\t%s\ty\n' "$(( now + 3600 ))"; } > "$f"
+  out="$("${E[@]}" 2>/dev/null)"
+  is  "policy override: two hand-edited ceilings: the first applies" "$(jq -r .weekly_runs <<< "$out")" "5"
+  has "policy override: ...the second is ignored" "$(jq -c .override_ignored <<< "$out")" "weekly_cost_usd"
+
+  # An invalid MEUTE_QUOTA_FLOOR is one ignored value, not every file row.
+  { printf 'quota_floor_percent\t1\t%s\tnight\n' "$(( now + 3600 ))"
+    printf 'tier3_max_in_flight\t1\t%s\ttighten\n' "$(( now + 3600 ))"; } > "$f"
+  out="$(MEUTE_QUOTA_FLOOR=abc "${E[@]}" 2>/dev/null)"
+  is  "policy override: a bad MEUTE_QUOTA_FLOOR keeps the file's floor" "$(jq -r .quota_floor_percent <<< "$out")" "1"
+  is  "policy override: ...and the file's other rows" "$(jq -r .tier3_max_in_flight <<< "$out")" "1"
+  has "policy override: ...and is named as ignored" "$(jq -c .override_ignored <<< "$out")" "MEUTE_QUOTA_FLOOR"
+
+  is "gitignore: state/policy-override is ignored" \
+     "$(git -C "$REPO" check-ignore -q -- state/policy-override; echo $?)" "0"
+  rm -f "$f" "$root/err"
+}
+
 # P2.4 (R21): privacy on a shared host. Credentials in a report or a log line
 # are redacted before they reach disk; files meute creates are owner-only;
 # doctor names loose permissions and credential-bearing remotes (by repo name
