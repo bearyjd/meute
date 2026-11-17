@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 
 import runprogress as rp
 
@@ -56,6 +58,21 @@ class RunnerFailed(Exception):
     """A meute command failed; the message is safe to show."""
 
 
+def scope_prefix() -> list[str]:
+    """The systemd-run prefix that puts a run.sh in a transient user scope, or
+    [] when unavailable (lib/scope.sh). The caller names and stops the scope."""
+    binary = os.environ.get("MEUTE_SYSTEMD_RUN", "systemd-run")
+    if os.environ.get("MEUTE_SCOPE", "on") == "off" or shutil.which(binary) is None:
+        return []
+    prefix = [binary, "--user", "--scope", "--collect", "--quiet"]
+    try:
+        probe = subprocess.run(prefix + ["true"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return prefix if probe.returncode == 0 else []
+
+
 def subprocess_runner(argv: list[str], cwd: str, out_path: str | None = None,
                       timeout: float | None = None, on_start=None) -> tuple[int, str]:
     """Run argv to completion. Returns (returncode, stdout).
@@ -80,12 +97,31 @@ def subprocess_runner(argv: list[str], cwd: str, out_path: str | None = None,
             proc.communicate()
             raise
         return proc.returncode, out
+    prefix = scope_prefix()
+    unit = f"meute-web-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    if prefix:
+        prefix = prefix + [f"--unit={unit}"]
     with open(out_path, "ab") as out:
-        child = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
+        child = subprocess.Popen(prefix + argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
                                  stderr=out, start_new_session=True)
     if on_start is not None:
         on_start(child.pid)
-    return child.wait(), ""
+    rc = child.wait()
+    if prefix:
+        stop_scope(unit)
+    return rc, ""
+
+
+def stop_scope(unit: str) -> None:
+    """Stop the scope a run.sh item ran in: a scope outlives its main process,
+    so this is what kills the stragglers it left (P2.7). Errors are ignored:
+    an empty scope is already gone."""
+    try:
+        subprocess.run([os.environ.get("MEUTE_SYSTEMCTL", "systemctl"), "--user", "stop",
+                        f"{unit}.scope"], stdin=subprocess.DEVNULL, capture_output=True,
+                       timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def _clean_paths(paths: object) -> list[str]:
