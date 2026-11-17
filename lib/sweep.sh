@@ -62,7 +62,7 @@ _sweep_worktree() {
   fi
   if (( _sweep_dry )); then _sweep_say "worktree ${dir}"; return 0; fi
   if [[ -n "$common" ]]; then
-    git --git-dir="$common" worktree remove --force "$dir" >/dev/null 2>&1 || rm -rf "$dir" 2>/dev/null
+    git --git-dir="$common" worktree remove --force "$dir" >/dev/null 2>&1 || rm -rf -- "$dir" 2>/dev/null
     git --git-dir="$common" worktree prune >/dev/null 2>&1 || true
     _sweep_done worktree "$dir" || return 0
     if [[ -n "$tip" && "$tip" == "$first" ]] \
@@ -70,7 +70,7 @@ _sweep_worktree() {
       _sweep_say "branch ${branch}"
     fi
   else
-    rm -rf "$dir" 2>/dev/null
+    rm -rf -- "$dir" 2>/dev/null
     _sweep_done worktree "$dir" || return 0
   fi
 }
@@ -84,6 +84,9 @@ sweep_stale() {
   for d in "$wtd"/*; do
     [[ -d "$d" && ! -L "$d" && "$d" =~ \.([0-9]+)$ ]] || continue
     pid="${BASH_REMATCH[1]}"
+    # A runner's tree is a checkout (a worktree's .git file, a clone's .git
+    # directory); anything else here is someone's own and stays.
+    [[ -e "$d/.git" || -L "$d/.git" ]] || continue
     _sweep_mine "$d" || continue
     _sweep_live "$pid" || _sweep_worktree "$d"
   done
@@ -97,14 +100,14 @@ sweep_stale() {
       _sweep_mine "$d" || continue
       _sweep_live "$pid" && continue
       if (( _sweep_dry )); then _sweep_say "temp dir ${d}"; continue; fi
-      rm -rf "$d" 2>/dev/null
+      rm -rf -- "$d" 2>/dev/null
       _sweep_done "temp dir" "$d" || true
     done
   fi
 
   while IFS= read -r -d '' f; do
     if (( _sweep_dry )); then _sweep_say "stale ${f}"; continue; fi
-    rm -f "$f" 2>/dev/null
+    rm -f -- "$f" 2>/dev/null
     _sweep_done stale "$f" || true
   done < <(find "$state" -maxdepth 1 -type f -name '.kv.*' -mmin +60 -print0 2>/dev/null)
   return 0

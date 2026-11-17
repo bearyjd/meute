@@ -1049,6 +1049,28 @@ test_startup_sweep() {
   has   "sweep: ...and says why" "$out" "not sweeping shared temp dir $root/shared"
   has   "sweep: ...the fire still ran" "$(tail -1 "$root/state/log")" "status=ok"
   chmod 755 "$root/shared"
+
+  # A symlinked run.<pid>.* (or .worktrees/*.<pid>) is never followed nor
+  # removed: the decoy it points at and the link itself are left alone.
+  mkdir -p "$root/decoy" "$root/decoy-wt"; : > "$root/decoy/keep"; : > "$root/decoy-wt/.git"; : > "$root/decoy-wt/keep"
+  ln -s "$root/decoy" "$root/state/tmp/run.4999997.FFFFFF"
+  ln -s "$root/decoy-wt" "$wt/lk-t-2026-01-01.4999997"
+  # A user's own directory under .worktrees that is no checkout (no .git) is
+  # not the runner's, whatever its name.
+  mkdir -p "$wt/notes.4999998"; : > "$wt/notes.4999998/mine"
+  out="$("${R[@]}" "$root/bin/run.sh" daily 2>&1)"
+  [[ -e "$root/decoy/keep" && -e "$root/decoy-wt/keep" ]] && ok "sweep: a symlinked dir's target survives" \
+    || bad "sweep: a symlinked dir's target survives" "$(ls -A "$root/decoy" "$root/decoy-wt")"
+  [[ -L "$root/state/tmp/run.4999997.FFFFFF" ]] && ok "sweep: ...the run.<pid> symlink is left alone" \
+    || bad "sweep: ...the run.<pid> symlink is left alone" "removed"
+  [[ -L "$wt/lk-t-2026-01-01.4999997" ]] && ok "sweep: ...the .worktrees symlink is left alone" \
+    || bad "sweep: ...the .worktrees symlink is left alone" "removed"
+  hasnt "sweep: ...and neither is reported" "$out" "4999997"
+  [[ -e "$wt/notes.4999998/mine" ]] && ok "sweep: a .worktrees dir without .git is not removed" \
+    || bad "sweep: a .worktrees dir without .git is not removed" "removed"
+  has "sweep: ...the fire still ran" "$(tail -1 "$root/state/log")" "status=ok"
+  rm -f "$root/state/tmp/run.4999997.FFFFFF" "$wt/lk-t-2026-01-01.4999997"
+  rm -rf "$root/decoy" "$root/decoy-wt" "$wt/notes.4999998"
 }
 
 # Review findings on P1.1: a hand-edited or special override file must never
