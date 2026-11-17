@@ -14,7 +14,9 @@ Subcommands
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sys
 
@@ -80,6 +82,28 @@ def parse_findings(body: str) -> list:
     return out
 
 
+def _norm_path(location: str) -> str:
+    """The file a location names: first token, no backticks, no line suffix."""
+    tokens = re.split(r"[\s,;]+", location.replace("`", "").strip(), maxsplit=1)
+    path = re.sub(r"(:\d.*|#L\d.*)$", "", tokens[0])
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def fingerprint(repo: str, location: str, title: str) -> str:
+    """A finding's identity across reports (P1.7): the same defect raised by a
+    later audit, with its line moved or its title re-punctuated, hashes the same."""
+    title_words = " ".join(re.findall(r"[a-z0-9]+", title.lower()))
+    key = f"{repo}|{_norm_path(location)}|{title_words}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
+def report_repo(meta: dict, path: str) -> str:
+    """The repo a report belongs to: its front-matter, else its directory."""
+    return meta.get("repo") or os.path.basename(os.path.dirname(os.path.abspath(path)))
+
+
 def has_findings_section(body: str) -> bool:
     return re.search(r"^## Findings\s*$", body, re.M) is not None
 
@@ -133,7 +157,9 @@ def cmd_findings(args: list) -> int:
     meta, body = read(args[0])
     if not has_findings_section(body):
         raise ReportError("findings: this report has no Findings section")
-    print(json.dumps(parse_findings(body)))
+    repo = report_repo(meta, args[0])
+    print(json.dumps([{**f, "fingerprint": fingerprint(repo, f["location"], f["title"])}
+                      for f in parse_findings(body)]))
     return 0
 
 
