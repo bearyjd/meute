@@ -213,11 +213,6 @@ retire_completed_plan() {
   note "all staged plan items were attempted; archived queue at ${archive}"
 }
 
-hold_gate() {
-  hold_active || return 0
-  skip hold "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
-}
-
 main() {
   outcome_scan_args "$@"; parse_args "$@"; trap 'outcome_on_exit tmp_cleanup' EXIT
   mkdir -p "$STATE_DIR" "$WORKTREE_DIR" "${MEUTE_ROOT}/reports"

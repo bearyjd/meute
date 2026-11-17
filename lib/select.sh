@@ -3,8 +3,17 @@
 # from the caller: SLOT, PLAN_MODE, FORCED, ONCE, ONCE_DONE, FORCE_REPO, FORCE_TASK,
 # ENGINE_OVERRIDE, RUNTIME_OVERRIDE, QUOTA_FLOOR, TIER3_CAP, CURSOR_FILE,
 # PLAN_DONE_FILE, MEUTE_ROOT, and note/skip (outcome.sh), refuse_entry,
-# state_get, kv_get/kv_set (state.sh), community_allowed, tier3_in_flight
-# (fleet.sh) and container_ready (container.sh).
+# state_get, kv_get/kv_set (state.sh), community_allowed, tier3_in_flight,
+# hold_active, hold_until_human, HOLD_UNTIL/HOLD_REASON (fleet.sh) and
+# container_ready (container.sh).
+
+# hold_gate: skip the fire as code=hold while a hold is in force. Called before
+# the lock and, after a --wait-lock wait, again once the lock is taken.
+hold_gate() {
+  hold_active || return 0
+  skip hold "paused until $(hold_until_human "$HOLD_UNTIL")${HOLD_REASON:+ — ${HOLD_REASON}}"
+}
+
 
 # A staged plan rotates on its own cursor. Sharing one would leave the
 # manifest cursor pointing at a plan key once the plan retires -- a key no

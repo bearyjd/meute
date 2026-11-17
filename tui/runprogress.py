@@ -106,9 +106,9 @@ def classify(records: list[dict], returncode: int, slot: str, since: float) -> d
     a timer firing the other slot (or a late line from an older run) writes
     to the same log and is not this call's outcome. The line's code= decides
     when it has one; the free-text status is the fallback for older lines.
-    Without a line, a strict-exit status of 10-15 still says "skipped". That
+    Without a line, a strict-exit status of 10-16 still says "skipped". That
     holds regardless of strictness: a non-strict run could in theory exit
-    10-15 via `exit "$commit_rc"`, but that is very unlikely.
+    10-16 via `exit "$commit_rc"`, but that is very unlikely.
     """
     own = [rec for rec in records
            if rec.get("slot") == slot and _at_or_after(rec, since)]
