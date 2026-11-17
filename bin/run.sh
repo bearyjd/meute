@@ -44,7 +44,7 @@ set -Eeuo pipefail
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
-source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"
+source "${MEUTE_ROOT}/lib/outcome.sh"; source "${MEUTE_ROOT}/lib/plan_quarantine.sh"; source "${MEUTE_ROOT}/lib/quota_age.sh"
 source "${MEUTE_ROOT}/lib/state.sh"
 source "${MEUTE_ROOT}/lib/fleet.sh"
 source "${MEUTE_ROOT}/lib/engines.sh"
@@ -289,7 +289,7 @@ quota_for_engine() {
     QUOTA_BY_ENGINE[$engine]="$(timeout --kill-after=5 35 "${MEUTE_ROOT}/bin/quota.sh" --engine "$engine" --with-source 9>&-)" \
       || QUOTA_BY_ENGINE[$engine]="fail"
   fi
-  QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"
+  QUOTA_PROBE="${QUOTA_BY_ENGINE[$engine]}"; quota_age_apply "$engine"
 }
 
 # Nothing was eligible. When a pool was the reason for any candidate, the
@@ -301,7 +301,7 @@ skip_nothing_eligible() {
   for engine in $(printf '%s\n' "${!QUOTA_BY_ENGINE[@]}" | LC_ALL=C sort); do
     probe="${QUOTA_BY_ENGINE[$engine]}"
     if [[ "$probe" == "fail" ]]; then
-      verdicts+=( "${engine} quota probe failed" ); quotas+=( "fail" )
+      verdicts+=( "${engine} quota probe failed${QUOTA_STALE[$engine]:+ (snapshot stale)}" ); quotas+=( "fail" )
     elif (( ${probe%% *} < QUOTA_FLOOR )); then
       verdicts+=( "${engine} quota ${probe%% *}% below floor ${QUOTA_FLOOR}%" )
       quotas+=( "${probe%% *}:${probe#* }" )
@@ -312,7 +312,7 @@ skip_nothing_eligible() {
   done
   (( ${#verdicts[@]} )) || skip nothing-eligible "no eligible entry for slot ${SLOT}"
   local why; why="$(printf '%s; ' "${verdicts[@]}")"
-  skip nothing-eligible "no eligible entry for slot ${SLOT} (${why%; })" \
+  skip "$(quota_age_empty_code)" "no eligible entry for slot ${SLOT} (${why%; })" \
     "quota=$(IFS=,; printf '%s' "${quotas[*]}")" "engine=$(IFS=,; printf '%s' "${engines[*]}")"
 }
 
@@ -462,7 +462,7 @@ main() {
   engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
   if [[ -n "$engine" ]]; then
     quota_for_engine "$engine"
-    [[ "$QUOTA_PROBE" != "fail" ]] || skip quota-unknown "${engine} quota probe failed"
+    [[ "$QUOTA_PROBE" != "fail" ]] || skip quota-unknown "${engine} quota probe failed or snapshot stale"
     remaining="${QUOTA_PROBE%% *}"
     QUOTA_SOURCE="${QUOTA_PROBE#* }"
     (( remaining < QUOTA_FLOOR )) \
@@ -787,7 +787,7 @@ run_entry() {
     || state_set "lens.${repo}.${task}" "$(( lens_index + 1 ))"
 
   log_run "$ENGINE_STATUS" "kind=${kind}" "repo=${repo}" "task=${task}" "tier=${tier}" \
-          "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" "budget=${BUDGET_LEFT}" \
+          "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" "quota_age=${QUOTA_AGE}" "budget=${BUDGET_LEFT}" \
           ${SCRUBBED:+"scrubbed=${SCRUBBED// /,}"} "commit=${committed}" "report=${report_rel}" "cost=${COST}" "turns=${TURNS}" \
           ${ENGINE_DETAIL:+"detail=${ENGINE_DETAIL}"}
   [[ "$ENGINE_STATUS" == "ok" ]]

@@ -73,6 +73,7 @@ OWNER_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*
 
 POLICY_DEFAULTS = {
     "quota_floor_percent": 30,
+    "quota_max_age_hours": None,
     "weekly_runs": None,
     "weekly_cost_usd": None,
     "community_share": 0.20,
@@ -129,6 +130,9 @@ def merged_policy(data: dict) -> dict:
     floor = policy["quota_floor_percent"]
     if not isinstance(floor, int) or not 0 <= floor <= 100:
         raise ManifestError("policy.quota_floor_percent: must be an integer 0-100")
+    max_age = policy["quota_max_age_hours"]
+    if max_age is not None and (isinstance(max_age, bool) or not isinstance(max_age, (int, float)) or max_age <= 0):
+        raise ManifestError("policy.quota_max_age_hours: must be a positive number")
     share = policy["community_share"]
     if not isinstance(share, (int, float)) or not 0.0 <= float(share) <= 1.0:
         raise ManifestError("policy.community_share: must be a number 0.0-1.0")
