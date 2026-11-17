@@ -3,6 +3,11 @@
 // All dynamic text goes through textContent.
 const TOKEN = document.querySelector('meta[name="meute-token"]').content;
 const $ = (id) => document.getElementById(id);
+// Beacons: tell the server the page rendered, or why it did not (tests/test_browser_smoke.py).
+const beacon = (url) => { fetch(url, { keepalive: true }).catch(() => {}); };
+window.onerror = (msg, src, line) => {
+  beacon("/api/client-error?msg=" + encodeURIComponent(msg + " @" + src + ":" + line));
+};
 const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false };
 
 function el(tag, text, cls) {
@@ -192,6 +197,7 @@ async function refresh() {
   try {
     state.data = await getJSON("/api/inbox");
     renderAll();
+    beacon("/api/client-ready?page=inbox");
   } catch (e) {
     notice("could not load inbox: " + e.message, false);
   }
