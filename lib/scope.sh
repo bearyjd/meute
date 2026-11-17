@@ -24,12 +24,31 @@ scope_init() {
   SCOPE_CMD=("$bin" --user --scope --collect --quiet)
 }
 
+# scope_stop UNIT: stop that scope, killing whatever its run left behind.
+scope_stop() { "${MEUTE_SYSTEMCTL:-systemctl}" --user stop "${1}.scope" >/dev/null 2>&1 || true; }
+
+# scope_on_signal SIG: an INT or TERM that reaches the drain mid-run must still
+# stop the live scope, then end the drain by that same signal. (bash runs the
+# trap once the foreground run.sh returns, so a TERM aimed at the drain alone
+# lets the item in flight finish.)
+scope_on_signal() {
+  [[ -z "${SCOPE_UNIT:-}" ]] || scope_stop "$SCOPE_UNIT"
+  SCOPE_UNIT=""
+  trap - "$1"
+  kill -s "$1" "$$"
+}
+
 # scope_run CMD...: run CMD in its own scope (if scope_init found one), then
 # stop that scope so no straggler survives. Returns CMD's exit status.
 scope_run() {
   (( ${#SCOPE_CMD[@]} )) || { "$@"; return; }
   local unit="meute-run-$$-$(( ++SCOPE_SEQ ))-${RANDOM}" rc=0
+  SCOPE_UNIT="$unit"
+  trap 'scope_on_signal INT' INT
+  trap 'scope_on_signal TERM' TERM
   "${SCOPE_CMD[@]}" --unit="$unit" "$@" || rc=$?
-  "${MEUTE_SYSTEMCTL:-systemctl}" --user stop "${unit}.scope" >/dev/null 2>&1 || true
+  trap - INT TERM
+  SCOPE_UNIT=""
+  scope_stop "$unit"
   return "$rc"
 }

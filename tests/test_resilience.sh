@@ -996,6 +996,8 @@ _scope_stub() {
   cat > "$root/stub/systemd-run" <<EOF
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> '$root/scope.calls'
+# SCOPE_INT: a Ctrl-C on the run: the drain gets INT and its child dies of it.
+[[ -n "\${SCOPE_INT:-}" && "\${!#}" != true ]] && { kill -INT \$PPID; kill -INT \$\$; sleep 5; }
 [[ "\${!#}" == true && -n "\${SCOPE_PROBE_FAIL:-}" ]] && exit 1
 while [[ "\$1" == --* ]]; do shift; done
 exec "\$@"
@@ -1019,7 +1021,8 @@ test_p2_7_scope_containment() {
   has "scope: ...as a user scope that is collected"           "$(grep 'bin/run.sh daily' "$root/scope.calls" | head -1)" "--user --scope --collect"
   local started stopped
   started="$(grep -o -- '--unit=meute-run-[0-9-]*' "$root/scope.calls" | cut -d= -f2 | sort | paste -sd' ')"
-  stopped="$(grep -o 'meute-run-[0-9-]*' "$root/stop.calls" 2>/dev/null | sort | paste -sd' ')"
+  # The exact stop line: `--user stop <unit>.scope`. A wrong suffix or verb names no unit.
+  stopped="$(sed -n 's/^--user stop \(meute-run-[0-9-]*\)\.scope$/\1/p' "$root/stop.calls" 2>/dev/null | sort | paste -sd' ')"
   is  "scope: ...and each named scope is stopped after its run.sh" "$(wc -w <<< "$started"):$stopped" "2:$started"
 
   rm -f "$root/scope.calls"; : > "$root/state/log"; rm -f "$root/state/cursor"
@@ -1035,6 +1038,44 @@ test_p2_7_scope_containment() {
   rc=0; "${env[@]}" MEUTE_SCOPE=off "$root/bin/meute" drain daily >/dev/null 2>&1 || rc=$?
   is  "scope: MEUTE_SCOPE=off never calls systemd-run"        "$rc:$(_scope_runs "$root"):$([[ -e $root/scope.calls ]] && echo called || echo none)" "0:0:none"
 }
+
+# An INT or TERM to the drain, mid run.sh, must still stop that run's scope and
+# then end the drain by that signal (a TERM aimed at the drain alone is deferred
+# by bash until run.sh returns, so the item in flight finishes; either way no
+# further fire starts).
+_scope_signal_case() {
+  local sig="$1" root="$FIXTURE/p27sig$1" rc started stopped
+  _drain_fixture "$root" 2
+  _scope_stub "$root"
+  sed -i "2a printf x >> '$root/engine.started'; while [[ ! -e '$root/release' ]]; do sleep 0.1; done" "$root/stub/claude"
+  rc=0
+  python3 - "$sig" "$root" <<'PY' || rc=$?
+import os, signal, subprocess, sys, time
+sig, root = getattr(signal, "SIG" + sys.argv[1]), sys.argv[2]
+env = dict(os.environ, SCOPE_INT="1" if sig == signal.SIGINT else "", PATH=f"{root}/stub:" + os.environ["PATH"], MEUTE_QUOTA_STUB="100", MEUTE_SCOPE="on",
+           MEUTE_SYSTEMD_RUN=f"{root}/stub/systemd-run", MEUTE_SYSTEMCTL=f"{root}/stub/systemctl")
+p = subprocess.Popen([f"{root}/bin/meute", "drain", "daily"], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))  # an ambient ignore would hide INT
+for _ in range(100):
+    if sig == signal.SIGINT or os.path.exists(f"{root}/engine.started"):
+        break
+    time.sleep(0.1)
+if sig == signal.SIGTERM:  # the web Stop: TERM to the drain alone, run.sh still going
+    os.kill(p.pid, sig)
+    open(f"{root}/release", "w").close()
+try:
+    sys.exit(abs(p.wait(timeout=30)) % 256)  # -N: ended by signal N
+except subprocess.TimeoutExpired:
+    p.kill(); sys.exit(99)
+PY
+  started="$(grep -o -- '--unit=meute-run-[0-9-]*' "$root/scope.calls" | cut -d= -f2 | sort | paste -sd' ')"
+  stopped="$(sed -n 's/^--user stop \(meute-run-[0-9-]*\)\.scope$/\1/p' "$root/stop.calls" 2>/dev/null | sort | paste -sd' ')"
+  is "scope $sig: the drain ends by the signal"  "$rc" "$(kill -l "$sig")"
+  is "scope $sig: ...the run in flight had its scope stopped" "$(wc -w <<< "$started"):$stopped" "1:$started"
+  is "scope $sig: ...and no second fire started"   "$(cat "$root/engine.started" 2>/dev/null | wc -c)" "$([[ $sig == TERM ]] && echo 1 || echo 0)"
+}
+test_p2_7_scope_signals() { _scope_signal_case TERM; _scope_signal_case INT; }
 
 # P2.7 for real: an engine straggler left by a drain run.sh must be gone once
 # that run.sh returns. A scope is not stopped when its main process exits, so
