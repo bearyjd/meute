@@ -6248,6 +6248,10 @@ test_plan_quarantine_manifest_broken
 test_p1_3_source_manifest
 test_p1_4_once
 test_p1_3_wait_lock
+test_p1_3_drain_rotation
+test_p1_3_drain_stops
+test_p1_3_drain_lock_and_source
+test_p1_3_drain_until
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

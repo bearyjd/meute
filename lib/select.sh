@@ -163,11 +163,17 @@ skip_nothing_eligible() {
 }
 
 # A forced --repo/--task names one entry; nothing else is a candidate.
+# MEUTE_ONLY_REPOS (newline-separated names, set by `meute drain --repo`)
+# narrows an unforced queue instead: the cursor and every gate still apply.
 load_queue() {
   local queue_file="$1"
   if (( FORCED )); then
     jq -c --arg r "$FORCE_REPO" --arg t "$FORCE_TASK" \
        'select(($r == "" or .repo == $r) and ($t == "" or .task == $t))' \
+       "$queue_file" > "${queue_file}.f"
+    mv "${queue_file}.f" "$queue_file"
+  elif [[ -n "${MEUTE_ONLY_REPOS:-}" ]]; then
+    jq -c --arg o "$MEUTE_ONLY_REPOS" '($o | split("\n")) as $l | select(.repo as $r | any($l[]; . == $r))' \
        "$queue_file" > "${queue_file}.f"
     mv "${queue_file}.f" "$queue_file"
   fi
