@@ -798,7 +798,8 @@ test_p1_3_wait_lock() {
   # A hold set while the fire waits is honoured once the lock is taken.
   ( "${run[@]}" --wait-lock 137 >/dev/null 2>&1; echo $? > "$root/held.rc" ) &
   local waiter=$!
-  for (( i = 0; i < 100; i++ )); do ps -eo args | grep -q '[f]lock -w 137' && break; sleep 0.2; done
+  for (( i = 0; i < 300; i++ )); do ps -eo args | grep -q '[f]lock -w 137' && break; sleep 0.2; done
+  (( i < 300 )) || bad "wait lock: the waiting fire reached flock -w" "not seen within 60 s"
   printf 'hold\t%s\t%s\n' "$(( $(date +%s) + 3600 ))" "set during the wait" > "$root/state/hold"
   kill "$P13_HOLDER" 2>/dev/null; wait "$P13_HOLDER" 2>/dev/null
   wait "$waiter"
