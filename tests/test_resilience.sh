@@ -695,6 +695,88 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
 
+# P1.7 (a), R5, D7: a finding has an identity across reports. The fingerprint is
+# sha1(repo | file path from the location | title), both normalised, so a repeat
+# audit that words the location `./src/db.py:90` instead of `src/db.py:88` is
+# still the same finding. A dismissal on one occurrence is inherited by later
+# occurrences: `findings --new` stops re-raising it, `--all` shows it as
+# `dismissed (seen before)`. Only dismissals are inherited (D7), never backwards,
+# never across repos, and a finding's own decision always wins.
+test_p1_7a_fingerprint_inherit() {
+  local root="$FIXTURE/p17a" out py="$REPO/lib/report.py"
+  mkdir -p "$root/reports/alpha" "$root/reports/beta" "$root/state" "$root/tasks"
+  ln -sfn "$REPO/bin" "$root/bin"; ln -sfn "$REPO/lib" "$root/lib"
+  cp "$REPO"/tasks/*.md "$root/tasks/"
+  cp "$FIXTURE/repos.yaml" "$root/repos.yaml"
+  _p17a_report() {  # repo id started finding-lines...
+    local repo="$1" id="$2" started="$3"; shift 3
+    { printf -- '---\nrepo: %s\ntask: audit-security\ntier: tier2\nstarted: %s\nstatus: ok\n---\n\n## Summary\nx\n\n## Findings\n\n' "$repo" "$started"
+      printf '%b\n' "$@"; } > "$root/reports/$repo/$id.md"
+  }
+  _p17a_report alpha audit-01 2026-09-01T04:00:00-04:00 \
+    '### [HIGH] SQL injection in query\n- **Location:** `src/db.py:88`\n' \
+    '### [LOW] Unused import\n- **Location:** `src/util.py:3`\n'
+  _p17a_report alpha audit-02 2026-09-08T04:00:00-04:00 \
+    '### [HIGH] SQL  Injection in query.\n- **Location:** `./src/db.py:90-94`\n' \
+    '### [MEDIUM] Missing timeout\n- **Location:** `src/net.py:12`\n' \
+    '### [LOW] Unused import\n- **Location:** src/util.py:4\n'
+  _p17a_report beta audit-01 2026-09-08T04:00:00-04:00 \
+    '### [HIGH] SQL injection in query\n- **Location:** `src/db.py:88`\n'
+
+  local fp1 fp2 fpb
+  fp1="$(python3 "$py" findings "$root/reports/alpha/audit-01.md" | jq -r '.[0].fingerprint')"
+  fp2="$(python3 "$py" findings "$root/reports/alpha/audit-02.md" | jq -r '.[0].fingerprint')"
+  fpb="$(python3 "$py" findings "$root/reports/beta/audit-01.md" | jq -r '.[0].fingerprint')"
+  is  "p1.7a: fingerprint is a sha1" "$(grep -cE '^[0-9a-f]{40}$' <<< "$fp1")" "1"
+  is  "p1.7a: same finding reworded and moved has the same fingerprint" "$fp2" "$fp1"
+  is  "p1.7a: another finding has another fingerprint" \
+      "$(python3 "$py" findings "$root/reports/alpha/audit-02.md" | jq -r '.[1].fingerprint' | grep -c "^${fp1}$")" "0"
+  is  "p1.7a: the same finding in another repo has another fingerprint" "$([[ ${#fpb} == 40 && $fpb != "$fp1" ]] && echo distinct)" "distinct"
+
+  # alpha/audit-01#1 dismissed, #2 actioned.
+  printf 'alpha/audit-01#1\tdismissed\t2026-09-02\tfalse-positive\nalpha/audit-01#2\tactioned\t2026-09-02\t\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7a: an inherited dismissal is hidden from --new" "$(grep -c 'alpha/audit-02#1' <<< "$out")" "0"
+  has "p1.7a: an unrelated new finding is still listed" "$out" "alpha/audit-02#2"
+  has "p1.7a: only dismissals are inherited (actioned is not)" "$out" "alpha/audit-02#3"
+  has "p1.7a: not across repos" "$out" "beta/audit-01#1"
+  out="$("$root/bin/meute" findings --all 2>&1)"
+  has "p1.7a: --all shows it as seen before" "$(grep 'alpha/audit-02#1' <<< "$out")" "dismissed (seen before)"
+  has "p1.7a: the original keeps its own state" "$(grep 'alpha/audit-01#1' <<< "$out")" "dismissed"
+  hasnt "p1.7a: ...not marked seen before" "$(grep 'alpha/audit-01#1' <<< "$out")" "seen before"
+  out="$(MEUTE_ROOT="$root" python3 "$REPO/lib/inbox.py" dump 2>/dev/null)"
+  is  "p1.7a: the inbox dump carries the fingerprint" \
+      "$(jq -r '.findings[] | select(.report=="alpha/audit-02" and .n==1) | .fingerprint' <<< "$out")" "$fp1"
+  is  "p1.7a: ...and the inherited decision" \
+      "$(jq -r '.findings[] | select(.report=="alpha/audit-02" and .n==1) | .inherited' <<< "$out")" "dismissed"
+  is  "p1.7a: ...and nothing inherited elsewhere" \
+      "$(jq -r '[.findings[] | select(.inherited != "")] | length' <<< "$out")" "1"
+
+  # A finding's own decision wins over an inherited one.
+  printf 'alpha/audit-02#1\tactioned\t2026-09-09\t\n' >> "$root/state/reports"
+  out="$("$root/bin/meute" findings --all 2>&1)"
+  has   "p1.7a: an own decision wins" "$(grep 'alpha/audit-02#1' <<< "$out")" "actioned"
+  hasnt "p1.7a: ...over the inherited one" "$(grep 'alpha/audit-02#1' <<< "$out")" "seen before"
+
+  # Never backwards: a dismissal on the later report leaves the earlier one new.
+  printf 'alpha/audit-02#1\tdismissed\t2026-09-09\tfalse-positive\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7a: a later dismissal is not inherited by an earlier report" "$out" "alpha/audit-01#1"
+  is  "p1.7a: state/reports is never written by reading" \
+      "$(cat "$root/state/reports")" "$(printf 'alpha/audit-02#1\tdismissed\t2026-09-09\tfalse-positive')"
+
+  # The latest earlier decision wins: dismissed, then reversed (actioned), then
+  # raised again -- the third occurrence is live and stays new.
+  _p17a_report alpha audit-03 2026-09-15T04:00:00-04:00 \
+    '### [HIGH] SQL injection in query\n- **Location:** `src/db.py:91`\n'
+  printf 'alpha/audit-01#1\tdismissed\t2026-09-02\tfalse-positive\nalpha/audit-02#1\tactioned\t2026-09-09\t\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  has "p1.7a: a reversed dismissal is not inherited" "$out" "alpha/audit-03#1"
+  printf 'alpha/audit-01#1\tdismissed\t2026-09-02\tfalse-positive\n' > "$root/state/reports"
+  out="$("$root/bin/meute" findings --new 2>&1)"
+  is  "p1.7a: an undecided middle occurrence does not break inheritance" "$(grep -c 'alpha/audit-0[23]#1' <<< "$out")" "0"
+}
+
 # P2.6 (R20): a typo under policy: used to fall back to the default silently.
 # validate and doctor now name unknown keys; they stay a warning, never an error.
 test_p26_unknown_policy_keys() {
