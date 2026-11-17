@@ -6253,6 +6253,7 @@ test_p1_3_drain_stops
 test_p1_3_drain_lock_and_source
 test_p1_3_drain_until
 test_p1_3_drain_repo_cursor
+test_p1_3_drain_empty_repo
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants

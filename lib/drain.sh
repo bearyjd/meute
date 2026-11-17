@@ -75,6 +75,7 @@ cmd_drain() {
       daily|weekly) [[ -z "$slot" ]] || drain_usage "one slot only"; slot="$1" ;;
       --source|--max|--until|--repo)
         (( $# > 1 )) || drain_usage "$1 needs a value"
+        [[ "$1" != --repo || -n "$2" ]] || drain_usage "--repo needs a non-empty repo name"
         case "$1" in
           --source) source="$2" ;; --max) max="$2" ;; --until) until="$2" ;; --repo) only+="$2"$'\n' ;;
         esac

@@ -987,3 +987,17 @@ test_p1_3_drain_repo_cursor() {
   is "drain --repo: a narrowed rotation over two repos"      "$(_drain_ran "$root"):$rc" "lk2 lk3:0"
   is "drain --repo: ...still leaves the shared cursor on lk4" "$(grep -P '^cursor\.daily\t' "$root/state/cursor" | grep -c lk4)" "1"
 }
+
+# An empty --repo value is a usage error (exit 2), not a drain that matches no
+# entry and exits 14 on every fire.
+test_p1_3_drain_empty_repo() {
+  local root="$FIXTURE/drain-emptyrepo" rc out
+  _drain_fixture "$root" 2
+  local env=( env PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 )
+  rc=0; out="$("${env[@]}" "$root/bin/meute" drain daily --repo "" 2>&1 >/dev/null)" || rc=$?
+  is "drain --repo '': usage error exit 2" "$rc" "2"
+  is "drain --repo '': names the empty value" "$(grep -c 'needs a non-empty' <<<"$out")" "1"
+  : > "$root/state/log"
+  rc=0; "${env[@]}" "$root/bin/meute" drain daily --repo lk1 --repo "" >/dev/null 2>&1 || rc=$?
+  is "drain --repo lk1 --repo '': also a usage error" "$rc:$(_drain_ran "$root")" "2:"
+}
