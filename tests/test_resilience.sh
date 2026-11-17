@@ -1021,6 +1021,15 @@ SH
 
   _hreset; : > "$state/log"; _health_log "$state/log" $(( now - 3 * 86400 )) ok
   _hcase "no log line within twice the daily cadence" "no run logged"
+  # An empty log is news only once the daily timer has had twice the cadence
+  # to fire: right after install-timers it is not.
+  local dtimer="$root/cfg/systemd/user/meute-daily.timer"; mkdir -p "${dtimer%/*}"
+  _hreset; : > "$state/log"; : > "$dtimer"; touch -d "@$(( now - 3600 ))" "$dtimer"
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: an empty log an hour after install-timers is not a problem" "$rc:$out" "0:"
+  _hreset; : > "$state/log"; touch -d "@$(( now - 3 * 86400 ))" "$dtimer"
+  _hcase "an empty log three days after install-timers" "no run has been logged yet"
+  rm -f "$dtimer"
   # On a UTC host systemd-analyze prints no "(in UTC)" lines; the weekend gap
   # of a Mon..Fri calendar must still widen the silence threshold.
   python3 - "$root/repos.yaml" <<'PY'
@@ -1052,6 +1061,23 @@ PY
   _hreset; printf 'hold\t%s\towner pause\n' $(( now + 3600 )) > "$state/hold"
   "${H[@]}" "$root/bin/meute" health >/dev/null 2>&1; rc=$?
   is "health: a pause the owner set is not a problem" "$rc" "0"
+  # Every fire of a long owner pause logs skipped code=hold; those are not
+  # failures, during the pause or after it ends, so no hourly false alarm.
+  _hlog_paused() {   # <hold reason prefix>: ok 5 days ago, then a hold skip each day
+    : > "$state/log"; _health_log "$state/log" $(( now - 5 * 86400 )) ok
+    for i in 4 3 2 1; do
+      printf '%s\tweek=x\tslot=daily\tstatus=skipped\treason=paused until x — %spause\tcode=hold\tdur=0s\n' \
+        "$(date -d "@$(( now - i * 86400 ))" --iso-8601=seconds)" "$1" >> "$state/log"
+    done
+  }
+  _hreset; _hlog_paused ""; printf 'hold\t%s\towner pause\n' $(( now + 3 * 86400 )) > "$state/hold"
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: a long owner pause raises nothing" "$rc:$out" "0:"
+  _hreset; _hlog_paused ""; printf 'hold\t%s\towner pause\n' $(( now - 3600 )) > "$state/hold"
+  out="$("${H[@]}" "$root/bin/meute" health 2>&1)"; rc=$?
+  is "health: ...nor the hours after it ends, before the next fire" "$rc:$out" "0:"
+  _hreset; _hlog_paused "auto: provider rate limit "
+  _hcase "days of automatic-hold skips with no success" "no successful run"
 
   _hreset; printf 'pid=4242 started=%s slot=daily key=zorblax-secret/t\n' "$(date -d "@$(( now - 3000 ))" --iso-8601=seconds)" > "$state/lock-info"
   _hcase "a lock held longer than the largest timeout" "lock held"

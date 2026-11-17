@@ -47,19 +47,27 @@ health_cadence_seconds() {
 _health_epoch() { [[ -n "$1" ]] && date -d "$1" +%s 2>/dev/null || true; }
 
 health_check_log() {
-  local now cadence last first last_ok errors t
+  local now cadence last first last_ok errors t armed
   now="$(now_epoch)"
+  cadence="$(health_cadence_seconds "${POLICY_DAILY_CALENDAR:-*-*-* 03:17:00}")"
   if [[ ! -s "$LOG_FILE" ]]; then
-    printf 'no run has been logged yet (state/log is empty): the timer may never have fired\n'
+    # Measured from when install-timers wrote the daily timer (state/ if it
+    # did not), so a fresh install is not reported before its first fire.
+    armed="$(stat -c %Y "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/meute-daily.timer" 2>/dev/null \
+               || stat -c %Y "$STATE_DIR" 2>/dev/null)" || armed=0
+    (( now - armed > 2 * cadence )) \
+      && printf 'no run has been logged yet (state/log is empty): the timer may never have fired\n'
     return 0
   fi
-  cadence="$(health_cadence_seconds "${POLICY_DAILY_CALENDAR:-*-*-* 03:17:00}")"
   last="$(_health_epoch "$(tail -n 1 "$LOG_FILE" | cut -f1)")"
   if [[ -n "$last" ]] && (( now - last > 2 * cadence )); then
     printf 'no run logged for %sh (twice the daily cadence is %sh): the fleet has stopped firing\n' \
       $(( (now - last) / 3600 )) $(( 2 * cadence / 3600 ))
   fi
-  t="$(awk -F'\t' 'index($0, "\tstatus=ok\t") { t = $1 } END { print t }' "$LOG_FILE")"
+  # A fire skipped by a pause the owner set is not a failure, during the pause
+  # or after it ends; an automatic hold's skips are (health_check_hold).
+  t="$(awk -F'\t' 'index($0, "\tstatus=ok\t") || (index($0, "\tcode=hold\t") && !index($0, "auto: ")) { t = $1 }
+                   END { print t }' "$LOG_FILE")"
   last_ok="$(_health_epoch "$t")"
   first="$(_health_epoch "$(head -n 1 "$LOG_FILE" | cut -f1)")"
   if [[ -n "$last_ok" ]]; then
