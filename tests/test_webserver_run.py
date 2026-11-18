@@ -109,6 +109,18 @@ class RunEndpointTests(WebTestCase):
         self.assertTrue(json.loads(raw)["scanning"])
         self.assertEqual(self.run.calls, [("plan_start",)])
 
+    def test_runner_failure_is_502(self):
+        self.run.start_error = webserver.runctl.RunnerFailed("meute drain failed (exit 1)")
+        resp, raw = self.request("POST", "/api/run/start", {})
+        self.assertEqual(resp.status, 502)
+        self.assertIn("exit 1", json.loads(raw)["message"])
+
+    def test_default_run_mod_is_a_run_controller(self):
+        server, _ = webserver.make_server("127.0.0.1", 0, self.inbox)
+        self.addCleanup(server.server_close)
+        self.assertIsInstance(server.run_mod, webserver.runctl.RunController)
+        self.assertEqual(server.run_mod.root, webserver.ROOT)
+
 
 class DuplicateEnqueueTests(WebTestCase):
     """The real controller behind the endpoint, over a fake fleet whose plan
