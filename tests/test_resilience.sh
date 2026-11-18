@@ -856,6 +856,27 @@ test_p15_only_one_spelling() {
     "$(jq '.entries | length' "$queue" 2>/dev/null)" "1"
 }
 
+# P1.5 (b): an empty --only argument is refused cleanly. Unguarded it was an
+# empty associative-array subscript (a crash under set -u) and `cd ""` named
+# the current directory. The CLI refuses it as a usage error; the precheck
+# refuses it too, as a `rejected` line, for any other caller.
+test_p15_only_empty_path() {
+  local u="$FIXTURE/p15h" root="$FIXTURE/p15h/meute-stand-in" out rc cwd="$FIXTURE/p15h-cwd"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  mkdir -p "$cwd"
+  rc=0; out="$(cd "$u/a" && "$root/bin/meute" plan --enqueue --only "" "$u" 2>&1)" || rc=$?
+  is  "p1.5 empty: --only \"\" is a usage error" "$rc" "2"
+  has "p1.5 empty: ...saying the path must be non-empty" "$out" "--only needs a non-empty path"
+  hasnt "p1.5 empty: ...without a bash crash" "$out" "bad array subscript"
+  is  "p1.5 empty: ...staging nothing (not the current directory)" "$(test -e "$queue"; echo $?)" "1"
+  rc=0; out="$(cd "$cwd" && MEUTE_ROOT="$REPO" bash -c 'set -Eeuo pipefail
+    source "$MEUTE_ROOT/lib/plan_only.sh"; plan_only_precheck "$1" ""; plan_only_report' _ "$u" 2>&1)" || rc=$?
+  is  "p1.5 empty: the precheck itself does not crash on an empty path" "$rc" "0"
+  has "p1.5 empty: ...and reports it as a rejected line" "$out" $'rejected\t\'\'\t'
+  hasnt "p1.5 empty: ...without a bash crash" "$out" "bad array subscript"
+}
+
 # P1.5 (a), R15: --append reads the queue, merges, and renames the result over
 # it. A retire that lands in between (the last item just finished) archives
 # the queue and clears plan-complete; the rename would then put every finished

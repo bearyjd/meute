@@ -682,7 +682,9 @@ cmd_plan() {
       --skip-invalid) skip_invalid=1 ;;
       --allow-web) allow_web=1 ;;
       --json) json=1 ;;
-      --only) (( $# >= 2 )) || die "plan: --only needs a path"; only+=( "$2" ); shift ;;
+      --only) (( $# >= 2 )) || die "plan: --only needs a path"
+        [[ -n "$2" ]] || { note "plan: --only needs a non-empty path"; exit 2; }
+        only+=( "$2" ); shift ;;
       --) shift; [[ $# -eq 1 ]] || die "plan: expected at most one directory"; requested="$1"; break ;;
       -*) die "plan: unknown option: $1" ;;
       *) [[ -z "$requested" ]] || die "plan: expected at most one directory"; requested="$1" ;;

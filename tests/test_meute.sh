@@ -6265,6 +6265,7 @@ test_p15_only_checked_first
 test_p15_plan_identity_cache
 test_p15_only_refuses_own_checkout
 test_p15_only_one_spelling
+test_p15_only_empty_path
 test_p15_append_vs_retire
 test_p15_retire_waits_for_lock
 test_p15_guard_rechecked_under_lock
