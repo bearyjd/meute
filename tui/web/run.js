@@ -71,7 +71,7 @@ function enqueueConfirmText(entries) {
   const paths = enqueuePayload(entries).paths;
   return "Enqueue " + paths.length + " repo(s):\n" + paths.join("\n")
     + "\n\nThey will be analysed by an AI model: their code leaves this machine's disk "
-    + "and is sent to the model provider.\nThis replaces the currently staged queue.";
+    + "and is sent to the model provider.\nIt is added to the currently staged queue.";
 }
 
 // meute plan stages one copy per repository; the copies it collapsed, the

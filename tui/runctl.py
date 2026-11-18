@@ -3,8 +3,8 @@
 Everything goes through meute's own commands, so the page cannot drift from
 the CLI or slip past a gate:
 
-  plan()     bin/meute plan --json                       (read-only)
-  enqueue()  bin/meute plan --enqueue --only <p>... -- <scan>
+  plan()     bin/meute plan --json                       (writes only state/plan-cache)
+  enqueue()  bin/meute plan --enqueue --append --skip-invalid --only <p>... [-- <scan>]
   start()    one background `bin/meute drain daily|weekly --source plan|manifest`
 
 `meute drain` (lib/drain.sh) is the loop: it calls run.sh unforced, so the
@@ -137,6 +137,20 @@ def _clean_paths(paths: object) -> list[str]:
     return clean
 
 
+def _rejected(out: str, wanted: list[str]) -> list[dict]:
+    """The CLI's `rejected<TAB>path<TAB>message` lines, matched to what was sent."""
+    found = []
+    for line in out.splitlines():
+        if not line.startswith("rejected\t"):
+            continue
+        rest = line[len("rejected\t"):]
+        for path in wanted:
+            if rest.startswith(path + "\t"):
+                found.append({"path": path, "reason": rest[len(path) + 1:]})
+                break
+    return found
+
+
 class RunController:
     def __init__(self, root: str, runner=subprocess_runner, scan_dir: str | None = None,
                  clock=time.time):
@@ -206,27 +220,35 @@ class RunController:
                 self._enqueuing = False
 
     def _enqueue(self, wanted: list[str]) -> dict:
-        fresh = self.plan()
-        offered = {item.get("path") for item in fresh["items"] if isinstance(item, dict)}
-        unknown = [p for p in wanted if p not in offered]
-        if unknown:
-            raise ValueError(f"not in the current plan: {unknown[0]}")
-        argv = [self.meute, "plan", "--enqueue"]
+        # The CLI checks each named path itself, without walking the tree, so
+        # there is no plan --json scan first. --append (decision D3) adds to a
+        # queue a CLI run staged rather than throwing its unattempted work
+        # away; --skip-invalid stages the good paths and names the rest.
+        argv = [self.meute, "plan", "--enqueue", "--append", "--skip-invalid"]
         for path in wanted:
             argv += ["--only", path]
-        argv += ["--", fresh["scan"]]
+        if self.scan_dir:
+            argv += ["--", self.scan_dir]
+        entries, archived, _ = rp.load_queue(self.state_dir)
+        before = 0 if archived else len(entries)
         started = int(self.clock())
-        rc, _ = self._call(argv, PLAN_TIMEOUT, "meute plan --enqueue")
-        if rc != 0:
+        rc, out = self._call(argv, PLAN_TIMEOUT, "meute plan --enqueue")
+        rejected = _rejected(out, wanted)
+        if rc not in (0, 3):
+            if rejected and len(rejected) == len(wanted):
+                raise ValueError(rejected[0]["reason"])
             return {"ok": False, "message": f"meute plan --enqueue failed (exit {rc})",
-                    "staged": 0}
-        staged = len(rp.load_queue(self.state_dir)[0])
+                    "staged": 0, "rejected": rejected}
+        staged = max(len(rp.load_queue(self.state_dir)[0]) - before, 0)
         with self._lock:
             self._enqueued_at = started
             self._stopped_reason = None
-        return {"ok": True, "staged": staged,
-                "message": f"staged {staged} item(s) across {len(wanted)} repositor"
-                           f"{'y' if len(wanted) == 1 else 'ies'}"}
+        good = len(wanted) - len(rejected)
+        message = (f"staged {staged} item(s) across {good} repositor"
+                   f"{'y' if good == 1 else 'ies'}")
+        if rejected:
+            message += f"; skipped {len(rejected)}: " + "; ".join(r["reason"] for r in rejected)
+        return {"ok": True, "staged": staged, "message": message, "rejected": rejected}
 
     # ------------------------------------------------------------- run ---
     def start(self, source: str = "plan") -> dict:

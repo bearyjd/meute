@@ -697,6 +697,277 @@ test_plan_quarantine_manifest_broken() {
   is  "plan quarantine (manifest broken): no plan-invalid line" "$(grep -c 'plan-invalid' "$log")" "0"
 }
 
+# P1.5 (R10, R15): a fixture universe for the enqueue tests: three unenrolled
+# repositories, one enrolled one, one task. Prints the queue path.
+_p15_universe() {
+  local u="$1" r
+  dedup_universe "$u" "enr=enrolled" >/dev/null
+  for r in a b c enrolled; do dedup_repo "$u/$r" "p15-$r" >/dev/null; done
+}
+
+# P1.5 (a), decision D3: re-enqueueing over a queue with unattempted items is
+# refused unless --append (merge, keep plan-complete) or --replace is given.
+test_p15_enqueue_refuses_unfinished() {
+  local u="$FIXTURE/p15a" root="$FIXTURE/p15a/meute-stand-in" out rc before
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" done="$root/state/plan-complete"
+  "$root/bin/meute" plan --enqueue --only "$u/a" --only "$u/b" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  before="$(md5sum "$queue" | cut -d' ' -f1)"
+  rc=0; out="$("$root/bin/meute" plan --enqueue --only "$u/c" "$u" 2>&1)" || rc=$?
+  is  "p1.5 enqueue: over a half-finished queue is refused" "$rc" "1"
+  has "p1.5 enqueue: ...naming --append" "$out" "--append"
+  has "p1.5 enqueue: ...and --replace" "$out" "--replace"
+  is  "p1.5 enqueue: ...leaving the queue byte-identical" "$(md5sum "$queue" | cut -d' ' -f1)" "$before"
+  is  "p1.5 enqueue: ...and the completion marks" "$(wc -l < "$done")" "1"
+
+  rc=0; "$root/bin/meute" plan --enqueue --append --only "$u/c" --only "$u/a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 enqueue: --append succeeds" "$rc" "0"
+  is  "p1.5 enqueue: --append merges, one entry per repo" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue")" "a,b,c"
+  is  "p1.5 enqueue: --append keeps plan-complete" "$(wc -l < "$done" 2>/dev/null)" "1"
+
+  rc=0; out="$("$root/bin/meute" plan --enqueue --append --replace --only "$u/c" "$u" 2>&1)" || rc=$?
+  is  "p1.5 enqueue: --append with --replace is a usage error" "$rc" "2"
+  rc=0; out="$("$root/bin/meute" plan --append "$u" 2>&1)" || rc=$?
+  is  "p1.5 enqueue: --append without --enqueue is a usage error" "$rc" "2"
+
+  rc=0; "$root/bin/meute" plan --enqueue --replace --only "$u/c" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 enqueue: --replace succeeds" "$rc" "0"
+  is  "p1.5 enqueue: --replace discards the old entries" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue")" "c"
+  is  "p1.5 enqueue: --replace clears plan-complete" "$(test -e "$done"; echo $?)" "1"
+
+  # A queue whose every item was attempted is finished: no flag needed.
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  rc=0; "$root/bin/meute" plan --enqueue --only "$u/b" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 enqueue: over a finished queue needs no flag" "$rc" "0"
+}
+
+# P1.5 (b), (c): --only paths are checked before anything else, all bad ones
+# reported together, without walking the tree; --skip-invalid stages the
+# good ones and exits 3.
+test_p15_only_checked_first() {
+  local u="$FIXTURE/p15b" root="$FIXTURE/p15b/meute-stand-in" out rc shim="$FIXTURE/p15b-shim"
+  local real_find; real_find="$(command -v find)"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\necho x >> "%s/find.calls"\nexec "%s" "$@"\n' "$shim" "$real_find" > "$shim/find"
+  chmod +x "$shim/find"
+
+  : > "$shim/find.calls"
+  rc=0; out="$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --only "$u/a" --only "$u/nope" \
+    --only "$u/enrolled" "$u" 2>&1)" || rc=$?
+  is  "p1.5 only: a bad path refuses the request" "$rc" "1"
+  has "p1.5 only: ...naming the missing path" "$out" "$u/nope"
+  has "p1.5 only: ...and the enrolled one, in the same run" "$out" "$u/enrolled"
+  is  "p1.5 only: ...staging nothing" "$(test -e "$queue"; echo $?)" "1"
+  is  "p1.5 only: ...without walking the tree" "$(wc -l < "$shim/find.calls")" "0"
+
+  : > "$shim/find.calls"
+  rc=0; out="$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --skip-invalid --only "$u/a" \
+    --only "$u/nope" --only "$u/b" "$u" 2>&1)" || rc=$?
+  is  "p1.5 only: --skip-invalid with one bad path exits 3" "$rc" "3"
+  is  "p1.5 only: --skip-invalid stages the two good ones" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue")" "a,b"
+  has "p1.5 only: --skip-invalid names the bad one on stdout" \
+    "$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --replace --skip-invalid --only "$u/a" --only "$u/nope" "$u" 2>/dev/null)" \
+    $'rejected\t'"$u/nope"$'\t'
+  is  "p1.5 only: a targeted enqueue never walks the tree" "$(wc -l < "$shim/find.calls")" "0"
+}
+
+# P1.5 (d): root-commit identity is cached in state/plan-cache by path and
+# HEAD, so a second scan of an unchanged tree walks no history.
+test_p15_plan_identity_cache() {
+  local u="$FIXTURE/p15d" root="$FIXTURE/p15d/meute-stand-in" shim="$FIXTURE/p15d-shim"
+  local real_git; real_git="$(command -v git)"
+  _p15_universe "$u"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\n[ "$3" = rev-list ] && echo x >> "%s/rev-list.calls"\nexec "%s" "$@"\n' \
+    "$shim" "$real_git" > "$shim/git"
+  chmod +x "$shim/git"
+  : > "$shim/rev-list.calls"
+  PATH="$shim:$PATH" "$root/bin/meute" plan --json "$u" >/dev/null 2>&1
+  is  "p1.5 cache: the first scan walks history" "$(( $(wc -l < "$shim/rev-list.calls") > 0 ))" "1"
+  [[ -s "$root/state/plan-cache" ]] && ok "p1.5 cache: the first scan writes state/plan-cache" \
+    || bad "p1.5 cache: the first scan writes state/plan-cache" "missing or empty"
+  : > "$shim/rev-list.calls"
+  local first second
+  first="$(PATH="$shim:$PATH" "$root/bin/meute" plan --json "$u" 2>/dev/null)"
+  is  "p1.5 cache: a second scan performs zero rev-list calls" "$(wc -l < "$shim/rev-list.calls")" "0"
+  rm -f "$root/state/plan-cache"
+  second="$("$root/bin/meute" plan --json "$u" 2>/dev/null)"
+  is  "p1.5 cache: the cached plan equals an uncached one" "$first" "$second"
+  # A new commit is a new HEAD: that repository is walked again.
+  dedup_repo "$u/a" "p15-a-more" >/dev/null
+  : > "$shim/rev-list.calls"
+  PATH="$shim:$PATH" "$root/bin/meute" plan --json "$u" >/dev/null 2>&1
+  is  "p1.5 cache: a moved HEAD is walked again, once" "$(wc -l < "$shim/rev-list.calls")" "1"
+}
+
+# P1.5 (b): --only never stages a repository inside meute's own checkout,
+# whether named directly or through a symlink elsewhere under the scan root.
+# A plain plan says what it did write: the derived state/plan-cache.
+test_p15_only_refuses_own_checkout() {
+  local u="$FIXTURE/p15e" root="$FIXTURE/p15e/meute-stand-in" out rc arg
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  dedup_repo "$root/.worktrees/nested" "p15-nested" >/dev/null
+  ln -s "$root/.worktrees/nested" "$u/sneaky"
+  for arg in "$root/.worktrees/nested" "$u/sneaky"; do
+    rm -f "$queue" "$root/state/plan-complete" "$root/state/plan-cache"
+    rc=0; out="$("$root/bin/meute" plan --enqueue --only "$arg" "$u" 2>&1)" || rc=$?
+    is  "p1.5 own checkout: --only ${arg#"$u"/} is refused" "$rc" "1"
+    has "p1.5 own checkout: ...saying why" "$out" "inside meute's own checkout"
+    is  "p1.5 own checkout: ...staging nothing" "$(test -e "$queue"; echo $?)" "1"
+  done
+  # The cheap .git check answers before git is asked, and says so.
+  mkdir -p "$u/plain"; rm -f "$queue"
+  rc=0; out="$("$root/bin/meute" plan --enqueue --only "$u/plain" "$u" 2>&1)" || rc=$?
+  is  "p1.5 only: a directory without .git is refused" "$rc" "1"
+  has "p1.5 only: ...as not a Git repository" "$out" "not a Git repository"
+  out="$("$root/bin/meute" plan "$u" 2>&1)"
+  hasnt "p1.5 cache: plan no longer calls itself read-only" "$out" "inventory (read-only)"
+  hasnt "p1.5 cache: plan no longer claims state is untouched" "$out" "or state files were changed"
+  has   "p1.5 cache: plan names the derived cache it wrote" "$out" "state/plan-cache is derived and safe to delete"
+}
+
+# P1.5 (b): a named path is staged under the spelling a scan would give it,
+# so a symlinked spelling is the same repository under the same name, and a
+# second spelling of the named directory in state/plan-cache is not a peer.
+test_p15_only_one_spelling() {
+  local u="$FIXTURE/p15f" root="$FIXTURE/p15f/meute-stand-in" rc name
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  ln -s "$u" "$FIXTURE/p15f-alias"; ln -s a "$u/alias-a"
+  "$root/bin/meute" plan "$FIXTURE/p15f-alias" >/dev/null 2>&1
+  rc=0; "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: a cached alias of the named path is not its duplicate" "$rc" "0"
+  name="$(jq -r '.entries[0].name // "none"' "$queue" 2>/dev/null || echo none)"
+  rc=0; "$root/bin/meute" plan --enqueue --replace --only "$u/alias-a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: --only through an in-root symlink succeeds" "$rc" "0"
+  is  "p1.5 spelling: ...under the same synthetic name" "$(jq -r '.entries[0].name // "missing"' "$queue" 2>/dev/null)" "$name"
+  is  "p1.5 spelling: ...and the scan's spelling" "$(jq -r '.entries[0].path' "$queue" 2>/dev/null)" "$u/a"
+  rc=0; "$root/bin/meute" plan --enqueue --replace --only "$u/a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: the real spelling still succeeds after the alias" "$rc" "0"
+  rc=0; "$root/bin/meute" plan --enqueue --append --only "$u/alias-a" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 spelling: --append of the other spelling adds no second entry" \
+    "$(jq '.entries | length' "$queue" 2>/dev/null)" "1"
+}
+
+# P1.5 (b): an empty --only argument is refused cleanly. Unguarded it was an
+# empty associative-array subscript (a crash under set -u) and `cd ""` named
+# the current directory. The CLI refuses it as a usage error; the precheck
+# refuses it too, as a `rejected` line, for any other caller.
+test_p15_only_empty_path() {
+  local u="$FIXTURE/p15h" root="$FIXTURE/p15h/meute-stand-in" out rc cwd="$FIXTURE/p15h-cwd"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json"
+  mkdir -p "$cwd"
+  rc=0; out="$(cd "$u/a" && "$root/bin/meute" plan --enqueue --only "" "$u" 2>&1)" || rc=$?
+  is  "p1.5 empty: --only \"\" is a usage error" "$rc" "2"
+  has "p1.5 empty: ...saying the path must be non-empty" "$out" "--only needs a non-empty path"
+  hasnt "p1.5 empty: ...without a bash crash" "$out" "bad array subscript"
+  is  "p1.5 empty: ...staging nothing (not the current directory)" "$(test -e "$queue"; echo $?)" "1"
+  rc=0; out="$(cd "$cwd" && MEUTE_ROOT="$REPO" bash -c 'set -Eeuo pipefail
+    source "$MEUTE_ROOT/lib/plan_only.sh"; plan_only_precheck "$1" ""; plan_only_report' _ "$u" 2>&1)" || rc=$?
+  is  "p1.5 empty: the precheck itself does not crash on an empty path" "$rc" "0"
+  has "p1.5 empty: ...and reports it as a rejected line" "$out" $'rejected\t\'\'\t'
+  hasnt "p1.5 empty: ...without a bash crash" "$out" "bad array subscript"
+}
+
+# P1.5 (a), R15: --append reads the queue, merges, and renames the result over
+# it. A retire that lands in between (the last item just finished) archives
+# the queue and clears plan-complete; the rename would then put every finished
+# entry back unmarked and the runner would run them all again. The append and
+# the retire share state/.plan-lock, so the retire waits. The jq shim
+# lets the merge read the queue, then retires the way the runner does, honouring
+# the same lock, before the merged queue is written.
+test_p15_append_vs_retire() {
+  local u="$FIXTURE/p15g" root="$FIXTURE/p15g/meute-stand-in" shim="$FIXTURE/p15g-shim" rc
+  local real_jq; real_jq="$(command -v jq)"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" done="$root/state/plan-complete"
+  local lock="$root/state/.plan-lock"
+  "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  mkdir -p "$shim"
+  cat > "$shim/jq" <<SHIM
+#!/usr/bin/env bash
+out="\$("$real_jq" "\$@")"; rc=\$?
+if [[ " \$* " == *" --slurpfile "* ]]; then
+  if flock -n "$lock" sh -c 'mv "$queue" "$queue.archived" && rm -f "$done"'; then
+    echo retired >> "$shim/calls"
+  else
+    echo deferred >> "$shim/calls"
+  fi
+fi
+printf '%s\n' "\$out"; exit \$rc
+SHIM
+  chmod +x "$shim/jq"
+  rc=0; PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue --append --only "$u/b" "$u" >/dev/null 2>&1 || rc=$?
+  is  "p1.5 race: --append over a finished queue succeeds" "$rc" "0"
+  is  "p1.5 race: a retire during the merge waits for the lock" "$(cat "$shim/calls" 2>/dev/null)" "deferred"
+  is  "p1.5 race: ...so the finished entry keeps its mark" "$(wc -l < "$done" 2>/dev/null || echo 0)" "1"
+  is  "p1.5 race: ...and the queue holds both entries" \
+    "$(jq -r '[.entries[].path] | map(sub(".*/"; "")) | join(",")' "$queue" 2>/dev/null)" "a,b"
+}
+
+# The runner's side of the same lock: while an enqueue holds it, a fire does
+# not retire the queue under it; once it is free, the next fire does.
+test_p15_retire_waits_for_lock() {
+  local u="$FIXTURE/p15h" root="$FIXTURE/p15h/meute-stand-in" out fd
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" lock="$root/state/.plan-lock"
+  "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$root/state/plan-complete"
+  mkdir -p "$root/stub"
+  printf '#!/bin/sh\n[ "$1" = auth ] && { echo %s; exit 0; }\nexit 1\n' \
+    "'{\"loggedIn\":true,\"subscriptionType\":\"max\",\"authMethod\":\"stub\"}'" > "$root/stub/claude"
+  chmod +x "$root/stub/claude"
+  exec {fd}>"$lock"; flock "$fd"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 MEUTE_PLAN_QUEUE_LOCK_WAIT=1 \
+    "$root/bin/run.sh" daily --dry-run 2>&1)"
+  exec {fd}>&-
+  hasnt "p1.5 race: a fire does not retire a queue an enqueue holds" "$out" "archived queue"
+  is    "p1.5 race: ...the queue stays put" "$([[ -f "$queue" ]] && echo staged || echo gone)" "staged"
+  has   "p1.5 race: ...and the fire says why" "$out" "plan queue is busy"
+  out="$(PATH="$root/stub:$PATH" MEUTE_QUOTA_STUB=100 "$root/bin/run.sh" daily --dry-run 2>&1)"
+  has   "p1.5 race: the next fire retires it" "$out" "archived queue"
+}
+
+# D3 is checked before the scan, but the queue can change during it: a web
+# Enqueue (--append) may stage unattempted work while a plain CLI enqueue is
+# still walking the tree. The write re-checks under the lock, so that work is
+# neither discarded nor its marks cleared. The find shim does the web's append,
+# taking the lock as it does, on the scan's first walk.
+test_p15_guard_rechecked_under_lock() {
+  local u="$FIXTURE/p15i" root="$FIXTURE/p15i/meute-stand-in" shim="$FIXTURE/p15i-shim" out rc after
+  local real_find real_jq; real_find="$(command -v find)"; real_jq="$(command -v jq)"
+  _p15_universe "$u"
+  local queue="$root/state/plan-queue.json" done="$root/state/plan-complete"
+  local lock="$root/state/.plan-lock"
+  "$root/bin/meute" plan --enqueue --only "$u/a" "$u" >/dev/null 2>&1
+  printf '%s\tattempted\n' "$(jq -r '.entries[0] | "plan/\(.name)/\(.task)"' "$queue")" > "$done"
+  mkdir -p "$shim"
+  cat > "$shim/find" <<SHIM
+#!/usr/bin/env bash
+if [[ ! -e "$shim/injected" ]]; then
+  touch "$shim/injected"
+  flock "$lock" sh -c '"$real_jq" ".entries += [{name:\"plan-web\",path:\"$u/b\",task:\"audit-security\",spec:\"web\"}]" "$queue" > "$queue.web" && mv "$queue.web" "$queue"'
+fi
+exec "$real_find" "\$@"
+SHIM
+  chmod +x "$shim/find"
+  rc=0; out="$(PATH="$shim:$PATH" "$root/bin/meute" plan --enqueue "$u" 2>&1)" || rc=$?
+  after="$(jq -r '[.entries[].name] | join(",")' "$queue" 2>/dev/null)"
+  is  "p1.5 race: work appended during the scan refuses a plain enqueue" "$rc" "1"
+  has "p1.5 race: ...naming --append" "$out" "--append"
+  has "p1.5 race: ...keeping the appended entry" "$after" "plan-web"
+  is  "p1.5 race: ...and the completion marks" "$(wc -l < "$done" 2>/dev/null || echo 0)" "1"
+}
+
 # P1.1 (R6, owner decision D2): an expiring policy override in state/, read
 # after the manifest, so the floor can be lowered for a night without editing
 # the manifest and remembering to put it back.

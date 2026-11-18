@@ -55,7 +55,7 @@ source "${MEUTE_ROOT}/lib/engines.sh"
 source "${MEUTE_ROOT}/lib/container.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
-source "${MEUTE_ROOT}/lib/runlock.sh"
+source "${MEUTE_ROOT}/lib/runlock.sh"; source "${MEUTE_ROOT}/lib/plan_queue_lock.sh"
 source "${MEUTE_ROOT}/lib/tmp.sh"; source "${MEUTE_ROOT}/lib/select.sh"
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 # The harness is public; a real fleet config names private projects and says what
@@ -187,10 +187,10 @@ parse_args() {
 }
 
 
-# The runner owns LOCK_FILE for its whole lifetime, so this check and the
-# subsequent rename cannot race another runner.  `meute plan --enqueue` writes
-# a complete replacement atomically; if an operator replaces a plan between
-# timer fires, the next invocation validates that new file from scratch.
+# The runner owns LOCK_FILE, so this cannot race another runner; callers hold
+# state/.plan-lock too (lib/plan_queue_lock.sh), so it cannot race an
+# enqueue's read-merge-rename either. A plan replaced between fires is
+# validated from scratch by the next one.
 retire_completed_plan() {
   [[ -f "$PLAN_QUEUE_FILE" ]] || return 0
   local all_file entry key archive complete=1
@@ -258,7 +258,7 @@ main() {
   # then the ordinary timers prioritize it until every staged item is attempted.
   # --source manifest leaves it untouched: not read, retired or quarantined.
   if [[ "$SOURCE" == plan && -f "$PLAN_QUEUE_FILE" ]]; then
-    retire_completed_plan
+    plan_queue_locked retire_completed_plan
   fi
   if [[ "$SOURCE" == plan && -f "$PLAN_QUEUE_FILE" ]]; then
     python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$SLOT" > "$queue_file" \
@@ -285,7 +285,7 @@ main() {
   if [[ -z "$entry" ]] && (( PLAN_MODE )); then
     (( ! ONCE_DONE )) || skip already-done "staged plan item already attempted (--once)" "repo=${FORCE_REPO:--}" "task=${FORCE_TASK:--}"
     note "no eligible staged plan item for slot ${SLOT}; falling back to the manifest queue"
-    retire_completed_plan
+    plan_queue_locked retire_completed_plan
     PLAN_MODE=0
     python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
     load_queue "$queue_file"
@@ -642,7 +642,7 @@ advance_past() {
   state_set "$(cursor_key)" "$key"
   if (( PLAN_MODE )); then
     kv_set "$PLAN_DONE_FILE" "$key" "$STARTED_AT"
-    retire_completed_plan
+    plan_queue_locked retire_completed_plan
   fi
 }
 

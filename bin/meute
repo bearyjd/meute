@@ -48,14 +48,16 @@
 #                                  exits with that fire's status (lib/drain.sh)
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
-#   plan [--enqueue [--only <repo>]...] [--allow-web] [--json] [dir]
-#                                  read-only portfolio inventory and proposed audit plan;
+#   plan [--enqueue [--append|--replace] [--only <repo>]... [--skip-invalid]] [--allow-web] [--json] [dir]
+#                                  portfolio inventory and proposed audit plan (writes only the derived state/plan-cache);
 #                                  --enqueue stages only read-only work for the normal runner
 #                                  (each staged run still cuts a scratch branch and worktree
 #                                  in the repository); tasks that reach the web are left out
 #                                  unless --allow-web, and a tier that can shell out is never
 #                                  staged -- enroll the repository for that instead
-#                                  --only stages just the named unconfigured repos (repeatable)
+#                                  --only stages just the named unconfigured repos (repeatable;
+#                                  no tree walk; --skip-invalid stages the good ones, exit 3)
+#                                  over unattempted staged work: --append or --replace
 #                                  --json prints the inventory and ranking as one JSON object
 #                                  defaults to this checkout's parent directory
 #   tui                           the triage inbox, in the terminal (PRP-003 screen 1)
@@ -108,6 +110,9 @@ source "${MEUTE_ROOT}/lib/preflight.sh"
 source "${MEUTE_ROOT}/lib/plan.sh"
 source "${MEUTE_ROOT}/lib/plan_dedup.sh"
 source "${MEUTE_ROOT}/lib/quota_age.sh"
+source "${MEUTE_ROOT}/lib/plan_cache.sh"
+source "${MEUTE_ROOT}/lib/plan_only.sh"
+source "${MEUTE_ROOT}/lib/plan_queue_lock.sh"
 source "${MEUTE_ROOT}/lib/status.sh"
 source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
@@ -663,18 +668,23 @@ cmd_policy() {
   esac
 }
 
-# Inventory a directory tree without enrolling anything, and optionally stage
-# the result for the runner. The work lives in lib/plan.sh; this is the
-# command line.
+# Inventory a directory tree without enrolling anything (only the derived
+# state/plan-cache is written), and optionally stage the result for the
+# runner. The work lives in lib/plan.sh; this is the command line.
 cmd_plan() {
-  local enqueue=0 allow_web=0 json=0 requested="" scan_dir
+  local enqueue=0 allow_web=0 json=0 skip_invalid=0 mode="" requested="" scan_dir
   local -a only=()
   while (( $# )); do
     case "$1" in
       --enqueue) enqueue=1 ;;
+      --append|--replace) [[ -z "$mode" || "$mode" == "${1#--}" ]] \
+          || { note "plan: --append and --replace are exclusive"; exit 2; }; mode="${1#--}" ;;
+      --skip-invalid) skip_invalid=1 ;;
       --allow-web) allow_web=1 ;;
       --json) json=1 ;;
-      --only) (( $# >= 2 )) || die "plan: --only needs a path"; only+=( "$2" ); shift ;;
+      --only) (( $# >= 2 )) || die "plan: --only needs a path"
+        [[ -n "$2" ]] || { note "plan: --only needs a non-empty path"; exit 2; }
+        only+=( "$2" ); shift ;;
       --) shift; [[ $# -eq 1 ]] || die "plan: expected at most one directory"; requested="$1"; break ;;
       -*) die "plan: unknown option: $1" ;;
       *) [[ -z "$requested" ]] || die "plan: expected at most one directory"; requested="$1" ;;
@@ -683,7 +693,10 @@ cmd_plan() {
   done
   # Usage errors exit 2, apart from the runtime refusals that exit 1.
   (( ${#only[@]} == 0 || enqueue )) || { note "plan: --only requires --enqueue"; exit 2; }
-  (( ! json || ! enqueue )) || { note "plan: --json is read-only and cannot be combined with --enqueue"; exit 2; }
+  (( ! json || ! enqueue )) || { note "plan: --json only reports and cannot be combined with --enqueue"; exit 2; }
+  [[ -z "$mode" ]] || (( enqueue )) || { note "plan: --${mode} requires --enqueue"; exit 2; }
+  (( ! skip_invalid || ${#only[@]} )) || { note "plan: --skip-invalid requires --only"; exit 2; }
+  (( ! enqueue )) || plan_queue_guard "$mode"
   requested="${requested:-$(dirname "$MEUTE_ROOT")}"
   scan_dir="$(cd "$requested" 2>/dev/null && pwd)" || die "plan: no such directory: ${requested}"
   # A manifest the runner would refuse is not one to plan against.
@@ -698,19 +711,33 @@ cmd_plan() {
     || die "plan: MEUTE_PLAN_MAX_DEPTH must be an integer from 1 to 16"
 
   plan_collect_tasks "$allow_web"
-  plan_scan_repos "$scan_dir" "$max_depth"
-  # One canonical copy per repository; copies are listed, never staged.
-  plan_dedup "$scan_dir"
+  plan_cache_load
+  if (( ${#only[@]} )); then
+    # Named paths only (lib/plan_only.sh): no walk, every refusal collected.
+    plan_only_precheck "$scan_dir" "${only[@]}"
+    plan_only_scan "$scan_dir"
+  else
+    plan_scan_repos "$scan_dir" "$max_depth"
+    # One canonical copy per repository; copies are listed, never staged.
+    plan_dedup "$scan_dir"
+  fi
+  plan_cache_save
   if (( json )); then
     plan_print_json "$scan_dir"
     return 0
   fi
-  (( ${#only[@]} == 0 )) || plan_restrict_to "${only[@]}"
+  if (( ${#PLAN_REJECTED[@]} )); then
+    plan_only_report
+    (( skip_invalid )) || die "plan: ${#PLAN_REJECTED[@]} --only path(s) refused; nothing staged (--skip-invalid stages the rest)"
+    (( ${#PLAN_UNCONFIGURED[@]} )) || die "plan: every --only path was refused; nothing staged"
+  fi
   plan_print "$scan_dir" "$max_depth"
   if (( enqueue )); then
-    plan_stage "$scan_dir" "$allow_web"
+    plan_stage "$scan_dir" "$allow_web" "$mode"
+    # 3: staged, but not everything that was asked for.
+    (( ${#PLAN_REJECTED[@]} == 0 )) || exit 3
   else
-    printf '\nNo manifest, repository, or state files were changed. Stage this exact plan for the runner with: meute plan --enqueue %s (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).\n' "$scan_dir"
+    printf '\nNo manifest or repository was changed (state/plan-cache is derived and safe to delete). Stage this exact plan for the runner with: meute plan --enqueue %s (the analysis is read-only, but each staged run cuts a scratch branch and a worktree in that repository while it works).\n' "$scan_dir"
   fi
 }
 

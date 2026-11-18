@@ -139,7 +139,7 @@ class DuplicateEnqueueTests(WebTestCase):
         resp, raw = self.request("POST", "/api/enqueue", {"paths": [DUP]})
         self.assertEqual(resp.status, 400)
         self.assertIn(DUP, json.loads(raw)["message"])
-        self.assertFalse(any("--enqueue" in c for c in self.fleet.calls))
+        self.assertFalse(os.path.exists(os.path.join(self.fleet.state, "plan-queue.json")))
 
     def test_enqueue_canonical_still_stages(self):
         resp, raw = self.request("POST", "/api/enqueue", {"paths": [ALPHA]})
@@ -273,7 +273,8 @@ process.stdout.write(JSON.stringify([
         self.assertNotIn("/home/u/skip", text)
         self.assertTrue(lines[0].startswith("Enqueue 2 repo"))
         self.assertIn("sent to the model provider", text)
-        self.assertIn("replaces the currently staged queue", text)
+        # Decision D3: the page appends (--append); it never replaces.
+        self.assertIn("added to the currently staged queue", text)
 
     @unittest.skipUnless(HAS_NODE, "node not installed")
     def test_excluded_summary_shows_counts_and_names_title(self):

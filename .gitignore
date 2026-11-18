@@ -39,6 +39,7 @@ state/policy-override
 # absolute path; its archives and mktemp leftovers carry the same list.
 state/plan-queue.json
 state/plan-complete
+state/plan-cache
 state/plan-queue.completed-*
 state/.plan-*
 # The subscription windows, snapshotted by contrib/statusline-capture.sh.

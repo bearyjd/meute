@@ -230,8 +230,9 @@ work:
    skipped paths are listed under it.
 2. **Tick repos** -- nothing is ticked by default, and Enqueue stays disabled
    until at least one is.
-3. **Enqueue** -- stages only the ticked repos. Re-enqueueing *replaces* the
-   staged queue rather than adding to it.
+3. **Enqueue** -- stages only the ticked repos, *adding* them to any staged
+   queue (`--append`), so unattempted work and completion marks survive. A
+   repo the CLI refuses is named in the notice; the others are still staged.
 4. **Start** (after a confirm click) -- Go runs the daily slot, then the weekly
    slot, for the staged items only (staged read-only tasks are mostly
    weekly-only; repos.yaml lists at least one read-only task for both slots), one
@@ -456,6 +457,7 @@ git dir lives outside the scan root are skipped. The depth limit is
 ./bin/meute plan /path/to/scan          # inventory a specific directory
 ./bin/meute plan --enqueue              # stage exactly that plan for the timers
 ./bin/meute plan --enqueue --allow-web  # also stage tasks that use WebSearch / WebFetch
+./bin/meute plan --enqueue --only /path/to/repo  # stage just that repo; no tree walk
 ./bin/run.sh daily --dry-run            # see which staged item the next fire would take
 ```
 
@@ -465,6 +467,16 @@ by absolute path, and is gitignored for that reason, as is the `state/.kv.*`
 scratch its bookkeeping uses — and the runner prefers it until every entry is
 attempted (or found missing), then archives it and returns to the manifest.
 Enrollment in `repos.local.yaml` is never a side effect.
+
+Staging over a queue that still has unattempted items is refused: pass
+`--append` to add to it (completion marks kept) or `--replace` to discard it and
+its marks. `--only` checks each named path without walking the tree, reports
+every bad one in one run (`rejected<TAB>path<TAB>reason` on stdout) and stages
+nothing; with `--skip-invalid` it stages the good ones and exits 3. Each repo's
+root-commit identity is cached in `state/plan-cache` by path and HEAD, so an
+unchanged repository costs one `rev-parse`; deleting the file is always safe.
+`--only` dedups against enrolled repos, the other named paths, and copies a
+previous scan recorded in that cache.
 
 A scan usually finds the same repository more than once — scratch clones under
 `output/` or `build/`, vendored upstream checkouts, a `--separate-git-dir`
