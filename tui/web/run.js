@@ -3,6 +3,7 @@
 // No decision logic here: the server decides. All dynamic text uses
 // textContent (via el() from app.js, which loads first). Token: TOKEN from app.js.
 const POLL_MS = 2000;
+const PLAN_POLL_MS = 1000;
 const runUi = { groups: [], timer: null, status: null, planned: false, busy: false,
   stopBusy: false, pollFailed: false, seq: 0, applied: 0, timerInFlight: false };
 
@@ -303,7 +304,14 @@ async function guarded(fn) {
 function doPlan() {
   return guarded(async () => {
     runNotice("planning...", true);
-    renderPlan(await runCall("GET", "/api/plan"));
+    let st = await runCall("POST", "/api/plan/start");
+    while (st.scanning) {
+      await new Promise((resolve) => setTimeout(resolve, PLAN_POLL_MS));
+      st = await runCall("GET", "/api/plan");
+    }
+    if (st.error) throw new Error(st.error);
+    if (!st.plan) throw new Error("the plan scan returned no result");
+    renderPlan(st.plan);
     runNotice("plan loaded; nothing is selected", true);
   });
 }

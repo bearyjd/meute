@@ -42,9 +42,13 @@ class FakeRun:
         self.calls = []
         self.start_error = None
 
-    def plan(self):
+    def plan_start(self):
+        self.calls.append(("plan_start",))
+        return {"scanning": True, "age": None, "error": None, "plan": None}
+
+    def plan_state(self):
         self.calls.append(("plan",))
-        return {"scan": "/s", "items": []}
+        return {"scanning": False, "age": 1, "error": None, "plan": {"scan": "/s", "items": []}}
 
     def enqueue(self, paths):
         self.calls.append(("enqueue", paths))

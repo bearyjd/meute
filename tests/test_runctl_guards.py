@@ -17,8 +17,18 @@ from runctl_helpers import ALPHA, BETA, RunCtlCase, name_for, runctl  # noqa: E4
 GAMMA = "/scan root/projects/gamma"
 
 
-class PlanSingleFlightTests(RunCtlCase):
-    def test_concurrent_plan_calls_run_one_scan_and_conflict_the_other(self):
+class PlanJobTests(RunCtlCase):
+    """P1.6: the scan runs in a thread; plan_start returns at once, plan_state
+    reports the last result with its age and `scanning`."""
+
+    def wait_done(self):
+        for _ in range(200):
+            if not self.ctl.plan_state()["scanning"]:
+                return self.ctl.plan_state()
+            time.sleep(0.02)
+        self.fail("scan did not finish")
+
+    def test_start_returns_while_scan_runs_and_second_start_is_single_flight(self):
         entered, release = threading.Event(), threading.Event()
         inner = self.fleet
 
@@ -28,26 +38,54 @@ class PlanSingleFlightTests(RunCtlCase):
                 release.wait(5)
             return inner(argv, cwd, out_path=out_path, timeout=timeout)
         self.ctl.runner = blocking
-        results = []
-        first = threading.Thread(target=lambda: results.append(self.ctl.plan()))
-        first.start()
+        self.assertTrue(self.ctl.plan_start()["scanning"])
         self.assertTrue(entered.wait(5))
         try:
-            with self.assertRaises(runctl.RunConflict):
-                self.ctl.plan()
+            self.assertTrue(self.ctl.plan_start()["scanning"])
+            state = self.ctl.plan_state()
+            self.assertTrue(state["scanning"])
+            self.assertIsNone(state["plan"])
         finally:
             release.set()
-            first.join(5)
-        self.assertEqual(len(results), 1)
+        state = self.wait_done()
         self.assertEqual(sum(1 for c in inner.calls if "--json" in c), 1)
-        self.ctl.plan()  # the flag is released afterwards
-        self.assertEqual(sum(1 for c in inner.calls if "--json" in c), 2)
+        self.assertIn("items", state["plan"])
+        self.assertIsNone(state["error"])
+        self.assertGreaterEqual(state["age"], 0)
 
-    def test_plan_flag_released_after_failure(self):
-        self.ctl.runner = lambda argv, cwd, out_path=None, timeout=None, on_start=None: (1, "")
-        for _ in range(2):
-            with self.assertRaises(runctl.RunnerFailed):
-                self.ctl.plan()
+    def test_failure_is_kept_as_error_and_flag_released(self):
+        self.ctl.runner = lambda argv, cwd, out_path=None, timeout=None: (1, "")
+        self.ctl.plan_start()
+        state = self.wait_done()
+        self.assertIn("exit 1", state["error"])
+        self.assertIsNone(state["plan"])
+        self.ctl.plan_start()  # not stuck scanning
+        self.wait_done()
+
+    def test_failed_rescan_keeps_the_last_good_result(self):
+        self.ctl.plan_start()
+        self.assertIn("items", self.wait_done()["plan"])
+        self.ctl.runner = lambda argv, cwd, out_path=None, timeout=None: (1, "")
+        self.ctl.plan_start()
+        state = self.wait_done()
+        self.assertIn("items", state["plan"])
+        self.assertIn("exit 1", state["error"])
+
+    def test_timeout_comes_from_env(self):
+        old = os.environ.get("MEUTE_PLAN_TIMEOUT")
+        os.environ["MEUTE_PLAN_TIMEOUT"] = "7"
+        try:
+            self.ctl.plan_start()
+            self.wait_done()
+        finally:
+            if old is None:
+                del os.environ["MEUTE_PLAN_TIMEOUT"]
+            else:
+                os.environ["MEUTE_PLAN_TIMEOUT"] = old
+        self.assertEqual([t for tag, t in self.fleet.timeouts if tag == "meute"], [7.0])
+
+    def test_default_timeout_is_900(self):
+        self.assertEqual(runctl.DEFAULT_PLAN_TIMEOUT, 900)
 
 
 class TimeoutTests(RunCtlCase):
@@ -57,8 +95,8 @@ class TimeoutTests(RunCtlCase):
         seen = {}
         for tag, timeout in self.fleet.timeouts:
             seen.setdefault(tag, set()).add(timeout)
-        self.assertEqual(seen["meute"], {runctl.PLAN_TIMEOUT, None})  # scans time out, drain never
-        self.assertEqual(runctl.PLAN_TIMEOUT, 120)
+        self.assertEqual(seen["meute"], {runctl.DEFAULT_PLAN_TIMEOUT, None})  # scans time out, drain never
+        self.assertEqual(runctl.DEFAULT_PLAN_TIMEOUT, 900)
 
     def hang(self, match):
         inner = self.fleet
@@ -71,9 +109,12 @@ class TimeoutTests(RunCtlCase):
 
     def test_plan_timeout_is_runner_failed(self):
         self.hang(lambda argv: "--json" in argv)
-        with self.assertRaises(runctl.RunnerFailed) as cm:
-            self.ctl.plan()
-        self.assertIn("timed out", str(cm.exception))
+        self.ctl.plan_start()
+        for _ in range(200):
+            if not self.ctl.plan_state()["scanning"]:
+                break
+            time.sleep(0.02)
+        self.assertIn("timed out", self.ctl.plan_state()["error"])
 
     def test_enqueue_timeout_resets_flags_so_start_works(self):
         self.ctl.enqueue([ALPHA])
