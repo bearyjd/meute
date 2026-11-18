@@ -3,6 +3,11 @@
 // All dynamic text goes through textContent.
 const TOKEN = document.querySelector('meta[name="meute-token"]').content;
 const $ = (id) => document.getElementById(id);
+// Beacons: tell the server the page rendered, or why it did not (tests/test_browser_smoke.py).
+const beacon = (url) => { fetch(url, { keepalive: true }).catch(() => {}); };
+window.onerror = (msg, src, line) => {
+  beacon("/api/client-error?msg=" + encodeURIComponent(msg + " @" + src + ":" + line));
+};
 const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false };
 
 function el(tag, text, cls) {
@@ -50,7 +55,15 @@ window.meuteShowTab = showTab;
 // ---- findings -------------------------------------------------------------
 const COLS = ["repo", "severity", "title", "location", "lens", "date", "state"];
 
-function isDecided(f) { return f.state !== "new"; }
+// gone, superseded and claimed rows are hidden as decided ones are (D7);
+// `hidden` comes from lib/finding_status.py, the CLI's own rule.
+function isDecided(f) { return f.state !== "new" || Boolean(f.inherited) || Boolean(f.hidden); }
+
+function cell(f, c) {
+  if (c !== "state") return f[c];
+  const label = f.claimed ? "claimed" : f.state;
+  return f.verdict && f.verdict !== "current" && f.verdict !== "unknown" ? label + " / " + f.verdict : label;
+}
 
 function visibleRows() {
   const q = $("filter").value.trim().toLowerCase();
@@ -72,7 +85,7 @@ function renderFindings() {
   state.rows.forEach((f, i) => {
     const tr = el("tr", null, "finding" + (isDecided(f) ? " decided" : ""));
     COLS.forEach((c) => {
-      const td = el("td", f[c]);
+      const td = el("td", cell(f, c));
       if (c === "severity") td.className = "sev-" + String(f.severity).toLowerCase();
       tr.appendChild(td);
     });
@@ -192,6 +205,7 @@ async function refresh() {
   try {
     state.data = await getJSON("/api/inbox");
     renderAll();
+    beacon("/api/client-ready?page=inbox");
   } catch (e) {
     notice("could not load inbox: " + e.message, false);
   }

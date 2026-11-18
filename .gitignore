@@ -5,6 +5,8 @@
 state/.lock
 state/lock-info
 state/.kv.*
+# lib/state.sh's write lock, one per store: state/reports.lock and so on.
+state/*.lock
 # Each fire's own temp directory (lib/tmp.sh), removed on exit.
 state/tmp/
 state/dry-run-prompt.md
@@ -32,6 +34,7 @@ state/cursor
 state/reports
 state/tickets.yaml*
 state/quota-override
+state/policy-override
 # A staged portfolio plan lists every unconfigured repo on the machine by
 # absolute path; its archives and mktemp leftovers carry the same list.
 state/plan-queue.json
@@ -42,9 +45,14 @@ state/.plan-*
 # The subscription windows, snapshotted by contrib/statusline-capture.sh.
 state/rate-limits.json
 state/hold
+# Which health problems were already alerted (lib/health.sh).
+state/health-alerted
 # Where each in-flight tier-3 ticket stands (PRP-004 §4.3): one row per
 # <repo>/<ticket> naming its stage, branch, base SHA and build report.
 state/stages
+# Verify verdicts and claims (P1.7 b): one row per <repo>/<report>#n, with PR URLs.
+state/finding-status
+state/finding-status.lock
 
 # The triage UI's own venv (uv-managed). The runner never touches it.
 tui/.venv/

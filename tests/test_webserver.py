@@ -11,7 +11,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from webtest_helpers import ROOT, WebTestCase, web_file  # noqa: E402
+from webtest_helpers import ROOT, WebTestCase, web_file, webserver  # noqa: E402
 
 class ReadTests(WebTestCase):
     def test_get_inbox_returns_dump(self):
@@ -41,7 +41,7 @@ class ReadTests(WebTestCase):
             self.assertEqual(resp.status, 400, q)
 
     def test_index_embeds_token(self):
-        resp, raw = self.request("GET", "/")
+        resp, raw = self.request("GET", "/", headers={"Cookie": f"meute_t_{self.port}={self.token}"})
         self.assertEqual(resp.status, 200)
         text = raw.decode()
         self.assertIn(f'<meta name="meute-token" content="{self.token}">', text)
@@ -163,7 +163,7 @@ class PageTests(WebTestCase):
         return web_file(name)
 
     def test_index_has_token_meta_and_no_inline_script(self):
-        resp, raw = self.request("GET", "/")
+        resp, raw = self.request("GET", "/", headers={"Cookie": f"meute_t_{self.port}={self.token}"})
         page = raw.decode()
         self.assertIn(f'<meta name="meute-token" content="{self.token}">', page)
         self.assertIn('<section id="run"', page)
@@ -233,6 +233,92 @@ class FetchSiteTests(WebTestCase):
         self.assertEqual(len(self.inbox.calls), 1)
 
 
+class TokenTests(WebTestCase):
+    """R17: the token reaches only a browser that opened the startup link."""
+
+    def cookie(self):
+        return {"Cookie": f"meute_t_{self.port}={self.token}"}
+
+    def test_index_without_cookie_hides_token(self):
+        resp, raw = self.request("GET", "/")
+        text = raw.decode()
+        self.assertNotIn(self.token, text)
+        self.assertNotIn("meute-token", text)
+        self.assertIn("open the link printed in the terminal", text)
+        self.assertNotIn("<script", text)
+
+    def test_startup_link_sets_cookie_and_redirects(self):
+        resp, raw = self.request("GET", f"/?t={self.token}")
+        self.assertIn(resp.status, (302, 303))
+        self.assertEqual(resp.getheader("Location"), "/")
+        self.assertNotIn(self.token, raw.decode())
+        cookie = resp.getheader("Set-Cookie") or ""
+        self.assertTrue(cookie.startswith(f"meute_t_{self.port}={self.token}"), cookie)
+        for attr in ("HttpOnly", "SameSite=Strict", "Path=/"):
+            self.assertIn(attr, cookie)
+        self.assertNotIn("Secure", cookie)
+        self.assertEqual(resp.getheader("X-Frame-Options"), "DENY")
+
+    def test_wrong_t_sets_no_cookie(self):
+        for q in ("t=nope", "t=%C3%A9", "t="):
+            resp, raw = self.request("GET", "/?" + q)
+            self.assertIsNone(resp.getheader("Set-Cookie"), q)
+            self.assertNotIn(self.token, raw.decode(), q)
+            self.assertIn("open the link printed in the terminal", raw.decode(), q)
+
+    def test_wrong_or_malformed_cookie_hides_token(self):
+        for c in (f"meute_t_{self.port}=nope", f"meute_t_{self.port}=é",
+                  f"meute_t_1={self.token}", 'a="b'):
+            resp, raw = self.request("GET", "/", headers={"Cookie": c})
+            self.assertEqual(resp.status, 403, c)
+            self.assertNotIn(self.token, raw.decode(errors="replace"), c)
+
+    def test_index_with_cookie_embeds_token(self):
+        resp, raw = self.request("GET", "/", headers=self.cookie())
+        self.assertEqual(resp.status, 200)
+        self.assertIn(f'<meta name="meute-token" content="{self.token}">', raw.decode())
+
+    def test_cookie_does_not_replace_post_token(self):
+        resp, _ = self.post_act({"verb": "promote", "id": "r1", "n": 1},
+                                token=False, headers=self.cookie())
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(self.inbox.calls, [])
+
+
+class SocketLimitTests(unittest.TestCase):
+    """R22: an idle client cannot hold a thread forever, and threads are capped."""
+
+    def test_handler_timeout_is_30(self):
+        self.assertEqual(webserver.Handler.timeout, 30)
+
+    def test_connections_over_the_cap_are_refused(self):
+        import time
+        old_max, old_timeout = getattr(webserver, "MAX_THREADS", None), webserver.Handler.timeout
+        webserver.MAX_THREADS, webserver.Handler.timeout = 2, 3
+        self.addCleanup(setattr, webserver.Handler, "timeout", old_timeout)
+        self.addCleanup(setattr, webserver, "MAX_THREADS", old_max)
+        t = WebTestCase("setUp")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        idle = [socket.create_connection(("127.0.0.1", t.port), timeout=5) for _ in range(2)]
+        for s in idle:
+            self.addCleanup(s.close)
+        time.sleep(0.3)
+        extra = socket.create_connection(("127.0.0.1", t.port), timeout=5)
+        self.addCleanup(extra.close)
+        extra.sendall(f"GET /api/inbox HTTP/1.0\r\nHost: 127.0.0.1:{t.port}\r\n\r\n".encode())
+        try:
+            data = extra.recv(4096)
+        except ConnectionResetError:
+            data = b""
+        self.assertEqual(data, b"")
+        for s in idle:
+            s.close()
+        time.sleep(0.3)
+        resp, _ = t.request("GET", "/api/inbox")
+        self.assertEqual(resp.status, 200)
+
+
 class PortInUseTests(unittest.TestCase):
     def test_busy_port_prints_one_line_and_exits_1(self):
         busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -246,6 +332,26 @@ class PortInUseTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(proc.stderr.strip(), f"meute web: port {port} is already in use")
         self.assertNotIn("Traceback", proc.stderr)
+
+
+class UmaskTests(unittest.TestCase):
+    """P2.4 (R21): the server and the runs it starts create owner-only files."""
+
+    def test_main_sets_owner_only_umask(self):
+        code = (
+            "import errno, os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import webserver\n"
+            "def busy(*a, **k): raise OSError(errno.EADDRINUSE, 'busy')\n"
+            "webserver.make_server = busy\n"
+            "sys.argv = ['webserver.py']\n"
+            "os.umask(0o022)\n"
+            "try:\n    webserver.main()\nexcept SystemExit:\n    pass\n"
+            "print(oct(os.umask(0)))\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code, os.path.join(ROOT, "tui")],
+                              capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.stdout.strip(), "0o77", proc.stderr)
 
 
 if __name__ == "__main__":

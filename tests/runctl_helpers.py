@@ -43,15 +43,25 @@ class FakeFleet:
         self.enqueue_rc = 0
         self.last_argv = ["run.sh", "daily"]
         self.on_pending = None
+        self.drains = []  # scripted `meute drain` runs: each a callable returning the exit status
+        self.drain_pid = 424242
+        self.before_drain_start = []  # callables run just before each drain's on_start, in order
         self.timeouts = []  # (basename of argv[0] or "manifest.py", timeout) per call
         self.duplicates = []  # plan --json's collapsed copies: [{path, of, reason}]
 
     # -- what the runner sees --
-    def __call__(self, argv, cwd, out_path=None, timeout=None):
+    def __call__(self, argv, cwd, out_path=None, timeout=None, on_start=None):
         self.calls.append(list(argv))
         tag = "manifest.py" if "plan-queue" in argv else os.path.basename(argv[0])
         self.timeouts.append((tag, timeout))
         base = os.path.basename(argv[0])
+        if base == "meute" and argv[1:2] == ["drain"]:
+            if self.before_drain_start:
+                self.before_drain_start.pop(0)()
+            if on_start:
+                on_start(self.drain_pid)
+            step = self.drains.pop(0) if self.drains else (lambda: 0)
+            return step(), ""
         if base == "meute" and "--json" in argv:
             return 0, json.dumps(self.plan_json())
         if base == "meute" and "--enqueue" in argv:
@@ -131,6 +141,39 @@ class FakeFleet:
             argv = self.last_argv
             return self.ok(argv[argv.index("--repo") + 1], argv[argv.index("--task") + 1])()
         return step
+
+    def skip_code(self, code):
+        def step():
+            argv = self.last_argv
+            self.log(f"{iso()}\tweek=2026-W46\tslot={argv[1]}\tstatus=skipped"
+                     f"\treason=r\trepo={argv[argv.index('--repo') + 1]}"
+                     f"\ttask={argv[argv.index('--task') + 1]}\tcode={code}\tdur=0s")
+            return 0, ""
+        return step
+
+    def already_done(self):
+        """A timer finished the forced item first; run.sh --once declines it."""
+        def step():
+            argv = self.last_argv
+            repo, task = argv[argv.index("--repo") + 1], argv[argv.index("--task") + 1]
+            with open(os.path.join(self.state, "plan-complete"), "a") as f:
+                f.write(f"plan/{repo}/{task}\t{iso()}\n")
+            self.log(f"{iso()}\tweek=2026-W46\tslot={argv[1]}\tstatus=skipped"
+                     f"\treason=staged plan item already attempted (--once)"
+                     f"\trepo={repo}\ttask={task}\tcode=already-done\tdur=0s")
+            return 0, ""
+        return step
+
+    def drained(self, *repos, rc=0, task="audit"):
+        """A `meute drain` run that ran `repos` (log line + plan-complete mark each)."""
+        def step():
+            for repo in repos:
+                self.ok(repo, task)()
+            return rc
+        return step
+
+    def drain_calls(self):
+        return [c for c in self.calls if os.path.basename(c[0]) == "meute" and c[1:2] == ["drain"]]
 
     def die(self):
         return lambda: (1, "")

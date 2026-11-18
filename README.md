@@ -80,6 +80,25 @@ warn  arm it with:  systemctl --user start meute-daily.timer
 That state self-heals at your next login, when `systemd --user` restarts and
 pulls `timers.target.wants` in. Until then the slot is dead.
 
+**Being told when it stops.** `./bin/meute health` prints one line per reason
+the fleet may have stopped and exits 1 if there is any: no `state/log` line
+within twice the daily cadence, no `status=ok` for 3 days, 3 errors in a row,
+an automatic (rate-limit) hold, the run lock held by a live run past the unit's
+timeout, a timer not armed or lingering off, `state/` under `policy.min_free_mb`,
+leftovers of killed runs, a quota snapshot over a day old, a policy override in
+force. A healthy fleet prints nothing. `install-timers` also writes
+`meute-health.timer` (hourly, `meute health --alert`) and adds
+`OnFailure=meute-alert.service` to both run units. Under `--alert` the text goes
+on stdin to `policy.alert_cmd`, a command line you choose; empty (the default)
+sends nothing. The text never names a repository. For example:
+
+```yaml
+policy:
+  alert_cmd: "notify-send 'meute' \"$(cat)\""     # or: curl -s --data-binary @- https://ntfy.sh/<topic>
+```
+
+Turn it off with `systemctl --user disable --now meute-health.timer`.
+
 **If you run meute from inside a container** (toolbox, distrobox, devcontainer),
 the *user* bus is usually reachable while the *system* bus is not — so
 `systemctl --user` works and `loginctl` fails with `Host is down`. The units then
@@ -118,7 +137,7 @@ PATH=/home/you/.local/bin:/home/you/.npm-global/bin:/usr/bin:/bin
 ```
 
 Overlapping fires are safe: the runner takes a non-blocking `flock` and exits 0
-if another run holds it. Subscription auth works headless — credentials live in
+if another run holds it. `--wait-lock SECS` waits up to SECS for it instead. Subscription auth works headless — credentials live in
 `~/.claude/.credentials.json`, not a keychain agent that a cron job could not
 reach.
 
@@ -140,11 +159,21 @@ on `$?` alone:
 | 13 | quota (below the floor, or the probe failed) |
 | 14 | nothing eligible (or no queue) |
 | 15 | host not healthy (load, disk) |
+| 16 | already done: a forced staged item another fire finished (`--once`) |
 | 70 | the runner itself died |
 
 The `code=` field of the `state/log` line uses the same vocabulary (`hold`,
 `lock`, `budget`, `quota-floor`, `quota-unknown`, `nothing-eligible`,
-`no-queue`, `load`, `disk`, `ok`, `failed`, `died`).
+`no-queue`, `load`, `disk`, `already-done`, `ok`, `failed`, `died`).
+
+`meute drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...`
+is that loop, written once. It runs the slot unforced, one fire after another
+(each waits up to 900 s for the lock), so the cursor, the community share, the
+tier-3 cap and the pool still apply; `--repo` narrows the queue without forcing,
+on a cursor of its own, so the timers' rotation is not moved.
+It ends with 0 after one full rotation, when the staged plan is drained, or at
+`--max`/`--until`; with 1 after three failed fires in a row; and otherwise
+with the status of the fire that declined (10-15, 2, 70).
 
 ## Subscription-only
 
@@ -354,6 +383,29 @@ Seven daily audits across mid-sized repos is comfortably $6–9, so a ceiling
 calibrated on your smallest repo will trip mid-week. `meute status` shows the
 week's burn against the ceiling. The floor does not apply here: the ceiling is
 already meute's allocation, so exhausted means 0 and 0 is what stops it.
+
+### `meute policy` — an override that cannot be forgotten
+
+To lower the floor or cap for a night without editing the manifest (and
+remembering to put it back):
+
+```sh
+./bin/meute policy set quota_floor_percent=1 weekly_cost_usd=50 --for 8h -r "night run"
+./bin/meute policy show
+./bin/meute policy clear          # lift it early
+MEUTE_QUOTA_FLOOR=1 ./bin/run.sh daily   # one invocation, nothing written
+```
+
+The override lives in `state/policy-override`, is read after the manifest, and
+is checked by the manifest's own rules (a bad value is refused at `set`, judged
+against the rows already in force; a non-finite number such as `nan` or
+`inf` is refused, and a hand-edited one is ignored like an expired row). There is one weekly ceiling at a time:
+setting `weekly_runs` drops a `weekly_cost_usd` row, and the reverse.
+`--for` is mandatory and capped at 7 days; an expired row, or a hand-edited one
+past the cap, is ignored. Every run
+line carries `policy=override` while one is in force, and `status`/`doctor`
+say so first. Overridable: `quota_floor_percent`, `weekly_runs`,
+`weekly_cost_usd`, `community_share`, `tier3_max_in_flight`.
 
 ### `meute pause` — the gate cannot protect you from yourself
 

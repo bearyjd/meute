@@ -52,8 +52,8 @@ class FakeRun:
             raise ValueError("select at least one repository")
         return {"ok": True, "message": "staged", "staged": len(paths)}
 
-    def start(self):
-        self.calls.append(("start",))
+    def start(self, source="plan"):
+        self.calls.append(("start", source))
         if self.start_error:
             raise self.start_error
         return {"state": "running"}
