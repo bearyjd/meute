@@ -6,6 +6,10 @@
     python3 lib/inbox.py counts            -- `reports_new=<n>`, for `meute status`
     python3 lib/inbox.py findings [--new|--all] --tsv
                                            -- one row per finding, for `meute findings`
+    python3 lib/inbox.py findings [--new|--all] --json
+                                           -- the same findings as a JSON array
+    python3 lib/inbox.py verify [--repo R] < list-repos JSON lines
+                                           -- verdicts into state/finding-status
     python3 lib/inbox.py promote <id> <n>
     python3 lib/inbox.py dismiss <id> <n> <reason> [message]
     python3 lib/inbox.py resolve <id> <n> <message>
@@ -33,6 +37,7 @@ ROOT = os.environ.get("MEUTE_ROOT") or os.path.dirname(HERE)
 SYSTEM_PYTHON = os.environ.get("MEUTE_PYTHON", "python3")
 sys.path.insert(0, HERE)
 import report as report_lib  # noqa: E402
+import finding_status  # noqa: E402
 
 SEVERITY_RANK = {s: i for i, s in enumerate(report_lib.SEVERITIES)}
 DISMISS_REASONS = ("false-positive", "wont-fix", "out-of-scope",
@@ -89,6 +94,41 @@ def report_path(rid: str) -> str:
     return os.path.join(ROOT, "reports", rid + ".md")
 
 
+def _order(meta: dict, rid: str) -> tuple:
+    """Oldest report first: by its start time, then its id."""
+    return (str(meta.get("started", "")), rid)
+
+
+def _group(meta: dict, rid: str, repo: str, keyfps: list[tuple[str, str]]) -> dict:
+    """One report as finding_status.superseded reads it."""
+    return {"group": (repo, meta.get("task", ""), meta.get("lens", "")),
+            "order": _order(meta, rid), "live": meta.get("status") == "ok",
+            "findings": keyfps}
+
+
+def _joins(occurrences: list, groups: list, rows: dict) -> tuple:
+    """What every view adds to a finding's own row: inherited decisions,
+    superseded keys, and state/finding-status (verdicts and claims)."""
+    return (finding_status.inherited(occurrences, rows),
+            finding_status.superseded(groups), finding_status.read_status(ROOT))
+
+
+def _derive(key: str, rows: dict, joins: tuple) -> dict:
+    """label and hidden as `findings` shows them; verdict, pr and claimed."""
+    inherited, superseded, status = joins
+    srow = status.get(key)
+    verdict = srow[0] if srow else ""
+    if verdict != "gone" and key in superseded:
+        verdict = "superseded"
+    own = rows.get(key)
+    claim_pr = srow[3] if srow else ""
+    label, hidden = finding_status.view(own[0] if own else None,
+                                        inherited.get(key, ""), verdict, claim_pr)
+    return {"label": label, "hidden": hidden, "verdict": verdict,
+            "pr": finding_status.pr_of(srow, own[2] if own else ""),
+            "claimed": label == "claimed"}
+
+
 # --------------------------------------------------------------- reports ---
 
 def load_reports() -> tuple[list[dict], list[dict]]:
@@ -96,6 +136,8 @@ def load_reports() -> tuple[list[dict], list[dict]]:
     rows = _state_rows()
     reports: list[dict] = []
     findings: list[dict] = []
+    occurrences: list[tuple[str, str, tuple]] = []
+    groups: list[dict] = []
     for rid in _report_ids():
         try:
             meta, body = report_lib.read(report_path(rid))
@@ -119,8 +161,13 @@ def load_reports() -> tuple[list[dict], list[dict]]:
             "findings": 0,
         }
         if report_lib.has_findings_section(body):
+            repo = report_lib.report_repo(meta, report_path(rid))
+            keyfps: list[tuple[str, str]] = []
             for f in report_lib.parse_findings(body):
                 fstate, fwhen, fnote = rows.get(f"{rid}#{f['n']}", ("new", "", ""))
+                fp = report_lib.fingerprint(repo, f["location"], f["title"])
+                occurrences.append((f"{rid}#{f['n']}", fp, _order(meta, rid)))
+                keyfps.append((f"{rid}#{f['n']}", fp))
                 findings.append({
                     "report": rid,
                     "n": f["n"],
@@ -135,9 +182,18 @@ def load_reports() -> tuple[list[dict], list[dict]]:
                     "state": fstate,
                     "decided_at": fwhen,
                     "note": fnote,
+                    "fingerprint": fp,
+                    "base": str(meta.get("base", "")).rpartition("@")[2],
                 })
                 entry["findings"] += 1
+            groups.append(_group(meta, rid, repo, keyfps))
         reports.append(entry)
+    joins = _joins(occurrences, groups, rows)
+    for f in findings:
+        key = f"{f['report']}#{f['n']}"
+        f["inherited"] = joins[0].get(key, "")
+        derived = _derive(key, rows, joins)
+        f.update({k: derived[k] for k in ("verdict", "pr", "hidden", "claimed")})
     findings.sort(key=lambda f: (f["repo"], f["rank"], f["report"], f["n"]))
     return reports, findings
 
@@ -154,7 +210,9 @@ def findings_tsv(only_new: bool) -> list[str]:
     the shape bin/meute's cmd_findings sorts and lays out. One process for every
     report, where the shell version spawned several per finding."""
     rows = _state_rows()
-    out: list[str] = []
+    found: list[tuple] = []
+    occurrences: list[tuple[str, str, tuple]] = []
+    groups: list[dict] = []
     for rid in _report_ids():
         try:
             meta, body = report_lib.read(report_path(rid))
@@ -164,15 +222,83 @@ def findings_tsv(only_new: bool) -> list[str]:
         if not report_lib.has_findings_section(body):
             continue
         repo = meta.get("repo") or ("" if meta.get("repo") == "" else "?")
+        fp_repo = report_lib.report_repo(meta, report_path(rid))
+        keyfps: list[tuple[str, str]] = []
         for f in report_lib.parse_findings(body):
-            state = rows.get(f"{rid}#{f['n']}", ("new",))[0]
-            if only_new and state != "new":
-                continue
-            out.append("\t".join((
-                repo, str(SEVERITY_RANK[f["severity"]]), f["severity"],
-                f"{rid}#{f['n']}", "NEW" if state == "new" else state,
-                f["title"].split("\t")[0])))
+            key = f"{rid}#{f['n']}"
+            fp = report_lib.fingerprint(fp_repo, f["location"], f["title"])
+            occurrences.append((key, fp, _order(meta, rid)))
+            keyfps.append((key, fp))
+            found.append((repo, f, key))
+        groups.append(_group(meta, rid, fp_repo, keyfps))
+    joins = _joins(occurrences, groups, rows)
+    out: list[str] = []
+    for repo, f, key in found:
+        derived = _derive(key, rows, joins)
+        if only_new and derived["hidden"]:
+            continue
+        state = derived["label"]
+        out.append("\t".join((
+            repo, str(SEVERITY_RANK[f["severity"]]), f["severity"],
+            key, "NEW" if state == "new" else state,
+            f["title"].split("\t")[0])))
     return out
+
+
+def findings_json(only_new: bool) -> list[dict]:
+    """`meute findings --json`: the contract external fix workflows read and
+    write back through `meute claim` and `meute resolve --pr` (P1.7)."""
+    _, findings = load_reports()
+    out: list[dict] = []
+    for f in findings:
+        if only_new and f["hidden"]:
+            continue
+        out.append({
+            "id": f"{f['report']}#{f['n']}", "report": f["report"], "n": f["n"],
+            "fingerprint": f["fingerprint"], "repo": f["repo"],
+            "severity": f["severity"], "title": f["title"],
+            "location": f["location"], "base": f["base"],
+            "state": "claimed" if f["claimed"] else f["state"],
+            "inherited": f["inherited"], "verdict": f["verdict"], "pr": f["pr"],
+        })
+    return out
+
+
+def verify(repo_paths: dict[str, str], only_repo: str = "") -> dict[str, int]:
+    """`meute findings verify`: a verdict for every undecided finding, written
+    to state/finding-status (claims kept). Returns counts per verdict."""
+    rows = _state_rows()
+    results: dict[str, tuple[str, str]] = {}
+    counts = {v: 0 for v in finding_status.VERDICTS}
+    now = subprocess.run(["date", "--iso-8601=seconds"], capture_output=True,
+                         text=True).stdout.strip()
+    for rid in _report_ids():
+        try:
+            meta, body = report_lib.read(report_path(rid))
+        except Exception as e:
+            sys.stderr.write(f"meute: skipping unreadable report {rid}: {e}\n")
+            continue
+        repo = report_lib.report_repo(meta, report_path(rid))
+        if (only_repo and repo != only_repo) or not report_lib.has_findings_section(body):
+            continue
+        todo = [f for f in report_lib.parse_findings(body) if f"{rid}#{f['n']}" not in rows]
+        if not todo:
+            continue
+        head, verdicts = finding_status.verify_report(
+            repo_paths.get(repo, ""), meta.get("base", ""),
+            [report_lib._norm_path(f["location"]) if f["location"] else "" for f in todo])
+        for f, verdict in zip(todo, verdicts):
+            results[f"{rid}#{f['n']}"] = (verdict, head)
+            counts[verdict] += 1
+    # Re-read under the lock: the git work above can take minutes, and a
+    # claim written meanwhile must keep its pr column.
+    with finding_status.locked(ROOT):
+        status = finding_status.read_status(ROOT)
+        for key, (verdict, head) in results.items():
+            pr = status.get(key, ["", "", "", ""])[3]
+            status[key] = [verdict, head, now, pr]
+        finding_status.write_status(ROOT, status)
+    return counts
 
 
 def finding_body(rid: str, n: int) -> str:
@@ -219,8 +345,10 @@ def load_status() -> dict:
         pass
     try:
         policy = json.loads(subprocess.run(
-            [SYSTEM_PYTHON, os.path.join(HERE, "manifest.py"), "policy",
-             os.environ.get("MEUTE_MANIFEST") or _manifest()],
+            # The policy a run obeys: the manifest's, with any override in force.
+            [SYSTEM_PYTHON, os.path.join(HERE, "manifest.py"), "policy-effective",
+             os.environ.get("MEUTE_MANIFEST") or _manifest(),
+             os.path.join(ROOT, "state", "policy-override")],
             capture_output=True, text=True, check=True).stdout)
         out["floor"] = policy.get("quota_floor_percent")
         out["ceiling"] = policy.get("weekly_cost_usd") or policy.get("weekly_runs")
@@ -308,6 +436,18 @@ def main(argv: list[str]) -> int:
     elif cmd == "findings" and "--tsv" in args:
         for row in findings_tsv("--new" in args):
             print(row)
+    elif cmd == "findings" and "--json" in args:
+        print(json.dumps(findings_json("--all" not in args)))
+    elif cmd == "verify":
+        # repo name -> path, as `manifest.py list-repos` JSON lines on stdin
+        paths = {}
+        for line in sys.stdin:
+            if line.strip():
+                r = json.loads(line)
+                paths.setdefault(r.get("name", ""), r.get("path", ""))
+        only = args[args.index("--repo") + 1] if "--repo" in args[:-1] else ""
+        counts = verify(paths, only)
+        print(" ".join(f"{k}={v}" for k, v in counts.items()))
     elif cmd in ("promote", "dismiss", "resolve") and len(args) >= 2:
         result = act(cmd, args[0], int(args[1]), *args[2:])
         print(json.dumps(result))

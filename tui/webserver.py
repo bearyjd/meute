@@ -7,8 +7,10 @@ drift from the CLI. Every request needs an exact Host match and is refused
 when the browser marks it cross-site or same-site (Sec-Fetch-Site): another
 site's <img> or no-cors fetch sends the right Host, and POST /api/plan/start
 runs a full scan. POSTs also need a per-process token and (when sent) an exact Origin
-match. Report text is untrusted: this module only ever serves it as text/plain
-or inside JSON.
+match. The token is printed as a startup link (/?t=...); opening it sets an
+HttpOnly cookie, and only GET / with that cookie embeds the token. Report
+text is untrusted: this module only ever serves it as text/plain or inside
+JSON.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import os
 import re
 import secrets
 import sys
+import threading
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -46,6 +50,16 @@ PLACEHOLDER = (
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 VERBS = ("promote", "dismiss", "resolve")
 MAX_BODY = 64 * 1024
+# R17: the token is printed as a startup link; opening it sets this cookie, and
+# only a request carrying it gets the page with the token embedded.
+NO_COOKIE_PAGE = (
+    '<!doctype html><html><head><meta charset="utf-8"><title>meute</title></head>'
+    "<body><p>meute: open the link printed in the terminal "
+    "where <code>meute web</code> started.</p></body></html>"
+)
+# R22: an idle connection frees its thread after Handler.timeout seconds, and
+# connections beyond MAX_THREADS are closed instead of spawning more threads.
+MAX_THREADS = 32
 # Sec-Fetch-Site values a browser sends for requests another site started.
 # same-origin (this page), none (address bar, bookmark) and absent (curl,
 # older browsers) pass.
@@ -105,7 +119,34 @@ def parse_act(payload: object, reasons: list[str]) -> tuple:
 
 # -------------------------------------------------------------- handlers ---
 
+def cookie_name(port: int) -> str:
+    # Cookies are not port-scoped: two servers on 127.0.0.1 must not clobber each other.
+    return f"meute_t_{port}"
+
+
+def token_ok(h: "Handler", value: str) -> bool:
+    return hmac.compare_digest(value.encode(), h.server.token.encode())
+
+
+def has_cookie(h: "Handler") -> bool:
+    try:
+        jar = SimpleCookie(h.headers.get("Cookie") or "")
+    except CookieError:
+        return False
+    morsel = jar.get(cookie_name(h.server.server_port))
+    return morsel is not None and token_ok(h, morsel.value)
+
+
 def get_index(h: "Handler", query: dict) -> None:
+    t = (query.get("t") or [""])[0]
+    if t and token_ok(h, t):
+        cookie = f"{cookie_name(h.server.server_port)}={h.server.token}; Path=/; HttpOnly; SameSite=Strict"
+        h.send_bytes(303, b"", "text/plain; charset=utf-8",
+                     {"Location": "/", "Set-Cookie": cookie})
+        return
+    if not has_cookie(h):
+        h.send_bytes(403, NO_COOKIE_PAGE.encode(), "text/html; charset=utf-8")
+        return
     path = os.path.join(WEB_DIR, "index.html")
     try:
         with open(path, encoding="utf-8") as f:
@@ -165,7 +206,11 @@ def post_enqueue(h: "Handler", query: dict) -> None:
 
 
 def post_run_start(h: "Handler", query: dict) -> None:
-    call_run(h, "start")
+    payload = h.read_json()
+    source = payload.get("source", "plan") if isinstance(payload, dict) else "plan"
+    if not isinstance(source, str):
+        raise BadRequest("source must be a string")
+    call_run(h, "start", source)
 
 
 def post_run_stop(h: "Handler", query: dict) -> None:
@@ -176,7 +221,34 @@ def get_run_status(h: "Handler", query: dict) -> None:
     call_run(h, "status")
 
 
+CLIENT_PAGES = ("inbox", "run")
+MAX_CLIENT_MSG = 300
+MAX_CLIENT_EVENTS = 1000  # beacons kept in memory; oldest dropped first
+
+
+def record_client(h: "Handler", kind: str, detail: str) -> None:
+    detail = detail[:MAX_CLIENT_MSG]
+    events = h.server.client_events
+    events.append((kind, detail))
+    del events[:-MAX_CLIENT_EVENTS]
+    sys.stderr.write(f"webserver: client-{kind} {detail!r}\n")
+    h.send_json(200, {"ok": True})
+
+
+def get_client_ready(h: "Handler", query: dict) -> None:
+    page = (query.get("page") or [""])[0]
+    if page not in CLIENT_PAGES:
+        raise BadRequest("bad page")
+    record_client(h, "ready", page)
+
+
+def get_client_error(h: "Handler", query: dict) -> None:
+    record_client(h, "error", (query.get("msg") or [""])[0])
+
+
 ROUTES = {
+    ("GET", "/api/client-ready"): get_client_ready,
+    ("GET", "/api/client-error"): get_client_error,
     ("GET", "/"): get_index,
     ("GET", "/api/inbox"): get_inbox,
     ("GET", "/api/finding"): get_finding,
@@ -212,16 +284,17 @@ def get_static(name: str):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"  # no keep-alive: rejected POSTs leave bodies unread
+    timeout = 30  # R22: socket timeout so an idle client cannot pin a thread
 
     # -- plumbing --
     def log_message(self, fmt, *args):
         sys.stderr.write("webserver: %s - %s\n" % (self.address_string(), fmt % args))
 
-    def send_bytes(self, status: int, data: bytes, ctype: str) -> None:
+    def send_bytes(self, status: int, data: bytes, ctype: str, extra: dict | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        for k, v in SECURITY_HEADERS.items():
+        for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
@@ -282,15 +355,38 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer with at most MAX_THREADS handler threads (R22)."""
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            sys.stderr.write(f"webserver: {MAX_THREADS} connections busy, dropped {client_address[0]}\n")
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None):
     """Build (server, token). port=0 picks a free port: read server.server_port.
 
     run_mod defaults to a RunController for ROOT; constructing one runs nothing.
     """
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = Server((host, port), Handler)
     server.daemon_threads = True
+    server.slots = threading.BoundedSemaphore(MAX_THREADS)
     server.token = secrets.token_urlsafe(32)
     server.bound_host = host
+    server.client_events = []  # (kind, detail) beacons from the page; see record_client
     server.inbox_mod = inbox_mod
     server.run_mod = run_mod if run_mod is not None else runctl.RunController(ROOT)
     return server, server.token
@@ -301,6 +397,9 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8642)
     args = ap.parse_args()
+    # Owner-only files on a shared host (P2.4): the run log and every run the
+    # server starts inherit this, also when it is launched without bin/meute.
+    os.umask(0o077)
     try:
         server, _ = make_server(args.host, args.port)
     except OSError as e:
@@ -308,7 +407,7 @@ def main() -> None:
             raise
         sys.stderr.write(f"meute web: port {args.port} is already in use\n")
         sys.exit(1)
-    print(f"meute web inbox on http://{args.host}:{server.server_port}/", flush=True)
+    print(f"meute web inbox on http://{args.host}:{server.server_port}/?t={server.token}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

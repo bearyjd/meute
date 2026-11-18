@@ -22,11 +22,17 @@ cmd_status() {
   [[ "$source" == "stub" ]] && gate="UNMEASURED (stub) — run: meute install-statusline"
   # A hold overrides the gate, so it is the first thing said. A paused fleet
   # reading "quota 100% · ok" is how you conclude it is about to run.
+  if (( POLICY_OVERRIDE_ACTIVE )); then
+    printf 'POLICY OVERRIDE in force (the manifest is not what is applied):\n'
+    if policy_override_show >/dev/null; then policy_override_show | sed 's/^/  /'
+    else printf '  quota floor set for this invocation by MEUTE_QUOTA_FLOOR\n'; fi
+  fi
   if hold_active; then
     printf 'PAUSED until %s%s\n' "$(hold_until_human "$HOLD_UNTIL")" "${HOLD_REASON:+ — ${HOLD_REASON}}"
     printf '  every slot declines until then; lift it with: meute resume\n'
   fi
   printf 'Claude quota %s%%  ·  %s\n' "$quota" "$gate"
+  quota_pool_line "$quota" "$("${MEUTE_ROOT}/bin/quota.sh" --engine claude --age 2>/dev/null || echo -)"
   if codex_probe="$("${MEUTE_ROOT}/bin/quota.sh" --engine codex --with-source 2>/dev/null)"; then
     printf 'Codex quota %s%%  ·  configured (%s)\n' "${codex_probe%% *}" "${codex_probe#* }"
   else
@@ -53,6 +59,7 @@ cmd_status() {
   [[ -n "${MEUTE_WEEKLY_RUNS:-}" ]] && ceiling=" (ceiling ${MEUTE_WEEKLY_RUNS} runs)"
   printf '  week %s   %s runs (%s personal · %s community) · $%s%s\n' \
     "$THIS_WEEK" "$total" "$(( total - community ))" "$community" "$cost" "$ceiling"
+  printf '  other consumers of this pool are not measured\n'
 
   local in_flight=0
   if fleet_load_scope 2>/dev/null; then in_flight="$(tier3_in_flight 2>/dev/null || echo 0)"; fi

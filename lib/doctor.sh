@@ -91,6 +91,10 @@ cmd_doctor() {
   if python3 "$MANIFEST_PY" validate "$MANIFEST" >/dev/null 2>&1; then
     d_ok "$(basename "$MANIFEST") is valid"
     fleet_load_policy >/dev/null 2>&1 || true
+    local unknown_keys
+    unknown_keys="$(python3 "$MANIFEST_PY" unknown-policy-keys "$MANIFEST" 2>/dev/null | paste -sd, - || true)"
+    [[ -z "$unknown_keys" ]] \
+      || d_warn "unknown policy key(s): ${unknown_keys//,/, } - not read by anything, so the default applies"
     local repos community
     repos="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('repos') or []))" "$MANIFEST")"
     community="$(python3 -c "import yaml,sys; d=yaml.safe_load(open(sys.argv[1])) or {}; print(len(d.get('community') or []))" "$MANIFEST")"
@@ -117,6 +121,7 @@ cmd_doctor() {
     d_err "$(basename "$MANIFEST") failed validation — run: ./bin/run.sh --validate"
   fi
 
+  doctor_stale
   doctor_containers
 
   printf '\n  quota gates\n'
@@ -209,6 +214,11 @@ cmd_doctor() {
         ;;
       *) d_ok "manifest lives outside the harness (${real})" ;;
     esac
+  fi
+  doctor_privacy
+
+  if (( POLICY_OVERRIDE_ACTIVE )); then
+    d_warn "a policy override is in force, not the manifest's policy (meute policy show; meute policy clear)"
   fi
 
   if hold_active; then
@@ -306,4 +316,15 @@ doctor_containers() {
   else
     d_ok "atelier-egress running at ${actual}"
   fi
+}
+
+# What the startup sweep would remove, listed and left alone (lib/sweep.sh).
+doctor_stale() {
+  local line any=0
+  printf '\n  leftovers of killed runs\n'
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    any=1; d_warn "$line (the next fire removes it)"
+  done < <(sweep_stale --dry-run 2>/dev/null)
+  (( any )) || d_ok "nothing stale"
 }

@@ -56,6 +56,11 @@ plan_only_precheck() {
   local scan_dir="$1" arg phys real why; shift
   PLAN_ONLY_ARGS=(); PLAN_ONLY_REAL=()
   for arg in "$@"; do
+    # An empty path is no subscript, and `cd ""` would name the cwd.
+    if [[ -z "$arg" ]]; then
+      plan_only_reject "''" "plan: --only '': not an unconfigured repository (empty path)"
+      continue
+    fi
     why=""
     if ! phys="$(cd "$arg" 2>/dev/null && pwd -P)"; then why="no such directory"
     elif [[ ! -e "$phys/.git" ]]; then why="not a Git repository"

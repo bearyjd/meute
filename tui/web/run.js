@@ -41,15 +41,16 @@ function shouldApply(seq, lastApplied) { return seq > lastApplied; }
 function isStaged(st) { return !!st && st.total > 0 && st.remaining > 0; }
 
 // Button enabled flags. Unknown state (last poll failed) disables Start/Enqueue;
-// Start also needs something staged (`hint`: idle, but nothing to start).
+// Start also needs something staged unless the source is the configured repos
+// (`hint`: idle, but nothing to start).
 // Stop is never blocked by busy, only by its own in-flight call.
 function buttonFlags(f) {
   const st = f.pollFailed ? null : f.state;
   const idle = st === "idle";
   return {
     enqueue: !!f.anyChecked && idle && !f.busy,
-    start: idle && !f.busy && !!f.staged,
-    hint: idle && !f.busy && !f.staged,
+    start: idle && !f.busy && (!!f.staged || f.source === "manifest"),
+    hint: idle && !f.busy && !f.staged && f.source !== "manifest",
     stop: f.pollFailed ? !f.stopBusy : st !== "idle" && !f.stopBusy,
     plan: !f.busy,
   };
@@ -136,8 +137,14 @@ function buildRunSection() {
   const mk = (id, label) => { const b = el("button", label); b.type = "button"; b.id = id; return b; };
   const hint = el("span", "", "muted");
   hint.id = "run-start-hint";
+  const src = el("select");
+  src.id = "run-source";
+  src.title = "What Start drains: the staged plan, or the repos in repos.yaml";
+  [["plan", "staged plan"], ["manifest", "configured repos"]].forEach(([v, t]) => {
+    const o = el("option", t); o.value = v; src.append(o);
+  });
   bar.append(mk("run-plan", "Plan"), mk("run-all", "select all"), mk("run-none", "select none"),
-    mk("run-enqueue", "Enqueue selected"), mk("run-start", "Start"),
+    mk("run-enqueue", "Enqueue selected"), src, mk("run-start", "Start"),
     hint, mk("run-stop", "Stop"));
   const help = el("p", "Tick the repos to analyse, then Enqueue selected. Enqueueing again replaces the "
     + "staged queue (it does not add to it). Nothing is ticked by default.", "muted");
@@ -218,7 +225,7 @@ function syncButtons() {
   const fl = buttonFlags({
     state: runUi.status ? runUi.status.state : "idle", pollFailed: runUi.pollFailed,
     busy: runUi.busy, stopBusy: runUi.stopBusy, anyChecked: checkedEntries().some((e) => e.checked),
-    staged: isStaged(runUi.status),
+    staged: isStaged(runUi.status), source: runSource(),
   });
   $("run-enqueue").disabled = !fl.enqueue;
   $("run-start").disabled = !fl.start;
@@ -320,12 +327,14 @@ function doEnqueue() {
   });
 }
 
+function runSource() { return $("run-source").value === "manifest" ? "manifest" : "plan"; }
+
 function doStart() {
   const ok = window.confirm("Start the run? This spends Claude/Codex subscription quota and keeps going "
-    + "until the staged queue is done, the quota floor/pause stops it, or you press Stop.");
+    + "until the source is drained, the quota floor/pause stops it, or you press Stop.");
   if (!ok) return Promise.resolve();
   return guarded(async () => {
-    const res = await runCall("POST", "/api/run/start", {});
+    const res = await runCall("POST", "/api/run/start", { source: runSource() });
     runNotice(res.message || "started", true);
     await pollStatus();
   });
@@ -358,8 +367,10 @@ $("run-all").addEventListener("click", () => setAllChecked(true));
 $("run-none").addEventListener("click", () => setAllChecked(false));
 $("run-enqueue").addEventListener("click", doEnqueue);
 $("run-start").addEventListener("click", doStart);
+$("run-source").addEventListener("change", syncButtons);
 $("run-stop").addEventListener("click", doStop);
 syncButtons();
 document.addEventListener("meute:tab", (e) => {
   if (e.detail === "run") startPolling(); else stopPolling();
 });
+beacon("/api/client-ready?page=run");

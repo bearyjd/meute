@@ -28,13 +28,16 @@
 timer_state() {
   local unit="$1" out
   out="$(systemctl --user show "$unit" \
-           -p LoadState -p UnitFileState -p ActiveState -p NextElapseUSecRealtime \
+           -p LoadState -p UnitFileState -p ActiveState -p SubState -p NextElapseUSecRealtime \
            2>/dev/null)" || { printf 'nobus\t\n'; return 0; }
   local load file next
   load="$(sed -n 's/^LoadState=//p'             <<<"$out")"
   file="$(sed -n 's/^UnitFileState=//p'         <<<"$out")"
   next="$(sed -n 's/^NextElapseUSecRealtime=//p' <<<"$out")"
   if [[ "$load" == "not-found" || -z "$load" ]]; then printf 'absent\t\n'; return 0; fi
+  # While its service runs a timer is SubState=running with no next elapse; it
+  # re-arms when the run ends, so it is armed, not inert.
+  [[ "$(sed -n 's/^SubState=//p' <<<"$out")" == running ]] && { printf 'armed\tnow (a run is in progress)\n'; return 0; }
   # systemd 258 leaves this empty for an inert timer; other versions answer "0"
   # or "n/a". Reading any of them as a time is the false positive this exists
   # to prevent, so all three mean the same thing: nothing is scheduled.
@@ -171,6 +174,9 @@ cmd_install_timers() {
 [Unit]
 Description=meute fleet runner (${slot} slot)
 Documentation=https://github.com/bearyjd/meute
+# A failed fire alerts through policy.alert_cmd (lib/health.sh). A skip exits
+# 0 (D1), so only a real failure reaches it.
+OnFailure=meute-alert.service
 
 [Service]
 Type=oneshot
@@ -196,14 +202,15 @@ WantedBy=timers.target
 UNIT
     note "wrote ${unit_dir}/meute-${slot}.{service,timer}"
   done
+  timers_write_health "$unit_dir" "$path_line"
   systemctl --user daemon-reload || true
-  systemctl --user enable --now meute-daily.timer meute-weekly.timer || true
+  systemctl --user enable --now meute-daily.timer meute-weekly.timer meute-health.timer || true
 
   # Assert the arming rather than trusting the exit code. The previous version
   # sent this listing to /dev/null, so it printed "0 timers listed" and reported
   # success over two timers that had never been started.
   local slot state detail inert=()
-  for slot in daily weekly; do
+  for slot in daily weekly health; do
     IFS=$'\t' read -r state detail <<<"$(timer_state "meute-${slot}.timer")"
     case "$state" in
       armed) note "meute-${slot}.timer armed - next ${detail}" ;;
@@ -221,4 +228,39 @@ UNIT
 
   (( ${#inert[@]} == 0 )) || \
     die "units written, but ${inert[*]} not armed. Start them where systemd can be reached:  systemctl --user start ${inert[*]}"
+}
+
+# timers_write_health <unit-dir> <path-line>: the hourly `meute health --alert`
+# and the alert unit both run services name as OnFailure= (plan P1.8).
+timers_write_health() {
+  local unit_dir="$1" path_line="$2" name args
+  for name in health alert; do
+    args="--alert"; [[ "$name" == alert ]] && args="--alert --failed"
+    cat > "${unit_dir}/meute-${name}.service" <<UNIT
+[Unit]
+Description=meute ${name} check
+Documentation=https://github.com/bearyjd/meute
+
+[Service]
+Type=oneshot
+WorkingDirectory=${MEUTE_ROOT}
+Environment=PATH=${path_line}
+ExecStart=${MEUTE_ROOT}/bin/meute health ${args}
+TimeoutStartSec=300
+UNIT
+  done
+  cat > "${unit_dir}/meute-health.timer" <<UNIT
+[Unit]
+Description=meute hourly health check
+Documentation=https://github.com/bearyjd/meute
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
+UNIT
+  note "wrote ${unit_dir}/meute-{health,alert}.service and meute-health.timer"
 }

@@ -18,11 +18,18 @@ set -uo pipefail
 # tests read the REAL state/log instead of the fixture's, and five of them fail
 # with nothing to indicate why. Found exactly that way.
 unset MEUTE_ROOT
+# No test starts a real systemd scope; the P2.7 tests turn it on with a stub.
+export MEUTE_SCOPE=off
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PASS=0; FAILED=0
 FIXTURE="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE"' EXIT
+# The host-health gate reads the real load by default, and a busy CI host or
+# a dev box would then skip every run these tests make. Pin a calm one;
+# test_host_gate overrides it per case.
+printf '0.10 0.10 0.10 1/100 1\n' > "$FIXTURE/loadavg"
+export MEUTE_LOADAVG="$FIXTURE/loadavg" MEUTE_NCPU=4
 
 ok()   { printf '  ok    %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad()  { printf '  FAIL  %s\n        %s\n' "$1" "$2"; FAILED=$(( FAILED + 1 )); }
@@ -3368,6 +3375,13 @@ test_web_bind_guard() {
   out="$(web --host 192.0.2.10 --insecure-public)"
   has "web: explicit insecure opt-in permits non-loopback" "$out" "webserver.py --host 192.0.2.10"
   has "web: warning says fleet runs spend quota" "$out" "start fleet runs"
+  # Any bare URL the CLI prints leads to the 403 "open the link" page: the
+  # only usable link is the token-bearing one the server prints at startup.
+  out="$(web --host 127.0.0.1 --port 8123)"
+  hasnt "web: CLI prints no tokenless URL (loopback)" "$(grep -E 'http://[0-9.]+:[0-9]+/($|[^?])' <<< "$out")" "http://"
+  has   "web: CLI points at the startup link" "$out" "link printed"
+  out="$(web --host 192.0.2.10 --insecure-public)"
+  hasnt "web: CLI prints no tokenless URL (non-loopback)" "$(grep -E 'http://[0-9.]+:[0-9]+/($|[^?])' <<< "$out")" "http://"
   # The Host check accepts only the bound host:port, and no browser sends
   # Host 0.0.0.0, so a wildcard bind could only ever answer 403.
   local wild
@@ -3402,12 +3416,12 @@ test_web_bind_guard() {
 test_web_invariants() {
   local f bad rc out
   for f in "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" \
-           "$REPO/lib/inbox.py" "$REPO/lib/report.py"; do
+           "$REPO/lib/inbox.py" "$REPO/lib/report.py" "$REPO/lib/finding_status.py"; do
     bad="$(python3 - "$f" <<'PY2'
 import ast, sys
 std = sys.stdlib_module_names
 # the only sibling modules the web files may import (never serve/app/model)
-siblings = {"inbox", "report", "runctl", "runprogress"}
+siblings = {"inbox", "report", "finding_status", "runctl", "runprogress"}
 tree = ast.parse(open(sys.argv[1]).read())
 bad = []
 for n in ast.walk(tree):
@@ -6251,13 +6265,45 @@ test_p15_only_checked_first
 test_p15_plan_identity_cache
 test_p15_only_refuses_own_checkout
 test_p15_only_one_spelling
+test_p15_only_empty_path
 test_p15_append_vs_retire
 test_p15_retire_waits_for_lock
 test_p15_guard_rechecked_under_lock
+test_policy_override
+test_host_gate
+test_startup_sweep
+test_health
+test_policy_override_hardening
+test_policy_override_bad_rows
+test_p24_redact
+test_p24_report_and_umask
+test_p24_doctor
+test_p24_doctor_fail_closed
+test_p23_quota_age
+test_p1_3_source_manifest
+test_p1_4_once
+test_p1_3_wait_lock
+test_p1_3_drain_rotation
+test_p1_3_drain_stops
+test_p1_3_drain_lock_and_source
+test_p1_3_drain_until
+test_p1_3_drain_repo_cursor
+test_p2_7_scope_containment
+test_p2_7_scope_signals
+test_p2_7_scope_lib
+test_p2_7_scope_reaps_stragglers
+test_p1_3_drain_empty_repo
 test_p0_ci_workflow
 test_real_repo_untouched
 test_web_invariants
 test_p0_5_single_process_reads
 test_p0_5_findings_failure_and_nonregular
+test_p1_7a_fingerprint_inherit
+test_p1_7b_verify_claim
+test_p1_7b_status_ignored
+test_p1_7b_verify_hardening
+test_p1_7b_rewritten_rename
+test_p26_unknown_policy_keys
+test_kv_writes_locked
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

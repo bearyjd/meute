@@ -36,6 +36,7 @@ command that writes repos.local.yaml or state/tickets.yaml.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -73,11 +74,18 @@ OWNER_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*
 
 POLICY_DEFAULTS = {
     "quota_floor_percent": 30,
+    "quota_max_age_hours": None,
     "weekly_runs": None,
     "weekly_cost_usd": None,
     "community_share": 0.20,
     "tier3_max_in_flight": 3,
     "branch_prefix": "meute",
+    # Host-health gate (lib/hostcheck.sh). 0 disables either check.
+    "max_load_per_cpu": 2.0,
+    "min_free_mb": 512,
+    # `meute health --alert` pipes its text to this command line (D4); empty
+    # means nothing is sent. Not overridable: lib/policy_override.py.
+    "alert_cmd": "",
     # systemd OnCalendar strings. One item runs per fire, so cadence is the
     # lever that turns "fleet coverage" into "how often each repo is seen".
     "daily_calendar": "*-*-* 03:17:00",
@@ -120,6 +128,14 @@ def load(path: str) -> dict:
     return data
 
 
+def unknown_policy_keys(data: dict) -> list:
+    """Keys under policy: that nothing reads; a typo here silently falls back to the default."""
+    supplied = data.get("policy")
+    if not isinstance(supplied, dict):
+        return []
+    return sorted(str(key) for key in supplied if key not in POLICY_DEFAULTS)
+
+
 def merged_policy(data: dict) -> dict:
     policy = dict(POLICY_DEFAULTS)
     supplied = data.get("policy") or {}
@@ -129,6 +145,9 @@ def merged_policy(data: dict) -> dict:
     floor = policy["quota_floor_percent"]
     if not isinstance(floor, int) or not 0 <= floor <= 100:
         raise ManifestError("policy.quota_floor_percent: must be an integer 0-100")
+    max_age = policy["quota_max_age_hours"]
+    if max_age is not None and (isinstance(max_age, bool) or not isinstance(max_age, (int, float)) or max_age <= 0):
+        raise ManifestError("policy.quota_max_age_hours: must be a positive number")
     share = policy["community_share"]
     if not isinstance(share, (int, float)) or not 0.0 <= float(share) <= 1.0:
         raise ManifestError("policy.community_share: must be a number 0.0-1.0")
@@ -144,6 +163,15 @@ def merged_policy(data: dict) -> dict:
         raise ManifestError("policy.weekly_runs: must be a positive integer")
     if cost is not None and (not isinstance(cost, (int, float)) or float(cost) <= 0):
         raise ManifestError("policy.weekly_cost_usd: must be a positive number")
+    load = policy["max_load_per_cpu"]
+    if isinstance(load, bool) or not isinstance(load, (int, float)) or not math.isfinite(load) or load < 0:
+        raise ManifestError("policy.max_load_per_cpu: must be a number >= 0 (0 disables the load check)")
+    free = policy["min_free_mb"]
+    if isinstance(free, bool) or not isinstance(free, int) or free < 0:
+        raise ManifestError("policy.min_free_mb: must be an integer >= 0 (0 disables the disk check)")
+    alert = policy["alert_cmd"]
+    if not isinstance(alert, str) or "\n" in alert:
+        raise ManifestError("policy.alert_cmd: must be a one-line command string (empty sends nothing)")
     if not SAFE_NAME.match(str(policy["branch_prefix"])):
         raise ManifestError("policy.branch_prefix: must be a safe identifier")
     for key in ("daily_calendar", "weekly_calendar"):
@@ -546,12 +574,20 @@ def cmd_validate(args: list) -> int:
     root = repo_root(manifest)
     data = load(manifest)
     merged_policy(data)
+    unknown = unknown_policy_keys(data)
+    if unknown:
+        sys.stderr.write(f"meute/manifest: warning: unknown policy key(s): {', '.join(unknown)}\n")
     entries = [entry for slot in VALID_SLOTS for entry in build_queue(data, slot, root)]
     # A stranded state/stages row is not a reason to refuse the manifest, but
     # validate is the one step that runs exactly once per fire, so this is
     # where the journal hears about it.
     warn_unconsumed_rows(load_stages(root), consumed_keys(entries))
     print(f"ok: {manifest}")
+    return 0
+
+
+def cmd_unknown_policy_keys(args: list) -> int:
+    print("\n".join(unknown_policy_keys(load(args[0]))))
     return 0
 
 
@@ -677,11 +713,15 @@ from manifest_write import (  # noqa: E402
     cmd_mark_delivered,
     cmd_set_image_digest,
 )
+from policy_override import cmd_policy_check, cmd_policy_effective  # noqa: E402
 
 
 COMMANDS = {
     "validate": (cmd_validate, 1),
     "policy": (cmd_policy, 1),
+    "policy-effective": (cmd_policy_effective, 1),
+    "policy-check": (cmd_policy_check, 3),
+    "unknown-policy-keys": (cmd_unknown_policy_keys, 1),
     "queue": (cmd_queue, 2),
     "plan-queue": (cmd_plan_queue, 3),
     "render": (cmd_render, 1),

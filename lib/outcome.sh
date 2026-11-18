@@ -21,14 +21,14 @@
 #    2  usage                            15  host not healthy (load, disk)
 #   10  hold                             70  the runner itself died
 #   11  another run holds the lock
-#   12  budget (meute's own ceiling)
+#   12  budget (meute's own ceiling)    16  already done (--once)
 # The code= field in state/log is the same vocabulary; tui/runprogress.py
 # reads it in preference to the free text.
 #
 # Expects from the caller: LOG_FILE, STARTED_AT, THIS_WEEK, START_EPOCH, SLOT,
 # and the LOG_RUNTIME/LOG_IMAGE/LOG_STAGE/LOG_PR columns (unset reads as "-").
 
-readonly OUTCOME_SKIP_CODES="hold lock budget quota-floor quota-unknown nothing-eligible no-queue load disk"
+readonly OUTCOME_SKIP_CODES="hold lock budget quota-floor quota-unknown nothing-eligible no-queue load disk already-done"
 OUTCOME_LOGGED=0
 OUTCOME_CODE=""
 OUTCOME_LAST_NOTE=""
@@ -54,6 +54,7 @@ outcome_exit_status() {
     quota-floor|quota-unknown) echo 13 ;;
     nothing-eligible|no-queue) echo 14 ;;
     load|disk) echo 15 ;;
+    already-done) echo 16 ;;
     *) echo 70 ;;
   esac
 }
@@ -75,6 +76,8 @@ log_run() {
   line="$(printf '%s\tweek=%s\tslot=%s\tstatus=%s' "$STARTED_AT" "$THIS_WEEK" "${SLOT:-none}" "$status")"
   local field
   for field in "$@"; do line+="$(printf '\t%s' "$field")"; done
+  (( ! ${POLICY_OVERRIDE_ACTIVE:-0} )) || line+="$(printf '\tpolicy=override')"
+  [[ -z "${POLICY_OVERRIDE_IGNORED:-}" ]] || line+="$(printf '\tpolicy_ignored=%s' "$POLICY_OVERRIDE_IGNORED")"
   local code="$OUTCOME_CODE"
   [[ -n "$code" ]] || { [[ "$status" == "ok" ]] && code="ok" || code="failed"; }
   line+="$(printf '\tcode=%s\tdur=%ss' "$code" "$duration")"

@@ -6,17 +6,25 @@
 #
 # Commands:
 #   doctor                        is this fleet deployable? checks the real scheduling environment
-#   install-timers                write and enable systemd user timers for both slots
+#   health [--alert]              one line per reason the fleet may have stopped; exits 1 if any.
+#                                  --alert also pipes the text to policy.alert_cmd (hourly timer)
+#   install-timers                write and enable systemd user timers for both slots, the
+#                                  hourly health check, and OnFailure alerts for both run units
 #   install-statusline            wrap Claude Code's status line so the real 5h/7d
 #                                  subscription windows reach the quota gate
 #   status                        quota, what runs next, this week's activity
 #   reports [--new|--all]         list reports with their triage state
-#   findings [--new|--all]        one row per finding — the actual unit of decision
+#   findings [--new|--all] [--json]
+#                                 one row per finding — the actual unit of decision;
+#                                  --new hides gone, superseded, claimed and inherited rows
+#   findings verify [--repo R]    is each new finding's file gone, changed or current
+#                                  at the repository's HEAD? (state/finding-status)
+#   claim <id> -f <n> --pr <url>  the finding is covered by an open PR
 #   show <id>                     print a report to stdout and mark it read
 #   promote <id> -f <n> [-t T]    turn finding <n> into a tier-3 specced ticket
-#   resolve <id> [-f <n>] -m <text>
+#   resolve <id> [-f <n>] -m <text> | --pr <url>
 #                                 record that a finding was already fixed directly
-#                                 (no ticket) -- -m is required, e.g. a PR link
+#                                 (no ticket) -- -m or --pr is required
 #   dismiss <id> [-f <n>] -r <reason> [-m <text>]
 #                                 record a decision; -r is required and is one of
 #                                 false-positive wont-fix out-of-scope duplicate too-large other
@@ -28,6 +36,16 @@
 #                                  uid, capabilities, /work, /out, the network
 #   pause [--for 3d] [-r why]     stand the fleet down; every slot declines until it expires
 #   resume                        lift the pause early
+#   policy set k=v... --for 8h [-r why]
+#                                 override quota_floor_percent, weekly_runs, weekly_cost_usd,
+#                                 community_share or tier3_max_in_flight until it expires (7d max)
+#   policy show | clear           what is overridden now | drop it early
+#                                 (one invocation only: MEUTE_QUOTA_FLOOR=1 bin/run.sh ...)
+#   drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...
+#                                  run the slot unforced, fire after fire (waiting up to
+#                                  900 s for the lock), until one full rotation is done,
+#                                  the staged plan is drained, or a fire is declined;
+#                                  exits with that fire's status (lib/drain.sh)
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
 #   plan [--enqueue [--append|--replace] [--only <repo>]... [--skip-invalid]] [--allow-web] [--json] [dir]
@@ -57,6 +75,9 @@
 # add-repo and set-image-digest both refuse to touch it.
 #
 set -Eeuo pipefail
+# Owner-only files on a shared host: state/ and reports/ name private repos
+# and carry unfixed findings (P2.4). Inherited by `meute web` and its runs.
+umask 077
 
 readonly MEUTE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MEUTE_ROOT
@@ -88,17 +109,26 @@ source "${MEUTE_ROOT}/lib/container.sh"
 source "${MEUTE_ROOT}/lib/preflight.sh"
 source "${MEUTE_ROOT}/lib/plan.sh"
 source "${MEUTE_ROOT}/lib/plan_dedup.sh"
+source "${MEUTE_ROOT}/lib/quota_age.sh"
 source "${MEUTE_ROOT}/lib/plan_cache.sh"
 source "${MEUTE_ROOT}/lib/plan_only.sh"
 source "${MEUTE_ROOT}/lib/plan_queue_lock.sh"
 source "${MEUTE_ROOT}/lib/status.sh"
 source "${MEUTE_ROOT}/lib/discover.sh"
 source "${MEUTE_ROOT}/lib/doctor.sh"
+source "${MEUTE_ROOT}/lib/privacy.sh"
 source "${MEUTE_ROOT}/lib/timers.sh"
+source "${MEUTE_ROOT}/lib/finding_cmds.sh"
 source "${MEUTE_ROOT}/lib/unitlimits.sh"
 source "${MEUTE_ROOT}/lib/statusline.sh"
 source "${MEUTE_ROOT}/lib/scratch.sh"
 source "${MEUTE_ROOT}/lib/tmp.sh"
+source "${MEUTE_ROOT}/lib/sweep.sh"
+source "${MEUTE_ROOT}/lib/policy_override.sh"
+source "${MEUTE_ROOT}/lib/hostcheck.sh"
+source "${MEUTE_ROOT}/lib/health.sh"
+source "${MEUTE_ROOT}/lib/scope.sh"
+source "${MEUTE_ROOT}/lib/drain.sh"
 
 SCRUBBED=""
 AUTH_MODE=""
@@ -181,7 +211,20 @@ mark_finding() {
 readonly DISMISS_REASONS="false-positive wont-fix out-of-scope duplicate too-large other"
 
 cmd_findings() {
-  local filter="${1:---new}"
+  [[ "${1:-}" == verify ]] && { shift; cmd_findings_verify "$@"; return; }
+  local filter="--new" json=0
+  while (( $# )); do
+    case "$1" in
+      --new|--all) filter="$1" ;;
+      --json) json=1 ;;
+      *) die "findings: unknown argument $1" ;;
+    esac
+    shift
+  done
+  if (( json )); then
+    python3 "$INBOX_PY" findings "$filter" --json || die "findings failed: lib/inbox.py exited with an error (see above)"
+    return 0
+  fi
   # Under state/tmp, not $TMPDIR, and gone however the command ends.
   tmp_init "$STATE_DIR"; trap tmp_cleanup EXIT
   local tmp; tmp="$(mktemp)"
@@ -236,17 +279,22 @@ cmd_show() {
 # would record the opposite of what happened.
 cmd_resolve() {
   local id="${1:-}"; shift || true
-  local number="" note_text=""
+  local number="" note_text="" pr=""
   while (( $# )); do
     case "$1" in
       -f|--finding) number="${2:?-f needs a finding number}"; shift ;;
       -m|--message) note_text="${2:?-m needs text}"; shift ;;
+      --pr) pr="${2:?--pr needs a URL}"; shift ;;
       *) die "resolve: unknown argument $1" ;;
     esac
     shift
   done
   require_report "$id"
-  [[ -n "$note_text" ]] || die "resolve: -m <text> is required (what was done, e.g. a PR link)"
+  if [[ -n "$pr" ]]; then
+    valid_pr_url "$pr" || die "resolve: --pr must be an http(s) URL with no spaces"
+    note_text="${note_text:+${note_text} }pr: ${pr}"
+  fi
+  [[ -n "$note_text" ]] || die "resolve: -m <text> or --pr <url> is required (what was done)"
 
   if [[ -n "$number" ]]; then
     [[ "$number" =~ ^[0-9]+$ ]] || die "resolve: -f takes a finding number"
@@ -610,6 +658,16 @@ cmd_resume() {
   fi
 }
 
+cmd_policy() {
+  local sub="${1:-show}"; shift || true
+  case "$sub" in
+    set) policy_override_set "$@" ;;
+    show) policy_override_show || note "no policy override in force; the manifest's policy applies" ;;
+    clear) policy_override_clear; note "policy override cleared; the manifest's policy applies" ;;
+    *) die "unknown policy command: ${sub} (try: meute policy set|show|clear)" ;;
+  esac
+}
+
 # Inventory a directory tree without enrolling anything (only the derived
 # state/plan-cache is written), and optionally stage the result for the
 # runner. The work lives in lib/plan.sh; this is the command line.
@@ -624,7 +682,9 @@ cmd_plan() {
       --skip-invalid) skip_invalid=1 ;;
       --allow-web) allow_web=1 ;;
       --json) json=1 ;;
-      --only) (( $# >= 2 )) || die "plan: --only needs a path"; only+=( "$2" ); shift ;;
+      --only) (( $# >= 2 )) || die "plan: --only needs a path"
+        [[ -n "$2" ]] || { note "plan: --only needs a non-empty path"; exit 2; }
+        only+=( "$2" ); shift ;;
       --) shift; [[ $# -eq 1 ]] || die "plan: expected at most one directory"; requested="$1"; break ;;
       -*) die "plan: unknown option: $1" ;;
       *) [[ -z "$requested" ]] || die "plan: expected at most one directory"; requested="$1" ;;
@@ -727,9 +787,9 @@ cmd_web() {
   [[ "$host" != *:* ]] || die "web: IPv6 host ${host} is not supported; use an IPv4 address (127.0.0.1 is the default)"
   if [[ "$host" != "127.0.0.1" && "$host" != "localhost" ]]; then
     (( insecure_public )) || die "web: refusing non-loopback host ${host}; pass --insecure-public to acknowledge the unauthenticated inbox"
-    note "WARNING: binding ${host} -- there is no login; anyone who can reach it can triage findings AND start fleet runs that spend your Claude/Codex quota. Browse to exactly http://${host}:${port}/ (the Host check only accepts the bound host:port)"
+    note "WARNING: binding ${host} -- there is no login; anyone who can reach it can triage findings AND start fleet runs that spend your Claude/Codex quota. Open the link printed below, with the address exactly as shown (the Host check only accepts the bound host:port)"
   fi
-  note "inbox at http://${host}:${port}/  (Ctrl-C to stop)"
+  note "starting the inbox: open the link printed below, it carries the access token (Ctrl-C to stop)"
   exec python3 "${MEUTE_ROOT}/tui/webserver.py" --host "$host" --port "$port"
 }
 
@@ -739,6 +799,7 @@ main() {
   case "$command" in
     status)   cmd_status "$@" ;;
     doctor)   cmd_doctor "$@" ;;
+    health)   cmd_health "$@" ;;
     install-timers) cmd_install_timers "$@" ;;
     install-statusline) cmd_install_statusline "$@" ;;
     reports)  cmd_reports "$@" ;;
@@ -746,12 +807,15 @@ main() {
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;
     resolve)  cmd_resolve "$@" ;;
+    claim)    cmd_claim "$@" ;;
     dismiss)  cmd_dismiss "$@" ;;
     branches) cmd_branches "$@" ;;
     image)    cmd_image "$@" ;;
     container) cmd_container "$@" ;;
     pause)    cmd_pause "$@" ;;
     resume)   cmd_resume "$@" ;;
+    policy)   cmd_policy "$@" ;;
+    drain)    cmd_drain "$@" ;;
     discover) cmd_discover "$@" ;;
     plan)     cmd_plan "$@" ;;
     tui)      cmd_tui "$@" ;;

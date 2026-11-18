@@ -49,7 +49,8 @@ class ClassifyTests(unittest.TestCase):
                            ("hold", "skipped"), ("lock", "skipped"), ("budget", "skipped"),
                            ("quota-floor", "skipped"), ("quota-unknown", "skipped"),
                            ("nothing-eligible", "skipped"), ("no-queue", "skipped"),
-                           ("load", "skipped"), ("disk", "skipped")]:
+                           ("load", "skipped"), ("disk", "skipped"),
+                           ("already-done", "skipped")]:
             with self.subTest(code=code):
                 # status says the opposite of the code: the code wins
                 other = "error" if want != "error" else "ok"
@@ -64,7 +65,7 @@ class ClassifyTests(unittest.TestCase):
     def test_strict_exit_status_stands_in_for_a_missing_line(self):
         since = time.time() + 5
         for rc, want in [(0, "error"), (1, "error"), (10, "skipped"), (11, "skipped"),
-                         (13, "skipped"), (15, "skipped"), (70, "error")]:
+                         (13, "skipped"), (15, "skipped"), (16, "skipped"), (70, "error")]:
             with self.subTest(rc=rc):
                 out = runprogress.classify([], rc, "daily", since)
                 self.assertEqual(out["status"], want)
