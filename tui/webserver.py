@@ -11,6 +11,9 @@ match. The token is printed as a startup link (/?t=...); opening it sets an
 HttpOnly cookie, and only GET / with that cookie embeds the token. Report
 text is untrusted: this module only ever serves it as text/plain or inside
 JSON.
+
+The separate --fleet-finding mode serves a read-only Fleet page on loopback
+for use behind an authenticated gateway. It creates no legacy token.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import re
 import secrets
 import sys
 import threading
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("MEUTE_ROOT") or os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 import inbox  # noqa: E402
+from report import ReportError  # noqa: E402
 
 sys.path.insert(0, HERE)
 import runctl  # noqa: E402
@@ -71,6 +76,7 @@ SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
     "X-Frame-Options": "DENY",
 }
+LEGACY_COOKIE = re.compile(r"(?:^|[;,])\s*meute_t_[0-9]+\s*=")
 
 
 class BadRequest(Exception):
@@ -272,20 +278,25 @@ def route(method: str, path: str):
 
 
 def get_static(name: str):
-    def handler(h: "Handler", query: dict) -> None:
+    return web_file(name, STATIC_TYPES[name])
+
+
+def web_file(name: str, content_type: str):
+    def handler(h: "Handler", query: dict | None = None) -> None:
         try:
             with open(os.path.join(WEB_DIR, name), "rb") as f:
                 data = f.read()
         except FileNotFoundError:
             h.send_error_json(404, "not found")
             return
-        h.send_bytes(200, data, STATIC_TYPES[name])
+        h.send_bytes(200, data, content_type)
     return handler
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"  # no keep-alive: rejected POSTs leave bodies unread
     timeout = 30  # R22: socket timeout so an idle client cannot pin a thread
+    security_headers = SECURITY_HEADERS
 
     # -- plumbing --
     def log_message(self, fmt, *args):
@@ -310,7 +321,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
+        for k, v in {**self.security_headers, **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
@@ -370,6 +381,72 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
+def get_fleet_status(h: "FleetHandler") -> None:
+    status = h.server.run_mod.status()
+    h.send_json(200, {
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "controller": {key: status[key] for key in ("state", "total", "done", "remaining")},
+        "finding": {"id": h.server.fleet_finding, "url": h.server.fleet_finding_path},
+    })
+
+
+def get_fleet_finding(h: "FleetHandler") -> None:
+    rid, _, n = h.server.fleet_finding.partition("#")
+    try:
+        body = h.server.inbox_mod.finding_body(rid, int(n), bounded=True)
+    except ReportError:
+        body = ""
+    if not body:
+        return h.send_error_json(404, "finding unavailable")
+    h.send_bytes(200, body.encode(), "text/plain; charset=utf-8")
+
+
+FLEET_ROUTES = {
+    "/": web_file("fleet.html", "text/html; charset=utf-8"),
+    "/static/fleet.js": web_file("fleet.js", "text/javascript; charset=utf-8"),
+    "/api/fleet/status": get_fleet_status,
+}
+
+
+class FleetHandler(Handler):
+    security_headers = {**SECURITY_HEADERS, "Referrer-Policy": "no-referrer"}
+
+    def log_request(self, code="-", size="-"):
+        path = getattr(self, "path", "").partition("?")[0]
+        if path == self.server.fleet_finding_path:
+            path = "/fleet/finding"
+        elif path not in FLEET_ROUTES:
+            path = "-"
+        self.log_message("fleet %s %s", path, code)
+
+    def send_error(self, code, message=None, explain=None):
+        # Parser and unsupported-method errors can contain raw request text.
+        self.close_connection = True
+        if self.command == "HEAD":
+            self.send_bytes(code, b"", "application/json")
+        else:
+            self.send_error_json(code, "request refused")
+
+    def _dispatch(self, method: str) -> None:
+        if (method != "GET" or not self._guard("GET")
+                or len(self.headers.get_all("Host", [])) != 1
+                or len(self.headers.get_all("Sec-Fetch-Site", [])) > 1
+                or "?" in self.path
+                or "X-Meute-Token" in self.headers
+                or any(LEGACY_COOKIE.search(value)
+                       for value in self.headers.get_all("Cookie", []))):
+            return self.send_error_json(403, "forbidden")
+        fn = (get_fleet_finding if self.path == self.server.fleet_finding_path
+              else FLEET_ROUTES.get(self.path))
+        if fn is None:
+            return self.send_error_json(404, "not found")
+        try:
+            fn(self)
+        except Exception as e:  # No report data or request content in logs.
+            self.log_message("request failed (%s)", type(e).__name__)
+            self.send_error_json(500, "internal error")
+
+
 class Server(ThreadingHTTPServer):
     """ThreadingHTTPServer with at most MAX_THREADS handler threads (R22)."""
 
@@ -395,15 +472,30 @@ class Server(ThreadingHTTPServer):
             self.slots.release()
 
 
-def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None):
+def validate_fleet_finding(value: str) -> None:
+    rid, _, n = value.partition("#")
+    parts = rid.split("/")
+    if (len(parts) != 2
+            or any(not ID_RE.fullmatch(part) or part == "." or ".." in part for part in parts)
+            or not re.fullmatch(r"[1-9][0-9]{0,9}", n)):
+        raise ValueError("expected a finding identity of the form repo/report#number")
+
+
+def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None, *, finding=None):
     """Build (server, token). port=0 picks a free port: read server.server_port.
 
     run_mod defaults to a RunController for ROOT; constructing one runs nothing.
     """
-    server = Server((host, port), Handler)
+    if finding is not None:
+        validate_fleet_finding(finding)
+        if host != "127.0.0.1":
+            raise ValueError("managed Fleet requires the 127.0.0.1 loopback bind")
+    server = Server((host, port), FleetHandler if finding is not None else Handler)
     server.daemon_threads = True
     server.slots = threading.BoundedSemaphore(MAX_THREADS)
-    server.token = secrets.token_urlsafe(32)
+    server.token = secrets.token_urlsafe(32) if finding is None else None
+    server.fleet_finding = finding
+    server.fleet_finding_path = "/fleet/finding/" + finding.replace("#", "/") if finding else None
     server.bound_host = host
     server.client_events = []  # (kind, detail) beacons from the page; see record_client
     server.inbox_mod = inbox_mod
@@ -415,18 +507,26 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="meute web inbox")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8642)
+    ap.add_argument("--fleet-finding", metavar="REPO/REPORT#N",
+                    help="serve the managed read-only Fleet page for this finding")
     args = ap.parse_args()
     # Owner-only files on a shared host (P2.4): the run log and every run the
     # server starts inherit this, also when it is launched without bin/meute.
     os.umask(0o077)
     try:
-        server, _ = make_server(args.host, args.port)
+        server, token = make_server(args.host, args.port, finding=args.fleet_finding)
+    except ValueError as e:
+        ap.error(str(e))
     except OSError as e:
         if e.errno != errno.EADDRINUSE:
             raise
         sys.stderr.write(f"meute web: port {args.port} is already in use\n")
         sys.exit(1)
-    print(f"meute web inbox on http://{args.host}:{server.server_port}/?t={server.token}", flush=True)
+    url = f"http://{server.bound_host}:{server.server_port}/"
+    if token is None:
+        print(f"meute managed Fleet on {url}", flush=True)
+    else:
+        print(f"meute web inbox on {url}?t={token}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

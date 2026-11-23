@@ -18,7 +18,9 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
+from contextlib import ExitStack
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 ABBREV = {"CRITICAL": "CRIT", "HIGH": "HIGH", "MEDIUM": "MED", "LOW": "LOW"}
@@ -27,6 +29,7 @@ FINDING_RE = re.compile(r"^###\s+\[(CRITICAL|HIGH|MEDIUM|LOW)\]\s*(.*)$", re.M)
 TEST_RE = re.compile(r"^###\s+\d+\.\s*(.*)$", re.M)
 LOCATION_RE = re.compile(r"^-\s+\*\*Location:\*\*\s*(.*)$", re.M)
 FAILED_MARKER = "# Run produced no report"
+MAX_REPORT_BYTES = 4 * 1024 * 1024
 
 
 class ReportError(Exception):
@@ -40,7 +43,35 @@ def read(path: str) -> tuple[dict, str]:
             text = handle.read()
     except OSError as error:
         raise ReportError(f"{path}: {error.strerror}") from error
+    return split_report(text)
 
+
+def read_bounded(reports: str, repo: str, name: str) -> tuple[dict, str]:
+    """Read a single native report for the managed surface without following links."""
+    if any(part in ("", ".", "..") or os.path.basename(part) != part for part in (repo, name)):
+        raise ReportError("invalid report identity")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        with ExitStack() as closing:
+            reports_fd = os.open(reports, directory_flags)
+            closing.callback(os.close, reports_fd)
+            repo_fd = os.open(repo, directory_flags, dir_fd=reports_fd)
+            closing.callback(os.close, repo_fd)
+            fd = os.open(name + ".md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=repo_fd)
+            with os.fdopen(fd, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_REPORT_BYTES:
+                    raise ReportError("expected a bounded regular report")
+                data = handle.read(MAX_REPORT_BYTES + 1)
+        if len(data) > MAX_REPORT_BYTES:
+            raise ReportError("report exceeds the size limit")
+        text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ReportError("report unavailable") from error
+    return split_report(text)
+
+
+def split_report(text: str) -> tuple[dict, str]:
     meta: dict = {}
     body = text
     if text.startswith("---\n"):

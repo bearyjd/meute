@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meute Fleet</title>
+  <script src="/static/fleet.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Meute Fleet</h1>
+    <p id="availability" role="status">Loading controller status</p>
+    <div id="observation" hidden>
+      <dl>
+        <dt>Controller state</dt>
+        <dd id="controller-state"></dd>
+        <dt>Staged queue</dt>
+        <dd id="queue"></dd>
+        <dt>Observed at</dt>
+        <dd><time id="observed-at"></time></dd>
+      </dl>
+      <p>Finding <a id="finding"></a></p>
+    </div>
+  </main>
+</body>
+</html>
