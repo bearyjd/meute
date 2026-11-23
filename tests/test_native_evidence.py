@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,16 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parents[1]
 SECRET = "ghp_fixture1234567890secret"
 PRODUCT_TASK = "netlens/0042"
+
+
+class EvidenceModuleTest(unittest.TestCase):
+    def test_export_help_runs_as_a_python_module(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "lib.evidence", "export", "--help"],
+            cwd=SOURCE, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage: meute evidence export", result.stdout)
 
 
 class NativeEvidenceTest(unittest.TestCase):

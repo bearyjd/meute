@@ -14,7 +14,10 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from native_evidence import CLAIM_FIELDS, CLAIM_VERSION, RUN_ID
+if __package__:
+    from .native_evidence import CLAIM_FIELDS, CLAIM_VERSION, RUN_ID
+else:
+    from native_evidence import CLAIM_FIELDS, CLAIM_VERSION, RUN_ID
 
 MAX_ROWS = 256
 MAX_EXPORT = 256 * 1024
