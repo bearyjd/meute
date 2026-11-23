@@ -435,7 +435,7 @@ run_entry() {
     "TASK=${task}" "TIER=${tier}" "DATE=${DATE}" "BRANCH=${BRANCH}" \
     "FILE_BUDGET=${file_budget}" "LENS=${lens}" "REPORT_PATH=${report_rel}" \
     "ALLOWED_COMMANDS=${ALLOWED_TOOLS:-<none: no shell command is pre-approved>}" \
-    "DEFAULT_BRANCH=${base_ref}" "UPSTREAM=$(jq -r '.upstream' <<< "$entry")" \
+    "DEFAULT_BRANCH=${base_ref}" "BASE_SHA=${BASE_SHA}" "UPSTREAM=$(jq -r '.upstream' <<< "$entry")" \
     "ETIQUETTE=$(jq -r '.etiquette' <<< "$entry")" \
     "ETIQUETTE_CONTENT=$(etiquette_content "$entry")" \
     "TICKET_ID=$(jq -r '.ticket_id' <<< "$entry")" \

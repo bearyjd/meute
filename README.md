@@ -569,6 +569,7 @@ checkout is never dirty from meute. It never pushes.
 | `dep-audit` | 1 | weekly | dependency risk, sorted by whether the vulnerable path is actually reachable |
 | `conventions` | 1 | weekly | conformance against the repo's **written** conventions only |
 | `audit-security` | 2 | daily/weekly | security audit through one rotating lens |
+| `audit-intent` | 2 | weekly | compares documented product claims with evidence at the audited commit, by explicit enrollment |
 | `draft-ticket` | 3 | weekly | fixes a `specced: true` ticket, reproduction first |
 | `scout` / `reproduce` / `draft` | community | weekly | the contribution pipeline |
 
@@ -577,6 +578,37 @@ nothing — no linter configured, no doc generator, no written conventions — a
 the templates state that declining is a successful run. Otherwise an unattended
 agent under implicit pressure to look productive finds something to do, and for
 maintenance work that means a large diff nobody asked for.
+
+### Enable an intent audit
+
+Add `audit-intent` to the chosen repository's `tasks` list in your active
+manifest. With `meute discover`, select the task by number. The default
+selection leaves it off, and portfolio plans leave it out of their queues.
+
+`repos.local.yaml` and `MEUTE_MANIFEST` select standalone manifests. In an
+existing private manifest, add this declaration under its `tasks:` mapping
+and keep its existing task declarations. Use the shipped read-only `tier2`
+definition from `repos.yaml`.
+
+```yaml
+  audit-intent:
+    tier: tier2
+    template: tasks/audit-intent.md
+    slots: [weekly]
+    portfolio: false
+```
+
+```sh
+./bin/run.sh --validate
+./bin/run.sh weekly --source manifest --repo YOUR_REPO --task audit-intent --dry-run
+```
+
+The rendered prompt in `state/dry-run-prompt.md` includes the exact Git
+commit the runner resolved. The audit reads the checkout and files a normal
+Meute report with stable intent references. If you have État-Major progress
+evidence for the same commit, you can supply a brief record with its full SHA
+and evidence identifiers in the repository's private manifest `spec`. The
+runner includes `spec` in every task prompt for that repository.
 
 ## Reviewing the output — `bin/meute`
 

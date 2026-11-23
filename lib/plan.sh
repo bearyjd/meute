@@ -60,12 +60,13 @@ plan_collect_tasks() {
     [[ -n "$line" ]] || continue
     [[ "$(jq -r '.writes_code' <<< "$line")" == "false" ]] || continue
     name="$(jq -r '.name' <<< "$line")"
-    # lib/manifest.py decides from the tier's tools what a plan may stage;
+    # lib/manifest.py classifies the task and tier for staging;
     # the runner-side validator applies the same verdict, so nothing ranked
     # here can be refused there. "other" -- Bash, Edit, anything unknown --
     # comes with an allowlist reviewed for enrolled projects only.
     plan_class="$(jq -r '.plan_class' <<< "$line")"
     case "$plan_class" in
+      enrollment) continue ;;
       local) ;;
       web) (( allow_web )) || { PLAN_WEB_TASKS+=( "$name" ); continue; } ;;
       *) PLAN_OTHER_TASKS+=( "$name" ); continue ;;

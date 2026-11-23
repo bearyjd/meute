@@ -2,9 +2,9 @@
 
 lib/plan.sh is the shell half of the feature: the inventory, the ranking,
 the staged state/plan-queue.json. It asks this module, through list-tasks'
-plan_class, which tiers a plan may stage at all, and the runner asks again
+plan_class, which tasks a plan may stage at all, and the runner asks again
 through plan-queue when it expands that file. The decision is made here,
-once, from the tier's tool list alone, so the planner and the runner-side
+once, from the task and tier, so the planner and the runner-side
 validator can never disagree about it.
 
 Separate from manifest.py because it is a feature, not schema: a plan runs
@@ -53,8 +53,10 @@ def tool_names(tools: str) -> frozenset:
                      for tool in tools.split(",") if tool.strip())
 
 
-def plan_tier_class(tier: dict) -> str:
-    """local | web | other. Only for tiers that passed checked_tiers."""
+def plan_task_class(task: dict, tier: dict) -> str:
+    """enrollment | local | web | other."""
+    if task.get("portfolio", True) is not True:
+        return "enrollment"
     names = tool_names(tier["tools"])
     if names <= LOCAL_TOOLS:
         return "local"
@@ -115,11 +117,14 @@ def build_plan_queue(data: dict, path: str, slot: str, root: str) -> list:
         if tiers[tier_name]["writes_code"]:
             raise ManifestError(
                 f"{path}: entries[{number}].task {task_name!r} writes code and cannot be staged")
-        tier_class = plan_tier_class(tiers[tier_name])
-        if tier_class == "other":
+        plan_class = plan_task_class(task, tiers[tier_name])
+        if plan_class == "enrollment":
+            raise ManifestError(
+                f"{path}: entries[{number}].task {task_name!r} requires explicit enrollment")
+        if plan_class == "other":
             raise ManifestError(
                 f"{path}: entries[{number}].task {task_name!r} uses tools plan cannot stage")
-        if tier_class == "web" and not allow_web:
+        if plan_class == "web" and not allow_web:
             raise ManifestError(
                 f"{path}: entries[{number}].task {task_name!r} uses web tools and the plan did not allow them")
         if slot != "all" and slot not in (task.get("slots") or list(VALID_SLOTS)):

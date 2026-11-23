@@ -88,19 +88,17 @@ cmd_discover() {
     done
   fi
 
-  # Available tasks and a safe default: the read-only tier-2 reports. Tasks
-  # that write code default OFF -- a freshly discovered repo's tooling is
-  # unknown, and lint-sweep/dep-audit/gen-tests against the wrong toolchain
-  # burns a slot to produce nothing.
+  # Default to read-only reports eligible for automatic enrollment. Tasks
+  # that write code and those requiring explicit enrollment default off.
   local -a task_names=() task_writes=() preselected=()
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     task_names+=( "$(jq -r '.name' <<< "$line")" )
     task_writes+=( "$(jq -r '.writes_code' <<< "$line")" )
+    if jq -e '.writes_code == false and .plan_class != "enrollment"' <<< "$line" >/dev/null; then
+      preselected+=( "${#task_names[@]}" )
+    fi
   done < <(python3 "$MANIFEST_PY" list-tasks "$MANIFEST")
-  for (( i = 0; i < ${#task_names[@]}; i++ )); do
-    [[ "${task_writes[$i]}" == "false" ]] && preselected+=( "$(( i + 1 ))" )
-  done
 
   local idx repo_path repo_name default_branch spec
   for idx in "${chosen_idx[@]}"; do
