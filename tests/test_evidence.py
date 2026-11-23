@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -53,9 +54,9 @@ class EvidenceExportTest(unittest.TestCase):
         path.write_text(json.dumps(self.provenance | overrides), encoding="utf-8")
         return path
 
-    def export(self, *bindings, output=None, log=None):
+    def export(self, *bindings, output=None, log=None, meute=MEUTE):
         args = [
-            MEUTE, "evidence", "export", "--project", "sample",
+            meute, "evidence", "export", "--project", "sample",
             "--output", output or self.output,
         ]
         for binding in bindings or (self.binding,):
@@ -89,6 +90,33 @@ class EvidenceExportTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("digest", result.stderr)
         self.assertEqual(self.output.read_bytes(), b"previous snapshot\n")
+
+    def test_new_snapshot_is_private_and_refresh_keeps_existing_mode(self):
+        result = self.export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o600)
+
+        self.output.chmod(0o640)
+        result = self.export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(self.output.stat().st_mode), 0o640)
+
+    def test_output_cannot_write_into_active_state_or_reports(self):
+        layout = self.root / "layout"
+        layout.mkdir()
+        (layout / "bin").symlink_to(MEUTE.parent, target_is_directory=True)
+        (layout / "lib").symlink_to(MEUTE.parents[1] / "lib", target_is_directory=True)
+        for directory in ("state", "reports"):
+            with self.subTest(directory=directory):
+                storage = self.root / directory
+                storage.mkdir()
+                (layout / directory).symlink_to(storage, target_is_directory=True)
+                output = storage / "existing.json"
+                output.write_bytes(b"original\n")
+                result = self.export(output=output, meute=layout / "bin" / "meute")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("outside Meute state and reports", result.stderr)
+                self.assertEqual(output.read_bytes(), b"original\n")
 
     def test_rejects_duplicate_keys_and_conflicting_rows(self):
         duplicate = self.root / "duplicate.json"

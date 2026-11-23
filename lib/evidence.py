@@ -33,7 +33,7 @@ BINDING_FIELDS = {
     "started_at", "outcome", "report_sha256",
 }
 AUDIT_FIELDS = {"task_reference_in_report", "task_reference_source", "submission_sha256"}
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("MEUTE_ROOT") or Path(__file__).resolve().parents[1])
 
 
 def read_input(path: Path, limit: int) -> tuple[bytes, tuple[int, int]]:
@@ -180,15 +180,16 @@ def verify_record(
     return row, instant, native_identity
 
 
-def check_output(path: Path, input_ids: set[tuple[int, int]]) -> None:
+def check_output(path: Path, input_ids: set[tuple[int, int]]) -> int | None:
     try:
         info = path.lstat()
     except FileNotFoundError:
-        return
+        return None
     if (info.st_dev, info.st_ino) in input_ids:
         raise ValueError("output collides with an input")
     if not stat.S_ISREG(info.st_mode):
         raise ValueError("output must be a regular file")
+    return info.st_mode & 0o777
 
 
 def write_snapshot(path: Path, data: bytes, input_ids: set[tuple[int, int]]) -> None:
@@ -202,8 +203,10 @@ def write_snapshot(path: Path, data: bytes, input_ids: set[tuple[int, int]]) -> 
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
+            mode = check_output(path, input_ids)
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
-        check_output(path, input_ids)
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -257,7 +260,8 @@ def main() -> int:
         epilog=(
             "Required provenance JSON keys: task, ref, source (meute-runner), "
             "engine, auth, commit, started_at, outcome, report_sha256. "
-            "Use trusted operator-owned parent directories for all paths."
+            "The exporter checks agreement among the binding, report, and log. "
+            "Use records from a trusted operator and trusted parent directories."
         ),
     )
     publish.add_argument("--project", required=True)

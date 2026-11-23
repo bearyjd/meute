@@ -15,7 +15,7 @@
 #   status                        quota, what runs next, this week's activity
 #   reports [--new|--all]         list reports with their triage state
 #   evidence export --project PROJECT --output FILE --record PROVENANCE REPORT TERMINAL_LOG ...
-#                                 export verified, owner-bound reports as a local snapshot
+#                                 export a local snapshot from trusted operator records
 #   findings [--new|--all] [--json]
 #                                 one row per finding — the actual unit of decision;
 #                                  --new hides gone, superseded, claimed and inherited rows
