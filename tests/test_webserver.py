@@ -2,6 +2,8 @@
 
 Run-endpoint and Run-tab tests live in test_webserver_run.py.
 """
+import http.client
+import io
 import json
 import os
 import shutil
@@ -9,6 +11,8 @@ import socket
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from webtest_helpers import ROOT, WebTestCase, web_file, webserver  # noqa: E402
@@ -283,6 +287,62 @@ class TokenTests(WebTestCase):
                                 token=False, headers=self.cookie())
         self.assertEqual(resp.status, 403)
         self.assertEqual(self.inbox.calls, [])
+
+
+class RequestLogTests(WebTestCase):
+    def test_request_logs_omit_bootstrap_token(self):
+        target = f"/?t={self.token}"
+        with redirect_stderr(io.StringIO()) as logs:
+            resp, _ = self.request("GET", target)
+            self.assertEqual(resp.status, 303)
+            resp, _ = self.request("GET", target, host="foreign.example:80")
+            self.assertEqual(resp.status, 403)
+            resp, _ = self.request("HEAD", target)
+            self.assertEqual(resp.status, 501)
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as conn:
+                conn.sendall(f"GET {target} extra HTTP/1.0\r\n\r\n".encode())
+                with conn.makefile("rb") as response:
+                    self.assertTrue(response.readline().startswith(b"HTTP/1.0 400 "))
+                    response.read()
+
+        output = logs.getvalue()
+        self.assertFalse(self.token in output, "bootstrap token reached stderr")
+        self.assertIn("GET / 303", output)
+        self.assertIn("GET / 403", output)
+        self.assertIn(" 501", output)
+        self.assertIn(" 400", output)
+
+    def test_request_errors_omit_credential_details(self):
+        target = f"/?t={self.token}"
+
+        def failing_dump():
+            raise ValueError(target)
+
+        self.inbox.dump = failing_dump
+        with redirect_stderr(io.StringIO()) as logs:
+            resp, _ = self.request("GET", f"/api/inbox?t={self.token}")
+            self.assertEqual(resp.status, 500)
+            resp, _ = self.request("GET", f"/api/client-error?msg={target}")
+            self.assertEqual(resp.status, 200)
+            resp, _ = self.request("GET", f"/{self.token}")
+            self.assertEqual(resp.status, 404)
+
+        output = logs.getvalue()
+        self.assertFalse(self.token in output, "bootstrap token reached stderr")
+        self.assertIn("GET /api/inbox 500", output)
+        self.assertIn("webserver: client-error\n", output)
+        self.assertIn("GET /api/client-error 200", output)
+
+    def test_handler_tracebacks_omit_credential_details(self):
+        target = f"/?t={self.token}"
+        with redirect_stderr(io.StringIO()) as logs:
+            with patch.object(webserver.Handler, "send_error_json", side_effect=ValueError(target)):
+                with self.assertRaises(http.client.RemoteDisconnected):
+                    self.request("GET", target, host="foreign.example:80")
+
+        output = logs.getvalue()
+        self.assertFalse(self.token in output, "bootstrap token reached stderr")
+        self.assertIn("request handler failed", output)
 
 
 class SocketLimitTests(unittest.TestCase):
