@@ -89,8 +89,15 @@ class BrowserSmoke(WebTestCase):
                 break
             time.sleep(0.25)
         events = list(self.server.client_events)
-        self.assertEqual([e for e in events if e[0] == "error"], [], "client-side error")
-        self.assertTrue(want <= set(events), f"missing ready beacons; got {events}")
+        error_count = sum(kind == "error" for kind, _ in events)
+        missing = sorted(page for _, page in want - set(events))
+        if error_count or missing:
+            returncode = proc.poll()
+            status = "running" if returncode is None else str(returncode)
+            self.fail(
+                f"browser smoke: browser={name}, exit={status}, "
+                f"missing_ready={','.join(missing) or 'none'}, client_errors={error_count}"
+            )
 
     @staticmethod
     def _kill(proc):

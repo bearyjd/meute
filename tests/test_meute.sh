@@ -3438,6 +3438,10 @@ PY2
   for f in "$REPO"/tests/test_*.py; do
     out="$(cd "$REPO/tests" && python3 -m unittest "$(basename "$f" .py)" 2>&1)"; rc=$?
     is "unittest: $(basename "$f") exits 0" "$rc" "0"
+    if [[ "$rc" != 0 && "${f##*/}" == test_browser_smoke.py ]]; then
+      # Print only the structured assertion, without captured URLs or browser output.
+      sed -nE 's/^AssertionError: (browser smoke: browser=(firefox|chromium|chromium-browser|google-chrome), exit=(running|-?[0-9]+), missing_ready=(none|inbox|run|inbox,run), client_errors=[0-9]+)$/        \1/p' <<< "$out"
+    fi
   done
 }
 
