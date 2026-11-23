@@ -14,6 +14,11 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+if __package__:
+    from .native_evidence import CLAIM_FIELDS, CLAIM_VERSION, RUN_ID
+else:
+    from native_evidence import CLAIM_FIELDS, CLAIM_VERSION, RUN_ID
+
 MAX_ROWS = 256
 MAX_EXPORT = 256 * 1024
 MAX_PROVENANCE = 16 * 1024
@@ -33,6 +38,8 @@ BINDING_FIELDS = {
     "started_at", "outcome", "report_sha256",
 }
 AUDIT_FIELDS = {"task_reference_in_report", "task_reference_source", "submission_sha256"}
+NATIVE_REPORT_FIELDS = {"run_id", "report_ref", "product_task"}
+NATIVE_LOG_FIELDS = {b"run_id", b"product_task", b"report_sha256"}
 ROOT = Path(os.environ.get("MEUTE_ROOT") or Path(__file__).resolve().parents[1])
 
 
@@ -60,6 +67,17 @@ def unique_object(pairs: list[tuple]) -> dict:
 
 def parse_binding(data: bytes) -> dict:
     binding = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+    if isinstance(binding, dict) and "version" in binding:
+        if (
+            not CLAIM_FIELDS <= binding.keys() <= CLAIM_FIELDS | {"task"}
+            or type(binding["version"]) is not int
+            or binding["version"] != CLAIM_VERSION
+            or any(not isinstance(value, str) or not value
+                   for key, value in binding.items() if key != "version")
+            or not re.fullmatch(RUN_ID, binding["run_id"])
+        ):
+            raise ValueError("invalid native run claim")
+        return binding
     if (
         not isinstance(binding, dict)
         or not BINDING_FIELDS <= binding.keys() <= BINDING_FIELDS | AUDIT_FIELDS
@@ -97,26 +115,31 @@ def native_header(report: bytes) -> dict[str, str]:
     return fields
 
 
-def verify_terminal_log(log: bytes, ref: str, meta: dict[str, str]) -> None:
-    timestamp = meta["started"].encode("utf-8") + b"\t"
+def verify_terminal_log(log: bytes, ref: str, meta: dict[str, str], digest: str) -> None:
+    timestamp = meta["started"].encode("utf-8")
     reference = f"report={ref}".encode("utf-8")
+    run_id = meta.get("run_id")
+    correlation = f"run_id={run_id}".encode("utf-8") if run_id else None
     if log and not log.endswith(b"\n"):
         raise ValueError("partial terminal log line")
     candidate = None
     for line in io.BytesIO(log):
-        if not line.startswith(timestamp):
+        if not correlation and not line.startswith(timestamp + b"\t"):
             continue
-        fields = line[:-1].split(b"\t")[1:]
-        if reference not in fields:
+        time, *entries = line[:-1].split(b"\t")
+        if reference not in entries and correlation not in entries:
             continue
         if candidate is not None:
             raise ValueError("ambiguous terminal log records")
-        candidate = fields
+        candidate = time, entries
     if candidate is None:
         raise ValueError("missing terminal log record for the report")
 
+    time, entries = candidate
+    if time != timestamp:
+        raise ValueError("timestamp does not match terminal log record")
     fields = {}
-    for field in candidate:
+    for field in entries:
         key, separator, value = field.partition(b"=")
         if not separator or not key:
             raise ValueError("malformed terminal log field")
@@ -135,6 +158,16 @@ def verify_terminal_log(log: bytes, ref: str, meta: dict[str, str]) -> None:
     code = {"ok": b"ok", "error": b"failed"}.get(meta["status"])
     if code is None or fields[b"code"] != code:
         raise ValueError("code does not attest a completed runner attempt")
+    if run_id:
+        if fields.get(b"run_id") != run_id.encode("utf-8") or reference not in entries:
+            raise ValueError("run ID or report ref does not match terminal log record")
+        if fields.get(b"report_sha256") != digest.encode("utf-8"):
+            raise ValueError("report digest does not match terminal log record")
+        task = meta.get("product_task")
+        if fields.get(b"product_task") != (task.encode("utf-8") if task else None):
+            raise ValueError("product task does not match terminal log record")
+    elif NATIVE_LOG_FIELDS & fields.keys():
+        raise ValueError("native terminal log record requires a native run claim")
 
 
 def verify_record(
@@ -142,12 +175,10 @@ def verify_record(
 ) -> tuple[dict, datetime, tuple[str, ...]]:
     if binding["source"] != "meute-runner":
         raise ValueError("expected meute-runner provenance")
-    task = binding["task"]
-    if len(task) > 160 or not re.fullmatch(rf"{re.escape(project)}/[0-9]+", task):
+    task = binding.get("task")
+    if task is not None and (len(task) > 160 or not re.fullmatch(rf"{re.escape(project)}/[0-9]+", task)):
         raise ValueError("expected a task key in the requested project")
     digest = hashlib.sha256(report).hexdigest()
-    if binding["report_sha256"] != digest:
-        raise ValueError("report digest does not match provenance")
     meta = native_header(report)
     ref = binding["ref"]
     if (
@@ -156,8 +187,22 @@ def verify_record(
         or ref != f"reports/{meta.get('repo', '')}/{path.name}"
     ):
         raise ValueError("report ref does not match native repo and report filename")
-    for key, field in (("engine", "engine"), ("auth", "auth"),
-                       ("started_at", "started"), ("outcome", "status")):
+    run_id = binding.get("run_id")
+    if run_id:
+        for key, field in (("run_id", "run_id"), ("repo", "repo"), ("slot", "slot"),
+                           ("meute_task", "task"), ("ref", "report_ref"), ("task", "product_task")):
+            if binding.get(key) != meta.get(field):
+                raise ValueError(f"{field} does not match the native run claim")
+        if run_id in ref:
+            raise ValueError("public report ref contains the internal run ID")
+    else:
+        if NATIVE_REPORT_FIELDS & meta.keys():
+            raise ValueError("native report requires a native run claim")
+        if binding["report_sha256"] != digest:
+            raise ValueError("report digest does not match provenance")
+        if binding["outcome"] != meta.get("status"):
+            raise ValueError("outcome does not match native report header")
+    for key, field in (("engine", "engine"), ("auth", "auth"), ("started_at", "started")):
         if binding[key] != meta.get(field):
             raise ValueError(f"{key} does not match native report header")
     if binding["engine"] not in {"claude", "codex"}:
@@ -169,14 +214,16 @@ def verify_record(
     if not re.fullmatch(TIMESTAMP, started):
         raise ValueError("expected an RFC 3339 started_at timestamp")
     instant = datetime.fromisoformat(started.replace("Z", "+00:00"))
-    outcome = binding["outcome"]
+    outcome = meta.get("status", "")
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", outcome):
         raise ValueError("invalid outcome token")
-    verify_terminal_log(log, ref, meta)
+    verify_terminal_log(log, ref, meta, digest)
     native_identity = (digest, *(meta[key] for key in (
         "repo", "task", "slot", "engine", "auth", "base", "started", "status"
     )))
-    row = {"ref": ref, "recorded_at": started, "outcome": outcome, "task": task}
+    row = {"ref": ref, "recorded_at": started, "outcome": outcome}
+    if task is not None:
+        row["task"] = task
     return row, instant, native_identity
 
 
@@ -218,6 +265,7 @@ def export(project: str, output: Path, records: list[list[Path]]) -> None:
     if len(records) > MAX_ROWS:
         raise ValueError(f"expected at most {MAX_ROWS} records")
     rows = {}
+    run_refs = {}
     input_ids = set()
     latest = datetime.min.replace(tzinfo=timezone.utc)
     for index, (binding_path, report_path, log_path) in enumerate(records, 1):
@@ -234,6 +282,9 @@ def export(project: str, output: Path, records: list[list[Path]]) -> None:
         record = (row, native_identity)
         if rows.setdefault(row["ref"], record) != record:
             raise ValueError(f"record {index}: conflicting report rows")
+        run_id = binding.get("run_id")
+        if run_id and run_refs.setdefault(run_id, row["ref"]) != row["ref"]:
+            raise ValueError(f"record {index}: conflicting references for the native run ID")
         input_ids.update((binding_id, report_id, log_id))
         latest = max(latest, instant)
 
@@ -258,7 +309,9 @@ def main() -> int:
     publish = commands.add_parser(
         "export", help="write a recorded project snapshot",
         epilog=(
-            "Required provenance JSON keys: task, ref, source (meute-runner), "
+            "For native runs, pass state/evidence/<run-id>.json, the matching report, and state/log. "
+            "For older runs, pass an explicit operator-issued binding instead of the claim. "
+            "Required legacy JSON keys: task, ref, source (meute-runner), "
             "engine, auth, commit, started_at, outcome, report_sha256. "
             "The exporter checks agreement among the binding, report, and log. "
             "Use records from a trusted operator and trusted parent directories."
@@ -267,9 +320,9 @@ def main() -> int:
     publish.add_argument("--project", required=True)
     publish.add_argument("--output", type=Path, required=True, help="local snapshot file")
     publish.add_argument(
-        "--record", type=Path, nargs=3, metavar=("PROVENANCE", "REPORT", "TERMINAL_LOG"),
+        "--record", type=Path, nargs=3, metavar=("CLAIM_OR_BINDING", "REPORT", "TERMINAL_LOG"),
         action="append", required=True,
-        help="owner-issued provenance JSON, copied report and runner state/log (repeatable)",
+        help="native claim or legacy binding JSON, copied report and runner state/log (repeatable)",
     )
     args = parser.parse_args()
     try:
