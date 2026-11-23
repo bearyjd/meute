@@ -212,6 +212,8 @@ tiers:
 # ---------------------------------------------------------------------------
 # Task registry. `template` is resolved relative to this file.
 # A task is only scheduled in the slots it lists.
+# `portfolio: false` requires explicit enrollment and excludes the task from
+# staged plans and the default task selection in `meute discover`.
 # ---------------------------------------------------------------------------
 tasks:
   gen-tests:
@@ -310,6 +312,12 @@ tasks:
     requires_specced_ticket: true
     model: opus
     allowed_tools: *verify_and_gh
+
+  audit-intent:
+    tier: tier2
+    template: tasks/audit-intent.md
+    slots: [weekly]
+    portfolio: false
 
   # ---- phase 2 ------------------------------------------------------------
   # All three tier-2 report templates are built above. "feature brainstorm"

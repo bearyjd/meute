@@ -264,6 +264,8 @@ def checked_tasks(data: dict, tiers: dict, root: str) -> dict:
         for slot in task.get("slots") or []:
             if slot not in VALID_SLOTS:
                 raise ManifestError(f"tasks.{name}.slots: unknown slot {slot!r}")
+        if not isinstance(task.get("portfolio", True), bool):
+            raise ManifestError(f"tasks.{name}.portfolio: must be true or false")
         if "network" in task:
             raise ManifestError(f"tasks.{name}.network: network is a tier key only")
         # build_entry's setting() would honour this silently; the runtime is
@@ -649,9 +651,8 @@ def cmd_list_repos(args: list) -> int:
 def cmd_list_tasks(args: list) -> int:
     """name + tier + writes_code + tools + plan_class for every declared task.
 
-    `meute discover`'s picker keys on writes_code; `meute plan` keys on
-    plan_class, decided here so the planner and the runner-side validator
-    (build_plan_queue) can never disagree about which tiers a plan may stage.
+    The discovery picker uses writes_code and plan_class for its defaults.
+    The planner and runner-side queue validator share the task classification.
     """
     data = load(args[0])
     tiers = checked_tiers(data)
@@ -665,7 +666,7 @@ def cmd_list_tasks(args: list) -> int:
             "tier": task.get("tier") if isinstance(task, dict) else None,
             "writes_code": bool(tier["writes_code"]) if tier else None,
             "tools": tier.get("tools") if tier else None,
-            "plan_class": plan_tier_class(tier) if tier else None,
+            "plan_class": plan_task_class(task, tier) if tier else None,
         }))
     return 0
 
@@ -699,7 +700,7 @@ def cmd_list_images(args: list) -> int:
 # they need: at this point `from manifest import ...` inside them resolves,
 # and the queue builder, list-tasks and COMMANDS see their functions as
 # plain names.
-from plan_queue import cmd_plan_queue, plan_tier_class  # noqa: E402
+from plan_queue import cmd_plan_queue, plan_task_class  # noqa: E402
 from stages import (  # noqa: E402
     cmd_list_stages,
     consumed_keys,
