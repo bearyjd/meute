@@ -17,6 +17,7 @@
 #                            that opted into isolation is not a downgrade path
 #   --repo <name>            force a repo (bypasses the cursor and the share gates)
 #   --task <name>            force a task (bypasses the cursor and the share gates)
+#   --audit-claims <path>    require a pinned JSON claim list for a forced weekly audit-intent
 #   --wait-lock <secs>       wait up to <secs> for another run's lock instead of skipping
 #   --source <plan|staged|manifest>
 #                            plan (default): try staged work, then the manifest
@@ -105,6 +106,7 @@ ENGINE_OVERRIDE=""
 RUNTIME_OVERRIDE=""
 FORCE_REPO=""
 FORCE_TASK=""
+AUDIT_CLAIMS_FILE=""
 DRY_RUN=0; WAIT_LOCK=0; SOURCE="plan"; ONCE=0; ONCE_DONE=0
 PLAN_MODE=0
 
@@ -170,6 +172,7 @@ parse_args() {
       --runtime)  RUNTIME_OVERRIDE="${2:?--runtime needs a value}"; shift ;;
       --repo)     FORCE_REPO="${2:?--repo needs a value}"; shift ;;
       --task)     FORCE_TASK="${2:?--task needs a value}"; shift ;;
+      --audit-claims) AUDIT_CLAIMS_FILE="${2:?--audit-claims needs a path}"; shift ;;
       --dry-run)  DRY_RUN=1 ;;
       --ignore-load) HOST_IGNORE_LOAD=1 ;;
       --wait-lock) WAIT_LOCK="${2:?--wait-lock needs a value}"; shift ;;
@@ -188,6 +191,10 @@ parse_args() {
   [[ "$WAIT_LOCK" =~ ^(0|[1-9][0-9]*)$ ]] || usage_die "--wait-lock needs whole seconds: $WAIT_LOCK"
   [[ "$SOURCE" =~ ^(plan|staged|manifest)$ ]] \
     || usage_die "unknown source: $SOURCE (expected plan, staged or manifest)"
+  if [[ -n "$AUDIT_CLAIMS_FILE" ]]; then
+    [[ "$SLOT" == "weekly" && "$SOURCE" == "manifest" && -n "$FORCE_REPO" && "$FORCE_TASK" == "audit-intent" ]] \
+      || usage_die "--audit-claims requires weekly --source manifest --repo NAME --task audit-intent"
+  fi
 }
 
 
@@ -348,6 +355,14 @@ run_entry() {
   ALLOWED_TOOLS="$(jq -r '.allowed_tools' <<< "$entry")"
   TIMEOUT_SECONDS="$(jq -r '.timeout_seconds' <<< "$entry")"
   WRITES_CODE=0; [[ "$(jq -r '.writes_code' <<< "$entry")" == "true" ]] && WRITES_CODE=1
+  local audit_claims="" audit_claim_ids="" audit_claim_digest="" audit_claim_detail=""
+  if [[ "$task" == "audit-intent" ]]; then
+    audit_claim_ids="unvalidated"
+  fi
+  if [[ -n "$AUDIT_CLAIMS_FILE" ]]; then
+    (( ! WRITES_CODE )) || abort_precondition "$entry" "--audit-claims requires a read-only audit-intent task"
+    local -x GIT_NO_REPLACE_OBJECTS=1
+  fi
   engine="${ENGINE_OVERRIDE:-$(jq -r '.engine' <<< "$entry")}"
   local kind; kind="$(jq -r '.kind' <<< "$entry")"
 
@@ -433,6 +448,15 @@ run_entry() {
   # repository, not an effect of running.
   BASE_SHA="$(git -C "$REPO_PATH" rev-parse --verify -q "${base_ref}^{commit}")" \
     || abort_entry "$entry" "no-head"
+  if [[ -n "$AUDIT_CLAIMS_FILE" ]]; then
+    audit_claims="${RUN_TMP}/audit-claims.json"
+    local claim_validation_error
+    claim_validation_error="$(python3 "${MEUTE_ROOT}/lib/audit_intent.py" prepare -- \
+      "$AUDIT_CLAIMS_FILE" "$REPO_PATH" "$BASE_SHA" 2>&1 > "$audit_claims")" \
+      || abort_precondition "$entry" "$(engine_detail_clean "${claim_validation_error:-invalid --audit-claims list}")"
+    audit_claim_digest="$(sha256sum < "$audit_claims")"
+    audit_claim_digest="${audit_claim_digest%% *}"
+  fi
 
   # The agent runs with the worktree as its cwd, and under dontAsk a read
   # outside cwd is refused. So the path the prompt calls "checked out at" has
@@ -445,7 +469,9 @@ run_entry() {
   # reach would fail every Read the template asks for.
   local agent_path="$WORKTREE"
   (( CONTAINER_MODE )) && agent_path="/work"
-  local prompt_file="${STATE_DIR}/dry-run-prompt.md"; (( DRY_RUN )) || prompt_file="$(mktemp)"
+  local dry_prompt="${STATE_DIR}/dry-run-prompt.md" prompt_file
+  prompt_file="$dry_prompt"
+  if (( ! DRY_RUN )) || [[ -n "$audit_claims" ]]; then prompt_file="$(mktemp)"; fi
   python3 "$MANIFEST_PY" render "$template" \
     "REPO_NAME=${repo}" "REPO_SPEC=${spec}" "REPO_PATH=${agent_path}" \
     "TASK=${task}" "TIER=${tier}" "DATE=${DATE}" "BRANCH=${BRANCH}" \
@@ -458,6 +484,22 @@ run_entry() {
     "TICKET_TITLE=$(jq -r '.ticket_title' <<< "$entry")" \
     "TICKET_NOTES=$(jq -r '.ticket_notes' <<< "$entry")" \
     > "$prompt_file" || die "prompt render failed for ${template}"
+  if [[ -n "$audit_claims" ]]; then
+    {
+      printf '\n## Operator claim list\n\n```json\n'
+      cat "$audit_claims"
+      printf '```\n'
+    } >> "$prompt_file"
+    # Both native engines take the entire prompt as one argv element.
+    local prompt_bytes
+    prompt_bytes="$(wc -c < "$prompt_file")"
+    (( prompt_bytes <= 96 * 1024 )) \
+      || abort_precondition "$entry" "pinned audit prompt exceeds 96 KiB"
+    if (( DRY_RUN )); then
+      mv -- "$prompt_file" "$dry_prompt"
+      prompt_file="$dry_prompt"
+    fi
+  fi
 
   if (( DRY_RUN )); then
     note "would run: key=${key} tier=${tier} engine=${engine} model=${MODEL} lens=${lens} runtime=${runtime}"
@@ -511,7 +553,11 @@ run_entry() {
     git -C "$REPO_PATH" "${checkout_c[@]}" worktree add -q -b "$BRANCH" "$WORKTREE" "$BASE_SHA" 9>&- \
       || abort_entry "$entry" "worktree-add-failed"
   fi
-  copy_worktree_files "$entry"
+  if [[ -z "$audit_claims" ]]; then
+    copy_worktree_files "$entry"
+  elif jq -e '.worktree_files | length > 0' <<< "$entry" >/dev/null; then
+    note "pinned audit uses the commit checkout without worktree file overlays"
+  fi
 
   local out err; out="$(mktemp)"; err="$(mktemp)"
   # Everything the runner reads back lands here, never in /work: the capture
@@ -604,6 +650,9 @@ run_entry() {
     note "provider rate limit hit; auto-paused until $(hold_until_human "$paused_until")"
   fi
 
+  if [[ -n "$audit_claims" ]]; then
+    check_audit_claim_results "$audit_claims"
+  fi
   write_report "$report_rel" "$entry" "$engine" "$lens" "$base_ref" "$err"
 
   local committed="-" imported=""
@@ -771,6 +820,19 @@ etiquette_content() {
   cat "${MEUTE_ROOT}/${rel}"
 }
 
+check_audit_claim_results() {
+  audit_claim_ids="unverified"
+  if [[ "$ENGINE_STATUS" != "ok" ]]; then
+    audit_claim_detail="engine did not complete successfully"
+  elif audit_claim_detail="$(printf '%s\n' "$REPORT" | python3 "${MEUTE_ROOT}/lib/audit_intent.py" check-output "$1" 2>&1)"; then
+    audit_claim_ids="verified"
+  else
+    audit_claim_detail="$(engine_detail_clean "${audit_claim_detail:-claim result validation failed}")"
+    ENGINE_STATUS="error"
+    ENGINE_DETAIL="$audit_claim_detail"
+  fi
+}
+
 # The report is written by the runner, not the subprocess: reports/ lives in
 # meute while the worktree lives in the target repo, and a read-only audit
 # cannot write outside its checkout by construction.
@@ -794,6 +856,11 @@ write_report() {
     printf 'status: %s\n'  "$ENGINE_STATUS"
     printf 'cost_usd: %s\n' "$COST"
     printf 'turns: %s\n'   "$TURNS"
+    if [[ -n "$audit_claim_ids" ]]; then
+      printf 'audit_claim_ids: %s\n' "$audit_claim_ids"
+      [[ -z "$audit_claim_digest" ]] || printf 'audit_claim_list_sha256: %s\n' "$audit_claim_digest"
+      [[ -z "$audit_claim_detail" ]] || printf 'audit_claim_ids_detail: %s\n' "$audit_claim_detail"
+    fi
     printf -- '---\n\n'
     if [[ -n "$REPORT" ]]; then
       printf '%s\n' "$REPORT"
