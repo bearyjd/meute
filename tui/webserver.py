@@ -24,6 +24,7 @@ import re
 import secrets
 import sys
 import threading
+from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -231,7 +232,7 @@ def record_client(h: "Handler", kind: str, detail: str) -> None:
     events = h.server.client_events
     events.append((kind, detail))
     del events[:-MAX_CLIENT_EVENTS]
-    sys.stderr.write(f"webserver: client-{kind} {detail!r}\n")
+    sys.stderr.write(f"webserver: client-{kind}\n")
     h.send_json(200, {"ok": True})
 
 
@@ -290,6 +291,21 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("webserver: %s - %s\n" % (self.address_string(), fmt % args))
 
+    def log_request(self, code="-", size="-"):
+        # Request lines can carry bootstrap credentials. Only log known routes.
+        if isinstance(code, HTTPStatus):
+            code = code.value
+        method = self.command if self.command in ("GET", "POST") else "-"
+        try:
+            path = urlsplit(getattr(self, "path", "")).path
+        except ValueError:
+            path = ""
+        self.log_message("%s %s %s", method, path if route(method, path) else "-", code)
+
+    def log_error(self, fmt, *args):
+        # The stdlib's parser errors can quote an entire malformed request.
+        self.log_message("request protocol or I/O error")
+
     def send_bytes(self, status: int, data: bytes, ctype: str, extra: dict | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -335,7 +351,6 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         try:
             if not self._guard(method):
-                sys.stderr.write(f"webserver: guard rejected {method} {self.path}\n")
                 return self.send_error_json(403, "forbidden")
             url = urlsplit(self.path)
             fn = route(method, url.path)
@@ -345,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
         except BadRequest as e:
             self.send_error_json(400, str(e))
         except Exception as e:  # never leak internals to the client
-            sys.stderr.write(f"webserver: {method} {self.path} failed: {e!r}\n")
+            self.log_message("request failed (%s)", type(e).__name__)
             self.send_error_json(500, "internal error")
 
     def do_GET(self):
@@ -357,6 +372,10 @@ class Handler(BaseHTTPRequestHandler):
 
 class Server(ThreadingHTTPServer):
     """ThreadingHTTPServer with at most MAX_THREADS handler threads (R22)."""
+
+    def handle_error(self, request, client_address):
+        # The default traceback can print request-derived exception messages.
+        sys.stderr.write(f"webserver: {client_address[0]} - request handler failed\n")
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
