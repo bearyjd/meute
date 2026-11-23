@@ -572,7 +572,7 @@ checkout is never dirty from meute. It never pushes.
 |---|---|---|---|
 | `lint-sweep` | 1 | daily | runs the repo's **own** linter/formatter; caps the diff at 300 lines |
 | `gen-tests` | 1 | weekly | writes tests, then breaks the code to prove they have teeth |
-| `doc-regen` | 1 | weekly | regenerates *generated* docs; never writes prose |
+| `doc-regen` | 1 | weekly | regenerates derived docs and corrects source-backed factual errors without rewriting authored prose |
 | `dep-audit` | 1 | weekly | dependency risk, sorted by whether the vulnerable path is actually reachable |
 | `conventions` | 1 | weekly | conformance against the repo's **written** conventions only |
 | `audit-security` | 2 | daily/weekly | security audit through one rotating lens |
@@ -581,7 +581,8 @@ checkout is never dirty from meute. It never pushes.
 | `scout` / `reproduce` / `draft` | community | weekly | the contribution pipeline |
 
 Each maintenance task has a condition under which the right answer is to change
-nothing — no linter configured, no doc generator, no written conventions — and
+nothing — no linter configured, neither a doc generator nor a convention-derived
+reference, or no written conventions — and
 the templates state that declining is a successful run. Otherwise an unattended
 agent under implicit pressure to look productive finds something to do, and for
 maintenance work that means a large diff nobody asked for.
