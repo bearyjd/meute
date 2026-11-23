@@ -611,11 +611,43 @@ definition from `repos.yaml`.
 ```
 
 The rendered prompt in `state/dry-run-prompt.md` includes the exact Git
-commit the runner resolved. The audit reads the checkout and files a normal
-Meute report with stable intent references. If you have État-Major progress
+commit the runner resolved. Free-form audits file a normal Markdown report
+with unvalidated claim references. If you have État-Major progress
 evidence for the same commit, you can supply a brief record with its full SHA
 and evidence identifiers in the repository's private manifest `spec`. The
 runner includes `spec` in every task prompt for that repository.
+
+To compare exact claim IDs across runs, supply a version 1 JSON claim list to
+an explicitly enrolled, read-only `audit-intent` task.
+
+```sh
+./bin/run.sh weekly --source manifest --repo YOUR_REPO --task audit-intent \
+  --audit-claims /path/to/claims.json --strict-exit
+```
+
+The `revision` must be the full commit ID the runner resolves for the repo.
+Each claim needs a tracked, repo-relative regular file `path`, a stable
+`section` and `key` in lowercase hyphenated form, and a display `title`.
+Optional `start_line` and `end_line` specify an inclusive range in the pinned
+file. Optional `id` preserves an operator's requirement ID verbatim. IDs can
+use up to 128 ASCII letters, digits, and `._:/#-`, starting with a letter or
+digit. With `id` omitted, Meute derives it from the exact path, section and
+key. Use `root` for unheaded source material. See the
+[six-claim Meute fixture](tests/fixtures/meute-audit-claims.json) for the shape.
+The list may have 1 to 25 claims and must fit in 16 KiB both before and after
+normalization. The rendered audit prompt must fit in 96 KiB. Pinned audits
+use the Git checkout without copying manifest `worktree_files` into it.
+
+The Markdown report includes a versioned JSON result block and the runner's
+`audit_claim_ids` status. `verified` means the exact ID set matched, including
+one record per ID. A missing, duplicate, unknown or malformed result marks
+the audit unverified and fails the run. You can check a saved report with
+the original claim list. Older reports remain readable and replay reports
+their IDs as `unvalidated`.
+
+```sh
+python3 lib/audit_intent.py verify /path/to/claims.json reports/YOUR_REPO/REPORT.md
+```
 
 ## Reviewing the output — `bin/meute`
 

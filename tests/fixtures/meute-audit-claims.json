@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "revision": "d0e981983c83fb953dc5d3ceaa645dad46f7b6ce",
+  "claims": [
+    {
+      "id": "web-inbox-page",
+      "path": "docs/superpowers/plans/2026-11-15-web-inbox.md",
+      "section": "task-2-inbox-page",
+      "key": "cli-backed-triage",
+      "title": "Web Inbox page and CLI-backed triage",
+      "start_line": 59,
+      "end_line": 70
+    },
+    {
+      "id": "run-tab-enqueue-fresh-plan",
+      "path": "docs/superpowers/specs/2026-11-15-web-inbox-design.md",
+      "section": "run-tab-flow",
+      "key": "enqueue-requires-fresh-plan",
+      "title": "Run tab Enqueue requires a fresh plan result",
+      "start_line": 50,
+      "end_line": 53
+    },
+    {
+      "id": "run-tab-start-staged-only",
+      "path": "README.md",
+      "section": "triage",
+      "key": "run-tab-start-staged-only",
+      "title": "Run tab Start runs staged items only",
+      "start_line": 236,
+      "end_line": 242
+    },
+    {
+      "id": "doc-regen",
+      "path": "tasks/doc-regen.md",
+      "section": "doc-regen",
+      "key": "regenerate-without-rewriting-prose",
+      "title": "Doc regeneration preserves authored prose",
+      "start_line": 17,
+      "end_line": 53
+    },
+    {
+      "id": "PRP-004/phase-4",
+      "path": "docs/prp/PRP-004-container-review-publish.md",
+      "section": "phase-4-review-stage",
+      "key": "automated-opposite-provider-review",
+      "title": "Automated review by the opposite provider",
+      "start_line": 534,
+      "end_line": 556
+    },
+    {
+      "id": "PRP-004/phase-5",
+      "path": "docs/prp/PRP-004-container-review-publish.md",
+      "section": "phase-5-publish-dont-merge",
+      "key": "draft-pr-and-checks-snapshot",
+      "title": "Draft PR publication and a checks snapshot",
+      "start_line": 558,
+      "end_line": 570
+    }
+  ]
+}
