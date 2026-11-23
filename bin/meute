@@ -14,6 +14,8 @@
 #                                  subscription windows reach the quota gate
 #   status                        quota, what runs next, this week's activity
 #   reports [--new|--all]         list reports with their triage state
+#   evidence export --project PROJECT --output FILE --record PROVENANCE REPORT TERMINAL_LOG ...
+#                                 export verified, owner-bound reports as a local snapshot
 #   findings [--new|--all] [--json]
 #                                 one row per finding — the actual unit of decision;
 #                                  --new hides gone, superseded, claimed and inherited rows
@@ -804,6 +806,7 @@ main() {
     install-timers) cmd_install_timers "$@" ;;
     install-statusline) cmd_install_statusline "$@" ;;
     reports)  cmd_reports "$@" ;;
+    evidence) exec python3 "${MEUTE_ROOT}/lib/evidence.py" "$@" ;;
     findings) cmd_findings "$@" ;;
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;
