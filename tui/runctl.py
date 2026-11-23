@@ -5,14 +5,15 @@ the CLI or slip past a gate:
 
   plan()     bin/meute plan --json                       (writes only state/plan-cache)
   enqueue()  bin/meute plan --enqueue --append --skip-invalid --only <p>... [-- <scan>]
-  start()    one background `bin/meute drain daily|weekly --source plan|manifest`
+  start()    one background `bin/meute drain daily|weekly --source staged|manifest`
 
 `meute drain` (lib/drain.sh) is the loop: it calls run.sh unforced, so the
 hold, the lock, the cursor, the community share, the tier-3 cap, the
 self-budget and the quota floor all still apply, and it ends on a stop-class
 exit status. This module starts it (daily, then weekly) and reads its exit
-status, never the log text. Source "plan" drains the staged plan, "manifest"
-the configured repos (D1: exit statuses are the opt-in --strict-exit ones).
+status, never the log text. The web source "plan" selects staged work only.
+Source "manifest" runs configured repos (D1: exit statuses are the opt-in
+--strict-exit ones).
 
 Subprocesses start in their own session. The drain has no timeout. Stop sends SIGTERM to the drain
 process only, never to its run.sh child, so the in-flight item finishes; a
@@ -41,10 +42,11 @@ DRAIN_STOPS = {
     1: "stopped after repeated failed runs",
     2: "the drain was refused (bad arguments)",
     10: "skipped: the fleet is on hold",
-    11: "skipped: another run holds the lock",
+    11: "skipped: the run or staged queue lock is busy",
     12: "skipped: the self-budget is spent",
     13: "skipped: the quota floor was reached",
     15: "skipped: the host is too loaded or low on disk",
+    17: "the staged plan failed validation",
 }
 NEXT_SLOT_STATUSES = (0, 14)  # finished, or nothing eligible: go on to the weekly slot
 RUN_OUTPUT = ".plan-web-run.log"  # under state/; matches the .gitignore'd state/.plan-*
@@ -352,7 +354,7 @@ class RunController:
         out = os.path.join(self.state_dir, RUN_OUTPUT)
         if slot == "daily" and os.path.exists(out):
             open(out, "wb").close()  # P1.3: one drain's output per run, not forever
-        argv = [self.meute, "drain", slot, "--source", source]
+        argv = [self.meute, "drain", slot, "--source", "staged" if source == "plan" else source]
         try:
             rc, _ = self.runner(argv, self.root, out_path=out, on_start=self._drain_started)
         finally:

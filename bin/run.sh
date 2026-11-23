@@ -18,7 +18,10 @@
 #   --repo <name>            force a repo (bypasses the cursor and the share gates)
 #   --task <name>            force a task (bypasses the cursor and the share gates)
 #   --wait-lock <secs>       wait up to <secs> for another run's lock instead of skipping
-#   --source <plan|manifest> plan (default): a staged plan first; manifest: ignore it this fire
+#   --source <plan|staged|manifest>
+#                            plan (default): try staged work, then the manifest
+#                            staged: use only staged work
+#                            manifest: ignore the staged plan
 #   --once                   a forced staged item already attempted exits code=already-done
 #   --dry-run                select and render, invoke nothing. Not a no-op on state/:
 #                            every skip before selection (hold, lock, budget, quota,
@@ -183,7 +186,8 @@ parse_args() {
   [[ -z "$ENGINE_OVERRIDE" || "$ENGINE_OVERRIDE" =~ ^(claude|codex)$ ]] || usage_die "unknown engine: $ENGINE_OVERRIDE"
   [[ -z "$RUNTIME_OVERRIDE" || "$RUNTIME_OVERRIDE" =~ ^(host|container)$ ]] || usage_die "unknown runtime: $RUNTIME_OVERRIDE (expected host or container)"
   [[ "$WAIT_LOCK" =~ ^(0|[1-9][0-9]*)$ ]] || usage_die "--wait-lock needs whole seconds: $WAIT_LOCK"
-  [[ "$SOURCE" =~ ^(plan|manifest)$ ]] || usage_die "unknown source: $SOURCE (expected plan or manifest)"
+  [[ "$SOURCE" =~ ^(plan|staged|manifest)$ ]] \
+    || usage_die "unknown source: $SOURCE (expected plan, staged or manifest)"
 }
 
 
@@ -257,17 +261,25 @@ main() {
   # It is independently re-expanded and refuses writing tiers in manifest.py;
   # then the ordinary timers prioritize it until every staged item is attempted.
   # --source manifest leaves it untouched: not read, retired or quarantined.
-  if [[ "$SOURCE" == plan && -f "$PLAN_QUEUE_FILE" ]]; then
+  if [[ "$SOURCE" == staged ]]; then
+    plan_queue_lock || skip lock "another process holds the staged plan queue lock"
+    retire_completed_plan
+  elif [[ "$SOURCE" == plan && -f "$PLAN_QUEUE_FILE" ]]; then
     plan_queue_locked retire_completed_plan
   fi
-  if [[ "$SOURCE" == plan && -f "$PLAN_QUEUE_FILE" ]]; then
+  if [[ "$SOURCE" != manifest && -f "$PLAN_QUEUE_FILE" ]]; then
     python3 "$MANIFEST_PY" plan-queue "$MANIFEST" "$PLAN_QUEUE_FILE" "$SLOT" > "$queue_file" \
       || plan_quarantine "staged plan queue failed validation"
     if [[ -s "$queue_file" ]]; then
       PLAN_MODE=1
     fi
   fi
-  (( PLAN_MODE )) || python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
+  if [[ "$SOURCE" == staged ]]; then
+    plan_queue_unlock
+    (( PLAN_MODE )) || skip no-queue "no staged plan entries for slot ${SLOT}"
+  elif (( ! PLAN_MODE )); then
+    python3 "$MANIFEST_PY" queue "$MANIFEST" "$SLOT" > "$queue_file" || die "queue build failed"
+  fi
   fleet_load_scope || die "queue build failed"
 
   FORCED=0
@@ -284,6 +296,10 @@ main() {
   # a plan whose last item just went missing is complete now, not next fire.
   if [[ -z "$entry" ]] && (( PLAN_MODE )); then
     (( ! ONCE_DONE )) || skip already-done "staged plan item already attempted (--once)" "repo=${FORCE_REPO:--}" "task=${FORCE_TASK:--}"
+    if [[ "$SOURCE" == staged ]]; then
+      plan_queue_locked retire_completed_plan
+      skip_nothing_eligible
+    fi
     note "no eligible staged plan item for slot ${SLOT}; falling back to the manifest queue"
     plan_queue_locked retire_completed_plan
     PLAN_MODE=0

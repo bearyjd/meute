@@ -77,7 +77,12 @@ def build_plan_queue(data: dict, path: str, slot: str, root: str) -> list:
     if not os.path.isfile(path):
         return []
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        handle = open(path, "r", encoding="utf-8")
+    except FileNotFoundError:
+        # A runner may archive the queue between the existence check and open.
+        return []
+    try:
+        with handle:
             staged = json.load(handle)
     except json.JSONDecodeError as error:
         raise ManifestError(f"{path}: invalid plan queue JSON: {error.msg}") from error

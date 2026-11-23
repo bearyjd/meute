@@ -22,6 +22,7 @@
 #   10  hold                             70  the runner itself died
 #   11  another run holds the lock
 #   12  budget (meute's own ceiling)    16  already done (--once)
+#   17  invalid staged plan
 # The code= field in state/log is the same vocabulary; tui/runprogress.py
 # reads it in preference to the free text.
 #
@@ -55,6 +56,7 @@ outcome_exit_status() {
     nothing-eligible|no-queue) echo 14 ;;
     load|disk) echo 15 ;;
     already-done) echo 16 ;;
+    plan-invalid) echo 17 ;;
     *) echo 70 ;;
   esac
 }
