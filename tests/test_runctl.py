@@ -129,8 +129,9 @@ class StartTests(RunCtlCase):
 
     def test_start_rejects_an_unknown_source(self):
         self.ctl.enqueue([ALPHA])
-        with self.assertRaises(ValueError):
-            self.ctl.start("everything")
+        for source in ("everything", "staged"):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                self.ctl.start(source)
 
 
 class DrainTests(RunCtlCase):
@@ -143,8 +144,8 @@ class DrainTests(RunCtlCase):
         self.ctl.enqueue([ALPHA, BETA])
         self.fleet.drains = [self.fleet.drained(name_for(ALPHA), name_for(BETA))]
         status = self.run_to_end()
-        self.assertEqual(self.drain_argv(), [["drain", "daily", "--source", "plan"],
-                                             ["drain", "weekly", "--source", "plan"]])
+        self.assertEqual(self.drain_argv(), [["drain", "daily", "--source", "staged"],
+                                             ["drain", "weekly", "--source", "staged"]])
         self.assertEqual(self.fleet.run_calls(), [])  # the page never calls run.sh itself
         self.assertEqual((status["total"], status["done"], status["remaining"]), (2, 2, 0))
         self.assertEqual(status["stopped_reason"], "drain finished")
@@ -158,7 +159,7 @@ class DrainTests(RunCtlCase):
     def test_default_source_is_the_staged_plan(self):
         self.ctl.enqueue([ALPHA])
         self.run_to_end()
-        self.assertEqual(self.drain_argv()[0][-1], "plan")
+        self.assertEqual(self.drain_argv()[0][-1], "staged")
 
     def test_a_stop_class_exit_ends_the_run_with_its_reason(self):
         self.ctl.enqueue([ALPHA])

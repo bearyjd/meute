@@ -41,11 +41,12 @@
 #                                 community_share or tier3_max_in_flight until it expires (7d max)
 #   policy show | clear           what is overridden now | drop it early
 #                                 (one invocation only: MEUTE_QUOTA_FLOOR=1 bin/run.sh ...)
-#   drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...
+#   drain <daily|weekly> [--source plan|staged|manifest] [--max N] [--until HH:MM] [--repo R]...
 #                                  run the slot unforced, fire after fire (waiting up to
 #                                  900 s for the lock), until one full rotation is done,
 #                                  the staged plan is drained, or a fire is declined;
-#                                  exits with that fire's status (lib/drain.sh)
+#                                  exits with that fire's status (lib/drain.sh).
+#                                  --source staged drains only the staged plan
 #   discover [dir]                find git repos under dir (default ~/Documents/vibe-code)
 #                                  not yet configured, and interactively add the ones you pick
 #   plan [--enqueue [--append|--replace] [--only <repo>]... [--skip-invalid]] [--allow-web] [--json] [dir]

@@ -1,7 +1,7 @@
 # meute drain, sourced by bin/meute (P1.3, R11): one loop for the staged plan
 # and for the configured repos.
 #
-#   meute drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...
+#   meute drain <daily|weekly> [--source plan|staged|manifest] [--max N] [--until HH:MM] [--repo R]...
 #
 # Each fire is `run.sh <slot> --strict-exit --wait-lock 900 --source <mode>`,
 # never forced, so the cursor, the community share, the tier-3 cap and the
@@ -11,7 +11,8 @@
 # status only (D1, --strict-exit), never the log text:
 #   0, 1     the fire ran an entry; go on (three failures in a row end it, 1)
 #   other    a stop-class status (hold 10, lock 11, budget 12, quota 13,
-#            nothing eligible 14, host 15, usage 2, died 70): end with it
+#            nothing eligible 14, host 15, invalid staged plan 17, usage 2,
+#            died 70): end with it
 # It also ends with 0 after one full rotation (the cursor is back on the key
 # it named at the start, or on the queue's last key when it named none), when
 # a staged plan has no unattempted item left, at --max fires, or at --until.
@@ -53,13 +54,17 @@ drain_keys() {
          | select(($l | length) == 0 or (.repo as $r | any($l[]; . == $r))) | "\(.key)\t\(.path)"'
 }
 
-# drain_plan_pending <slot> <only>: is any staged item still unattempted? The
+# drain_plan_pending <slot> <only> <fire-source>: is any staged item still unattempted? The
 # runner's own test (lib/status.sh next_in_queue): no plan-complete mark and
 # still a repository. A retired plan has none.
 drain_plan_pending() {
   local key path keys
   [[ -f "$PLAN_QUEUE_FILE" ]] || return 1
-  keys="$(drain_keys plan "$1" "$2")" || { printf 'meute: drain: the staged plan failed validation (see meute status)\n' >&2; exit 1; }
+  if ! keys="$(drain_keys plan "$1" "$2")"; then
+    [[ "$3" != staged ]] || drain_stop 17 "the staged plan failed validation"
+    printf 'meute: drain: the staged plan failed validation (see meute status)\n' >&2
+    exit 1
+  fi
   while IFS=$'\t' read -r key path; do
     [[ -n "$key" && -z "$(kv_get "$PLAN_DONE_FILE" "$key")" ]] || continue
     [[ -d "$path/.git" || -f "$path/.git" ]] && return 0
@@ -68,7 +73,7 @@ drain_plan_pending() {
 }
 
 cmd_drain() {
-  local slot="" source=plan max="" until="" only="" mode ckey keys start sentinel cursor seen rc errors=0
+  local slot="" source=plan max="" until="" only="" mode fire_source ckey keys start sentinel cursor seen rc errors=0
   DRAIN_FIRES=0
   while (( $# )); do
     case "$1" in
@@ -80,22 +85,31 @@ cmd_drain() {
           --source) source="$2" ;; --max) max="$2" ;; --until) until="$2" ;; --repo) only+="$2"$'\n' ;;
         esac
         shift ;;
-      *) drain_usage "unknown argument: $1 (usage: meute drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...)" ;;
+      *) drain_usage "unknown argument: $1 (usage: meute drain <daily|weekly> [--source plan|staged|manifest] [--max N] [--until HH:MM] [--repo R]...)" ;;
     esac
     shift
   done
   [[ -n "$slot" ]] || drain_usage "missing slot: expected 'daily' or 'weekly'"
-  [[ "$source" =~ ^(plan|manifest)$ ]] || drain_usage "unknown source: $source (expected plan or manifest)"
+  [[ "$source" =~ ^(plan|staged|manifest)$ ]] || drain_usage "unknown source: $source (expected plan, staged or manifest)"
   [[ -z "$max" || "$max" =~ ^[1-9][0-9]*$ ]] || drain_usage "--max needs a whole number of fires above 0: $max"
   [[ -z "$until" || "$until" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || drain_usage "--until needs HH:MM (24-hour): $until"
   [[ -z "$until" ]] || DRAIN_DEADLINE="$(drain_deadline "$until")"
 
-  # A staged plan is drained only while one is staged; --source manifest, or
-  # no plan, drains the manifest and keeps a plan staged mid-drain out of it.
-  mode=manifest; [[ "$source" == plan && -f "$PLAN_QUEUE_FILE" ]] && mode=plan
+  # Staged-only requests retain the plan cursor and queue mode if the queue
+  # vanishes before this drain or before a later fire.
+  mode=manifest
+  if [[ "$source" == staged || ( "$source" == plan && -f "$PLAN_QUEUE_FILE" ) ]]; then
+    mode=plan
+  fi
+  fire_source="$mode"
+  [[ "$source" != staged ]] || fire_source=staged
   ckey="$(cursor_name "$slot" "$mode" "$only")"
-  keys="$(drain_keys "$mode" "$slot" "$only")" || drain_usage "cannot read the ${slot} ${mode} queue"
-  [[ -z "$only" || -n "$keys" ]] || drain_usage "--repo matches no entry in the ${slot} ${mode} queue"
+  if ! keys="$(drain_keys "$mode" "$slot" "$only")"; then
+    [[ "$source" != staged ]] || drain_stop 17 "the staged plan failed validation"
+    drain_usage "cannot read the ${slot} ${mode} queue"
+  fi
+  [[ "$source" == staged || -z "$only" || -n "$keys" ]] \
+    || drain_usage "--repo matches no entry in the ${slot} ${mode} queue"
   start="$(kv_get "$CURSOR_FILE" "$ckey")"
   # An unknown cursor makes run.sh start at the head, so the rotation ends on the tail.
   sentinel="$start"
@@ -104,12 +118,14 @@ cmd_drain() {
 
   scope_init
   while :; do
-    if [[ "$mode" == plan ]] && ! drain_plan_pending "$slot" "$only"; then drain_stop 0 "the staged plan is drained"; fi
+    if [[ "$mode" == plan ]] && ! drain_plan_pending "$slot" "$only" "$fire_source"; then
+      drain_stop 0 "the staged plan is drained"
+    fi
     drain_before_deadline || drain_stop 0 "reached --until ${until}"
     [[ -z "$max" ]] || (( DRAIN_FIRES < max )) || drain_stop 0 "reached --max ${max}"
     rc=0
     MEUTE_ONLY_REPOS="$only" scope_run "${MEUTE_ROOT}/bin/run.sh" "$slot" --strict-exit \
-      --wait-lock "$DRAIN_WAIT_LOCK" --source "$mode" --once || rc=$?
+      --wait-lock "$DRAIN_WAIT_LOCK" --source "$fire_source" --once || rc=$?
     (( rc <= 1 )) || drain_stop "$rc" "stopped on run.sh exit ${rc}"
     DRAIN_FIRES=$(( DRAIN_FIRES + 1 ))
     if (( rc )); then errors=$(( errors + 1 )); else errors=0; fi

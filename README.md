@@ -154,26 +154,31 @@ on `$?` alone:
 | 1 | ran and failed |
 | 2 | usage error |
 | 10 | hold |
-| 11 | another run holds the lock |
+| 11 | another process holds the run or staged queue lock |
 | 12 | budget (meute's own ceiling) |
 | 13 | quota (below the floor, or the probe failed) |
 | 14 | nothing eligible (or no queue) |
 | 15 | host not healthy (load, disk) |
 | 16 | already done: a forced staged item another fire finished (`--once`) |
+| 17 | staged-only run stopped because the staged plan failed validation |
 | 70 | the runner itself died |
 
 The `code=` field of the `state/log` line uses the same vocabulary (`hold`,
 `lock`, `budget`, `quota-floor`, `quota-unknown`, `nothing-eligible`,
-`no-queue`, `load`, `disk`, `already-done`, `ok`, `failed`, `died`).
+`no-queue`, `load`, `disk`, `already-done`, `plan-invalid`, `ok`, `failed`, `died`).
 
-`meute drain <daily|weekly> [--source plan|manifest] [--max N] [--until HH:MM] [--repo R]...`
+`meute drain <daily|weekly> [--source plan|staged|manifest] [--max N] [--until HH:MM] [--repo R]...`
 is that loop, written once. It runs the slot unforced, one fire after another
 (each waits up to 900 s for the lock), so the cursor, the community share, the
 tier-3 cap and the pool still apply; `--repo` narrows the queue without forcing,
 on a cursor of its own, so the timers' rotation is not moved.
 It ends with 0 after one full rotation, when the staged plan is drained, or at
 `--max`/`--until`; with 1 after three failed fires in a row; and otherwise
-with the status of the fire that declined (10-15, 2, 70).
+with the status of the fire that declined. Use `--source staged` to limit the
+drain to staged work even after a queue is exhausted or removed. Each fire
+reads the current staged queue, so an authorized replacement can change the
+work available to later fires. The default `plan` source allows manifest
+fallback. Use `--source manifest` to drain configured repositories.
 
 ## Subscription-only
 
@@ -236,8 +241,10 @@ work:
 4. **Start** (after a confirm click) -- Go runs the daily slot, then the weekly
    slot, for the staged items only (staged read-only tasks are mostly
    weekly-only; repos.yaml lists at least one read-only task for both slots), one
-   item at a time. Each item is forced via `--repo/--task`; the quota floor,
-   pause, lock and budget still apply. Stop lets the current item finish.
+   item at a time. The staged source runs through the ordinary scheduler
+   gates, including the quota floor, pause, lock and budget. Choose the
+   manifest source to run configured repositories. Stop lets the current
+   item finish.
 5. **Progress** -- the page polls the run status (current item, done/remaining,
    recent outcomes).
 
