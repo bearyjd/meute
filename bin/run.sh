@@ -33,6 +33,9 @@
 #                            is archived)
 #   --ignore-load            skip the host load check, for a forced run (lib/hostcheck.sh; disk is always checked)
 #   --strict-exit            exit status names the outcome (also MEUTE_STRICT_EXIT=1); table in lib/outcome.sh
+#   --record-evidence        record one read-only invocation selected with --source manifest, --repo and --task
+#                            writes a claim under state/evidence for meute evidence export
+#   --product-task <key>     bind a recorded run to an operator-selected project/task key
 #   --validate               validate the manifest and exit
 #   --help
 #
@@ -109,6 +112,8 @@ FORCE_TASK=""
 AUDIT_CLAIMS_FILE=""
 DRY_RUN=0; WAIT_LOCK=0; SOURCE="plan"; ONCE=0; ONCE_DONE=0
 PLAN_MODE=0
+RECORD_EVIDENCE=0
+PRODUCT_TASK=""
 
 # Populated during a run; the EXIT trap reads them.
 REPO_PATH=""
@@ -179,6 +184,8 @@ parse_args() {
       --source)   SOURCE="${2:?--source needs a value}"; shift ;;
       --once)     ONCE=1 ;;
       --strict-exit) ;;   # read by outcome_scan_args, before anything can fail
+      --record-evidence) RECORD_EVIDENCE=1 ;;
+      --product-task) PRODUCT_TASK="${2:?--product-task needs a value}"; shift ;;
       --validate) python3 "$MANIFEST_PY" validate "$MANIFEST"; exit $? ;;   # validate's own status, even under --strict-exit
       --help|-h)  usage; exit 0 ;;
       *)          usage_die "unknown argument: $1 (try --help)" ;;
@@ -194,6 +201,15 @@ parse_args() {
   if [[ -n "$AUDIT_CLAIMS_FILE" ]]; then
     [[ "$SLOT" == "weekly" && "$SOURCE" == "manifest" && -n "$FORCE_REPO" && "$FORCE_TASK" == "audit-intent" ]] \
       || usage_die "--audit-claims requires weekly --source manifest --repo NAME --task audit-intent"
+  fi
+  if (( RECORD_EVIDENCE )); then
+    [[ "$SOURCE" == manifest && -n "$FORCE_REPO" && -n "$FORCE_TASK" && "$DRY_RUN" == 0 ]] \
+      || usage_die "--record-evidence requires --source manifest, --repo and --task for an executed run"
+  fi
+  if [[ -n "$PRODUCT_TASK" ]]; then
+    (( RECORD_EVIDENCE )) || usage_die "--product-task requires --record-evidence"
+    [[ ${#PRODUCT_TASK} -le 160 && "$PRODUCT_TASK" =~ ^[a-z0-9][a-z0-9_-]{0,127}/[0-9]+$ ]] \
+      || usage_die "--product-task must be a project/numeric task key"
   fi
 }
 
@@ -292,6 +308,13 @@ main() {
   FORCED=0
   [[ -z "$FORCE_REPO" && -z "$FORCE_TASK" ]] || FORCED=1
   load_queue "$queue_file"
+
+  if (( RECORD_EVIDENCE && ${#QUEUE[@]} )); then
+    (( ${#QUEUE[@]} == 1 )) && jq -e --arg key "$FORCE_REPO/$FORCE_TASK" \
+      '.key == $key and .writes_code == false and .stage_entry == false and .ticket_id == ""' \
+      <<< "${QUEUE[0]}" >/dev/null \
+      || usage_die "--record-evidence requires one read-only manifest task without a ticket or stage"
+  fi
 
   local entry
   select_entry || true
@@ -456,6 +479,15 @@ run_entry() {
       || abort_precondition "$entry" "$(engine_detail_clean "${claim_validation_error:-invalid --audit-claims list}")"
     audit_claim_digest="$(sha256sum < "$audit_claims")"
     audit_claim_digest="${audit_claim_digest%% *}"
+  fi
+
+  local run_id="" report_sha256=""
+  if (( RECORD_EVIDENCE )); then
+    local claim
+    claim="$(python3 "${MEUTE_ROOT}/lib/native_evidence.py" "$STATE_DIR" "$repo" "$task" \
+      "$SLOT" "$DATE" "$STARTED_AT" "$BASE_SHA" "$engine" "$AUTH_MODE" "$PRODUCT_TASK")" \
+      || die "could not record native run claim"
+    IFS=$'\t' read -r run_id report_rel <<< "$claim"
   fi
 
   # The agent runs with the worktree as its cwd, and under dontAsk a read
@@ -653,7 +685,11 @@ run_entry() {
   if [[ -n "$audit_claims" ]]; then
     check_audit_claim_results "$audit_claims"
   fi
-  write_report "$report_rel" "$entry" "$engine" "$lens" "$base_ref" "$err"
+  write_report "$report_rel" "$entry" "$engine" "$lens" "$base_ref" "$err" "$run_id"
+  if [[ -n "$run_id" ]]; then
+    report_sha256="$(sha256sum < "${MEUTE_ROOT}/${report_rel}")"
+    report_sha256="${report_sha256%% *}"
+  fi
 
   local committed="-" imported=""
   if (( WRITES_CODE )); then
@@ -693,9 +729,15 @@ run_entry() {
   [[ "$lens" == "none" || "$ENGINE_STATUS" != "ok" ]] \
     || state_set "lens.${repo}.${task}" "$(( lens_index + 1 ))"
 
+  local -a evidence_fields=()
+  if [[ -n "$run_id" ]]; then
+    evidence_fields=("run_id=$run_id" "report_sha256=$report_sha256")
+    [[ -z "$PRODUCT_TASK" ]] || evidence_fields+=("product_task=$PRODUCT_TASK")
+  fi
   log_run "$ENGINE_STATUS" "kind=${kind}" "repo=${repo}" "task=${task}" "tier=${tier}" \
           "lens=${lens}" "engine=${engine}" "auth=${AUTH_MODE}" "branch=${BRANCH}" "quota=${remaining_at_start}:${QUOTA_SOURCE}" "quota_age=${QUOTA_AGE}" "budget=${BUDGET_LEFT}" \
           ${SCRUBBED:+"scrubbed=${SCRUBBED// /,}"} "commit=${committed}" "report=${report_rel}" "cost=${COST}" "turns=${TURNS}" \
+          ${evidence_fields[@]+"${evidence_fields[@]}"} \
           ${ENGINE_DETAIL:+"detail=${ENGINE_DETAIL}"}
   [[ "$ENGINE_STATUS" == "ok" ]]
 }
@@ -837,9 +879,14 @@ check_audit_claim_results() {
 # meute while the worktree lives in the target repo, and a read-only audit
 # cannot write outside its checkout by construction.
 write_report() {
-  local rel="$1" entry="$2" engine="$3" lens="$4" base_ref="$5" err="$6"
-  local dest="${MEUTE_ROOT}/${rel}"
+  local rel="$1" entry="$2" engine="$3" lens="$4" base_ref="$5" err="$6" run_id="$7"
+  local dest="${MEUTE_ROOT}/${rel}" output
   mkdir -p "$(dirname "$dest")"
+  output="$dest"
+  if [[ -n "$run_id" ]]; then
+    output="$(mktemp "$(dirname "$dest")/.report.XXXXXX")"
+  fi
+  local write_rc=0
   {
     printf -- '---\n'
     printf 'repo: %s\n'    "$(jq -r '.repo' <<< "$entry")"
@@ -861,6 +908,10 @@ write_report() {
       [[ -z "$audit_claim_digest" ]] || printf 'audit_claim_list_sha256: %s\n' "$audit_claim_digest"
       [[ -z "$audit_claim_detail" ]] || printf 'audit_claim_ids_detail: %s\n' "$audit_claim_detail"
     fi
+    if [[ -n "$run_id" ]]; then
+      printf 'run_id: %s\nreport_ref: %s\n' "$run_id" "$rel"
+      [[ -z "$PRODUCT_TASK" ]] || printf 'product_task: %s\n' "$PRODUCT_TASK"
+    fi
     printf -- '---\n\n'
     if [[ -n "$REPORT" ]]; then
       printf '%s\n' "$REPORT"
@@ -868,7 +919,19 @@ write_report() {
       printf '# Run produced no report\n\n**Status:** %s — %s\n\n' "$ENGINE_STATUS" "${ENGINE_DETAIL:-no detail}"
       printf 'Last 40 lines of engine stderr:\n\n```\n%s\n```\n' "$(tail -n 40 "$err")"
     fi
-  } | python3 "${MEUTE_ROOT}/lib/redact.py" > "$dest"  # credentials never reach disk (P2.4)
+  } | python3 "${MEUTE_ROOT}/lib/redact.py" > "$output" || write_rc=$?
+  if (( write_rc )); then
+    [[ -z "$run_id" ]] || rm -f "$output"
+    return "$write_rc"
+  fi
+  if [[ -n "$run_id" ]]; then
+    # Install the completed, redacted inode without replacing a report or symlink.
+    if ! ln -T "$output" "$dest"; then
+      rm -f "$output"
+      die "could not install native report without replacing an artifact"
+    fi
+    rm -f "$output"
+  fi
 }
 
 # Commits whatever the write tier left in the worktree, onto the scratch branch
