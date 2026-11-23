@@ -677,6 +677,38 @@ passed straight back in. `show` writes only the report to stdout, so
 finds something, one command turns it into the `specced: true` ticket that tier 3
 is allowed to fix. It refuses when the tier-3 in-flight cap is already reached.
 
+### Validate feature readiness
+
+```sh
+./bin/meute readiness validate readiness.json --owner-policy owner-policy.json
+```
+
+Use two UTF-8 JSON documents. Each takes integer `version` set to `1`.
+
+| Document | Required fields besides `version` |
+| --- | --- |
+| Readiness record | `repo` (enrollment name), `ref` (literal `refs/heads/…`), `base_commit` (full commit ID), `slice_id`, `intent_ref`, `plan_revision`, and `evidence` |
+| Operator policy | `repo`, `slice_id`, `plan_revision`, `record_sha256`, `manifest_path`, `manifest_sha256`, `checkout`, and `report_inventory` |
+
+The record's `evidence` object has arrays for `docs`, `codemap`, `baseline`,
+`acceptance`, and `audits`. Use empty arrays for missing evidence. Each supplied
+reference has `ref`, `revision`, and either the lowercase `sha256` digest or a
+full `git_blob` ID. An optional `command` appears in output as text.
+
+Supply the policy from an operator-controlled path. Use the canonical absolute
+paths for `manifest_path` and `checkout`, and lowercase SHA-256 digests of the
+record and manifest bytes. The effective manifest is `MEUTE_MANIFEST` if set
+and nonempty, otherwise `repos.local.yaml` if present, then `repos.yaml`.
+`report_inventory` maps report paths relative to `reports/` to lowercase
+SHA-256 digests. An empty inventory is `{}`.
+
+The result is versioned JSON containing individual checks and a UTC timestamp.
+Exit `2` means invalid input. A matching identity exits `1` with readiness
+pending until evidence and the report inventory can be evaluated. A deleted or
+moved branch also exits `1` and reports the expected and observed commits.
+The command reads local inputs, leaves runner state untouched, and never
+executes commands from the record.
+
 ### Where tickets live
 
 `promote` writes to `state/tickets.yaml`, never to `repos.yaml`. The manifest
