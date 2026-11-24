@@ -182,6 +182,37 @@ class ReadinessTest(unittest.TestCase):
         with (self.layout / "state/reports").open("a", encoding="utf-8") as handle:
             handle.write(f"{key}\t{state}\t2026-01-03\tnote\n")
 
+    def set_resolved(self, key):
+        """The state `meute resolve` really writes: actioned with a resolved note."""
+        (self.layout / "state").mkdir(exist_ok=True)
+        with (self.layout / "state/reports").open("a", encoding="utf-8") as handle:
+            handle.write(f"{key}\tactioned\t2026-01-03\tresolved: fixed it\n")
+
+    def fix(self, key=FINDING, **overrides):
+        return {"id": key, "fingerprint": self.assessment["security"]["findings"][key]["fingerprint"],
+                **overrides}
+
+    def put_native(self, *, commit=None, status="ok", log_extra=b""):
+        commit = commit or self.base_commit
+        started = "2026-01-01T00:00:00Z"
+        report = (f"---\nrepo: sample\ntask: sample/1\nslot: a\nengine: claude\nauth: sub\n"
+                  f"base: sample@{commit}\nstarted: {started}\nstatus: {status}\n---\n# Audit\n").encode()
+        (self.reports).mkdir(parents=True, exist_ok=True)
+        (self.reports / "native.md").write_bytes(report)
+        binding = {"task": "sample/1", "ref": "reports/sample/native.md", "source": "meute-runner",
+                   "engine": "claude", "auth": "sub", "commit": commit, "started_at": started,
+                   "outcome": status, "report_sha256": hashlib.sha256(report).hexdigest()}
+        run_id = "a" * 32
+        (self.layout / "state/evidence").mkdir(parents=True, exist_ok=True)
+        (self.layout / "state/evidence" / f"{run_id}.json").write_text(json.dumps(binding), encoding="utf-8")
+        code = {"ok": "ok", "error": "failed"}[status]
+        line = (f"{started}\tweek=1\tslot=a\tcode={code}\tdur=5s\truntime=x\timage=y\tstage=z\tpr=n"
+                f"\trepo=sample\ttask=sample/1\tengine=claude\tauth=sub\tstatus={status}"
+                f"\treport=reports/sample/native.md\n").encode()
+        (self.layout / "state/log").write_bytes(line + log_extra)
+        self.put_evidence("audits", self.evidence_doc("audits", native={"run_id": run_id}), replace=True)
+        self.write_inputs()
+
     def deferral(self, expires, finding=FINDING, **overrides):
         item = {"finding": finding, "fingerprint": self.assessment["security"]["findings"][finding]["fingerprint"],
                 **self.scope, "reason": "tracked elsewhere", "expires_at": expires}
@@ -449,7 +480,7 @@ class ReadinessTest(unittest.TestCase):
         bad.unlink()
         bad.symlink_to(self.root / "nowhere")
         self.write_inputs()
-        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+        self.assert_reason(self.run_validate(), "report_unreadable")
 
     def test_path_and_header_repo_mismatch_is_pending(self):
         self.make_ready()
@@ -506,9 +537,9 @@ class ReadinessTest(unittest.TestCase):
 
     def test_claimed_fix_needs_evidence_naming_the_finding(self):
         self.make_ready(applicable=True)
-        self.set_state(FINDING, "resolved")
+        self.set_resolved(FINDING)
         self.assert_reason(self.run_validate(), "fix_unverified")
-        self.put_evidence("acceptance", self.evidence_doc("acceptance", fixes=[FINDING]), replace=True)
+        self.put_evidence("acceptance", self.evidence_doc("acceptance", fixes=[self.fix()]), replace=True)
         self.write_inputs()
         self.assertEqual(self.run_validate(code=0)["status"], "ready")
 
@@ -620,3 +651,185 @@ class ReadinessTest(unittest.TestCase):
                 self.assertEqual(self.run_inline()[0], 0)
                 item = self.assert_pending("inputs_drifted", after_evaluation=mutate)
                 self.assertIn(key, item["drifted"])
+
+    def ready_with_fix(self, purpose="acceptance"):
+        self.make_ready(applicable=True)
+        self.set_resolved(FINDING)
+        self.put_evidence(purpose, self.evidence_doc(purpose, fixes=[self.fix()]), replace=True)
+        self.write_inputs()
+
+    # ----- severity policy -------------------------------------------------
+
+    def test_severity_policy_cannot_hide_an_applicable_open_finding(self):
+        self.make_ready(applicable=True)
+        self.write_policy(severity_policy=["CRITICAL"])
+        self.assert_pending("finding_open")
+
+    def test_empty_severity_policy_is_invalid(self):
+        self.make_ready()
+        self.write_policy(severity_policy=[])
+        self.assert_reason(self.run_validate(code=2), "policy_rules_invalid")
+
+    # ----- claimed fixes ---------------------------------------------------
+
+    def test_real_resolve_state_with_bound_fix_is_ready(self):
+        self.ready_with_fix()
+        self.assertEqual(self.run_inline()[0], 0)
+        self.ready_with_fix("audits")
+        self.assertEqual(self.run_inline()[0], 0)
+
+    def test_state_meute_never_writes_does_not_clear_a_blocker(self):
+        self.ready_with_fix()
+        (self.layout / "state/reports").unlink()
+        self.set_state(FINDING, "resolved")
+        self.assert_pending("finding_open")
+
+    def test_actioned_without_resolved_note_is_open(self):
+        self.ready_with_fix()
+        (self.layout / "state/reports").unlink()
+        self.set_state(FINDING, "actioned")
+        self.assert_pending("finding_open")
+
+    def test_fixes_from_docs_evidence_are_not_accepted(self):
+        self.ready_with_fix()
+        self.put_evidence("docs", self.evidence_doc("docs", fixes=[self.fix()]), replace=True)
+        self.put_evidence("acceptance", replace=True)
+        self.write_inputs()
+        self.assert_pending("fix_unverified")
+
+    def test_fixes_must_bind_the_fingerprint(self):
+        self.ready_with_fix()
+        for entry in (FINDING, self.fix(fingerprint="0" * 40), {"id": FINDING}):
+            with self.subTest(entry=entry):
+                self.put_evidence("acceptance", self.evidence_doc("acceptance", fixes=[entry]), replace=True)
+                self.write_inputs()
+                self.assert_pending("fix_unverified")
+
+    # ----- decision state recheck -------------------------------------------
+
+    def test_inbox_state_changed_after_evaluation_is_pending(self):
+        self.ready_with_fix()
+        self.assertEqual(self.run_inline()[0], 0)
+        reopen = lambda: (self.layout / "state/reports").write_text(f"{FINDING}\tnew\t2026-01-04\tx\n")
+        item = self.assert_pending("inputs_drifted", after_evaluation=reopen)
+        self.assertIn("state", item["drifted"])
+
+    def test_finding_status_changed_after_evaluation_is_pending(self):
+        self.ready_with_fix()
+        verdict = lambda: (self.layout / "state/finding-status").write_text(f"{FINDING}\tgone\tabc\t2026-01-04\t\n")
+        item = self.assert_pending("inputs_drifted", after_evaluation=verdict)
+        self.assertIn("state", item["drifted"])
+
+    # ----- report parsing and scanning -------------------------------------
+
+    def test_findings_section_with_unparseable_entries_is_malformed(self):
+        self.make_ready()
+        text = self.report_text().replace("### [HIGH] ", "### HIGH ").replace(f"- **Location:** `{LOCATION}`", "- **Location:** `x:1`")
+        (self.reports / "bad.md").write_text(text.replace("audit", "audit2", 1), encoding="utf-8")
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "report_malformed")
+
+    def test_symlinked_report_file_is_unreadable_not_skipped(self):
+        self.make_ready()
+        hidden = self.layout / "hidden.md"
+        hidden.write_bytes((self.reports / "audit-1.md").read_bytes())
+        (self.reports / "sneaky.md").symlink_to(hidden)
+        self.write_inputs()
+        item = self.assert_reason(self.run_validate(), "report_unreadable")
+        self.assertIn({"path": "sample/sneaky.md", "reason": "report_unreadable"}, item["reports"])
+
+    def test_symlinked_repo_directory_is_unreadable(self):
+        self.make_ready()
+        real = self.layout / "elsewhere"
+        real.mkdir()
+        (self.reports / "audit-1.md").rename(real / "audit-1.md")
+        self.reports.rmdir()
+        self.reports.symlink_to(real, target_is_directory=True)
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "report_unreadable")
+
+    def test_md_directory_under_repo_is_unreadable(self):
+        self.make_ready()
+        (self.reports / "odd.md").mkdir()
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "report_unreadable")
+
+    def test_unreadable_directory_is_pending_json_not_a_traceback(self):
+        self.make_ready()
+        other = self.layout / "reports/other"
+        other.mkdir()
+        other.chmod(0)
+        self.addCleanup(other.chmod, 0o755)
+        if os.access(other, os.R_OK):
+            self.skipTest("permissions are not enforced for this user")
+        self.write_inputs()
+        self.assert_pending("report_unreadable")
+
+    def test_unexpected_evaluation_error_is_pending_json(self):
+        self.make_ready()
+        original = readiness.evaluate
+        self.addCleanup(setattr, readiness, "evaluate", original)
+        def boom(*args):
+            raise RuntimeError("/secret/path")
+        readiness.evaluate = boom
+        code, result = self.run_inline()
+        self.assertEqual((code, result["status"]), (1, "pending"))
+        self.assertNotIn("/secret/path", json.dumps(result))
+
+    # ----- evidence trust --------------------------------------------------
+
+    def test_evidence_through_a_symlinked_directory_out_of_root_is_unattested(self):
+        self.make_ready()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.evidence_root / "link").symlink_to(outside, target_is_directory=True)
+        data = json.dumps(self.evidence_doc("docs")).encode()
+        (outside / "ev.json").write_bytes(data)
+        self.record["evidence"]["docs"] = [{"ref": "link/ev.json", "revision": self.base_commit,
+                                            "sha256": hashlib.sha256(data).hexdigest()}]
+        self.write_inputs()
+        self.assert_pending("evidence_unattested")
+
+    def test_git_blob_is_not_trusted_for_run_purposes(self):
+        doc = {key: value for key, value in self.evidence_doc("acceptance").items() if key != "revision"}
+        (self.checkout / "acceptance.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.git("add", "acceptance.json")
+        self.git("commit", "-qm", "evidence")
+        self.record["base_commit"] = self.base_commit = self.git("rev-parse", "HEAD")
+        self.git("update-ref", REF, self.base_commit)
+        self.make_ready()
+        self.record["evidence"]["acceptance"] = [{
+            "ref": "acceptance.json", "revision": self.base_commit,
+            "git_blob": self.git("rev-parse", "HEAD:acceptance.json")}]
+        self.write_inputs()
+        self.assert_pending("evidence_blob_untrusted")
+
+    def test_native_evidence_with_runner_state_is_ready(self):
+        self.make_ready()
+        self.put_native()
+        self.assertEqual(self.run_inline()[0], 0)
+
+    def test_native_evidence_wrong_revision_and_failed_outcome_are_pending(self):
+        self.make_ready()
+        self.put_native(commit="b" * 40)
+        self.assert_pending("evidence_wrong_revision")
+        self.put_native(status="error")
+        self.assert_pending("evidence_failed_outcome")
+
+    def test_native_digest_change_after_evaluation_is_pending(self):
+        self.make_ready()
+        self.put_native()
+        grow = lambda: (self.layout / "state/log").write_bytes(
+            (self.layout / "state/log").read_bytes() + b"unrelated\tline\n")
+        item = self.assert_pending("inputs_drifted", after_evaluation=grow)
+        self.assertIn("evidence", item["drifted"])
+
+    # ----- accepted conditions ----------------------------------------------
+
+    def test_baseline_condition_does_not_accept_a_missing_codemap(self):
+        self.make_ready()
+        self.record["evidence"]["codemap"] = []
+        self.write_inputs()
+        rule = {"condition": "baseline_preexisting_failure", **self.scope, "reason": "documented"}
+        self.write_policy(accepted_conditions=[rule])
+        self.assert_pending("evidence_missing")

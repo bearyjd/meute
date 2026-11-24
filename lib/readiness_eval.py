@@ -19,6 +19,9 @@ from readiness_rules import CATEGORIES, SCOPE, covers, expired, parse_utc
 PURPOSES = ("docs", "codemap", "baseline", "acceptance", "audits")
 EVIDENCE_FIELDS = {"version", "purpose", *SCOPE, "revision", "outcome"}
 OPTIONAL_FIELDS = {"result", "fixes", "native", "preexisting"}
+FINDING_HEADING = re.compile(r"^###\s", re.M)
+BLOB_PURPOSES = ("docs", "codemap")
+FIX_PURPOSES = ("acceptance", "audits")
 PRECEDENCE = ("report_unreadable", "report_malformed", "report_repo_mismatch",
               "inventory_report_changed", "inventory_report_added", "inventory_report_removed")
 
@@ -56,11 +59,15 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
         return {**entry, "error": "report_repo_mismatch"}
     rid = f"{directory}/{name[:-3]}"
     fp_repo = report_lib.report_repo(meta, str(path))
+    section = report_lib.has_findings_section(body)
+    parsed = report_lib.parse_findings(body) if section else []
+    if section and not parsed and FINDING_HEADING.search(body):
+        return {**entry, "error": "report_malformed"}
     findings = [
         {"id": f"{rid}#{f['n']}", "report": rid, "n": f["n"], "severity": f["severity"],
          "fingerprint": report_lib.fingerprint(fp_repo, f["location"], f["title"])}
-        for f in report_lib.parse_findings(body)
-    ] if report_lib.has_findings_section(body) else []
+        for f in parsed
+    ]
     return {**entry, "findings": findings}
 
 
@@ -70,12 +77,29 @@ def scan_reports(root: Path, repo: str) -> dict[str, dict]:
     found: dict[str, dict] = {}
     if not base.is_dir():
         return found
-    for directory in sorted(os.listdir(base)):
+    unreadable = {"digest": None, "error": "report_unreadable", "claimed": None, "findings": []}
+    try:
+        directories = sorted(os.listdir(base))
+    except OSError:
+        return {"reports/": unreadable}
+    for directory in directories:
         folder = base / directory
-        if folder.is_symlink() or not folder.is_dir():
+        if folder.is_symlink():
+            if directory == repo:
+                found[f"{directory}/"] = unreadable
             continue
-        for name in sorted(os.listdir(folder)):
+        if not folder.is_dir():
+            continue
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            found[f"{directory}/"] = unreadable
+            continue
+        for name in names:
             path = folder / name
+            if directory == repo and (path.is_symlink() or (name.endswith(".md") and not path.is_file())):
+                found[f"{directory}/{name}"] = unreadable
+                continue
             if not name.endswith(".md") or path.is_symlink() or not path.is_file():
                 continue
             entry = _parse_report(path, directory, name, repo)
@@ -129,7 +153,7 @@ def resolve_findings(root: Path, reports: dict[str, dict]) -> tuple[list[dict], 
         if row is None or row["fingerprint"] != finding["fingerprint"]:
             unresolved.append(finding["id"])
             continue
-        resolved.append({**finding, "state": row["state"], "hidden": row["hidden"]})
+        resolved.append({**finding, "state": row["state"], "note": row["note"], "hidden": row["hidden"]})
     if unresolved:
         return resolved, {"check": "findings", "status": "pending",
                           "reason": "finding_identity_unresolved", "findings": unresolved}
@@ -153,25 +177,24 @@ def assessment_check(assessment: dict, findings: list[dict], resolved_all: bool)
     return {"check": "assessment", "status": "passed", "reason": "assessment_complete"}
 
 
-def _blocker(finding: dict, ctx: Context, fixed: set[str], now: datetime) -> tuple[str | None, datetime | None]:
+def _blocker(finding: dict, ctx: Context, fixed: set[tuple[str, str]], now: datetime) -> tuple[str | None, datetime | None]:
     scope = ctx.record
     deferrals = [d for d in covers(ctx.policy["deferrals"], scope)
                  if d["finding"] == finding["id"] and d["fingerprint"] == finding["fingerprint"]]
     live = [d for d in deferrals if not expired(d, now)]
     if live:
         return None, max(parse_utc(d["expires_at"]) for d in live)
-    if finding["state"] == "resolved":
-        return (None if finding["id"] in fixed else "fix_unverified"), None
+    if finding["state"] == "actioned" and finding["note"].startswith("resolved:"):  # what `meute resolve` writes
+        return (None if (finding["id"], finding["fingerprint"]) in fixed else "fix_unverified"), None
     return ("deferral_expired" if deferrals else "finding_open"), None
 
 
-def blockers_check(ctx: Context, findings: list[dict], fixed: set[str], now: datetime) -> tuple[dict, list[datetime]]:
+def blockers_check(ctx: Context, findings: list[dict], fixed: set[tuple[str, str]], now: datetime) -> tuple[dict, list[datetime]]:
     applicable = {key for name in CATEGORIES for key, item in ctx.policy["assessment"][name]["findings"].items()
                   if item["applicable"]}
-    blocking = set(ctx.policy["severity_policy"])
     open_, relied = [], []
     for finding in findings:
-        if finding["id"] not in applicable or finding["severity"] not in blocking:
+        if finding["id"] not in applicable:
             continue
         reason, expiry = _blocker(finding, ctx, fixed, now)
         if reason:
@@ -187,7 +210,7 @@ def blockers_check(ctx: Context, findings: list[dict], fixed: set[str], now: dat
 
 def _inside(path: Path, root: Path) -> bool:
     try:
-        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+        path.relative_to(root.resolve(strict=True))
     except (OSError, ValueError, RuntimeError):
         return False
     return True
@@ -201,8 +224,9 @@ def _file_evidence(ctx: Context, ref: str, pin: str) -> tuple[bytes | None, str 
     if not path.is_absolute():
         path = root / path
     try:
+        path = path.resolve(strict=True)  # open the resolved path, so no directory symlink is followed after the check
         data, _ = read_input(path, 1024 * 1024)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return None, "evidence_unreadable"
     if sha256(data) != pin:
         return None, "evidence_digest_mismatch"
@@ -250,6 +274,8 @@ def load_evidence(ctx: Context, purpose: str, item: dict) -> dict:
         return {"ref": item["ref"], "doc": None, "digest": digest, "reason": reason}
     if item["revision"] != ctx.record["base_commit"]:
         return bad("evidence_wrong_revision")
+    if "sha256" not in item and purpose not in BLOB_PURPOSES:
+        return bad("evidence_blob_untrusted")  # a blob in the reviewed repo cannot vouch for itself
     loader = _file_evidence if "sha256" in item else _blob_evidence
     data, reason = loader(ctx, item["ref"], item.get("sha256") or item["git_blob"])
     if reason:
@@ -296,14 +322,21 @@ def _result_reason(ctx: Context, purpose: str, doc: dict) -> str | None:
     return "evidence_failed"
 
 
-def evaluate_evidence(ctx: Context) -> tuple[list[dict], set[str], dict[str, str]]:
+def _fixes(doc: dict) -> set[tuple[str, str]]:
+    claims = doc.get("fixes")
+    return {(fix["id"], fix["fingerprint"]) for fix in claims if isinstance(fix, dict)
+            and isinstance(fix.get("id"), str) and isinstance(fix.get("fingerprint"), str)} \
+        if isinstance(claims, list) else set()
+
+
+def evaluate_evidence(ctx: Context) -> tuple[list[dict], set[tuple[str, str]], dict[str, str]]:
     checks, fixed, digests = [], set(), {}
     for purpose in PURPOSES:
         loaded = [load_evidence(ctx, purpose, item) for item in ctx.record["evidence"][purpose]]
         for entry in loaded:
             digests[f"{purpose}:{entry['ref']}"] = entry["digest"] or entry["reason"]
-            if entry["doc"] and isinstance(entry["doc"].get("fixes"), list):
-                fixed |= {fix for fix in entry["doc"]["fixes"] if isinstance(fix, str)}
+            if entry["doc"] and purpose in FIX_PURPOSES:
+                fixed |= _fixes(entry["doc"])
         checks.append(_purpose_check(ctx, purpose, loaded))
     return checks, fixed, digests
 
@@ -330,8 +363,22 @@ def evidence_digests(ctx: Context) -> dict[str, str]:
     }
 
 
+def state_digests(root: Path) -> dict[str, str]:
+    """Digests of the inbox decision files that decide each finding's state."""
+    digests = {}
+    for name in ("reports", "finding-status"):
+        try:
+            digests[name] = sha256((root / "state" / name).read_bytes())
+        except FileNotFoundError:
+            digests[name] = "absent"
+        except OSError:
+            digests[name] = "unreadable"
+    return digests
+
+
 def evaluate(ctx: Context, now: datetime) -> tuple[list[dict], dict, list[datetime]]:
     """(checks, observation snapshot, expiries of deferrals relied on)."""
+    state = state_digests(ctx.root)
     reports = scan_reports(ctx.root, ctx.record["repo"])
     findings, found = resolve_findings(ctx.root, reports)
     evidence_checks, fixed, digests = evaluate_evidence(ctx)
@@ -341,10 +388,10 @@ def evaluate(ctx: Context, now: datetime) -> tuple[list[dict], dict, list[dateti
         assessment_check(ctx.policy["assessment"], findings, found["status"] == "passed"),
         *evidence_checks, blockers,
     ]
-    return checks, {"inventory": report_digests(reports), "evidence": digests}, relied
+    return checks, {"inventory": report_digests(reports), "evidence": digests, "state": state}, relied
 
 
 def observe_mutable(ctx: Context) -> dict:
     """The report inventory and evidence digests, re-read from disk."""
     return {"inventory": report_digests(scan_reports(ctx.root, ctx.record["repo"])),
-            "evidence": evidence_digests(ctx)}
+            "evidence": evidence_digests(ctx), "state": state_digests(ctx.root)}

@@ -363,6 +363,11 @@ def validate(
                        "reason": error.reason, "detail": str(error)})
         result.update(status="invalid", observed_at=clock().isoformat())
         return 2, result
+    except Exception as error:  # never a traceback or a path: the contract is structured status
+        checks.append({"check": "evaluation", "status": "pending", "reason": "evaluation_failed",
+                       "detail": type(error).__name__})
+        result.update(status="pending", observed_at=clock().isoformat())
+        return 1, result
 
     ready = all(item["status"] == "passed" for item in checks)
     result.update(status="ready" if ready else "pending", observed_at=final.isoformat())
