@@ -1,11 +1,12 @@
 """Exercise readiness v1 through the public Meute CLI with disposable repos."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -13,7 +14,15 @@ import yaml
 
 
 MEUTE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(MEUTE / "lib"))
+import readiness  # noqa: E402
+import report as report_lib  # noqa: E402
+
 REF = "refs/heads/topic"
+PURPOSES = ("docs", "codemap", "baseline", "acceptance", "audits")
+FINDING = "sample/audit-1#1"
+LOCATION, TITLE = "src/a.py:3", "Unsafe thing"
+T0 = datetime(2026, 12, 1, 12, 0, tzinfo=timezone.utc)
 
 
 class ReadinessTest(unittest.TestCase):
@@ -45,7 +54,18 @@ class ReadinessTest(unittest.TestCase):
             "intent_ref": "planning/0001",
             "evidence": {purpose: [] for purpose in ("docs", "codemap", "baseline", "acceptance", "audits")},
         }
+        self.evidence_root = self.root / "evidence"
+        self.evidence_root.mkdir()
+        self.reports = self.layout / "reports/sample"
+        self.assessment = {name: {"affirmed": True, "findings": {}} for name in ("security", "cleanup")}
         self.write_inputs()
+
+    def disk_inventory(self):
+        base = self.layout / "reports"
+        return {
+            str(path.relative_to(base)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(base.glob("*/*.md")) if path.is_file()
+        }
 
     def git(self, *args):
         return subprocess.run(
@@ -72,7 +92,13 @@ class ReadinessTest(unittest.TestCase):
             "manifest_path": str(manifest.resolve()),
             "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
             "checkout": str(self.checkout),
-            "report_inventory": {},
+            "report_inventory": self.disk_inventory(),
+            "evidence_root": str(self.evidence_root),
+            "attested_digests": [],
+            "severity_policy": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+            "assessment": self.assessment,
+            "deferrals": [],
+            "accepted_conditions": [],
             **overrides,
         }
         self.policy_path.write_text(json.dumps(policy), encoding="utf-8")
@@ -94,6 +120,88 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(result["version"], 1)
         return next(item for item in result["checks"] if item["reason"] == reason)
 
+    # ----- 4.2 fixtures ---------------------------------------------------
+
+    def report_text(self, count=1, repo="sample"):
+        findings = "".join(
+            f"### [HIGH] {TITLE} {n}\n- **Location:** `src/a.py:{n}`\n\n" if n > 1 else
+            f"### [HIGH] {TITLE}\n- **Location:** `{LOCATION}`\n\n" for n in range(1, count + 1)
+        )
+        return (f"---\nrepo: {repo}\ntask: audit\nlens: security\nstatus: ok\n"
+                f"started: 2026-01-01T00:00:00Z\nbase: sample@{self.base_commit}\n---\n"
+                f"# Audit\n\n## Findings\n\n{findings}")
+
+    def put_report(self, name="audit-1", directory="sample", **kwargs):
+        target = self.layout / "reports" / directory
+        target.mkdir(parents=True, exist_ok=True)
+        (target / f"{name}.md").write_text(self.report_text(**kwargs), encoding="utf-8")
+        return target / f"{name}.md"
+
+    def put_zero_report(self, name="clean"):
+        path = self.reports / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\nrepo: sample\ntask: audit\nstatus: ok\nstarted: 2026-01-02T00:00:00Z\n---\n"
+                        "# Audit\n\nNothing found.\n", encoding="utf-8")
+        return path
+
+    def evidence_doc(self, kind, **overrides):
+        return {"version": 1, "purpose": kind, **self.scope, "revision": self.base_commit,
+                "outcome": "ok", "result": "pass", **overrides}
+
+    def put_evidence(self, purpose, doc=None, *, name=None, directory=None, replace=False):
+        directory = directory or self.evidence_root
+        path = directory / (name or f"{purpose}.json")
+        data = json.dumps(doc if doc is not None else self.evidence_doc(purpose)).encode()
+        path.write_bytes(data)
+        reference = {"ref": str(path) if directory != self.evidence_root else path.name,
+                     "revision": self.base_commit, "sha256": hashlib.sha256(data).hexdigest()}
+        self.record["evidence"][purpose] = [reference] if replace or not self.record["evidence"][purpose] \
+            else [*self.record["evidence"][purpose], reference]
+        return path
+
+    def assess(self, applicable=False, ordinals=(1,), **extra):
+        findings = {
+            f"sample/audit-1#{n}": {
+                "fingerprint": report_lib.fingerprint(
+                    "sample", LOCATION if n == 1 else f"src/a.py:{n}", TITLE if n == 1 else f"{TITLE} {n}"),
+                "applicable": applicable if n == 1 else extra.get("second", applicable),
+            } for n in ordinals
+        }
+        self.assessment = {"security": {"affirmed": True, "findings": findings},
+                           "cleanup": {"affirmed": True, "findings": {}}}
+
+    def make_ready(self, **assess):
+        self.put_report()
+        self.assess(**assess)
+        for purpose in PURPOSES:
+            self.put_evidence(purpose, replace=True)
+        self.write_inputs()
+
+    def set_state(self, key, state):
+        (self.layout / "state").mkdir(exist_ok=True)
+        with (self.layout / "state/reports").open("a", encoding="utf-8") as handle:
+            handle.write(f"{key}\t{state}\t2026-01-03\tnote\n")
+
+    def deferral(self, expires, finding=FINDING, **overrides):
+        item = {"finding": finding, "fingerprint": self.assessment["security"]["findings"][finding]["fingerprint"],
+                **self.scope, "reason": "tracked elsewhere", "expires_at": expires}
+        return {**item, **overrides}
+
+    def run_inline(self, *, now=T0, **options):
+        clock = options.pop("clock", None) or (lambda: now)
+        code, result = readiness.validate(
+            self.record_path, self.policy_path, self.manifest, clock=clock, root=self.layout, **options)
+        return code, result
+
+    def assert_pending(self, reason, **options):
+        code, result = self.run_inline(**options)
+        self.assertEqual((code, result["status"]), (1, "pending"), result)
+        return self.assert_reason(result, reason)
+
+    def tree(self):
+        return {str(p.relative_to(self.root)): p.read_bytes()
+                for p in sorted(self.root.rglob("*")) if p.is_file() and ".git/" not in str(p)}
+
     def test_current_identity_is_pending_and_commands_are_data(self):
         marker = self.root / "should-not-exist"
         command = f"touch {marker}"
@@ -106,10 +214,11 @@ class ReadinessTest(unittest.TestCase):
         ticket.write_bytes(b"unchanged")
         before = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*"))
         result = self.run_validate()
+        self.assert_reason(result, "evidence_missing")
         self.assertEqual(result["status"], "pending")
         self.assertIsNotNone(datetime.fromisoformat(result["observed_at"]).utcoffset())
         self.assertEqual(self.assert_reason(result, "ref_matches")["observed_commit"], self.base_commit)
-        self.assertEqual(self.assert_reason(result, "evidence_not_evaluated")["commands"], [
+        self.assertEqual(self.assert_reason(result, "commands_not_executed")["commands"], [
             {"purpose": "baseline", "ref": "build.log", "command": command},
         ])
         self.assertFalse(marker.exists())
@@ -261,3 +370,253 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("exactly once", error)
         result = self.run_validate(code=2, args=[self.record_path, "--owner-policy", self.record_path])
         self.assert_reason(result, "policy_not_separate")
+
+    # ----- 4.2 acceptance -------------------------------------------------
+
+    def test_fully_evidenced_fixture_is_ready_and_stable(self):
+        self.make_ready()
+        first = self.run_validate(code=0)
+        self.assertEqual(first["status"], "ready")
+        self.assertTrue(all(item["status"] == "passed" for item in first["checks"]))
+        self.assertEqual(first["observed_at"][-6:], "+00:00")
+        _, one = self.run_inline()
+        _, two = self.run_inline()
+        self.assertEqual(one["checks"], two["checks"])
+        self.assertEqual(one, two)
+
+    def test_zero_finding_report_is_accepted(self):
+        self.make_ready()
+        self.put_zero_report()
+        self.write_inputs()
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+
+    def test_ready_validation_does_not_mutate_anything(self):
+        self.make_ready()
+        self.set_state("sample/other#1", "promoted")
+        before = self.tree()
+        self.run_validate(code=0)
+        self.assertEqual(before, self.tree())
+        self.assertFalse((self.layout / "state/finding-status").exists())
+
+    def test_hidden_finding_unaccounted_for_is_pending(self):
+        self.make_ready()
+        self.set_state(FINDING, "dismissed")
+        self.assessment["security"]["findings"] = {}
+        self.write_inputs()
+        item = self.assert_pending("assessment_incomplete")
+        self.assertEqual(item["findings"], [FINDING])
+
+    def test_hidden_applicable_finding_still_blocks(self):
+        self.make_ready(applicable=True)
+        self.set_state(FINDING, "dismissed")
+        self.assert_reason(self.run_validate(), "finding_open")
+
+    def test_open_applicable_finding_is_pending_and_nonapplicable_is_not(self):
+        self.make_ready(applicable=True)
+        self.assert_reason(self.run_validate(), "finding_open")
+        self.make_ready(applicable=False)
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+
+    def test_unaffirmed_or_stale_fingerprint_assessment_is_pending(self):
+        self.make_ready()
+        self.assessment["cleanup"]["affirmed"] = False
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "assessment_not_affirmed")
+        self.assess()
+        self.assessment["security"]["findings"][FINDING]["fingerprint"] = "0" * 40
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "assessment_fingerprint_mismatch")
+
+    def test_zero_finding_report_added_then_removed_is_pending(self):
+        self.make_ready()
+        added = self.put_zero_report()
+        item = self.assert_pending("inventory_report_added")
+        self.assertEqual(item["reports"], [{"path": "sample/clean.md", "reason": "inventory_report_added"}])
+        self.write_inputs()
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+        added.unlink()
+        self.assert_reason(self.run_validate(), "inventory_report_removed")
+
+    def test_malformed_and_unreadable_reports_are_pending_without_findings(self):
+        self.make_ready()
+        bad = self.reports / "broken.md"
+        bad.write_bytes(b"no front matter at all\n")
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "report_malformed")
+        bad.write_bytes(b"---\nrepo: sample\n---\n\xff\xfe\n")
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "report_malformed")
+        bad.unlink()
+        bad.symlink_to(self.root / "nowhere")
+        self.write_inputs()
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+
+    def test_path_and_header_repo_mismatch_is_pending(self):
+        self.make_ready()
+        self.put_report("mislabelled", repo="other", count=0)
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "report_repo_mismatch")
+        (self.reports / "mislabelled.md").unlink()
+        self.put_report("foreign", directory="elsewhere", count=0)
+        self.write_inputs()
+        item = self.assert_reason(self.run_validate(), "report_repo_mismatch")
+        self.assertEqual(item["reports"][0]["path"], "elsewhere/foreign.md")
+
+    def test_changed_report_bytes_are_pending(self):
+        self.make_ready()
+        path = self.reports / "audit-1.md"
+        path.write_bytes(path.read_bytes() + b"\nextra\n")
+        self.assert_reason(self.run_validate(), "inventory_report_changed")
+
+    def test_expired_and_exact_expiry_deferrals_do_not_defer(self):
+        self.make_ready(applicable=True)
+        expiry = T0 + timedelta(hours=1)
+        stamp = expiry.isoformat().replace("+00:00", "Z")
+        self.write_policy(deferrals=[self.deferral(stamp)])
+        self.assertEqual(self.run_inline(now=expiry - timedelta(microseconds=1))[1]["status"], "ready")
+        self.assert_pending("deferral_expired", now=expiry)
+        self.assert_pending("deferral_expired", now=expiry + timedelta(seconds=1))
+
+    def test_deferral_expiring_during_evaluation_is_pending(self):
+        self.make_ready(applicable=True)
+        expiry = T0 + timedelta(minutes=5)
+        self.write_policy(deferrals=[self.deferral(expiry.isoformat())])
+        ticks = iter([T0, expiry])
+        self.assert_pending("deferral_expired_at_final", clock=lambda: next(ticks))
+
+    def test_naive_or_non_utc_deferral_expiry_is_invalid(self):
+        self.make_ready(applicable=True)
+        for stamp in ("2099-01-01T00:00:00", "2099-01-01T00:00:00+02:00", "2099-01-01"):
+            with self.subTest(stamp=stamp):
+                self.write_policy(deferrals=[self.deferral(stamp)])
+                self.assert_reason(self.run_validate(code=2), "policy_rules_invalid")
+
+    def test_deferral_covers_only_its_named_finding_and_scope(self):
+        self.make_ready(applicable=True, ordinals=(1, 2))
+        self.put_report(count=2)
+        later = "2099-01-01T00:00:00Z"
+        self.write_policy(deferrals=[self.deferral(later)])
+        item = self.assert_pending("finding_open")
+        self.assertEqual(item["findings"], [{"id": "sample/audit-1#2", "reason": "finding_open"}])
+        self.write_policy(deferrals=[self.deferral(later), self.deferral(later, "sample/audit-1#2")])
+        self.assertEqual(self.run_inline()[1]["status"], "ready")
+        self.write_policy(deferrals=[self.deferral(later, plan_revision="plan/v2"),
+                                     self.deferral(later, "sample/audit-1#2", slice_id="other")])
+        self.assert_pending("finding_open")
+
+    def test_claimed_fix_needs_evidence_naming_the_finding(self):
+        self.make_ready(applicable=True)
+        self.set_state(FINDING, "resolved")
+        self.assert_reason(self.run_validate(), "fix_unverified")
+        self.put_evidence("acceptance", self.evidence_doc("acceptance", fixes=[FINDING]), replace=True)
+        self.write_inputs()
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+
+    def test_evidence_with_wrong_revision_failed_outcome_or_scope_is_pending(self):
+        self.make_ready()
+        cases = (
+            ({"revision": "b" * 40}, "evidence_wrong_revision"),
+            ({"outcome": "failed"}, "evidence_failed_outcome"),
+            ({"result": "fail"}, "evidence_failed"),
+            ({"plan_revision": "plan/v0"}, "evidence_wrong_scope"),
+            ({"purpose": "docs"}, "evidence_wrong_purpose"),
+        )
+        for overrides, reason in cases:
+            with self.subTest(reason=reason):
+                self.put_evidence("acceptance", self.evidence_doc("acceptance", **overrides), replace=True)
+                self.write_inputs()
+                self.assert_reason(self.run_validate(), reason)
+
+    def test_digest_mismatch_and_missing_evidence_are_pending(self):
+        self.make_ready()
+        (self.evidence_root / "docs.json").write_bytes(b"{}")
+        self.assert_reason(self.run_validate(), "evidence_digest_mismatch")
+        self.record["evidence"]["docs"] = []
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_missing")
+
+    def test_unattested_copy_is_pending_until_operator_attests_its_digest(self):
+        self.make_ready()
+        copied = self.put_evidence("docs", directory=self.root, name="copy.json", replace=True)
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_unattested")
+        self.write_policy(attested_digests=[hashlib.sha256(copied.read_bytes()).hexdigest()])
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+
+    def test_exact_id_audit_envelope_alone_is_not_a_positive_result(self):
+        self.make_ready()
+        envelope = self.evidence_doc("audits")
+        del envelope["result"]
+        envelope["audit_claim_ids"] = {"ids": ["A-1", "A-2"]}
+        self.put_evidence("audits", envelope, replace=True)
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_malformed")
+        envelope = self.evidence_doc("audits")
+        del envelope["result"]
+        self.put_evidence("audits", envelope, replace=True)
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_result_missing")
+
+    def test_native_evidence_without_trusted_runner_state_is_pending(self):
+        self.make_ready()
+        doc = self.evidence_doc("audits", native={"run_id": "0" * 32})
+        self.put_evidence("audits", doc, replace=True)
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_native_unverified")
+
+    def test_git_blob_evidence_is_verified_at_the_pinned_commit(self):
+        doc = {key: value for key, value in self.evidence_doc("docs").items() if key != "revision"}
+        (self.checkout / "docs.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.git("add", "docs.json")
+        self.git("commit", "-qm", "evidence")
+        self.record["base_commit"] = self.git("rev-parse", "HEAD")
+        self.git("update-ref", REF, self.record["base_commit"])
+        self.base_commit = self.record["base_commit"]
+        self.make_ready()
+        blob = self.git("rev-parse", "HEAD:docs.json")
+        self.record["evidence"]["docs"] = [{"ref": "docs.json", "revision": self.base_commit, "git_blob": blob}]
+        self.write_inputs()
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+        self.record["evidence"]["docs"][0]["git_blob"] = "c" * 40
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_blob_mismatch")
+
+    def test_missing_codemap_and_preexisting_baseline_failure_need_scoped_policy(self):
+        self.make_ready()
+        self.record["evidence"]["codemap"] = []
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_missing")
+        rule = {"condition": "codemap_missing", **self.scope, "reason": "no codemap tooling"}
+        self.write_policy(accepted_conditions=[{**rule, "slice_id": "other"}])
+        self.assert_reason(self.run_validate(), "evidence_missing")
+        self.write_policy(accepted_conditions=[rule])
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+        failed = self.evidence_doc("baseline", result="fail", preexisting=True)
+        self.put_evidence("baseline", failed, replace=True)
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "evidence_failed")
+        self.write_policy(accepted_conditions=[
+            rule, {**rule, "condition": "baseline_preexisting_failure", "reason": "documented"}])
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+
+    def test_mutation_between_evaluation_and_final_recheck_is_pending(self):
+        def mutate_ref():
+            self.git("commit", "--allow-empty", "-qm", "same tree")
+            self.git("update-ref", REF, self.git("rev-parse", "HEAD"))
+
+        mutations = {
+            "ref": mutate_ref,
+            "manifest": lambda: self.manifest.write_bytes(self.manifest.read_bytes() + b"\n"),
+            "policy": lambda: self.policy_path.write_bytes(self.policy_path.read_bytes() + b"\n"),
+            "inventory": lambda: (self.reports / "audit-1.md").write_bytes(b"---\nrepo: sample\n---\nchanged\n"),
+            "evidence": lambda: (self.evidence_root / "docs.json").write_bytes(b"{}"),
+        }
+        for key, mutate in mutations.items():
+            with self.subTest(key=key):
+                self.make_ready()
+                self.git("update-ref", REF, self.base_commit)
+                self.write_manifest(self.manifest, repos=[self.enrollment])
+                self.write_inputs()
+                self.assertEqual(self.run_inline()[0], 0)
+                item = self.assert_pending("inputs_drifted", after_evaluation=mutate)
+                self.assertIn(key, item["drifted"])
