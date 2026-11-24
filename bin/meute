@@ -16,6 +16,8 @@
 #   reports [--new|--all]         list reports with their triage state
 #   evidence export --project PROJECT --output FILE --record PROVENANCE REPORT TERMINAL_LOG ...
 #                                 export a local snapshot from trusted operator records
+#   readiness validate RECORD --owner-policy POLICY
+#                                 check feature readiness identity against operator policy
 #   findings [--new|--all] [--json]
 #                                 one row per finding — the actual unit of decision;
 #                                  --new hides gone, superseded, claimed and inherited rows
@@ -807,6 +809,7 @@ main() {
     install-statusline) cmd_install_statusline "$@" ;;
     reports)  cmd_reports "$@" ;;
     evidence) exec python3 "${MEUTE_ROOT}/lib/evidence.py" "$@" ;;
+    readiness) exec python3 -B "${MEUTE_ROOT}/lib/readiness.py" "$MANIFEST" "$@" ;;
     findings) cmd_findings "$@" ;;
     show)     cmd_show "$@" ;;
     promote)  cmd_promote "$@" ;;
