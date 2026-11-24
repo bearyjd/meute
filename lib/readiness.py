@@ -24,7 +24,7 @@ PURPOSES = {"docs", "codemap", "baseline", "acceptance", "audits"}
 RECORD_FIELDS = {"version", *SCOPE, "ref", "base_commit", "intent_ref", "evidence"}
 POLICY_FIELDS = {
     "version", *SCOPE, "record_sha256", "manifest_path", "manifest_sha256",
-    "checkout", "report_inventory", "evidence_root", "attested_digests", "severity_policy",
+    "checkout", "report_inventory", "evidence_root", "attested_digests",
     "assessment", "deferrals", "accepted_conditions",
 }
 

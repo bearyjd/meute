@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 import re
 
 from evidence import SHA256
-from report import SEVERITIES
 
 CATEGORIES = ("security", "cleanup")
 CONDITIONS = ("codemap_missing", "baseline_preexisting_failure")
@@ -63,10 +62,6 @@ def validate_rules(policy: dict) -> None:
     if not (isinstance(assessment, dict) and assessment.keys() == set(CATEGORIES)
             and all(_check_category(assessment[name]) for name in CATEGORIES)):
         raise ValueError("Expected an assessment of security and cleanup with per-finding applicability")
-    severities = policy["severity_policy"]
-    if not (isinstance(severities, list) and severities and set(severities) <= set(SEVERITIES)
-            and len(set(severities)) == len(severities)):
-        raise ValueError("Expected severity_policy to list at least one severity")
     attested = policy["attested_digests"]
     if not (isinstance(attested, list) and all(_matches(SHA256, item) for item in attested)):
         raise ValueError("Expected attested_digests to list SHA-256 digests")

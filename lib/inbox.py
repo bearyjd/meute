@@ -83,7 +83,11 @@ def _report_ids() -> list[str]:
         d = os.path.join(base, repo)
         if os.path.islink(d) or not os.path.isdir(d):
             continue
-        for name in sorted(os.listdir(d)):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:  # an unreadable directory has no listable reports
+            continue
+        for name in names:
             p = os.path.join(d, name)
             if name.endswith(".md") and os.path.isfile(p) and not os.path.islink(p):
                 ids.append(f"{repo}/{name[:-3]}")

@@ -61,8 +61,10 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
     fp_repo = report_lib.report_repo(meta, str(path))
     section = report_lib.has_findings_section(body)
     parsed = report_lib.parse_findings(body) if section else []
-    if section and not parsed and FINDING_HEADING.search(body):
-        return {**entry, "error": "report_malformed"}
+    if section:
+        findings_text = report_lib.section(body, "Findings")
+        if len(FINDING_HEADING.findall(findings_text)) != len(report_lib.parse_findings(findings_text)):
+            return {**entry, "error": "report_malformed"}
     findings = [
         {"id": f"{rid}#{f['n']}", "report": rid, "n": f["n"], "severity": f["severity"],
          "fingerprint": report_lib.fingerprint(fp_repo, f["location"], f["title"])}
@@ -71,48 +73,56 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
     return {**entry, "findings": findings}
 
 
-def scan_reports(root: Path, repo: str) -> dict[str, dict]:
-    """Every report in reports/<repo> plus readable reports elsewhere claiming the repo."""
+def scan_reports(root: Path, repo: str) -> tuple[dict[str, dict], list[str]]:
+    """Every report in reports/<repo> plus readable reports elsewhere claiming the repo.
+
+    Also returns the unreadable unrelated directories that were ignored: their
+    contents cannot be shown to claim the repo.
+    """
     base = root / "reports"
     found: dict[str, dict] = {}
+    ignored: list[str] = []
     if not base.is_dir():
-        return found
+        return found, ignored
     unreadable = {"digest": None, "error": "report_unreadable", "claimed": None, "findings": []}
     try:
         directories = sorted(os.listdir(base))
     except OSError:
-        return {"reports/": unreadable}
+        return {"reports/": unreadable}, ignored
     for directory in directories:
         folder = base / directory
         if folder.is_symlink():
-            if directory == repo:
-                found[f"{directory}/"] = unreadable
+            found[f"{directory}/"] = unreadable
             continue
         if not folder.is_dir():
             continue
         try:
             names = sorted(os.listdir(folder))
         except OSError:
-            found[f"{directory}/"] = unreadable
+            if directory == repo:
+                found[f"{directory}/"] = unreadable
+            else:
+                ignored.append(f"{directory}/")
             continue
         for name in names:
             path = folder / name
-            if directory == repo and (path.is_symlink() or (name.endswith(".md") and not path.is_file())):
+            is_report = name.endswith(".md")
+            if is_report and (path.is_symlink() or (directory == repo and not path.is_file())):
                 found[f"{directory}/{name}"] = unreadable
                 continue
-            if not name.endswith(".md") or path.is_symlink() or not path.is_file():
+            if not is_report or not path.is_file():
                 continue
             entry = _parse_report(path, directory, name, repo)
             if directory == repo or entry["claimed"] == repo:
                 found[f"{directory}/{name}"] = entry
-    return found
+    return found, ignored
 
 
 def report_digests(reports: dict[str, dict]) -> dict[str, str]:
     return {path: entry["error"] or entry["digest"] for path, entry in sorted(reports.items())}
 
 
-def inventory_check(reports: dict[str, dict], expected: dict[str, str]) -> dict:
+def inventory_check(reports: dict[str, dict], expected: dict[str, str], ignored: list[str]) -> dict:
     items = []
     for path, entry in sorted(reports.items()):
         if entry["error"]:
@@ -123,9 +133,11 @@ def inventory_check(reports: dict[str, dict], expected: dict[str, str]) -> dict:
             items.append({"path": path, "reason": "inventory_report_changed"})
     items += [{"path": path, "reason": "inventory_report_removed"} for path in sorted(expected.keys() - reports.keys())]
     if not items:
-        return {"check": "inventory", "status": "passed", "reason": "inventory_matches", "reports": len(reports)}
+        passed = {"check": "inventory", "status": "passed", "reason": "inventory_matches", "reports": len(reports)}
+        return {**passed, "ignored_unreadable": ignored} if ignored else passed
     reason = min((item["reason"] for item in items), key=PRECEDENCE.index)
-    return {"check": "inventory", "status": "pending", "reason": reason, "reports": items}
+    pending = {"check": "inventory", "status": "pending", "reason": reason, "reports": items}
+    return {**pending, "ignored_unreadable": ignored} if ignored else pending
 
 
 # --------------------------------------------------------------- findings ---
@@ -379,12 +391,12 @@ def state_digests(root: Path) -> dict[str, str]:
 def evaluate(ctx: Context, now: datetime) -> tuple[list[dict], dict, list[datetime]]:
     """(checks, observation snapshot, expiries of deferrals relied on)."""
     state = state_digests(ctx.root)
-    reports = scan_reports(ctx.root, ctx.record["repo"])
+    reports, ignored = scan_reports(ctx.root, ctx.record["repo"])
     findings, found = resolve_findings(ctx.root, reports)
     evidence_checks, fixed, digests = evaluate_evidence(ctx)
     blockers, relied = blockers_check(ctx, findings, fixed, now)
     checks = [
-        inventory_check(reports, ctx.policy["report_inventory"]), found,
+        inventory_check(reports, ctx.policy["report_inventory"], ignored), found,
         assessment_check(ctx.policy["assessment"], findings, found["status"] == "passed"),
         *evidence_checks, blockers,
     ]
@@ -393,5 +405,5 @@ def evaluate(ctx: Context, now: datetime) -> tuple[list[dict], dict, list[dateti
 
 def observe_mutable(ctx: Context) -> dict:
     """The report inventory and evidence digests, re-read from disk."""
-    return {"inventory": report_digests(scan_reports(ctx.root, ctx.record["repo"])),
+    return {"inventory": report_digests(scan_reports(ctx.root, ctx.record["repo"])[0]),
             "evidence": evidence_digests(ctx), "state": state_digests(ctx.root)}

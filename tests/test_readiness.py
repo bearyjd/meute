@@ -95,7 +95,6 @@ class ReadinessTest(unittest.TestCase):
             "report_inventory": self.disk_inventory(),
             "evidence_root": str(self.evidence_root),
             "attested_digests": [],
-            "severity_policy": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
             "assessment": self.assessment,
             "deferrals": [],
             "accepted_conditions": [],
@@ -658,18 +657,6 @@ class ReadinessTest(unittest.TestCase):
         self.put_evidence(purpose, self.evidence_doc(purpose, fixes=[self.fix()]), replace=True)
         self.write_inputs()
 
-    # ----- severity policy -------------------------------------------------
-
-    def test_severity_policy_cannot_hide_an_applicable_open_finding(self):
-        self.make_ready(applicable=True)
-        self.write_policy(severity_policy=["CRITICAL"])
-        self.assert_pending("finding_open")
-
-    def test_empty_severity_policy_is_invalid(self):
-        self.make_ready()
-        self.write_policy(severity_policy=[])
-        self.assert_reason(self.run_validate(code=2), "policy_rules_invalid")
-
     # ----- claimed fixes ---------------------------------------------------
 
     def test_real_resolve_state_with_bound_fix_is_ready(self):
@@ -754,13 +741,63 @@ class ReadinessTest(unittest.TestCase):
         self.write_inputs()
         self.assert_reason(self.run_validate(), "report_unreadable")
 
-    def test_unreadable_directory_is_pending_json_not_a_traceback(self):
+    def test_symlinked_report_file_in_another_repo_directory_is_unreadable(self):
+        self.make_ready()
+        other = self.layout / "reports/other"
+        other.mkdir()
+        hidden = self.layout / "hidden.md"
+        hidden.write_bytes((self.reports / "audit-1.md").read_bytes())
+        (other / "sneaky.md").symlink_to(hidden)
+        self.write_inputs()
+        item = self.assert_reason(self.run_validate(), "report_unreadable")
+        self.assertIn({"path": "other/sneaky.md", "reason": "report_unreadable"}, item["reports"])
+
+    def test_symlinked_directory_under_reports_is_unreadable(self):
+        self.make_ready()
+        real = self.layout / "elsewhere"
+        real.mkdir()
+        (self.layout / "reports/other").symlink_to(real, target_is_directory=True)
+        self.write_inputs()
+        item = self.assert_reason(self.run_validate(), "report_unreadable")
+        self.assertIn({"path": "other/", "reason": "report_unreadable"}, item["reports"])
+
+    def test_findings_section_with_some_unparseable_entries_is_malformed(self):
+        self.make_ready()
+        text = self.report_text() + "\n### HIGH missing brackets\n- **Location:** `x:1`\n"
+        (self.reports / "partial.md").write_text(text, encoding="utf-8")
+        self.write_inputs()
+        self.assert_reason(self.run_validate(), "report_malformed")
+
+    def test_finding_style_heading_outside_findings_section_stays_clean(self):
+        self.make_ready()
+        text = self.report_text(count=0) + "None.\n\n## Notes\n\n### Background\nprose\n"
+        (self.reports / "notes.md").write_text(text, encoding="utf-8")
+        self.write_inputs()
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+
+    def test_unreadable_unrelated_directory_is_ignored_and_noted(self):
         self.make_ready()
         other = self.layout / "reports/other"
         other.mkdir()
         other.chmod(0)
         self.addCleanup(other.chmod, 0o755)
         if os.access(other, os.R_OK):
+            self.skipTest("permissions are not enforced for this user")
+        self.write_inputs()
+        result = self.run_validate(code=0)
+        inventory = next(c for c in result["checks"] if c["check"] == "inventory")
+        self.assertEqual(inventory["ignored_unreadable"], ["other/"])
+
+    def test_severity_policy_is_not_a_policy_field(self):
+        self.make_ready()
+        self.write_policy(severity_policy=["CRITICAL"])
+        self.assert_reason(self.run_validate(code=2), "policy_schema_invalid")
+
+    def test_unreadable_enrolled_repo_directory_is_pending_json_not_a_traceback(self):
+        self.make_ready()
+        self.reports.chmod(0)
+        self.addCleanup(self.reports.chmod, 0o755)
+        if os.access(self.reports, os.R_OK):
             self.skipTest("permissions are not enforced for this user")
         self.write_inputs()
         self.assert_pending("report_unreadable")
