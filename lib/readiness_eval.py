@@ -1,4 +1,20 @@
-"""Read-only evaluation of readiness reports, findings, evidence and deferrals."""
+"""Read-only evaluation of readiness reports, findings, evidence and deferrals.
+
+Everything here fails closed. A filesystem error or an ambiguity (a symlink, a
+non-directory, a path that cannot be stat'ed) at reports/ or under the enrolled
+repo's reports is reported as report_unreadable; it is never read as "nothing
+there". Unreadable paths in clearly unrelated repo directories are ignored but
+listed in the inventory check as ignored_unreadable. A report whose findings sit
+under anything but a canonical `## Findings` heading, or whose Findings sections
+(all of them) hold a heading that does not parse, is report_malformed.
+
+An applicable finding stays open unless this record's own evidence or policy
+clears it, intentionally: a decision inherited from an earlier report with the
+same fingerprint, and a whole-report `meute resolve` with no per-finding row,
+both leave the finding open here. Only a live scoped deferral, or the finding's
+own `resolved:` row together with fix evidence binding its id and fingerprint,
+clears a blocker, whatever the severity.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Callable
 
 import inbox
@@ -20,6 +37,9 @@ PURPOSES = ("docs", "codemap", "baseline", "acceptance", "audits")
 EVIDENCE_FIELDS = {"version", "purpose", *SCOPE, "revision", "outcome"}
 OPTIONAL_FIELDS = {"result", "fixes", "native", "preexisting"}
 FINDING_HEADING = re.compile(r"^###\s", re.M)
+FINDINGS_SECTION = re.compile(r"^## Findings\s*$", re.M)  # report_lib.has_findings_section, every occurrence
+NEXT_SECTION = re.compile(r"^##\s+", re.M)
+UNREADABLE = {"digest": None, "error": "report_unreadable", "claimed": None, "findings": []}
 BLOB_PURPOSES = ("docs", "codemap")
 FIX_PURPOSES = ("acceptance", "audits")
 PRECEDENCE = ("report_unreadable", "report_malformed", "report_repo_mismatch",
@@ -59,12 +79,12 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
         return {**entry, "error": "report_repo_mismatch"}
     rid = f"{directory}/{name[:-3]}"
     fp_repo = report_lib.report_repo(meta, str(path))
-    section = report_lib.has_findings_section(body)
-    parsed = report_lib.parse_findings(body) if section else []
-    if section:
-        findings_text = report_lib.section(body, "Findings")
-        if len(FINDING_HEADING.findall(findings_text)) != len(report_lib.parse_findings(findings_text)):
-            return {**entry, "error": "report_malformed"}
+    listed = _findings_sections(body)
+    parsed = report_lib.parse_findings(body) if listed is not None else []
+    if listed is None and report_lib.FINDING_RE.search(body):
+        return {**entry, "error": "report_malformed"}  # findings under a heading the inbox does not read
+    if listed is not None and len(FINDING_HEADING.findall(listed)) != len(report_lib.parse_findings(listed)):
+        return {**entry, "error": "report_malformed"}
     findings = [
         {"id": f"{rid}#{f['n']}", "report": rid, "n": f["n"], "severity": f["severity"],
          "fingerprint": report_lib.fingerprint(fp_repo, f["location"], f["title"])}
@@ -73,48 +93,83 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
     return {**entry, "findings": findings}
 
 
+def _findings_sections(body: str) -> str | None:
+    """The text under every canonical `## Findings` heading, or None when there is none."""
+    parts = []
+    for match in FINDINGS_SECTION.finditer(body):
+        rest = body[match.end():]
+        following = NEXT_SECTION.search(rest)
+        parts.append(rest[:following.start()] if following else rest)
+    return "\n".join(parts) if parts else None
+
+
+def _scan_file(folder: Path, directory: str, name: str, repo: str) -> tuple[dict | None, bool]:
+    """(inventory entry or None, ignored as unreadable) for one .md name in a real directory."""
+    mine = directory == repo
+    try:
+        mode = os.lstat(folder / name).st_mode
+    except OSError:
+        return (UNREADABLE, False) if mine else (None, True)
+    if stat.S_ISLNK(mode) or (mine and not stat.S_ISREG(mode)):
+        return UNREADABLE, False
+    if not stat.S_ISREG(mode):
+        return None, False
+    entry = _parse_report(folder / name, directory, name, repo)
+    if mine or entry["claimed"] == repo:
+        return entry, False
+    return None, entry["error"] == "report_unreadable"  # it cannot be shown not to claim the repo
+
+
+def _scan_directory(base: Path, directory: str, repo: str) -> tuple[dict[str, dict], list[str]]:
+    """(inventory entries, ignored unreadable paths) for one name under reports/."""
+    folder = base / directory
+    mine = directory == repo
+    try:
+        mode = os.lstat(folder).st_mode
+    except OSError:  # lstat needs only search permission on reports/ itself
+        return {(f"{directory}/" if mine else "reports/"): UNREADABLE}, []
+    if stat.S_ISLNK(mode) or (mine and not stat.S_ISDIR(mode)):
+        return {f"{directory}/": UNREADABLE}, []
+    if not stat.S_ISDIR(mode):
+        return {}, []
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return ({f"{directory}/": UNREADABLE}, []) if mine else ({}, [f"{directory}/"])
+    found: dict[str, dict] = {}
+    ignored: list[str] = []
+    for name in (name for name in names if name.endswith(".md")):
+        entry, skipped = _scan_file(folder, directory, name, repo)
+        if entry is not None:
+            found[f"{directory}/{name}"] = entry
+        if skipped:
+            ignored.append(f"{directory}/{name}")
+    return found, ignored
+
+
 def scan_reports(root: Path, repo: str) -> tuple[dict[str, dict], list[str]]:
     """Every report in reports/<repo> plus readable reports elsewhere claiming the repo.
 
-    Also returns the unreadable unrelated directories that were ignored: their
-    contents cannot be shown to claim the repo.
+    Also returns the unreadable unrelated paths that were ignored: their
+    contents cannot be shown to claim the repo. Anything unreadable or
+    ambiguous at reports/ itself or under reports/<repo> is an inventory
+    entry with the error report_unreadable, never an absence.
     """
     base = root / "reports"
+    try:
+        if not stat.S_ISDIR(os.lstat(base).st_mode):  # a symlink or a file: `find reports` lists nothing
+            return {"reports/": UNREADABLE}, []
+        directories = sorted(os.listdir(base))
+    except FileNotFoundError:
+        return {}, []
+    except OSError:
+        return {"reports/": UNREADABLE}, []
     found: dict[str, dict] = {}
     ignored: list[str] = []
-    if not base.is_dir():
-        return found, ignored
-    unreadable = {"digest": None, "error": "report_unreadable", "claimed": None, "findings": []}
-    try:
-        directories = sorted(os.listdir(base))
-    except OSError:
-        return {"reports/": unreadable}, ignored
     for directory in directories:
-        folder = base / directory
-        if folder.is_symlink():
-            found[f"{directory}/"] = unreadable
-            continue
-        if not folder.is_dir():
-            continue
-        try:
-            names = sorted(os.listdir(folder))
-        except OSError:
-            if directory == repo:
-                found[f"{directory}/"] = unreadable
-            else:
-                ignored.append(f"{directory}/")
-            continue
-        for name in names:
-            path = folder / name
-            is_report = name.endswith(".md")
-            if is_report and (path.is_symlink() or (directory == repo and not path.is_file())):
-                found[f"{directory}/{name}"] = unreadable
-                continue
-            if not is_report or not path.is_file():
-                continue
-            entry = _parse_report(path, directory, name, repo)
-            if directory == repo or entry["claimed"] == repo:
-                found[f"{directory}/{name}"] = entry
+        entries, skipped = _scan_directory(base, directory, repo)
+        found.update(entries)
+        ignored.extend(skipped)
     return found, ignored
 
 
@@ -131,7 +186,12 @@ def inventory_check(reports: dict[str, dict], expected: dict[str, str], ignored:
             items.append({"path": path, "reason": "inventory_report_added"})
         elif expected[path] != entry["digest"]:
             items.append({"path": path, "reason": "inventory_report_changed"})
-    items += [{"path": path, "reason": "inventory_report_removed"} for path in sorted(expected.keys() - reports.keys())]
+    hidden = set(ignored)  # a pinned report behind an unreadable path is unreadable, not removed
+    items += [
+        {"path": path, "reason": "report_unreadable" if {path, f"{path.split('/')[0]}/"} & hidden
+         else "inventory_report_removed"}
+        for path in sorted(expected.keys() - reports.keys())
+    ]
     if not items:
         passed = {"check": "inventory", "status": "passed", "reason": "inventory_matches", "reports": len(reports)}
         return {**passed, "ignored_unreadable": ignored} if ignored else passed
@@ -142,21 +202,27 @@ def inventory_check(reports: dict[str, dict], expected: dict[str, str], ignored:
 
 # --------------------------------------------------------------- findings ---
 
-def inbox_rows(root: Path) -> dict[str, dict]:
-    """Inbox state for every finding, hidden ones included; load_reports never writes."""
+def inbox_rows(root: Path, repo: str) -> dict[str, dict]:
+    """Inbox state for every finding, hidden ones included; load_reports never writes.
+
+    Raises OSError when the inbox skipped reports/ itself or anything under reports/<repo>.
+    """
     previous = inbox.ROOT
     inbox.ROOT = str(root)
     try:
+        skipped = [path for path in inbox.scan_report_ids()[1] if path == "reports/" or path.startswith(f"{repo}/")]
+        if skipped:
+            raise OSError(f"inbox could not read {', '.join(skipped)}")
         _, found = inbox.load_reports()
     finally:
         inbox.ROOT = previous
     return {f"{item['report']}#{item['n']}": item for item in found}
 
 
-def resolve_findings(root: Path, reports: dict[str, dict]) -> tuple[list[dict], dict]:
+def resolve_findings(root: Path, repo: str, reports: dict[str, dict]) -> tuple[list[dict], dict]:
     observed = [f for path in sorted(reports) if not reports[path]["error"] for f in reports[path]["findings"]]
     try:
-        rows = inbox_rows(root)
+        rows = inbox_rows(root, repo)
     except (OSError, ValueError) as error:
         return [], {"check": "findings", "status": "pending", "reason": "findings_unavailable", "detail": str(error)}
     resolved, unresolved = [], []
@@ -392,7 +458,7 @@ def evaluate(ctx: Context, now: datetime) -> tuple[list[dict], dict, list[dateti
     """(checks, observation snapshot, expiries of deferrals relied on)."""
     state = state_digests(ctx.root)
     reports, ignored = scan_reports(ctx.root, ctx.record["repo"])
-    findings, found = resolve_findings(ctx.root, reports)
+    findings, found = resolve_findings(ctx.root, ctx.record["repo"], reports)
     evidence_checks, fixed, digests = evaluate_evidence(ctx)
     blockers, relied = blockers_check(ctx, findings, fixed, now)
     checks = [

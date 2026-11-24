@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -72,26 +73,47 @@ def _state_rows() -> dict[str, tuple[str, str, str]]:
     return rows
 
 
-def _report_ids() -> list[str]:
+def scan_report_ids() -> tuple[list[str], list[str]]:
+    """(report ids, skipped paths under reports/).
+
+    Regular files in real directories only: what bin/meute's `find -type f`
+    lists, so the count and the list agree with `meute reports`. A path that
+    could not be read is skipped as find skips it, but named, so a caller can
+    tell "no reports" from "reports I could not see".
+    """
     base = os.path.join(ROOT, "reports")
+    try:
+        if not stat.S_ISDIR(os.lstat(base).st_mode):  # find does not descend a symlinked start point
+            return [], ["reports/"]
+        repos = sorted(os.listdir(base))
+    except FileNotFoundError:
+        return [], []
+    except OSError:
+        return [], ["reports/"]
     ids: list[str] = []
-    if not os.path.isdir(base):
-        return ids
-    # Regular files in real directories only: what bin/meute's `find -type f`
-    # lists, so the count and the list agree with `meute reports`.
-    for repo in sorted(os.listdir(base)):
+    skipped: list[str] = []
+    for repo in repos:
         d = os.path.join(base, repo)
-        if os.path.islink(d) or not os.path.isdir(d):
-            continue
         try:
+            if not stat.S_ISDIR(os.lstat(d).st_mode):
+                continue
             names = sorted(os.listdir(d))
-        except OSError:  # an unreadable directory has no listable reports
+        except OSError:
+            skipped.append(f"{repo}/")
             continue
-        for name in names:
-            p = os.path.join(d, name)
-            if name.endswith(".md") and os.path.isfile(p) and not os.path.islink(p):
+        for name in (name for name in names if name.endswith(".md")):
+            try:
+                regular = stat.S_ISREG(os.lstat(os.path.join(d, name)).st_mode)
+            except OSError:
+                skipped.append(f"{repo}/{name}")
+                continue
+            if regular:
                 ids.append(f"{repo}/{name[:-3]}")
-    return ids
+    return ids, skipped
+
+
+def _report_ids() -> list[str]:
+    return scan_report_ids()[0]
 
 
 def report_path(rid: str) -> str:
@@ -401,6 +423,7 @@ def load_branches() -> list[dict]:
 def dump() -> dict:
     reports, findings = load_reports()
     return {
+        "unreadable": scan_report_ids()[1],
         "status": load_status(),
         "reports": reports,
         "findings": findings,
@@ -433,6 +456,10 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(__doc__ or "")
         return 2
     cmd, args = argv[1], argv[2:]
+    if cmd in ("dump", "counts", "findings", "verify"):
+        # A note, never an exit code: the listing below is what find could see.
+        for path in scan_report_ids()[1]:
+            sys.stderr.write(f"meute: skipping unreadable reports path {path}\n")
     if cmd == "dump":
         print(json.dumps(dump()))
     elif cmd == "report" and args:

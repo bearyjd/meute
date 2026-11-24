@@ -92,7 +92,8 @@ class ReadinessTest(unittest.TestCase):
             "manifest_path": str(manifest.resolve()),
             "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
             "checkout": str(self.checkout),
-            "report_inventory": self.disk_inventory(),
+            "report_inventory": overrides["report_inventory"] if "report_inventory" in overrides
+            else self.disk_inventory(),
             "evidence_root": str(self.evidence_root),
             "attested_digests": [],
             "assessment": self.assessment,
@@ -787,6 +788,151 @@ class ReadinessTest(unittest.TestCase):
         result = self.run_validate(code=0)
         inventory = next(c for c in result["checks"] if c["check"] == "inventory")
         self.assertEqual(inventory["ignored_unreadable"], ["other/"])
+
+    def test_reports_root_listable_but_not_searchable_is_unreadable(self):
+        self.make_ready(applicable=True)
+        self.write_policy(report_inventory={})
+        base = self.layout / "reports"
+        base.chmod(0o644)
+        self.addCleanup(base.chmod, 0o755)
+        if os.access(base, os.X_OK):
+            self.skipTest("permissions are not enforced for this user")
+        item = self.assert_pending("report_unreadable")
+        self.assertIn({"path": "sample/", "reason": "report_unreadable"}, item["reports"])
+        _, result = self.run_inline()
+        self.assert_reason(result, "findings_unavailable")
+        self.assert_reason(self.run_validate(), "report_unreadable")
+
+    def test_enrolled_directory_listable_but_not_searchable_is_unreadable(self):
+        self.make_ready(applicable=True)
+        self.write_policy(report_inventory={})
+        self.reports.chmod(0o644)
+        self.addCleanup(self.reports.chmod, 0o755)
+        if os.access(self.reports, os.X_OK):
+            self.skipTest("permissions are not enforced for this user")
+        item = self.assert_pending("report_unreadable")
+        self.assertEqual(item["reports"], [{"path": "sample/audit-1.md", "reason": "report_unreadable"}])
+
+    def test_unsearchable_reports_root_with_only_other_directories_is_unreadable(self):
+        self.make_ready()
+        (self.reports / "audit-1.md").unlink()
+        self.reports.rename(self.layout / "reports/other")
+        self.assessment["security"]["findings"] = {}
+        self.write_inputs(report_inventory={})
+        base = self.layout / "reports"
+        base.chmod(0o644)
+        self.addCleanup(base.chmod, 0o755)
+        if os.access(base, os.X_OK):
+            self.skipTest("permissions are not enforced for this user")
+        item = self.assert_pending("report_unreadable")
+        self.assertEqual(item["reports"], [{"path": "reports/", "reason": "report_unreadable"}])
+
+    def test_symlinked_reports_root_is_unreadable(self):
+        self.make_ready()
+        base = self.layout / "reports"
+        base.rename(self.layout / "real-reports")
+        base.symlink_to(self.layout / "real-reports", target_is_directory=True)
+        self.write_inputs()
+        item = self.assert_pending("report_unreadable")
+        self.assertEqual(item["reports"][0], {"path": "reports/", "reason": "report_unreadable"})
+        self.assert_reason(self.run_inline()[1], "findings_unavailable")
+
+    def test_reports_root_that_is_a_file_is_unreadable(self):
+        self.make_ready()
+        (self.reports / "audit-1.md").unlink()
+        self.reports.rmdir()
+        base = self.layout / "reports"
+        base.rmdir()
+        base.write_text("not a directory\n", encoding="utf-8")
+        self.assessment["security"]["findings"] = {}
+        self.write_inputs()
+        self.assert_pending("report_unreadable")
+
+    def test_enrolled_repo_path_that_is_a_file_is_unreadable(self):
+        self.make_ready()
+        (self.reports / "audit-1.md").unlink()
+        self.reports.rmdir()
+        self.reports.write_text("not a directory\n", encoding="utf-8")
+        self.assessment["security"]["findings"] = {}
+        self.write_inputs()
+        item = self.assert_pending("report_unreadable")
+        self.assertIn({"path": "sample/", "reason": "report_unreadable"}, item["reports"])
+
+    def test_unparseable_heading_in_a_second_findings_section_is_malformed(self):
+        self.make_ready()
+        text = self.report_text(count=0) + "None.\n\n## Notes\n\nprose\n\n## Findings\n\n"
+        (self.reports / "second.md").write_text(
+            text + "### HIGH missing brackets\n- **Location:** `x:1`\n", encoding="utf-8")
+        self.write_inputs()
+        self.assert_pending("report_malformed")
+        (self.reports / "second.md").write_text(
+            text + "### [LOW] Late finding\n- **Location:** `y:1`\n", encoding="utf-8")
+        self.write_inputs()
+        item = self.assert_pending("assessment_incomplete")
+        self.assertEqual(item["findings"], ["sample/second#1"])
+
+    def test_near_miss_findings_heading_with_findings_is_malformed(self):
+        self.make_ready()
+        for heading in ("## Findings:", "## Findings (1)", "##  Findings", "## findings", "### Findings"):
+            with self.subTest(heading=heading):
+                text = self.report_text().replace("## Findings", heading)
+                (self.reports / "near.md").write_text(text, encoding="utf-8")
+                self.write_inputs()
+                item = self.assert_pending("report_malformed")
+                self.assertEqual(item["reports"], [{"path": "sample/near.md", "reason": "report_malformed"}])
+
+    def test_unreadable_report_in_unrelated_directory_is_noted_or_reported_when_pinned(self):
+        self.make_ready()
+        foreign = self.put_report("foreign", directory="other", repo="other")
+        pinned = self.disk_inventory()
+        foreign.chmod(0)
+        self.addCleanup(foreign.chmod, 0o644)
+        if os.access(foreign, os.R_OK):
+            self.skipTest("permissions are not enforced for this user")
+        self.write_policy(report_inventory=pinned)
+        item = self.assert_pending("report_unreadable")
+        self.assertEqual(item["reports"], [{"path": "other/foreign.md", "reason": "report_unreadable"}])
+        self.write_policy(report_inventory={k: v for k, v in pinned.items() if k != "other/foreign.md"})
+        code, result = self.run_inline()
+        self.assertEqual((code, result["status"]), (0, "ready"), result)
+        inventory = next(c for c in result["checks"] if c["check"] == "inventory")
+        self.assertEqual(inventory["ignored_unreadable"], ["other/foreign.md"])
+
+    def test_unsearchable_unrelated_directory_lists_each_report_as_ignored(self):
+        self.make_ready()
+        foreign = self.put_report("foreign", directory="other", repo="other")
+        pinned = self.disk_inventory()
+        foreign.parent.chmod(0o644)
+        self.addCleanup(foreign.parent.chmod, 0o755)
+        if os.access(foreign.parent, os.X_OK):
+            self.skipTest("permissions are not enforced for this user")
+        self.write_policy(report_inventory={k: v for k, v in pinned.items() if k != "other/foreign.md"})
+        code, result = self.run_inline()
+        self.assertEqual((code, result["status"]), (0, "ready"), result)
+        inventory = next(c for c in result["checks"] if c["check"] == "inventory")
+        self.assertEqual(inventory["ignored_unreadable"], ["other/foreign.md"])
+
+    def test_pinned_report_in_unreadable_unrelated_directory_is_unreadable_not_removed(self):
+        self.make_ready()
+        foreign = self.put_report("foreign", directory="other", repo="other")
+        pinned = self.disk_inventory()
+        foreign.parent.chmod(0)
+        self.addCleanup(foreign.parent.chmod, 0o755)
+        if os.access(foreign.parent, os.R_OK):
+            self.skipTest("permissions are not enforced for this user")
+        self.write_policy(report_inventory=pinned)
+        item = self.assert_pending("report_unreadable")
+        self.assertEqual(item["reports"], [{"path": "other/foreign.md", "reason": "report_unreadable"}])
+
+    def test_medium_and_low_applicable_open_findings_block(self):
+        for severity in ("MEDIUM", "LOW"):
+            with self.subTest(severity=severity):
+                self.make_ready(applicable=True)
+                path = self.reports / "audit-1.md"
+                path.write_text(path.read_text(encoding="utf-8").replace("[HIGH]", f"[{severity}]"), encoding="utf-8")
+                self.write_inputs()
+                item = self.assert_pending("finding_open")
+                self.assertEqual(item["findings"], [{"id": FINDING, "reason": "finding_open"}])
 
     def test_severity_policy_is_not_a_policy_field(self):
         self.make_ready()
