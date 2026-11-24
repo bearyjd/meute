@@ -751,17 +751,62 @@ Reports fail closed:
   repo, so readiness stays pending with `ignored_unreadable_paths`, and the
   paths are listed relative to `reports/` under `ignored_unreadable`. The policy
   has no field to acknowledge such a path: make it readable or remove it.
-- A report is `report_malformed` unless every line naming a severity
-  (`critical`, `high`, `medium`, `low`, `crit`, `med`, in any case) is either a
-  `### [SEVERITY] title` line inside a `## Findings` section, exactly as the
-  inbox reads it, or plain prose. Plain prose starts with a letter or digit, is
-  not a numbered list item and is not underlined as a heading. So a heading of
-  any level, a bold or emphasised line, a list item, a table row, a quote or
-  HTML that names a severity anywhere else makes the report malformed, as does
-  any other `###` heading inside `## Findings`. Fenced code blocks are not
-  exempt, because the inbox parser does not exempt them. This is deliberately
-  strict: a list item such as `- **Confidence:** high` keeps readiness pending
-  until the report is reworded.
+- A report is `report_malformed` when it may show a finding the inbox does not
+  list. The inbox lists exactly the `### [SEVERITY] title` lines, and readiness
+  accepts those only inside a `## Findings` section. Any other line naming a
+  severity (`critical`, `high`, `medium`, `low`, `crit`, `med`, in any case) is
+  judged by its shape:
+  1. Structure. After indentation, `>` and list markers the line starts with
+     `#`, `<`, `=` or a link or footnote definition; or it is underlined as a
+     heading; or it holds an HTML heading tag (`<h1>` to `<h6>`) anywhere, even
+     in the middle of a sentence; or it is a table row with a cell that is only
+     a severity. Always malformed.
+  2. Title. The line starts with `[SEV]` or `(SEV, qualifier)` followed by
+     anything but the word `finding`, in any emphasis and after any list
+     marker, `A)` and `I.` included. Always malformed.
+  3. Field or label. `Severity: High`, or running text that opens with
+     `HIGH - ...` or `High: ...`. Always malformed.
+  4. Reference. A list, quote or emphasis line that leads with a severity
+     (`- **HIGH:** ...`, `- **LOW finding:**`), brackets one
+     (`- **Finding 1 (HIGH):**`), or is bold from end to end (`**Why LOW:**`).
+     Malformed only when no parsed finding in the same report has that
+     severity.
+  A severity in the middle of a list item or a field value
+  (`- **Consequence:** ... a high-privilege account`) and in running text is
+  accepted. The report templates put severities in exactly these places: the
+  `Consequence`, `Why now` and `Why LOW` fields, the per-finding bullets under
+  `## Verification notes`, and the `Summary`, `Coverage` and `Out-of-lens
+  sightings` sections. An earlier rule refused every such line and kept about
+  one clean report in five pending.
+- Rule 4 is a trade-off. `- **HIGH:** second SQL injection` in a report that
+  already has a parsed `[HIGH]` finding is read as a reference to it, so a
+  second finding written that way, at a severity the report already lists, is
+  not caught. At a severity the report does not list, it is.
+- Severities are matched on a folded copy of each line: Unicode compatibility
+  forms (fullwidth `ＨＩＧＨ`, `Ⅰ.`), zero-width and other format characters,
+  combining marks, and the Cyrillic and Greek letters drawn like the letters of
+  the severity words. No other lookalike is folded.
+- A heading that holds a `[` is malformed whatever it names (`### [SEVERE] x`,
+  `### [P0] x`), unless it is indented as code. Under `## Findings` every
+  `###` heading must be a finding the inbox reads, except a heading starting
+  with `Not ` or `No ` that holds no severity and no bracket
+  (`### Not a finding: ...`). Fenced code blocks are not exempt, because the
+  inbox parser does not exempt them.
+- Deliberately not caught: a severity mid-sentence or after a title
+  (`Note: [HIGH] SQL injection`, `SQL injection (HIGH)`); running text opening
+  with a severity and no dash or colon; a rating under another field name
+  (`Risk: High`); an unknown label outside a heading (`- [SEVERE] x`); a
+  severity spelled with digits or spaces, or split across lines outside a
+  heading; lookalikes from other scripts.
+- A report in another repo's directory whose front matter names this repo
+  only once a byte order mark, key case, value case and quotes are set aside
+  (`repo: "sample"`, `Repo: sample`) is `report_repo_mismatch`. The inbox reads
+  the same file differently: it files it under the literal value or the
+  directory, never under this repo, so its findings do not appear among this
+  repo's. Readiness stays pending until the front matter is corrected or the
+  file removed.
+- A symlinked directory under `reports/` is `report_unreadable` here and is
+  skipped, and named, by the inbox.
 
 The result is versioned JSON containing individual checks and a UTC timestamp.
 Exit `2` means invalid input. Exit `1` means readiness is pending: a check

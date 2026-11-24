@@ -1068,6 +1068,218 @@ class ReadinessTest(unittest.TestCase):
         "real finding followed by a rule": "## Findings\n\n### [MEDIUM] Real two\n---\n- **Location:** `c.py:2`\n",
     }
 
+    # Shapes a reviewer got past bccc1d3 with, appended to a report holding one parsed finding:
+    # (text, reason when appended inside `## Findings`, reason when appended under `## Notes`).
+    # assessment_incomplete means the inbox parser reads the shape as a second finding.
+    LOC = "- **Location:** `src/login.py:9`\n"
+    MALFORMED, UNASSESSED = "report_malformed", "assessment_incomplete"
+    ADVERSARIAL_SHAPES = {
+        "fullwidth severity": ("### [ＨＩＧＨ] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "zero-width space in severity": ("### [H\u200bIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "nbsp-led heading": ("\u00a0### [HIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "tab-led heading": ("\t### [HIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "tab after hashes": ("###\t[HIGH] SQL injection\n" + LOC, UNASSESSED, MALFORMED),
+        "bare carriage return before heading": ("note\r### [HIGH] SQL injection\n" + LOC, UNASSESSED, MALFORMED),
+        "html heading": ("<h3>[HIGH] SQL injection</h3>\n", MALFORMED, MALFORMED),
+        "html bold severity": ("<b>HIGH</b> SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "table row": ("| HIGH | SQL injection | src/login.py:9 |\n", MALFORMED, MALFORMED),
+        "quoted heading": ("> ### [HIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "nested list heading": ("- - ### [HIGH] SQL injection\n", MALFORMED, MALFORMED),
+        "link reference definition": ("[HIGH]: https://x.invalid 'SQL injection'\n", MALFORMED, MALFORMED),
+        "fenced heading": ("```\n### [HIGH] SQL injection\n```\n", UNASSESSED, MALFORMED),
+        "html comment": ("<!--\n### [HIGH] SQL injection\n-->\n", UNASSESSED, MALFORMED),
+        "severity field lines": ("SQL injection in login\nSeverity: High\nLocation: src/login.py:9\n", MALFORMED, MALFORMED),
+        "severity in an underline": ("SQL injection in login\n=== HIGH ===\n", MALFORMED, MALFORMED),
+        "long heading ending in a severity": ("### " + "A" * 200000 + " [HIGH]\n", MALFORMED, MALFORMED),
+        "severity split across lines": ("### [HI\nGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "severity then a dash": ("HIGH - SQL injection in src/login.py:9\n" + LOC, MALFORMED, MALFORMED),
+        "letter-ordered item": ("A) [HIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "roman numeral item": ("Ⅰ. [HIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "html heading inside prose": ("Note <h3>[HIGH] SQL injection</h3>\n", MALFORMED, MALFORMED),
+        "fullwidth digit item": ("２. [HIGH] SQL injection\n", MALFORMED, MALFORMED),
+        "unknown severity labels": ("### [SEVERE] SQL injection\n### [P0] RCE\n" + LOC, MALFORMED, MALFORMED),
+        "unknown severity label alone": ("### [SEVERE] SQL injection\n", MALFORMED, MALFORMED),
+        "priority label alone": ("### [P0] RCE\n", MALFORMED, MALFORMED),
+        "deeper heading with an unknown label": ("#### [P0] RCE\n", MALFORMED, MALFORMED),
+        "quoted heading with an unknown label": ("> ## [SEVERE] RCE\n", MALFORMED, MALFORMED),
+        "severity field with a dash": ("Severity - High\n", MALFORMED, MALFORMED),
+        "four-space indented heading": ("    ### [HIGH] SQL injection\n", MALFORMED, MALFORMED),
+        "footnote definition": ("[^1]: HIGH SQL injection\n", MALFORMED, MALFORMED),
+        "second findings section": ("## Findings\n\n### [HIGH] SQL injection\n" + LOC, UNASSESSED, UNASSESSED),
+        "two-space findings section": ("##  Findings\n\n### [HIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "cyrillic lookalike severity": ("### [НІGН] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "greek lookalike severity": ("### [ΗΙGΗ] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "soft hyphen in severity": ("### [HI\u00adGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "word joiner before heading": ("\u2060### [HIGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "combining mark in severity": ("**[HI\u0301GH] SQL injection**\n" + LOC, MALFORMED, MALFORMED),
+        "fullwidth severity in a bold title": ("**[ＨＩＧＨ] SQL injection**\n" + LOC, MALFORMED, MALFORMED),
+        "zero-width joiner in a bullet title": ("- [HI\u200dGH] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "cyrillic severity in a bullet title": ("- [НІGН] SQL injection\n" + LOC, MALFORMED, MALFORMED),
+        "severity then a colon": ("High: SQL injection in src/login.py:9\n", MALFORMED, MALFORMED),
+        "bold severity field": ("- **Severity:** High\n", MALFORMED, MALFORMED),
+        "parenthesised title": ("- (HIGH, confirmed) SQL injection in login\n", MALFORMED, MALFORMED),
+        "bulleted bracket title": ("- [HIGH] SQL injection in login\n", MALFORMED, MALFORMED),
+        "bold bracket title": ("**[HIGH] SQL injection**\n" + LOC, MALFORMED, MALFORMED),
+        "html heading in a list item": ("- see <H2>HIGH SQL injection</H2>\n", MALFORMED, MALFORMED),
+    }
+    # Lines that lead with a severity are read as references when a parsed finding of the same
+    # report carries that severity, and as unlisted findings when none does.
+    REFERENCE_SHAPES = {
+        "bold severity label": "- **HIGH:** SQL injection in login\n",
+        "bold severity finding": "- **HIGH finding:** run curl against /login\n",
+        "bold-only line": "**Why HIGH:**\n",
+        "bracketed finding reference": "- **[HIGH] finding:** run curl\n",
+        "parenthesised mention": "- **Finding 1 (HIGH):** replay the cookie\n",
+        "bare leading severity": "- HIGH SQL injection #2\n",
+        "ordered bold severity": "1. **HIGH** RCE in upload\n",
+    }
+    # Template lines that name a severity inside a field or a sentence: never a finding title.
+    FIELD_SHAPES = {
+        "consequence field": "- **Consequence:** data loss at high volume\n",
+        "why-now field": "- **Why now:** the effort is low and the payoff medium\n",
+        "path with a severity word": "- `lib/low_level.py:10` is critical to startup\n",
+        "leading file name with a severity word": "- low.py and high/water.py are critical to startup\n",
+        "sentence in a bullet": "- To reproduce the MEDIUM case, open the page\n",
+        "table row with prose cells": "| area | risk is high here | notes |\n",
+        "prose line": "This is high risk.\n",
+        "prose opening with a severity word": "High-severity paths were read first; low: none.\n",
+        "indented code comment with a bracket": "    # [tenants.thresholds]\n",
+        "attribute line that is no heading": "  #[serde(default)]\n",
+        "tab-indented code comment with a bracket": "\t# [tenants.thresholds]\n",
+        "prose naming a bracketed severity": "The [CRITICAL] finding in the other report is unrelated.\n",
+    }
+
+    def put_based(self, severity, extra, notes):
+        """audit-1 with one parsed finding of `severity`, assessed, then `extra` inside or outside Findings."""
+        text = self.report_text().replace("[HIGH]", f"[{severity}]")
+        (self.reports / "audit-1.md").write_text(text + ("## Notes\n\n" if notes else "") + extra, encoding="utf-8")
+        self.write_inputs()
+
+    def based_reason(self):
+        code, result = self.run_inline()
+        failed = [item["reason"] for item in result["checks"] if item["status"] != "passed"]
+        return failed[0] if failed else (code, result["status"])
+
+    def test_adversarial_shapes_never_leave_a_visible_finding_ready(self):
+        self.make_ready()
+        for name, (extra, inside, outside) in self.ADVERSARIAL_SHAPES.items():
+            for severity in ("HIGH", "LOW"):
+                for notes, expected in ((False, inside), (True, outside)):
+                    with self.subTest(shape=name, base=severity, notes=notes):
+                        self.put_based(severity, extra, notes)
+                        self.assertEqual(self.based_reason(), expected)
+
+    def test_severity_leading_line_is_a_reference_only_to_a_parsed_severity(self):
+        self.make_ready()
+        for name, extra in self.REFERENCE_SHAPES.items():
+            for notes in (False, True):
+                with self.subTest(shape=name, notes=notes):
+                    self.put_based("HIGH", extra, notes)
+                    self.assertEqual(self.based_reason(), (0, "ready"))
+                    self.put_based("LOW", extra, notes)
+                    self.assertEqual(self.based_reason(), "report_malformed")
+
+    def test_bold_only_line_must_name_only_parsed_severities(self):
+        self.make_ready()
+        self.put_based("LOW", "**Why LOW and not MEDIUM:**\n", notes=True)
+        self.assertEqual(self.based_reason(), "report_malformed")
+        self.put_based("LOW", "**Why LOW and not lower:**\n", notes=True)
+        self.assertEqual(self.based_reason(), (0, "ready"))
+
+    def test_severity_inside_a_field_or_sentence_is_not_a_finding(self):
+        self.make_ready()
+        for name, extra in self.FIELD_SHAPES.items():
+            for severity in ("HIGH", "LOW"):
+                for notes in (False, True):
+                    with self.subTest(shape=name, base=severity, notes=notes):
+                        self.put_based(severity, extra, notes)
+                        self.assertEqual(self.based_reason(), (0, "ready"))
+
+    def test_extra_heading_under_findings_is_malformed_unless_it_says_not_a_finding(self):
+        self.make_ready()
+        accepted = ("### Not a finding: `/learn` replay", "### Not exploitable today, but worth knowing",
+                    "### No path from untrusted input", "### not a finding")
+        refused = ("### [LOW, suspected] ffmpeg/ffprobe run on attacker-supplied container",
+                   "### Hardening gaps (not findings: no path from untrusted input)",
+                   "### Notable gap", "### Nothing", "### Not a [SEVERE] thing", "### Not (yet) rated",
+                   "### Not high enough to list", "### No ＬＯＷ rating", "### Not ［yet］ rated", "### Not （yet） rated", "### Note")
+        for heading in accepted:
+            with self.subTest(heading=heading):
+                self.put_based("HIGH", heading + "\nprose\n", notes=False)
+                self.assertEqual(self.based_reason(), (0, "ready"))
+        for heading in refused:
+            with self.subTest(heading=heading):
+                self.put_based("HIGH", heading + "\nprose\n", notes=False)
+                self.assertEqual(self.based_reason(), "report_malformed")
+
+    def test_real_report_shapes_are_not_malformed_and_their_findings_count(self):
+        import readiness_eval
+        expected = {"01-consequence-field": 1, "02-why-low-field": 1, "03-why-now-implication": 1,
+                    "04-verification-finding-refs": 2, "05-verification-parenthesised": 2,
+                    "06-verification-bracket-refs": 2, "07-summary-severity-leading": 3,
+                    "08-summary-parenthesised": 2, "09-coverage-only": 0, "10-out-of-lens": 1,
+                    "11-evidence-code-lines": 1, "12-not-a-finding-headings": 1}
+        fixtures = sorted((MEUTE / "tests/fixtures/readiness_shapes").glob("*.md"))
+        self.assertEqual([path.stem for path in fixtures], sorted(expected))
+        self.make_ready()
+        findings = dict(self.assessment["security"]["findings"])
+        for path in fixtures:
+            (self.reports / path.name).write_bytes(path.read_bytes())
+            for f in report_lib.parse_findings(path.read_text(encoding="utf-8")):
+                findings[f"sample/{path.stem}#{f['n']}"] = {
+                    "fingerprint": report_lib.fingerprint("sample", f["location"], f["title"]), "applicable": False}
+        reports, ignored = readiness_eval.scan_reports(self.layout, "sample")
+        for path in fixtures:
+            with self.subTest(fixture=path.stem):
+                entry = reports[f"sample/{path.name}"]
+                self.assertEqual((entry["error"], len(entry["findings"])), (None, expected[path.stem]))
+        self.assertEqual(ignored, [])
+        self.assessment["security"]["findings"] = findings
+        self.write_inputs()
+        code, result = self.run_inline()
+        self.assertEqual((code, result["status"]), (0, "ready"), result)
+        counted = next(item for item in result["checks"] if item["check"] == "findings")
+        self.assertEqual(counted["count"], 1 + sum(expected.values()))
+
+    def test_foreign_report_claiming_the_repo_in_another_spelling_is_a_mismatch(self):
+        import inbox
+        self.make_ready()
+        other = self.layout / "reports/other"
+        other.mkdir()
+        plain = self.report_text().replace("[HIGH]", "[CRITICAL]")
+        forms = {"double-quoted": plain.replace("repo: sample", 'repo: "sample"'),
+                 "single-quoted": plain.replace("repo: sample", "repo: 'sample'"),
+                 "capitalised key": plain.replace("repo: sample", "Repo: sample"),
+                 "capitalised value": plain.replace("repo: sample", "repo: Sample"),
+                 "quoted and capitalised": plain.replace("repo: sample", 'REPO: "SAMPLE"'),
+                 "beside another repo key": plain.replace("repo: sample", "repo: other\nRepo: sample"),
+                 "byte order mark": "\ufeff" + plain,
+                 "byte order mark and quotes": "\ufeff" + plain.replace("repo: sample", 'repo: "sample"')}
+        for name, text in forms.items():
+            with self.subTest(form=name):
+                (other / "x.md").write_text(text, encoding="utf-8")
+                self.write_inputs(report_inventory=self.own_inventory())
+                item = self.assert_pending("report_repo_mismatch")
+                self.assertEqual(item["reports"], [{"path": "other/x.md", "reason": "report_repo_mismatch"}])
+                # The inbox still reads the file, but never files it under the enrolled repo.
+                listed, _ = inbox.load_reports(str(self.layout))
+                self.assertEqual([r["repo"] == "sample" for r in listed if r["id"] == "other/x"], [False])
+        (other / "x.md").write_text(plain.replace("repo: sample", 'repo: "samples"'), encoding="utf-8")
+        self.write_inputs(report_inventory=self.own_inventory())
+        self.assertEqual(self.based_reason(), (0, "ready"))
+
+    def test_symlinked_unrelated_directory_is_unreadable_here_and_skipped_by_the_inbox(self):
+        import inbox
+        self.make_ready()
+        real = self.layout / "elsewhere"
+        real.mkdir()
+        (real / "audit.md").write_text(self.report_text(repo="other"), encoding="utf-8")
+        (self.layout / "reports/other").symlink_to(real, target_is_directory=True)
+        self.write_inputs(report_inventory=self.own_inventory())
+        item = self.assert_pending("report_unreadable")
+        self.assertEqual(item["reports"], [{"path": "other/", "reason": "report_unreadable"}])
+        self.assertEqual(inbox.scan_report_ids(str(self.layout)), (["sample/audit-1"], ["other/"]))
+
     def own_inventory(self):
         return {path: digest for path, digest in self.disk_inventory().items() if path.startswith("sample/")}
 

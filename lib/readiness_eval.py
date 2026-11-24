@@ -8,11 +8,11 @@ shown not to claim the enrolled repo, so it is listed as ignored_unreadable and
 keeps readiness pending (ignored_unreadable_paths). The policy has no field to
 acknowledge such a path: make it readable or remove it.
 
-Findings are not recognised by listing bad shapes. A report of the enrolled
-repo (or one elsewhere claiming it) is report_malformed unless every line that
-names a severity is either a finding line the inbox parser reads inside a
-canonical `## Findings` section, or plain prose: see _unparsed_finding. Fenced
-code blocks are not exempt, because the inbox parser does not exempt them.
+A report of the enrolled repo (or one elsewhere claiming it) is report_malformed
+when it may show a finding the inbox parser does not list: see readiness_shapes.
+A report elsewhere that names the repo only once a byte order mark, key case,
+value case and quotes are set aside is report_repo_mismatch: the inbox does not
+file it under the repo, and readiness will not ignore it.
 
 An applicable finding stays open unless this record's own evidence or policy
 clears it, intentionally: a decision inherited from an earlier report with the
@@ -38,18 +38,11 @@ import inbox
 import report as report_lib
 from evidence import SEGMENT, read_input, unique_object, verify_record, parse_binding, MAX_LOG
 from readiness_rules import CATEGORIES, SCOPE, covers, expired, parse_utc
+from readiness_shapes import unlisted_finding
 
 PURPOSES = ("docs", "codemap", "baseline", "acceptance", "audits")
 EVIDENCE_FIELDS = {"version", "purpose", *SCOPE, "revision", "outcome"}
 OPTIONAL_FIELDS = {"result", "fixes", "native", "preexisting"}
-FINDING_HEADING = re.compile(r"^###\s", re.M)
-FINDINGS_SECTION = re.compile(r"^## Findings\s*$", re.M)  # report_lib.has_findings_section, every occurrence
-NEXT_SECTION = re.compile(r"^##\s+", re.M)
-# A severity word or its inbox abbreviation, but not a longer word or a path segment (highly, src/low.py).
-SEVERITY_WORD = re.compile(
-    r"(?<![^\W_])(?<![./])(?:crit(?:ical)?|high|med(?:ium)?|low)(?![^\W_]|/|\.\w)", re.I)
-ORDERED_ITEM = re.compile(r"\d+[.):]")
-SETEXT_UNDERLINE = re.compile(r"\s*(?:=+|-+)\s*$")
 UNREADABLE = {"digest": None, "error": "report_unreadable", "claimed": None, "findings": []}
 BLOB_PURPOSES = ("docs", "codemap")
 FIX_PURPOSES = ("acceptance", "audits")
@@ -85,15 +78,13 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
         sniffed = report_lib.split_report(_normalise(data.decode("utf-8", "replace")))[0].get("repo")
         return {**entry, "error": "report_malformed", "claimed": sniffed, "undecodable": True}
     meta, body = report_lib.split_report(text)
+    if directory != repo and meta.get("repo") != repo and _claims_loosely(text, repo):
+        # It names the repo in a spelling the inbox does not read as this repo: not ours, yet not ignorable.
+        return {**entry, "error": "report_repo_mismatch", "claimed": repo}
     if not meta:
         return {**entry, "error": "report_malformed"}
     entry["claimed"] = meta.get("repo")
-    spans = _findings_spans(body)
-    listed = "\n".join(body[start:end] for start, end in spans)
-    if repo in (directory, entry["claimed"]) and (
-        _unparsed_finding(body, spans)
-        or len(FINDING_HEADING.findall(listed)) != len(report_lib.parse_findings(listed))
-    ):
+    if repo in (directory, entry["claimed"]) and unlisted_finding(body):
         return {**entry, "error": "report_malformed"}
     if meta.get("repo", directory) != directory or directory != repo:
         return {**entry, "error": "report_repo_mismatch"}
@@ -112,45 +103,12 @@ def _normalise(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _findings_spans(body: str) -> list[tuple[int, int]]:
-    """(start, end) offsets of the text under every canonical `## Findings` heading."""
-    spans = []
-    for match in FINDINGS_SECTION.finditer(body):
-        following = NEXT_SECTION.search(body, match.end())
-        spans.append((match.end(), following.start() if following else len(body)))
-    return spans
-
-
-def _plain_prose(line: str, following: str) -> bool:
-    """A line that names a severity yet cannot be a finding title in any markup.
-
-    Only running text qualifies: it starts with a letter or a digit, is not an
-    ordered list item, and is not underlined into a setext heading. A heading
-    of any level, emphasis, a list item, a table row, a quote, HTML or a
-    leading bracket all start with something else, however they are indented.
-    """
-    text = line.strip()
-    return text[0].isalnum() and not ORDERED_ITEM.match(text) and not SETEXT_UNDERLINE.match(following)
-
-
-def _unparsed_finding(body: str, spans: list[tuple[int, int]]) -> bool:
-    """Whether the report may hold a finding the inbox would not list.
-
-    The inbox lists exactly the report_lib.FINDING_RE lines, and readiness
-    accepts those only inside a canonical Findings section. Every other line
-    naming a severity must be plain prose. Code fences are read like any other
-    text, as the inbox parser reads them.
-    """
-    lines = body.split("\n")
-    read: set[int] = set()
-    for match in report_lib.FINDING_RE.finditer(body):
-        if not any(start <= match.start() and match.end() <= end for start, end in spans):
-            return True
-        read.update(range(body.count("\n", 0, match.start()), body.count("\n", 0, match.end()) + 1))
-    following = [*lines[1:], ""]
+def _claims_loosely(text: str, repo: str) -> bool:
+    """Whether a front matter names the repo once a byte order mark, key and value case, and quotes are set aside."""
+    meta = report_lib.split_report(text.lstrip("\ufeff"))[0]
     return any(
-        index not in read and SEVERITY_WORD.search(line) and not _plain_prose(line, following[index])
-        for index, line in enumerate(lines)
+        key.casefold() == "repo" and value.strip("'\"").strip().casefold() == repo.casefold()
+        for key, value in meta.items()
     )
 
 
