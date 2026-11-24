@@ -71,6 +71,40 @@ class InboxUnreadableTest(unittest.TestCase):
         (self.root / "reports").symlink_to(self.root / "real", target_is_directory=True)
         self.assertEqual(inbox.scan_report_ids(), ([], ["reports/"]))
 
+    def test_symlinked_report_directory_is_skipped_and_named(self):
+        (self.root / "real").mkdir()
+        (self.root / "real/audit.md").write_text(REPORT.format(repo="linked"), encoding="utf-8")
+        (self.root / "reports/linked").symlink_to(self.root / "real", target_is_directory=True)
+        (self.root / "reports/stray.txt").write_text("not a directory\n", encoding="utf-8")
+        self.assertEqual(inbox.scan_report_ids(), (["other/audit", "sample/audit"], ["linked/"]))
+        self.assertIn("meute: skipping unreadable reports path linked/", self.cli("counts").stderr)
+
+    def test_dump_scans_reports_once_and_reports_both_lists(self):
+        self.lock(self.root / "reports/other", 0)
+        for name in ("load_status", "load_branches"):
+            self.addCleanup(setattr, inbox, name, getattr(inbox, name))
+            setattr(inbox, name, lambda: None)
+        calls = []
+        real = inbox.scan_report_ids
+        self.addCleanup(setattr, inbox, "scan_report_ids", real)
+        inbox.scan_report_ids = lambda *args: calls.append(args) or real(*args)
+        dumped = inbox.dump()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((dumped["unreadable"], [r["id"] for r in dumped["reports"]]), (["other/"], ["sample/audit"]))
+
+    def test_root_parameter_reads_another_tree_without_touching_the_global(self):
+        (self.root / "state").mkdir()
+        (self.root / "state/reports").write_text("sample/audit#1\tdismissed\t2026-01-03\twont-fix\n", encoding="utf-8")
+        inbox.finding_status.write_status(str(self.root), {"other/audit#1": ["gone", "", "", ""]})
+        inbox.ROOT = str(self.root / "nowhere")
+        self.assertEqual(inbox.scan_report_ids(str(self.root)), (["other/audit", "sample/audit"], []))
+        reports, findings = inbox.load_reports(str(self.root))
+        self.assertEqual([r["id"] for r in reports], ["other/audit", "sample/audit"])
+        self.assertEqual({f"{f['report']}#{f['n']}": (f["state"], f["verdict"]) for f in findings},
+                         {"other/audit#1": ("new", "gone"), "sample/audit#1": ("dismissed", "")})
+        self.assertEqual(inbox.ROOT, str(self.root / "nowhere"))
+        self.assertEqual(inbox.load_reports(), ([], []))
+
     def test_missing_reports_root_is_simply_empty(self):
         inbox.ROOT = str(self.root / "nowhere")
         self.assertEqual(inbox.scan_report_ids(), ([], []))

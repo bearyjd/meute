@@ -3,10 +3,16 @@
 Everything here fails closed. A filesystem error or an ambiguity (a symlink, a
 non-directory, a path that cannot be stat'ed) at reports/ or under the enrolled
 repo's reports is reported as report_unreadable; it is never read as "nothing
-there". Unreadable paths in clearly unrelated repo directories are ignored but
-listed in the inventory check as ignored_unreadable. A report whose findings sit
-under anything but a canonical `## Findings` heading, or whose Findings sections
-(all of them) hold a heading that does not parse, is report_malformed.
+there". An unreadable or non-UTF-8 path in another repo's directory cannot be
+shown not to claim the enrolled repo, so it is listed as ignored_unreadable and
+keeps readiness pending (ignored_unreadable_paths). The policy has no field to
+acknowledge such a path: make it readable or remove it.
+
+Findings are not recognised by listing bad shapes. A report of the enrolled
+repo (or one elsewhere claiming it) is report_malformed unless every line that
+names a severity is either a finding line the inbox parser reads inside a
+canonical `## Findings` section, or plain prose: see _unparsed_finding. Fenced
+code blocks are not exempt, because the inbox parser does not exempt them.
 
 An applicable finding stays open unless this record's own evidence or policy
 clears it, intentionally: a decision inherited from an earlier report with the
@@ -39,11 +45,17 @@ OPTIONAL_FIELDS = {"result", "fixes", "native", "preexisting"}
 FINDING_HEADING = re.compile(r"^###\s", re.M)
 FINDINGS_SECTION = re.compile(r"^## Findings\s*$", re.M)  # report_lib.has_findings_section, every occurrence
 NEXT_SECTION = re.compile(r"^##\s+", re.M)
+# A severity word or its inbox abbreviation, but not a longer word or a path segment (highly, src/low.py).
+SEVERITY_WORD = re.compile(
+    r"(?<![^\W_])(?<![./])(?:crit(?:ical)?|high|med(?:ium)?|low)(?![^\W_]|/|\.\w)", re.I)
+ORDERED_ITEM = re.compile(r"\d+[.):]")
+SETEXT_UNDERLINE = re.compile(r"\s*(?:=+|-+)\s*$")
 UNREADABLE = {"digest": None, "error": "report_unreadable", "claimed": None, "findings": []}
 BLOB_PURPOSES = ("docs", "codemap")
 FIX_PURPOSES = ("acceptance", "audits")
 PRECEDENCE = ("report_unreadable", "report_malformed", "report_repo_mismatch",
-              "inventory_report_changed", "inventory_report_added", "inventory_report_removed")
+              "inventory_report_changed", "inventory_report_added", "inventory_report_removed",
+              "ignored_unreadable_paths")
 
 
 @dataclass(frozen=True)
@@ -68,23 +80,26 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
         return {**entry, "error": "report_unreadable"}
     entry["digest"] = sha256(data)
     try:
-        text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        text = _normalise(data.decode("utf-8"))
     except UnicodeDecodeError:
-        return {**entry, "error": "report_malformed"}
+        sniffed = report_lib.split_report(_normalise(data.decode("utf-8", "replace")))[0].get("repo")
+        return {**entry, "error": "report_malformed", "claimed": sniffed, "undecodable": True}
     meta, body = report_lib.split_report(text)
     if not meta:
         return {**entry, "error": "report_malformed"}
     entry["claimed"] = meta.get("repo")
+    spans = _findings_spans(body)
+    listed = "\n".join(body[start:end] for start, end in spans)
+    if repo in (directory, entry["claimed"]) and (
+        _unparsed_finding(body, spans)
+        or len(FINDING_HEADING.findall(listed)) != len(report_lib.parse_findings(listed))
+    ):
+        return {**entry, "error": "report_malformed"}
     if meta.get("repo", directory) != directory or directory != repo:
         return {**entry, "error": "report_repo_mismatch"}
     rid = f"{directory}/{name[:-3]}"
     fp_repo = report_lib.report_repo(meta, str(path))
-    listed = _findings_sections(body)
-    parsed = report_lib.parse_findings(body) if listed is not None else []
-    if listed is None and report_lib.FINDING_RE.search(body):
-        return {**entry, "error": "report_malformed"}  # findings under a heading the inbox does not read
-    if listed is not None and len(FINDING_HEADING.findall(listed)) != len(report_lib.parse_findings(listed)):
-        return {**entry, "error": "report_malformed"}
+    parsed = report_lib.parse_findings(body)  # as the inbox reads it; every match sits in a Findings section
     findings = [
         {"id": f"{rid}#{f['n']}", "report": rid, "n": f["n"], "severity": f["severity"],
          "fingerprint": report_lib.fingerprint(fp_repo, f["location"], f["title"])}
@@ -93,14 +108,50 @@ def _parse_report(path: Path, directory: str, name: str, repo: str) -> dict:
     return {**entry, "findings": findings}
 
 
-def _findings_sections(body: str) -> str | None:
-    """The text under every canonical `## Findings` heading, or None when there is none."""
-    parts = []
+def _normalise(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _findings_spans(body: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of the text under every canonical `## Findings` heading."""
+    spans = []
     for match in FINDINGS_SECTION.finditer(body):
-        rest = body[match.end():]
-        following = NEXT_SECTION.search(rest)
-        parts.append(rest[:following.start()] if following else rest)
-    return "\n".join(parts) if parts else None
+        following = NEXT_SECTION.search(body, match.end())
+        spans.append((match.end(), following.start() if following else len(body)))
+    return spans
+
+
+def _plain_prose(line: str, following: str) -> bool:
+    """A line that names a severity yet cannot be a finding title in any markup.
+
+    Only running text qualifies: it starts with a letter or a digit, is not an
+    ordered list item, and is not underlined into a setext heading. A heading
+    of any level, emphasis, a list item, a table row, a quote, HTML or a
+    leading bracket all start with something else, however they are indented.
+    """
+    text = line.strip()
+    return text[0].isalnum() and not ORDERED_ITEM.match(text) and not SETEXT_UNDERLINE.match(following)
+
+
+def _unparsed_finding(body: str, spans: list[tuple[int, int]]) -> bool:
+    """Whether the report may hold a finding the inbox would not list.
+
+    The inbox lists exactly the report_lib.FINDING_RE lines, and readiness
+    accepts those only inside a canonical Findings section. Every other line
+    naming a severity must be plain prose. Code fences are read like any other
+    text, as the inbox parser reads them.
+    """
+    lines = body.split("\n")
+    read: set[int] = set()
+    for match in report_lib.FINDING_RE.finditer(body):
+        if not any(start <= match.start() and match.end() <= end for start, end in spans):
+            return True
+        read.update(range(body.count("\n", 0, match.start()), body.count("\n", 0, match.end()) + 1))
+    following = [*lines[1:], ""]
+    return any(
+        index not in read and SEVERITY_WORD.search(line) and not _plain_prose(line, following[index])
+        for index, line in enumerate(lines)
+    )
 
 
 def _scan_file(folder: Path, directory: str, name: str, repo: str) -> tuple[dict | None, bool]:
@@ -117,7 +168,8 @@ def _scan_file(folder: Path, directory: str, name: str, repo: str) -> tuple[dict
     entry = _parse_report(folder / name, directory, name, repo)
     if mine or entry["claimed"] == repo:
         return entry, False
-    return None, entry["error"] == "report_unreadable"  # it cannot be shown not to claim the repo
+    # Unreadable or not UTF-8: it cannot be shown not to claim the repo.
+    return None, entry["error"] == "report_unreadable" or entry.get("undecodable", False)
 
 
 def _scan_directory(base: Path, directory: str, repo: str) -> tuple[dict[str, dict], list[str]]:
@@ -148,10 +200,11 @@ def _scan_directory(base: Path, directory: str, repo: str) -> tuple[dict[str, di
 
 
 def scan_reports(root: Path, repo: str) -> tuple[dict[str, dict], list[str]]:
-    """Every report in reports/<repo> plus readable reports elsewhere claiming the repo.
+    """Every report in reports/<repo> plus reports elsewhere claiming the repo.
 
-    Also returns the unreadable unrelated paths that were ignored: their
-    contents cannot be shown to claim the repo. Anything unreadable or
+    Also returns the unreadable or non-UTF-8 paths elsewhere, relative to
+    reports/: their contents cannot be shown not to claim the repo, so
+    inventory_check keeps readiness pending on them. Anything unreadable or
     ambiguous at reports/ itself or under reports/<repo> is an inventory
     entry with the error report_unreadable, never an absence.
     """
@@ -192,9 +245,10 @@ def inventory_check(reports: dict[str, dict], expected: dict[str, str], ignored:
          else "inventory_report_removed"}
         for path in sorted(expected.keys() - reports.keys())
     ]
+    named = {name for item in items for name in (item["path"], f"{item['path'].split('/')[0]}/")}
+    items += [{"path": path, "reason": "ignored_unreadable_paths"} for path in ignored if path not in named]
     if not items:
-        passed = {"check": "inventory", "status": "passed", "reason": "inventory_matches", "reports": len(reports)}
-        return {**passed, "ignored_unreadable": ignored} if ignored else passed
+        return {"check": "inventory", "status": "passed", "reason": "inventory_matches", "reports": len(reports)}
     reason = min((item["reason"] for item in items), key=PRECEDENCE.index)
     pending = {"check": "inventory", "status": "pending", "reason": reason, "reports": items}
     return {**pending, "ignored_unreadable": ignored} if ignored else pending
@@ -207,15 +261,11 @@ def inbox_rows(root: Path, repo: str) -> dict[str, dict]:
 
     Raises OSError when the inbox skipped reports/ itself or anything under reports/<repo>.
     """
-    previous = inbox.ROOT
-    inbox.ROOT = str(root)
-    try:
-        skipped = [path for path in inbox.scan_report_ids()[1] if path == "reports/" or path.startswith(f"{repo}/")]
-        if skipped:
-            raise OSError(f"inbox could not read {', '.join(skipped)}")
-        _, found = inbox.load_reports()
-    finally:
-        inbox.ROOT = previous
+    ids, skipped = inbox.scan_report_ids(str(root))
+    mine = [path for path in skipped if path == "reports/" or path.startswith(f"{repo}/")]
+    if mine:
+        raise OSError(f"inbox could not read {', '.join(mine)}")
+    _, found = inbox.load_reports(str(root), ids)
     return {f"{item['report']}#{item['n']}": item for item in found}
 
 

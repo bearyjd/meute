@@ -55,10 +55,10 @@ def _meute(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 # ---------------------------------------------------------------- state ---
 
-def _state_rows() -> dict[str, tuple[str, str, str]]:
+def _state_rows(root: str | None = None) -> dict[str, tuple[str, str, str]]:
     """state/reports as {key: (state, when, note)}. Keys are report ids or
     `report#n` for a single finding -- the same shape bin/meute writes."""
-    path = os.path.join(ROOT, "state", "reports")
+    path = os.path.join(ROOT if root is None else root, "state", "reports")
     rows: dict[str, tuple[str, str, str]] = {}
     if not os.path.isfile(path):
         return rows
@@ -73,15 +73,16 @@ def _state_rows() -> dict[str, tuple[str, str, str]]:
     return rows
 
 
-def scan_report_ids() -> tuple[list[str], list[str]]:
-    """(report ids, skipped paths under reports/).
+def scan_report_ids(root: str | None = None) -> tuple[list[str], list[str]]:
+    """(report ids, skipped paths under reports/), for `root` or else ROOT.
 
     Regular files in real directories only: what bin/meute's `find -type f`
     lists, so the count and the list agree with `meute reports`. A path that
-    could not be read is skipped as find skips it, but named, so a caller can
-    tell "no reports" from "reports I could not see".
+    could not be read, or a symlinked directory find does not descend, is
+    skipped as find skips it, but named, so a caller can tell "no reports"
+    from "reports I could not see".
     """
-    base = os.path.join(ROOT, "reports")
+    base = os.path.join(ROOT if root is None else root, "reports")
     try:
         if not stat.S_ISDIR(os.lstat(base).st_mode):  # find does not descend a symlinked start point
             return [], ["reports/"]
@@ -95,7 +96,10 @@ def scan_report_ids() -> tuple[list[str], list[str]]:
     for repo in repos:
         d = os.path.join(base, repo)
         try:
-            if not stat.S_ISDIR(os.lstat(d).st_mode):
+            mode = os.lstat(d).st_mode
+            if stat.S_ISLNK(mode):
+                skipped.append(f"{repo}/")
+            if not stat.S_ISDIR(mode):
                 continue
             names = sorted(os.listdir(d))
         except OSError:
@@ -116,8 +120,8 @@ def _report_ids() -> list[str]:
     return scan_report_ids()[0]
 
 
-def report_path(rid: str) -> str:
-    return os.path.join(ROOT, "reports", rid + ".md")
+def report_path(rid: str, root: str | None = None) -> str:
+    return os.path.join(ROOT if root is None else root, "reports", rid + ".md")
 
 
 def _order(meta: dict, rid: str) -> tuple:
@@ -132,11 +136,11 @@ def _group(meta: dict, rid: str, repo: str, keyfps: list[tuple[str, str]]) -> di
             "findings": keyfps}
 
 
-def _joins(occurrences: list, groups: list, rows: dict) -> tuple:
+def _joins(occurrences: list, groups: list, rows: dict, root: str | None = None) -> tuple:
     """What every view adds to a finding's own row: inherited decisions,
     superseded keys, and state/finding-status (verdicts and claims)."""
-    return (finding_status.inherited(occurrences, rows),
-            finding_status.superseded(groups), finding_status.read_status(ROOT))
+    return (finding_status.inherited(occurrences, rows), finding_status.superseded(groups),
+            finding_status.read_status(ROOT if root is None else root))
 
 
 def _derive(key: str, rows: dict, joins: tuple) -> dict:
@@ -157,16 +161,19 @@ def _derive(key: str, rows: dict, joins: tuple) -> dict:
 
 # --------------------------------------------------------------- reports ---
 
-def load_reports() -> tuple[list[dict], list[dict]]:
-    """(reports, findings). A finding row carries everything a list needs."""
-    rows = _state_rows()
+def load_reports(root: str | None = None, ids: list[str] | None = None) -> tuple[list[dict], list[dict]]:
+    """(reports, findings). A finding row carries everything a list needs.
+
+    Reads `root` or else ROOT, and the report ids already scanned there when given.
+    """
+    rows = _state_rows(root)
     reports: list[dict] = []
     findings: list[dict] = []
     occurrences: list[tuple[str, str, tuple]] = []
     groups: list[dict] = []
-    for rid in _report_ids():
+    for rid in (scan_report_ids(root)[0] if ids is None else ids):
         try:
-            meta, body = report_lib.read(report_path(rid))
+            meta, body = report_lib.read(report_path(rid, root))
         except Exception as e:  # a malformed report is a row, not a crash
             reports.append({"id": rid, "repo": rid.split("/")[0], "task": "?",
                             "state": "unreadable", "summary": f"unreadable: {e}"})
@@ -187,7 +194,7 @@ def load_reports() -> tuple[list[dict], list[dict]]:
             "findings": 0,
         }
         if report_lib.has_findings_section(body):
-            repo = report_lib.report_repo(meta, report_path(rid))
+            repo = report_lib.report_repo(meta, report_path(rid, root))
             keyfps: list[tuple[str, str]] = []
             for f in report_lib.parse_findings(body):
                 fstate, fwhen, fnote = rows.get(f"{rid}#{f['n']}", ("new", "", ""))
@@ -214,7 +221,7 @@ def load_reports() -> tuple[list[dict], list[dict]]:
                 entry["findings"] += 1
             groups.append(_group(meta, rid, repo, keyfps))
         reports.append(entry)
-    joins = _joins(occurrences, groups, rows)
+    joins = _joins(occurrences, groups, rows, root)
     for f in findings:
         key = f"{f['report']}#{f['n']}"
         f["inherited"] = joins[0].get(key, "")
@@ -421,9 +428,10 @@ def load_branches() -> list[dict]:
 
 
 def dump() -> dict:
-    reports, findings = load_reports()
+    ids, unreadable = scan_report_ids()
+    reports, findings = load_reports(ids=ids)
     return {
-        "unreadable": scan_report_ids()[1],
+        "unreadable": unreadable,
         "status": load_status(),
         "reports": reports,
         "findings": findings,

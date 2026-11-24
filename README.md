@@ -703,7 +703,7 @@ Use two UTF-8 JSON documents. Each takes integer `version` set to `1`.
 | Document | Required fields besides `version` |
 | --- | --- |
 | Readiness record | `repo` (enrollment name), `ref` (literal `refs/heads/…`), `base_commit` (full commit ID), `slice_id`, `intent_ref`, `plan_revision`, and `evidence` |
-| Operator policy | `repo`, `slice_id`, `plan_revision`, `record_sha256`, `manifest_path`, `manifest_sha256`, `checkout`, and `report_inventory` |
+| Operator policy | `repo`, `slice_id`, `plan_revision`, `record_sha256`, `manifest_path`, `manifest_sha256`, `checkout`, `report_inventory`, `evidence_root`, `attested_digests`, `assessment`, `deferrals`, and `accepted_conditions` |
 
 The record's `evidence` object has arrays for `docs`, `codemap`, `baseline`,
 `acceptance`, and `audits`. Use empty arrays for missing evidence. Each supplied
@@ -717,10 +717,56 @@ and nonempty, otherwise `repos.local.yaml` if present, then `repos.yaml`.
 `report_inventory` maps report paths relative to `reports/` to lowercase
 SHA-256 digests. An empty inventory is `{}`.
 
+Every policy field is required and no other field is accepted:
+
+- `evidence_root`: the absolute directory evidence files are trusted from.
+- `attested_digests`: SHA-256 digests of evidence files outside
+  `evidence_root` that the operator vouches for. Use `[]` for none.
+- `assessment`: `security` and `cleanup`, each `{"affirmed": true|false,
+  "findings": {"<report id>#<n>": {"fingerprint": "<40 hex>", "applicable":
+  true|false}}}`. Both must be affirmed and every finding of the repo's
+  reports must be listed with its current fingerprint.
+- `deferrals`: a list of `{finding, fingerprint, repo, slice_id,
+  plan_revision, reason, expires_at}`. `expires_at` is a UTC timestamp
+  (`…Z` or `…+00:00`) and is exclusive: at that instant the deferral has
+  already expired.
+- `accepted_conditions`: a list of `{condition, repo, slice_id,
+  plan_revision, reason}` where `condition` is `codemap_missing` or
+  `baseline_preexisting_failure`.
+
+Blockers: every finding the assessment marks `applicable` blocks readiness,
+whatever its severity, until this record clears it. Only two things clear it: a
+live deferral naming the finding, its fingerprint and the record's scope, or the
+finding's own `meute resolve` row together with `acceptance` or `audits`
+evidence whose `fixes` name its id and fingerprint. A decision inherited from an
+earlier report with the same fingerprint, and a whole-report `meute resolve`
+with no per-finding row, both leave the finding open.
+
+Reports fail closed:
+
+- Anything unreadable or ambiguous at `reports/` or under the repo's own
+  directory (a symlink, a non-directory, a permission error) is
+  `report_unreadable`.
+- An unreadable or non-UTF-8 path in another repo's directory might claim this
+  repo, so readiness stays pending with `ignored_unreadable_paths`, and the
+  paths are listed relative to `reports/` under `ignored_unreadable`. The policy
+  has no field to acknowledge such a path: make it readable or remove it.
+- A report is `report_malformed` unless every line naming a severity
+  (`critical`, `high`, `medium`, `low`, `crit`, `med`, in any case) is either a
+  `### [SEVERITY] title` line inside a `## Findings` section, exactly as the
+  inbox reads it, or plain prose. Plain prose starts with a letter or digit, is
+  not a numbered list item and is not underlined as a heading. So a heading of
+  any level, a bold or emphasised line, a list item, a table row, a quote or
+  HTML that names a severity anywhere else makes the report malformed, as does
+  any other `###` heading inside `## Findings`. Fenced code blocks are not
+  exempt, because the inbox parser does not exempt them. This is deliberately
+  strict: a list item such as `- **Confidence:** high` keeps readiness pending
+  until the report is reworded.
+
 The result is versioned JSON containing individual checks and a UTC timestamp.
-Exit `2` means invalid input. A matching identity exits `1` with readiness
-pending until evidence and the report inventory can be evaluated. A deleted or
-moved branch also exits `1` and reports the expected and observed commits.
+Exit `2` means invalid input. Exit `1` means readiness is pending: a check
+names the reason. A deleted or moved branch also exits `1` and reports the
+expected and observed commits. Exit `0` means ready.
 The command reads local inputs, leaves runner state untouched, and never
 executes commands from the record.
 

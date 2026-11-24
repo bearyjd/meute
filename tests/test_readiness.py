@@ -769,7 +769,7 @@ class ReadinessTest(unittest.TestCase):
         self.write_inputs()
         self.assert_reason(self.run_validate(), "report_malformed")
 
-    def test_finding_style_heading_outside_findings_section_stays_clean(self):
+    def test_plain_heading_outside_findings_section_stays_clean(self):
         self.make_ready()
         text = self.report_text(count=0) + "None.\n\n## Notes\n\n### Background\nprose\n"
         (self.reports / "notes.md").write_text(text, encoding="utf-8")
@@ -785,9 +785,11 @@ class ReadinessTest(unittest.TestCase):
         if os.access(other, os.R_OK):
             self.skipTest("permissions are not enforced for this user")
         self.write_inputs()
-        result = self.run_validate(code=0)
-        inventory = next(c for c in result["checks"] if c["check"] == "inventory")
+        result = self.run_validate()
+        self.assertEqual(result["status"], "pending")
+        inventory = self.assert_reason(result, "ignored_unreadable_paths")
         self.assertEqual(inventory["ignored_unreadable"], ["other/"])
+        self.assertNotIn(str(self.root), json.dumps(result["checks"]))
 
     def test_reports_root_listable_but_not_searchable_is_unreadable(self):
         self.make_ready(applicable=True)
@@ -893,10 +895,9 @@ class ReadinessTest(unittest.TestCase):
         item = self.assert_pending("report_unreadable")
         self.assertEqual(item["reports"], [{"path": "other/foreign.md", "reason": "report_unreadable"}])
         self.write_policy(report_inventory={k: v for k, v in pinned.items() if k != "other/foreign.md"})
-        code, result = self.run_inline()
-        self.assertEqual((code, result["status"]), (0, "ready"), result)
-        inventory = next(c for c in result["checks"] if c["check"] == "inventory")
+        inventory = self.assert_pending("ignored_unreadable_paths")
         self.assertEqual(inventory["ignored_unreadable"], ["other/foreign.md"])
+        self.assertEqual(inventory["reports"], [{"path": "other/foreign.md", "reason": "ignored_unreadable_paths"}])
 
     def test_unsearchable_unrelated_directory_lists_each_report_as_ignored(self):
         self.make_ready()
@@ -907,10 +908,9 @@ class ReadinessTest(unittest.TestCase):
         if os.access(foreign.parent, os.X_OK):
             self.skipTest("permissions are not enforced for this user")
         self.write_policy(report_inventory={k: v for k, v in pinned.items() if k != "other/foreign.md"})
-        code, result = self.run_inline()
-        self.assertEqual((code, result["status"]), (0, "ready"), result)
-        inventory = next(c for c in result["checks"] if c["check"] == "inventory")
+        inventory = self.assert_pending("ignored_unreadable_paths")
         self.assertEqual(inventory["ignored_unreadable"], ["other/foreign.md"])
+        self.assertEqual(inventory["reports"], [{"path": "other/foreign.md", "reason": "ignored_unreadable_paths"}])
 
     def test_pinned_report_in_unreadable_unrelated_directory_is_unreadable_not_removed(self):
         self.make_ready()
@@ -1016,3 +1016,144 @@ class ReadinessTest(unittest.TestCase):
         rule = {"condition": "baseline_preexisting_failure", **self.scope, "reason": "documented"}
         self.write_policy(accepted_conditions=[rule])
         self.assert_pending("evidence_missing")
+
+    # ----- fail-closed finding shapes -------------------------------------
+
+    HEAD = "---\nrepo: sample\ntask: audit\nstatus: ok\nstarted: 2026-01-02T00:00:00Z\n---\n# Audit\n\n"
+    NONE = "## Findings\n\nNone.\n\n"
+    STRAY_SHAPES = {
+        "no space after hashes": "## Findings\n\n###[HIGH] x\n",
+        "no space, no findings section": "###[HIGH] x\n",
+        "h4": "## Findings\n\n#### [HIGH] x\n",
+        "h1": NONE + "# [CRITICAL] x\n",
+        "h6 lowercase": NONE + "###### [low] x\n",
+        "indented heading": "## Findings\n\n ### [HIGH] x\n",
+        "tab-indented heading": "## Findings\n\n\t### [HIGH] x\n",
+        "deeply indented heading": "## Findings\n\n      ### [HIGH] x\n",
+        "bold line": "## Findings\n\n**[HIGH] x**\n",
+        "underscore emphasis": NONE + "__MEDIUM__ x\n",
+        "setext after bracketed line": "## Findings\n\n[HIGH] x\n------\n",
+        "setext after plain line": NONE + "High x\n---\n",
+        "setext with equals": NONE + "Severity low x\n  ===  \n",
+        "lowercase under near-miss section": NONE + "## Findings (cont)\n\n### [high] x\n",
+        "inner spacing under near-miss section": NONE + "## Findings (cont)\n\n### [HIGH ] x\n",
+        "inner spacing in findings": "## Findings\n\n### [ HIGH ] x\n",
+        "only lowercase findings section": "## findings\n\n### [High] x\n",
+        "exact heading outside findings": NONE + "## Notes\n\n### [HIGH] x\n- **Location:** `a.py:1`\n",
+        "exact heading before findings": "### [HIGH] x\n\n" + NONE,
+        "unbracketed heading outside findings": NONE + "## Notes\n\n### HIGH x\n",
+        "abbreviated severity": NONE + "## Notes\n\n### [CRIT] x\n",
+        "unrated heading in findings": "## Findings\n\n### Unrated thing\n- **Location:** `a.py:1`\n",
+        "uppercase prose is still prose, but not in a heading": NONE + "#### Severity: Medium\n",
+        "bullet": NONE + "- [HIGH] x\n",
+        "star bullet with bare word": NONE + "* **Severity:** high\n",
+        "plus bullet": NONE + "+ medium: x\n",
+        "ordered item": NONE + "1. HIGH x\n",
+        "ordered item with parenthesis": NONE + "2) low x\n",
+        "table row": NONE + "| HIGH | x |\n",
+        "blockquote": NONE + "> ### [HIGH] x\n",
+        "html heading": NONE + "<h3>[HIGH] x</h3>\n",
+        "bracket first": NONE + "[HIGH] x\n",
+        "fenced example heading": NONE + "## Notes\n\n```\n### [HIGH] example\n```\n",
+        "fenced example in findings is not exempt either": "## Findings\n\n```\n#### [HIGH] example\n```\n",
+    }
+    CLEAN_SHAPES = {
+        "prose with the words": NONE + "The risk here is high and the effort is low; medium at worst.\nCritical paths were read.\n",
+        "prose naming a bracketed severity": NONE + "## Verification notes\n\nThe [HIGH] finding above reproduces with curl.\n",
+        "notes and background sections": NONE + "## Notes\n\n### Background\nprose about a high bar\n",
+        "fenced headings without a severity": NONE + "## Notes\n\n```\n### Example heading\n- item\n## Another\n```\n",
+        "list items without a severity": NONE + "- **Location:** `src/low.py:1`\n- see lib/high/low_level.py and highly lowered things\n"
+                                              "- low.py and high/water.py were read in full\n",
+        "real finding with its fields": "## Findings\n\n### [LOW] Real one\n- **Location:** `b.py:2`\n- **Confidence:** confirmed\n",
+        "real finding followed by a rule": "## Findings\n\n### [MEDIUM] Real two\n---\n- **Location:** `c.py:2`\n",
+    }
+
+    def own_inventory(self):
+        return {path: digest for path, digest in self.disk_inventory().items() if path.startswith("sample/")}
+
+    def put_probe(self, body, directory="sample"):
+        target = self.layout / "reports" / directory
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "probe.md").write_text(self.HEAD + body, encoding="utf-8")
+        probe = report_lib.parse_findings(body)
+        fingerprints = {f"sample/probe#{f['n']}": {"fingerprint": report_lib.fingerprint("sample", f["location"], f["title"]),
+                                                   "applicable": False} for f in probe}
+        base = {key: value for key, value in self.assessment["security"]["findings"].items() if "probe" not in key}
+        self.assessment["security"]["findings"] = {**base, **fingerprints}
+        self.write_inputs()
+
+    def test_every_unparsed_finding_shape_is_malformed(self):
+        self.make_ready()
+        for name, body in self.STRAY_SHAPES.items():
+            with self.subTest(shape=name):
+                self.put_probe(body)
+                item = self.assert_pending("report_malformed")
+                self.assertEqual(item["reports"], [{"path": "sample/probe.md", "reason": "report_malformed"}])
+
+    def test_clean_report_shapes_stay_ready(self):
+        self.make_ready()
+        for name, body in self.CLEAN_SHAPES.items():
+            with self.subTest(shape=name):
+                self.put_probe(body)
+                code, result = self.run_inline()
+                self.assertEqual((code, result["status"]), (0, "ready"), result)
+
+    def test_unparsed_finding_shape_in_another_directory_claiming_the_repo_is_malformed(self):
+        self.make_ready()
+        for name in ("no space after hashes", "bold line", "exact heading outside findings"):
+            with self.subTest(shape=name):
+                self.put_probe(self.STRAY_SHAPES[name], directory="other")
+                item = self.assert_pending("report_malformed")
+                self.assertEqual(item["reports"], [{"path": "other/probe.md", "reason": "report_malformed"}])
+        self.put_probe(self.NONE, directory="other")
+        self.assert_pending("report_repo_mismatch")
+
+    def test_non_utf8_report_elsewhere_blocks_whether_or_not_it_names_the_repo(self):
+        self.make_ready()
+        other = self.layout / "reports/other"
+        other.mkdir()
+        (other / "latin.md").write_bytes(b"---\nrepo: other\n---\n# Audit\n\xff\xfe\n")
+        self.write_inputs(report_inventory=self.own_inventory())
+        item = self.assert_pending("ignored_unreadable_paths")
+        self.assertEqual(item["ignored_unreadable"], ["other/latin.md"])
+        result = self.run_validate()
+        self.assert_reason(result, "ignored_unreadable_paths")
+        self.assertNotIn(str(self.root), json.dumps(result["checks"]))
+        (other / "latin.md").write_bytes(b"\xff\xfe no front matter\n")
+        self.assertEqual(self.assert_pending("ignored_unreadable_paths")["ignored_unreadable"], ["other/latin.md"])
+        (other / "latin.md").write_bytes(b"---\nrepo: sample\n---\n# Audit\n\xff\xfe\n")
+        self.write_inputs()
+        item = self.assert_pending("report_malformed")
+        self.assertEqual(item["reports"], [{"path": "other/latin.md", "reason": "report_malformed"}])
+        self.assertNotIn("ignored_unreadable", item)
+
+    def test_readable_foreign_report_without_front_matter_is_not_ours(self):
+        self.make_ready()
+        other = self.layout / "reports/other"
+        other.mkdir()
+        (other / "plain.md").write_text("### [HIGH] someone else's\n", encoding="utf-8")
+        self.write_inputs(report_inventory=self.own_inventory())
+        code, result = self.run_inline()
+        self.assertEqual((code, result["status"]), (0, "ready"), result)
+
+    def test_ignored_unreadable_path_is_named_beside_another_inventory_reason(self):
+        self.make_ready()
+        other = self.layout / "reports/other"
+        other.mkdir()
+        (other / "latin.md").write_bytes(b"\xff")
+        self.write_inputs(report_inventory=self.own_inventory())
+        self.put_zero_report()
+        item = self.assert_pending("inventory_report_added")
+        self.assertEqual(item["ignored_unreadable"], ["other/latin.md"])
+        self.assertIn({"path": "other/latin.md", "reason": "ignored_unreadable_paths"}, item["reports"])
+
+    def test_evaluation_leaves_the_inbox_root_alone(self):
+        self.make_ready()
+        import inbox
+        seen = []
+        real = inbox.load_reports
+        self.addCleanup(setattr, inbox, "load_reports", real)
+        inbox.load_reports = lambda *args, **kwargs: seen.append(inbox.ROOT) or real(*args, **kwargs)
+        code, _ = self.run_inline()
+        self.assertEqual((code, seen), (0, [inbox.ROOT]))
+        self.assertNotEqual(Path(inbox.ROOT), self.layout)
