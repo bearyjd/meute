@@ -1121,6 +1121,18 @@ class ReadinessTest(unittest.TestCase):
         "bulleted bracket title": ("- [HIGH] SQL injection in login\n", MALFORMED, MALFORMED),
         "bold bracket title": ("**[HIGH] SQL injection**\n" + LOC, MALFORMED, MALFORMED),
         "html heading in a list item": ("- see <H2>HIGH SQL injection</H2>\n", MALFORMED, MALFORMED),
+        "emoji before a bold severity": ("- **🔴 CRITICAL:** SQL injection in src/login.py:9\n", MALFORMED, MALFORMED),
+        "emoji before a severity and a dash": ("🔴 CRITICAL - SQL injection in src/login.py:9\n", MALFORMED, MALFORMED),
+        "emoji before a severity in a table cell": ("| 1 | 🔴 Critical | SQL injection |\n", MALFORMED, MALFORMED),
+        "emoji with a variation selector": ("⚠️ CRITICAL - SQL injection in src/login.py:9\n", MALFORMED, MALFORMED),
+        "emoji modifier (Sk) before a severity": ("- \U0001f3fb **CRITICAL:** SQL injection in src/login.py:9\n",
+                                              MALFORMED, MALFORMED),
+        "table row with a parenthesised severity cell": ("| High (confirmed) | SQL injection |\n", MALFORMED, MALFORMED),
+        "table severity cell with a trailing parenthesis only": ("| SQL injection | High (confirmed) |\n", MALFORMED, MALFORMED),
+        "table without leading pipe": ("CRITICAL | SQL injection\n", MALFORMED, MALFORMED),
+        "table without leading pipe, parenthesised": ("High (confirmed) | SQL injection\n", MALFORMED, MALFORMED),
+        "capital cyrillic che-like h in a bullet title": ("- [\u04baIGH] SQL injection\n", MALFORMED, MALFORMED),
+        "capital komi de in a bullet title": ("- [ME\u0500IUM] SQL injection\n", MALFORMED, MALFORMED),
     }
     # Lines that lead with a severity are read as references when a parsed finding of the same
     # report carries that severity, and as unlisted findings when none does.
@@ -1147,7 +1159,20 @@ class ReadinessTest(unittest.TestCase):
         "attribute line that is no heading": "  #[serde(default)]\n",
         "tab-indented code comment with a bracket": "\t# [tenants.thresholds]\n",
         "prose naming a bracketed severity": "The [CRITICAL] finding in the other report is unrelated.\n",
+        "task item with a high-level word": "- [ ] write the high-level overview\n",
+        "checked task item with a low-level word": "- [x] read the low-level helpers\n",
+        "prose with a pipe and a severity word": "| area | risk is high here | notes |\n",
+        "table cell that only contains a severity word": "| the high road | x |\n",
+        "pipe in a sentence": '- The contract says "possible_bypass | critical | sum of bytes"\n',
+        "severity after a pipe in prose": "Run it through tee | low-level tools\n",
+        "emoji before prose": "🔴 the high-level view is unchanged\n",
     }
+    # A task-list item that leads with a severity: a reference to a parsed one, an unlisted finding otherwise.
+    TASK_SHAPES = {"bold": "- [ ] **HIGH** SQL injection\n", "plain checked": "- [x] HIGH SQL injection\n",
+                   "upper checked": "* [X] HIGH SQL injection\n", "ordered": "1. [ ] **HIGH** SQL injection\n"}
+    # Bodies read by readiness_shapes directly, with no parsed finding: (line, malformed).
+    SYMBOL_LINES = ("- 🟠 High: x", "⚠️ HIGH: x", "🔴 Critical - x", "- **🔴 CRITICAL:** x", "| 🔴 Critical | x |",
+                    "- ⚠️ [HIGH] x", "- 🔴 (HIGH, confirmed) x")
 
     def put_based(self, severity, extra, notes):
         """audit-1 with one parsed finding of `severity`, assessed, then `extra` inside or outside Findings."""
@@ -1178,6 +1203,23 @@ class ReadinessTest(unittest.TestCase):
                     self.assertEqual(self.based_reason(), (0, "ready"))
                     self.put_based("LOW", extra, notes)
                     self.assertEqual(self.based_reason(), "report_malformed")
+
+    def test_task_list_item_leading_with_a_severity_is_a_reference_only_to_a_parsed_severity(self):
+        self.make_ready()
+        for name, extra in self.TASK_SHAPES.items():
+            for notes in (False, True):
+                with self.subTest(shape=name, notes=notes):
+                    self.put_based("HIGH", extra, notes)
+                    self.assertEqual(self.based_reason(), (0, "ready"))
+                    self.put_based("LOW", extra, notes)
+                    self.assertEqual(self.based_reason(), "report_malformed")
+
+    def test_symbol_prefixed_severity_lines_are_unlisted_inside_and_outside_findings(self):
+        import readiness_shapes
+        for line in self.SYMBOL_LINES:
+            for prefix in ("", "## Findings\n\n", "## Notes\n\n"):
+                with self.subTest(line=line, prefix=prefix):
+                    self.assertTrue(readiness_shapes.unlisted_finding(prefix + line + "\n"))
 
     def test_bold_only_line_must_name_only_parsed_severities(self):
         self.make_ready()
@@ -1218,7 +1260,8 @@ class ReadinessTest(unittest.TestCase):
                     "04-verification-finding-refs": 2, "05-verification-parenthesised": 2,
                     "06-verification-bracket-refs": 2, "07-summary-severity-leading": 3,
                     "08-summary-parenthesised": 2, "09-coverage-only": 0, "10-out-of-lens": 1,
-                    "11-evidence-code-lines": 1, "12-not-a-finding-headings": 1}
+                    "11-evidence-code-lines": 1, "12-not-a-finding-headings": 1,
+                    "13-emoji-and-task-list": 1}
         fixtures = sorted((MEUTE / "tests/fixtures/readiness_shapes").glob("*.md"))
         self.assertEqual([path.stem for path in fixtures], sorted(expected))
         self.make_ready()

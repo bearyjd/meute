@@ -760,7 +760,10 @@ Reports fail closed:
      `#`, `<`, `=` or a link or footnote definition; or it is underlined as a
      heading; or it holds an HTML heading tag (`<h1>` to `<h6>`) anywhere, even
      in the middle of a sentence; or it is a table row with a cell that is only
-     a severity. Always malformed.
+     a severity, with an optional trailing parenthesis (`| High (confirmed) |`).
+     A row that opens with a pipe is checked in every cell; a row without one
+     (`CRITICAL | SQL injection`) in its first cell only, because a pipe inside a
+     sentence is prose. Always malformed.
   2. Title. The line starts with `[SEV]` or `(SEV, qualifier)` followed by
      anything but the word `finding`, in any emphasis and after any list
      marker, `A)` and `I.` included. Always malformed.
@@ -771,6 +774,9 @@ Reports fail closed:
      (`- **Finding 1 (HIGH):**`), or is bold from end to end (`**Why LOW:**`).
      Malformed only when no parsed finding in the same report has that
      severity.
+  List markers include task-list boxes (`- [ ] **HIGH** x`, `- [x] HIGH x`),
+  and emoji and other symbols before a severity are ignored (`- **🔴 CRITICAL:**
+  x`, `⚠️ HIGH: x`), so both are judged as the same line without them.
   A severity in the middle of a list item or a field value
   (`- **Consequence:** ... a high-privilege account`) and in running text is
   accepted. The report templates put severities in exactly these places: the
@@ -784,8 +790,9 @@ Reports fail closed:
   not caught. At a severity the report does not list, it is.
 - Severities are matched on a folded copy of each line: Unicode compatibility
   forms (fullwidth `ＨＩＧＨ`, `Ⅰ.`), zero-width and other format characters,
-  combining marks, and the Cyrillic and Greek letters drawn like the letters of
-  the severity words. No other lookalike is folded.
+  combining marks, emoji and other symbols, and a fixed table of 33 Cyrillic and
+  Greek letters drawn like the letters of the severity words (capitals
+  included). No other lookalike is folded.
 - A heading that holds a `[` is malformed whatever it names (`### [SEVERE] x`,
   `### [P0] x`), unless it is indented as code. Under `## Findings` every
   `###` heading must be a finding the inbox reads, except a heading starting
@@ -797,7 +804,8 @@ Reports fail closed:
   with a severity and no dash or colon; a rating under another field name
   (`Risk: High`); an unknown label outside a heading (`- [SEVERE] x`); a
   severity spelled with digits or spaces, or split across lines outside a
-  heading; lookalikes from other scripts.
+  heading; lookalikes outside that table; a severity cell after the first one
+  in a table row with no leading pipe.
 - A report in another repo's directory whose front matter names this repo
   only once a byte order mark, key case, value case and quotes are set aside
   (`repo: "sample"`, `Repo: sample`) is `report_repo_mismatch`. The inbox reads
