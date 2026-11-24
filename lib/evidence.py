@@ -16,13 +16,15 @@ from pathlib import Path
 
 if __package__:
     from .native_evidence import CLAIM_FIELDS, CLAIM_VERSION, RUN_ID
+    from .report import MAX_REPORT_BYTES
 else:
     from native_evidence import CLAIM_FIELDS, CLAIM_VERSION, RUN_ID
+    from report import MAX_REPORT_BYTES
 
 MAX_ROWS = 256
 MAX_EXPORT = 256 * 1024
 MAX_PROVENANCE = 16 * 1024
-MAX_REPORT = 4 * 1024 * 1024
+MAX_REPORT = MAX_REPORT_BYTES
 MAX_LOG = 16 * 1024 * 1024
 MAX_HEADER = 16 * 1024
 PROJECT = r"[a-z0-9][a-z0-9_-]*"

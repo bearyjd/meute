@@ -301,9 +301,13 @@ def verify(repo_paths: dict[str, str], only_repo: str = "") -> dict[str, int]:
     return counts
 
 
-def finding_body(rid: str, n: int) -> str:
+def finding_body(rid: str, n: int, *, bounded=False) -> str:
     """The markdown of one finding, from its `###` header to the next."""
-    _, body = report_lib.read(report_path(rid))
+    if bounded:
+        repo, _, name = rid.partition("/")
+        _, body = report_lib.read_bounded(os.path.join(ROOT, "reports"), repo, name)
+    else:
+        _, body = report_lib.read(report_path(rid))
     heads = list(report_lib.FINDING_RE.finditer(body))
     if n < 1 or n > len(heads):
         return ""

@@ -68,6 +68,8 @@
 #   tui                           the triage inbox, in the terminal (PRP-003 screen 1)
 #   web [--host H] [--port P] [--insecure-public]
 #                                  the inbox in a browser; loopback by default
+#   web --fleet-finding REPO/REPORT#N [--port P]
+#                                  a read-only Fleet view for an authenticated gateway
 #   help
 #
 # A report id is its path under reports/ without the .md, e.g.
@@ -771,18 +773,24 @@ cmd_tui() {
 # acknowledgement. The server only accepts requests whose Host header is the
 # bound host:port, so a non-loopback bind must use the address the browser uses.
 cmd_web() {
-  local host="127.0.0.1" port="8642" insecure_public=0
+  local host="127.0.0.1" port="8642" insecure_public=0 fleet_finding=""
   while (( $# )); do
     case "$1" in
       --host) (( $# >= 2 )) || die "web: --host needs a value"; host="$2"; [[ "$host" != --* ]] || die "web: --host needs a value, got '${host}'"; shift ;;
       --port) port="${2:?--port needs a value}"; [[ "$port" != --* ]] || die "web: --port needs a value, got '${port}'"; shift ;;
       --insecure-public) insecure_public=1 ;;
+      --fleet-finding) (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || die "web: --fleet-finding needs a repo/report#number"; fleet_finding="$2"; shift ;;
       *) die "web: unknown argument $1" ;;
     esac
     shift
   done
   [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) \
     || die "web: --port must be an integer 1-65535, got '${port}'"
+  if [[ -n "$fleet_finding" ]]; then
+    [[ "$host" == "127.0.0.1" ]] && (( ! insecure_public )) \
+      || die "web: managed Fleet requires the 127.0.0.1 loopback bind"
+    exec python3 "${MEUTE_ROOT}/tui/webserver.py" --host "$host" --port "$port" --fleet-finding "$fleet_finding"
+  fi
   # The server accepts only Host == the bound host:port, and no browser sends
   # Host 0.0.0.0: a wildcard bind would answer every request with 403.
   case "$host" in

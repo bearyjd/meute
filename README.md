@@ -265,6 +265,21 @@ header. With the default bind, browse to `127.0.0.1:<port>`; with
 `--host localhost` the browser must use `localhost:<port>` (`127.0.0.1:<port>`
 then returns 403); a non-loopback bind must be browsed at the same address.
 
+An authenticated gateway can use the separate managed Fleet listener:
+
+```sh
+meute web --port 8643 --fleet-finding 'repo/report#1'
+```
+
+It binds to `127.0.0.1`. Restrict access to the listener to the gateway
+trust domain and authorize each request at the gateway. Its GET routes are
+`/`, `/static/fleet.js`, `/api/fleet/status`, and the exact finding URL
+(`/fleet/finding/repo/report/1` in this example).
+The status is the serving process's controller observation. It includes
+staged queue counts and the configured finding reference. The finding opens
+as plain text from a regular report of up to 4 MiB. Continue to use
+`meute web` for interactive triage and run controls.
+
 Known limitation: if a scheduled timer finishes the same staged item between
 the page's pending check (a `lib/manifest.py` subprocess) and `run.sh` taking
 its lock -- a window of tens to hundreds of milliseconds -- one duplicate
