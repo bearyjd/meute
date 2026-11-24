@@ -68,7 +68,7 @@ TITLE = re.compile(
 LEADING = re.compile(rf"[\s*_`~\[(]*({SEVERITY_WORD.pattern})", re.I)
 LABEL = re.compile(rf"{SEVERITY}(?:\s+[-–—]|:)\s+\S", re.I)
 SEVERITY_FIELD = re.compile(rf"[*_`\s]*severity[*_`\s]*[:=\-\u2013\u2014][*_`\s]*{SEVERITY}(?![^\W_])", re.I)
-SEVERITY_CELL = re.compile(rf"(?:^|\|)\s*[*_`\[]*{SEVERITY}[*_`\]]*\s*(?:\([^|)]*\)\s*)?(?:\||$)", re.I)
+SEVERITY_CELL = re.compile(rf"(?:^|\|)\s*[*_`\[\s]*{SEVERITY}[*_`\]\s]*\s*(?:\([^|)]*\)\s*)?(?:\||$)", re.I)
 BOLD_ONLY = re.compile(r"(\*\*|__).*\1:?")
 DISMISSAL = re.compile(r"###\s+(?:not|no)\s", re.I)
 BRACKET = re.compile(r"[\[(]")

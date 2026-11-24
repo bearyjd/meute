@@ -775,8 +775,10 @@ Reports fail closed:
      Malformed only when no parsed finding in the same report has that
      severity.
   List markers include task-list boxes (`- [ ] **HIGH** x`, `- [x] HIGH x`),
-  and emoji and other symbols before a severity are ignored (`- **🔴 CRITICAL:**
-  x`, `⚠️ HIGH: x`), so both are judged as the same line without them.
+  and emoji before a severity are ignored (`- **🔴 CRITICAL:** x`, `⚠️ HIGH: x`,
+  `| 1 | **🔴 Critical** | x |`), so both are judged as the same line without
+  them. Only Unicode categories `So` and `Sk` (emoji, dingbats, emoji
+  modifiers) are dropped, not every symbol; see "Not caught" below.
   A severity in the middle of a list item or a field value
   (`- **Consequence:** ... a high-privilege account`) and in running text is
   accepted. The report templates put severities in exactly these places: the
@@ -806,6 +808,24 @@ Reports fail closed:
   severity spelled with digits or spaces, or split across lines outside a
   heading; lookalikes outside that table; a severity cell after the first one
   in a table row with no leading pipe.
+- This check is a best-effort shape screen, not proof that a report holds no
+  unlisted finding. Readiness stays pending, never ready, whenever it flags
+  anything. Not caught (each verified to leave readiness ready):
+  - Symbols outside `So` and `Sk` before a severity: `• **CRITICAL:** x` (a
+    `Po` bullet), `‼️ CRITICAL: x`, `→ CRITICAL: x` (`Sm`), `– **CRITICAL:** x`
+    (a `Pd` dash), `1️⃣ CRITICAL: x` (keycap). These classes are not dropped
+    because the pipe, colon and label rules depend on them.
+  - Task boxes that are not GFM: `- [ ]HIGH x`, `- [-] HIGH x`.
+  - Table cells that are more than a severity and an optional parenthesis:
+    `| High: | x |`, `| High - confirmed | x |`, `| High (see a) (b) | x |`.
+  - A table row inside a blockquote: `> | 1 | Critical | x |`.
+  - The gaps listed above: prose-shaped `High: ...` without markup, a bracketed
+    severity mid-sentence, `Risk:`, `Priority:` and `Impact:` fields, a trailing
+    `(HIGH)`, a severity in a non-first cell of a row without a leading pipe,
+    lookalikes outside the 33-letter table, and a severity split across lines
+    outside headings.
+  - Known false positive, which fails closed: `Low | latency is the goal of this
+    design` is flagged by the first-cell table rule.
 - A report in another repo's directory whose front matter names this repo
   only once a byte order mark, key case, value case and quotes are set aside
   (`repo: "sample"`, `Repo: sample`) is `report_repo_mismatch`. The inbox reads

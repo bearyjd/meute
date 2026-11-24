@@ -1127,6 +1127,11 @@ class ReadinessTest(unittest.TestCase):
         "emoji with a variation selector": ("⚠️ CRITICAL - SQL injection in src/login.py:9\n", MALFORMED, MALFORMED),
         "emoji modifier (Sk) before a severity": ("- \U0001f3fb **CRITICAL:** SQL injection in src/login.py:9\n",
                                               MALFORMED, MALFORMED),
+        "bold emoji severity cell": ("| 1 | **\U0001f534 Critical** | SQL injection in src/login.py:9 |\n", MALFORMED, MALFORMED),
+        "bold emoji severity first cell": ("| **\U0001f7e0 High** | SQL injection |\n", MALFORMED, MALFORMED),
+        "bold emoji severity cell with a parenthesis": ("| 1 | **\U0001f534 High** (confirmed) | x |\n", MALFORMED, MALFORMED),
+        "space before the closing emphasis of a severity cell": ("| 1 | **\U0001f534 Critical ** | x |\n", MALFORMED, MALFORMED),
+        "emoji before a bold severity cell": ("| \U0001f534 **High** | x |\n", MALFORMED, MALFORMED),
         "table row with a parenthesised severity cell": ("| High (confirmed) | SQL injection |\n", MALFORMED, MALFORMED),
         "table severity cell with a trailing parenthesis only": ("| SQL injection | High (confirmed) |\n", MALFORMED, MALFORMED),
         "table without leading pipe": ("CRITICAL | SQL injection\n", MALFORMED, MALFORMED),
@@ -1165,6 +1170,7 @@ class ReadinessTest(unittest.TestCase):
         "table cell that only contains a severity word": "| the high road | x |\n",
         "pipe in a sentence": '- The contract says "possible_bypass | critical | sum of bytes"\n',
         "severity after a pipe in prose": "Run it through tee | low-level tools\n",
+        "bold table cell that is no severity": "| 1 | **Overview** | the high-level plan |\n",
         "emoji before prose": "🔴 the high-level view is unchanged\n",
     }
     # A task-list item that leads with a severity: a reference to a parsed one, an unlisted finding otherwise.
