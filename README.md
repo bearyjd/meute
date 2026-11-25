@@ -703,7 +703,7 @@ Use two UTF-8 JSON documents. Each takes integer `version` set to `1`.
 | Document | Required fields besides `version` |
 | --- | --- |
 | Readiness record | `repo` (enrollment name), `ref` (literal `refs/heads/…`), `base_commit` (full commit ID), `slice_id`, `intent_ref`, `plan_revision`, and `evidence` |
-| Operator policy | `repo`, `slice_id`, `plan_revision`, `record_sha256`, `manifest_path`, `manifest_sha256`, `checkout`, and `report_inventory` |
+| Operator policy | `repo`, `slice_id`, `plan_revision`, `record_sha256`, `manifest_path`, `manifest_sha256`, `checkout`, `report_inventory`, `evidence_root`, `attested_digests`, `assessment`, `deferrals`, and `accepted_conditions` |
 
 The record's `evidence` object has arrays for `docs`, `codemap`, `baseline`,
 `acceptance`, and `audits`. Use empty arrays for missing evidence. Each supplied
@@ -717,10 +717,129 @@ and nonempty, otherwise `repos.local.yaml` if present, then `repos.yaml`.
 `report_inventory` maps report paths relative to `reports/` to lowercase
 SHA-256 digests. An empty inventory is `{}`.
 
+Every policy field is required and no other field is accepted:
+
+- `evidence_root`: the absolute directory evidence files are trusted from.
+- `attested_digests`: SHA-256 digests of evidence files outside
+  `evidence_root` that the operator vouches for. Use `[]` for none.
+- `assessment`: `security` and `cleanup`, each `{"affirmed": true|false,
+  "findings": {"<report id>#<n>": {"fingerprint": "<40 hex>", "applicable":
+  true|false}}}`. Both must be affirmed and every finding of the repo's
+  reports must be listed with its current fingerprint.
+- `deferrals`: a list of `{finding, fingerprint, repo, slice_id,
+  plan_revision, reason, expires_at}`. `expires_at` is a UTC timestamp
+  (`…Z` or `…+00:00`) and is exclusive: at that instant the deferral has
+  already expired.
+- `accepted_conditions`: a list of `{condition, repo, slice_id,
+  plan_revision, reason}` where `condition` is `codemap_missing` or
+  `baseline_preexisting_failure`.
+
+Blockers: every finding the assessment marks `applicable` blocks readiness,
+whatever its severity, until this record clears it. Only two things clear it: a
+live deferral naming the finding, its fingerprint and the record's scope, or the
+finding's own `meute resolve` row together with `acceptance` or `audits`
+evidence whose `fixes` name its id and fingerprint. A decision inherited from an
+earlier report with the same fingerprint, and a whole-report `meute resolve`
+with no per-finding row, both leave the finding open.
+
+Reports fail closed:
+
+- Anything unreadable or ambiguous at `reports/` or under the repo's own
+  directory (a symlink, a non-directory, a permission error) is
+  `report_unreadable`.
+- An unreadable or non-UTF-8 path in another repo's directory might claim this
+  repo, so readiness stays pending with `ignored_unreadable_paths`, and the
+  paths are listed relative to `reports/` under `ignored_unreadable`. The policy
+  has no field to acknowledge such a path: make it readable or remove it.
+- A report is `report_malformed` when it may show a finding the inbox does not
+  list. The inbox lists exactly the `### [SEVERITY] title` lines, and readiness
+  accepts those only inside a `## Findings` section. Any other line naming a
+  severity (`critical`, `high`, `medium`, `low`, `crit`, `med`, in any case) is
+  judged by its shape:
+  1. Structure. After indentation, `>` and list markers the line starts with
+     `#`, `<`, `=` or a link or footnote definition; or it is underlined as a
+     heading; or it holds an HTML heading tag (`<h1>` to `<h6>`) anywhere, even
+     in the middle of a sentence; or it is a table row with a cell that is only
+     a severity, with an optional trailing parenthesis (`| High (confirmed) |`).
+     A row that opens with a pipe is checked in every cell; a row without one
+     (`CRITICAL | SQL injection`) in its first cell only, because a pipe inside a
+     sentence is prose. Always malformed.
+  2. Title. The line starts with `[SEV]` or `(SEV, qualifier)` followed by
+     anything but the word `finding`, in any emphasis and after any list
+     marker, `A)` and `I.` included. Always malformed.
+  3. Field or label. `Severity: High`, or running text that opens with
+     `HIGH - ...` or `High: ...`. Always malformed.
+  4. Reference. A list, quote or emphasis line that leads with a severity
+     (`- **HIGH:** ...`, `- **LOW finding:**`), brackets one
+     (`- **Finding 1 (HIGH):**`), or is bold from end to end (`**Why LOW:**`).
+     Malformed only when no parsed finding in the same report has that
+     severity.
+  List markers include task-list boxes (`- [ ] **HIGH** x`, `- [x] HIGH x`),
+  and emoji before a severity are ignored (`- **🔴 CRITICAL:** x`, `⚠️ HIGH: x`,
+  `| 1 | **🔴 Critical** | x |`), so both are judged as the same line without
+  them. Only Unicode categories `So` and `Sk` (emoji, dingbats, emoji
+  modifiers) are dropped, not every symbol; see "Not caught" below.
+  A severity in the middle of a list item or a field value
+  (`- **Consequence:** ... a high-privilege account`) and in running text is
+  accepted. The report templates put severities in exactly these places: the
+  `Consequence`, `Why now` and `Why LOW` fields, the per-finding bullets under
+  `## Verification notes`, and the `Summary`, `Coverage` and `Out-of-lens
+  sightings` sections. An earlier rule refused every such line and kept about
+  one clean report in five pending.
+- Rule 4 is a trade-off. `- **HIGH:** second SQL injection` in a report that
+  already has a parsed `[HIGH]` finding is read as a reference to it, so a
+  second finding written that way, at a severity the report already lists, is
+  not caught. At a severity the report does not list, it is.
+- Severities are matched on a folded copy of each line: Unicode compatibility
+  forms (fullwidth `ＨＩＧＨ`, `Ⅰ.`), zero-width and other format characters,
+  combining marks, emoji and other symbols, and a fixed table of 33 Cyrillic and
+  Greek letters drawn like the letters of the severity words (capitals
+  included). No other lookalike is folded.
+- A heading that holds a `[` is malformed whatever it names (`### [SEVERE] x`,
+  `### [P0] x`), unless it is indented as code. Under `## Findings` every
+  `###` heading must be a finding the inbox reads, except a heading starting
+  with `Not ` or `No ` that holds no severity and no bracket
+  (`### Not a finding: ...`). Fenced code blocks are not exempt, because the
+  inbox parser does not exempt them.
+- Deliberately not caught: a severity mid-sentence or after a title
+  (`Note: [HIGH] SQL injection`, `SQL injection (HIGH)`); running text opening
+  with a severity and no dash or colon; a rating under another field name
+  (`Risk: High`); an unknown label outside a heading (`- [SEVERE] x`); a
+  severity spelled with digits or spaces, or split across lines outside a
+  heading; lookalikes outside that table; a severity cell after the first one
+  in a table row with no leading pipe.
+- This check is a best-effort shape screen, not proof that a report holds no
+  unlisted finding. Readiness stays pending, never ready, whenever it flags
+  anything. Not caught (each verified to leave readiness ready):
+  - Symbols outside `So` and `Sk` before a severity: `• **CRITICAL:** x` (a
+    `Po` bullet), `‼️ CRITICAL: x`, `→ CRITICAL: x` (`Sm`), `– **CRITICAL:** x`
+    (a `Pd` dash), `1️⃣ CRITICAL: x` (keycap). These classes are not dropped
+    because the pipe, colon and label rules depend on them.
+  - Task boxes that are not GFM: `- [ ]HIGH x`, `- [-] HIGH x`.
+  - Table cells that are more than a severity and an optional parenthesis:
+    `| High: | x |`, `| High - confirmed | x |`, `| High (see a) (b) | x |`.
+  - A table row inside a blockquote: `> | 1 | Critical | x |`.
+  - The gaps listed above: prose-shaped `High: ...` without markup, a bracketed
+    severity mid-sentence, `Risk:`, `Priority:` and `Impact:` fields, a trailing
+    `(HIGH)`, a severity in a non-first cell of a row without a leading pipe,
+    lookalikes outside the 33-letter table, and a severity split across lines
+    outside headings.
+  - Known false positive, which fails closed: `Low | latency is the goal of this
+    design` is flagged by the first-cell table rule.
+- A report in another repo's directory whose front matter names this repo
+  only once a byte order mark, key case, value case and quotes are set aside
+  (`repo: "sample"`, `Repo: sample`) is `report_repo_mismatch`. The inbox reads
+  the same file differently: it files it under the literal value or the
+  directory, never under this repo, so its findings do not appear among this
+  repo's. Readiness stays pending until the front matter is corrected or the
+  file removed.
+- A symlinked directory under `reports/` is `report_unreadable` here and is
+  skipped, and named, by the inbox.
+
 The result is versioned JSON containing individual checks and a UTC timestamp.
-Exit `2` means invalid input. A matching identity exits `1` with readiness
-pending until evidence and the report inventory can be evaluated. A deleted or
-moved branch also exits `1` and reports the expected and observed commits.
+Exit `2` means invalid input. Exit `1` means readiness is pending: a check
+names the reason. A deleted or moved branch also exits `1` and reports the
+expected and observed commits. Exit `0` means ready.
 The command reads local inputs, leaves runner state untouched, and never
 executes commands from the record.
 

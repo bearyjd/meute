@@ -12,8 +12,10 @@ import re
 import subprocess
 import sys
 
-from evidence import OID, SHA256, read_input, unique_object
+from evidence import OID, ROOT, SHA256, read_input, unique_object
 from manifest import SAFE_NAME, expand, yaml
+from readiness_eval import Context, evaluate, observe_mutable
+from readiness_rules import validate_rules
 
 
 MAX_INPUT_BYTES = 4 * 1024 * 1024
@@ -22,7 +24,8 @@ PURPOSES = {"docs", "codemap", "baseline", "acceptance", "audits"}
 RECORD_FIELDS = {"version", *SCOPE, "ref", "base_commit", "intent_ref", "evidence"}
 POLICY_FIELDS = {
     "version", *SCOPE, "record_sha256", "manifest_path", "manifest_sha256",
-    "checkout", "report_inventory",
+    "checkout", "report_inventory", "evidence_root", "attested_digests",
+    "assessment", "deferrals", "accepted_conditions",
 }
 
 
@@ -145,6 +148,10 @@ def parse_policy(data: bytes) -> dict:
         not report_path(path) or not matches(SHA256, digest) for path, digest in inventory.items()
     ):
         raise InvalidInput("policy_inventory_invalid", "Expected relative Markdown report paths and SHA-256 digests")
+    try:
+        validate_rules(policy)
+    except ValueError as error:
+        raise InvalidInput("policy_rules_invalid", str(error)) from error
     return policy
 
 
@@ -244,9 +251,8 @@ def observe_ref(checkout: Path, ref: str, expected: str) -> dict:
     return {"status": "pending", "reason": "ref_missing", **observation}
 
 
-def validate(record_path: Path, policy_path: Path, manifest_path: Path) -> tuple[int, dict]:
-    checks: list[dict] = []
-    result = {"version": 1, "checks": checks}
+def identify(record_path: Path, policy_path: Path, manifest_path: Path, checks: list[dict]) -> dict:
+    """The 4.1 identity checks. Raises InvalidInput tagged with the failing check."""
     check = "input"
     try:
         _, record_bytes, record_file = snapshot(record_path, "record")
@@ -255,7 +261,6 @@ def validate(record_path: Path, policy_path: Path, manifest_path: Path) -> tuple
             raise InvalidInput("policy_not_separate", "Record and operator policy must be separate files")
         record = parse_record(record_bytes)
         policy = parse_policy(policy_bytes)
-        result["scope"] = {key: record[key] for key in (*SCOPE, "intent_ref")}
         checks.append({"check": check, "status": "passed", "reason": "input_valid"})
 
         check = "policy"
@@ -278,22 +283,95 @@ def validate(record_path: Path, policy_path: Path, manifest_path: Path) -> tuple
         check = "ref"
         check_ref_format(checkout, record["ref"], record["base_commit"], object_format)
         checks.append({"check": check, **observe_ref(checkout, record["ref"], record["base_commit"])})
-        commands = [
-            {"purpose": purpose, "ref": item["ref"], "command": item["command"]}
-            for purpose, references in record["evidence"].items()
-            for item in references if "command" in item
-        ]
-        checks.append({
-            "check": "evidence", "status": "pending", "reason": "evidence_not_evaluated",
-            "commands": commands,
-        })
     except InvalidInput as error:
-        checks.append({"check": check, "status": "invalid", "reason": error.reason, "detail": str(error)})
-        result.update(status="invalid", observed_at=datetime.now(timezone.utc).isoformat())
-        return 2, result
+        error.check = check
+        raise
+    return {
+        "record": record, "policy": policy, "checkout": checkout,
+        "inputs": {
+            "record": hashlib.sha256(record_bytes).hexdigest(), "policy": hashlib.sha256(policy_bytes).hexdigest(),
+            "manifest": (str(canonical_manifest), hashlib.sha256(manifest_bytes).hexdigest()),
+            "ref": {key: checks[-1][key] for key in ("status", "observed_commit")},
+        },
+    }
 
-    result.update(status="pending", observed_at=datetime.now(timezone.utc).isoformat())
-    return 1, result
+
+def commands_check(record: dict) -> dict:
+    commands = [
+        {"purpose": purpose, "ref": item["ref"], "command": item["command"]}
+        for purpose, references in record["evidence"].items()
+        for item in references if "command" in item
+    ]
+    return {"check": "commands", "status": "passed", "reason": "commands_not_executed", "commands": commands}
+
+
+def _file_state(path: Path, label: str):
+    try:
+        canonical, data, _ = snapshot(path, label)
+    except InvalidInput:
+        return None
+    return str(canonical), hashlib.sha256(data).hexdigest()
+
+
+def observe_inputs(paths: tuple[Path, Path, Path], ctx: Context, checkout: Path) -> dict:
+    """Re-read every mutable input as identify and evaluate first saw it."""
+    record_path, policy_path, manifest_path = paths
+    record, policy = _file_state(record_path, "record"), _file_state(policy_path, "policy")
+    ref = observe_ref(checkout, ctx.record["ref"], ctx.record["base_commit"])
+    return {
+        "record": record and record[1], "policy": policy and policy[1],
+        "manifest": _file_state(manifest_path, "manifest"),
+        "ref": {key: ref[key] for key in ("status", "observed_commit")},
+        **observe_mutable(ctx),
+    }
+
+
+def final_checks(observed: dict, baseline: dict, relied: list, now: datetime) -> list[dict]:
+    drifted = sorted(key for key in baseline if observed[key] != baseline[key])
+    recheck = {"check": "recheck", "status": "pending", "reason": "inputs_drifted", "drifted": drifted} if drifted \
+        else {"check": "recheck", "status": "passed", "reason": "inputs_unchanged"}
+    lapsed = any(now >= expiry for expiry in relied)
+    expiry = {"check": "expiry", "status": "pending", "reason": "deferral_expired_at_final"} if lapsed \
+        else {"check": "expiry", "status": "passed", "reason": "deferrals_current"}
+    return [recheck, expiry]
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def validate(
+    record_path: Path, policy_path: Path, manifest_path: Path, *,
+    clock=utc_now, root: Path = ROOT, after_evaluation=lambda: None,
+) -> tuple[int, dict]:
+    checks: list[dict] = []
+    result = {"version": 1, "checks": checks}
+    try:
+        identity = identify(record_path, policy_path, manifest_path, checks)
+        record = identity["record"]
+        result["scope"] = {key: record[key] for key in (*SCOPE, "intent_ref")}
+        checkout = identity["checkout"]
+        ctx = Context(root, record, identity["policy"], lambda *args: local_git(checkout, *args))
+        evaluated, snapshot_state, relied = evaluate(ctx, clock())
+        checks.extend((*evaluated, commands_check(record)))
+        after_evaluation()
+        observed = observe_inputs((record_path, policy_path, manifest_path), ctx, checkout)
+        final = clock()
+        checks.extend(final_checks(observed, {**identity["inputs"], **snapshot_state}, relied, final))
+    except InvalidInput as error:
+        checks.append({"check": getattr(error, "check", "input"), "status": "invalid",
+                       "reason": error.reason, "detail": str(error)})
+        result.update(status="invalid", observed_at=clock().isoformat())
+        return 2, result
+    except Exception as error:  # never a traceback or a path: the contract is structured status
+        checks.append({"check": "evaluation", "status": "pending", "reason": "evaluation_failed",
+                       "detail": type(error).__name__})
+        result.update(status="pending", observed_at=clock().isoformat())
+        return 1, result
+
+    ready = all(item["status"] == "passed" for item in checks)
+    result.update(status="ready" if ready else "pending", observed_at=final.isoformat())
+    return (0 if ready else 1), result
 
 
 def main(manifest_path: Path, args: list[str]) -> int:
