@@ -612,6 +612,39 @@ class ReadinessTest(unittest.TestCase):
         self.write_inputs()
         self.assert_reason(self.run_validate(), "evidence_blob_mismatch")
 
+    def commit_blob_evidence(self, data):
+        (self.checkout / "docs.json").write_bytes(data)
+        self.git("add", "docs.json")
+        self.git("commit", "-qm", "evidence")
+        self.record["base_commit"] = self.git("rev-parse", "HEAD")
+        self.git("update-ref", REF, self.record["base_commit"])
+        self.base_commit = self.record["base_commit"]
+        self.make_ready()
+        item = {"ref": "docs.json", "revision": self.base_commit, "git_blob": self.git("rev-parse", "HEAD:docs.json")}
+        self.record["evidence"]["docs"] = [item]
+        self.write_inputs()
+        return item
+
+    def test_blob_evidence_digest_covers_the_raw_bytes_of_a_crlf_blob(self):
+        import readiness_eval
+        doc = {key: value for key, value in self.evidence_doc("docs").items() if key != "revision"}
+        raw = json.dumps(doc, indent=1).replace("\n", "\r\n").encode()
+        item = self.commit_blob_evidence(raw)
+        self.assertEqual(self.run_validate(code=0)["status"], "ready")
+        policy = json.loads(self.policy_path.read_text(encoding="utf-8"))
+        ctx = readiness_eval.Context(self.layout, self.record, policy,
+                                     lambda *args, **kwargs: readiness.local_git(self.checkout, *args, **kwargs))
+        loaded = readiness_eval.load_evidence(ctx, "docs", item)
+        self.assertIsNone(loaded["reason"])
+        self.assertEqual(loaded["digest"], hashlib.sha256(raw).hexdigest())
+        self.assertNotEqual(loaded["digest"], hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest())
+
+    def test_blob_evidence_that_is_not_utf8_is_pending_without_a_traceback(self):
+        self.commit_blob_evidence(b'{"version": 1, "note": "\xff\xfe"}')
+        result = self.run_validate()
+        self.assert_reason(result, "evidence_malformed")
+        self.assertEqual(result["status"], "pending")
+
     def test_missing_codemap_and_preexisting_baseline_failure_need_scoped_policy(self):
         self.make_ready()
         self.record["evidence"]["codemap"] = []
@@ -1226,6 +1259,27 @@ class ReadinessTest(unittest.TestCase):
             for prefix in ("", "## Findings\n\n", "## Notes\n\n"):
                 with self.subTest(line=line, prefix=prefix):
                     self.assertTrue(readiness_shapes.unlisted_finding(prefix + line + "\n"))
+
+    # A severity-cell table row behind a quote or list marker is still a table row.
+    PREFIXED_ROWS = ("- | 1 | Critical | x |", "> | 1 | Critical | x |", "> - | 1 | Critical | x |",
+                     "1. | 1 | Critical | x |")
+    PREFIXED_CLEAN = ("- the | pipe | in prose about a high-level plan", "> | 1 | **Overview** | notes |")
+
+    def test_severity_table_row_behind_a_quote_or_list_marker_is_unlisted(self):
+        self.make_ready()
+        for line in self.PREFIXED_ROWS:
+            for notes in (False, True):
+                with self.subTest(line=line, notes=notes):
+                    self.put_based("HIGH", line + "\n", notes)
+                    self.assertEqual(self.based_reason(), "report_malformed")
+
+    def test_prefixed_table_rows_without_a_severity_cell_stay_ready(self):
+        self.make_ready()
+        for line in self.PREFIXED_CLEAN:
+            for notes in (False, True):
+                with self.subTest(line=line, notes=notes):
+                    self.put_based("HIGH", line + "\n", notes)
+                    self.assertEqual(self.based_reason(), (0, "ready"))
 
     def test_bold_only_line_must_name_only_parsed_severities(self):
         self.make_ready()

@@ -818,8 +818,8 @@ Reports fail closed:
   - Task boxes that are not GFM: `- [ ]HIGH x`, `- [-] HIGH x`.
   - Table cells that are more than a severity and an optional parenthesis:
     `| High: | x |`, `| High - confirmed | x |`, `| High (see a) (b) | x |`.
-  - A table row inside a blockquote: `> | 1 | Critical | x |`.
-  - The gaps listed above: prose-shaped `High: ...` without markup, a bracketed
+  - The gaps listed above: a severity with no dash or colon (`High SQL injection`)
+    or no space after the colon (`Critical:SQL injection`), a bracketed
     severity mid-sentence, `Risk:`, `Priority:` and `Impact:` fields, a trailing
     `(HIGH)`, a severity in a non-first cell of a row without a leading pipe,
     lookalikes outside the 33-letter table, and a severity split across lines
