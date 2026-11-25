@@ -39,6 +39,7 @@ SYSTEM_PYTHON = os.environ.get("MEUTE_PYTHON", "python3")
 sys.path.insert(0, HERE)
 import report as report_lib  # noqa: E402
 import finding_status  # noqa: E402
+import receipt_keys  # noqa: E402
 
 SEVERITY_RANK = {s: i for i, s in enumerate(report_lib.SEVERITIES)}
 DISMISS_REASONS = ("false-positive", "wont-fix", "out-of-scope",
@@ -167,6 +168,11 @@ def load_reports(root: str | None = None, ids: list[str] | None = None) -> tuple
     Reads `root` or else ROOT, and the report ids already scanned there when given.
     """
     rows = _state_rows(root)
+    # Revisions come from the raw bytes, not `rows`: the decision path must
+    # agree with itself on a row `_state_rows` would have to decode.
+    reports_path = os.path.join(ROOT if root is None else root, "state", "reports")
+    # Not a regular file (a directory, a FIFO): no decisions, as _state_rows reads it.
+    revisions = receipt_keys.read_rows(reports_path) if os.path.isfile(reports_path) else {}
     reports: list[dict] = []
     findings: list[dict] = []
     occurrences: list[tuple[str, str, tuple]] = []
@@ -217,6 +223,7 @@ def load_reports(root: str | None = None, ids: list[str] | None = None) -> tuple
                     "note": fnote,
                     "fingerprint": fp,
                     "base": str(meta.get("base", "")).rpartition("@")[2],
+                    "revision": receipt_keys.revision(revisions, f"{rid}#{f['n']}"),
                 })
                 entry["findings"] += 1
             groups.append(_group(meta, rid, repo, keyfps))
@@ -280,7 +287,8 @@ def findings_tsv(only_new: bool) -> list[str]:
 
 def findings_json(only_new: bool) -> list[dict]:
     """`meute findings --json`: the contract external fix workflows read and
-    write back through `meute claim` and `meute resolve --pr` (P1.7)."""
+    write back through `meute claim` and `meute resolve --pr` (P1.7).
+    `revision` is the value `meute resolve|dismiss --expected-revision` takes."""
     _, findings = load_reports()
     out: list[dict] = []
     for f in findings:
@@ -293,6 +301,7 @@ def findings_json(only_new: bool) -> list[dict]:
             "location": f["location"], "base": f["base"],
             "state": "claimed" if f["claimed"] else f["state"],
             "inherited": f["inherited"], "verdict": f["verdict"], "pr": f["pr"],
+            "revision": f["revision"],
         })
     return out
 

@@ -32,6 +32,10 @@
 #   dismiss <id> [-f <n>] -r <reason> [-m <text>]
 #                                 record a decision; -r is required and is one of
 #                                 false-positive wont-fix out-of-scope duplicate too-large other
+#   resolve|dismiss <id> -f <n> ... --request-key K --expected-revision REV [--operator OP]
+#                                 a durable decision: refused (exit 3) if the finding
+#                                 changed since REV, answered with the same receipt on a
+#                                 retry of K (see `findings --json` for each revision)
 #   branches                      tier-3 drafts currently in flight
 #   image bump <repo>             pin the repo's container image: record the digest
 #                                  podman has for its image.tag into repos.local.yaml
@@ -91,6 +95,7 @@ export MEUTE_ROOT
 readonly MANIFEST_PY="${MEUTE_ROOT}/lib/manifest.py"
 readonly REPORT_PY="${MEUTE_ROOT}/lib/report.py"
 readonly INBOX_PY="${MEUTE_ROOT}/lib/inbox.py"
+readonly DECISIONS_PY="${MEUTE_ROOT}/lib/decisions.py"
 if [[ -n "${MEUTE_MANIFEST:-}" ]]; then
   readonly MANIFEST="$MEUTE_MANIFEST"
 elif [[ -f "${MEUTE_ROOT}/repos.local.yaml" ]]; then
@@ -287,15 +292,22 @@ cmd_show() {
 cmd_resolve() {
   local id="${1:-}"; shift || true
   local number="" note_text="" pr=""
+  local -a rx=(); local rx_key=0 rx_extra=0
   while (( $# )); do
     case "$1" in
-      -f|--finding) number="${2:?-f needs a finding number}"; shift ;;
-      -m|--message) note_text="${2:?-m needs text}"; shift ;;
-      --pr) pr="${2:?--pr needs a URL}"; shift ;;
+      -f|--finding) number="${2:?-f needs a finding number}"; rx+=("--finding=${number}"); shift ;;
+      -m|--message) note_text="${2:?-m needs text}"; rx+=("--message=${note_text}"); shift ;;
+      --pr) pr="${2:?--pr needs a URL}"; rx+=("--pr=${pr}"); shift ;;
+      --request-key) rx+=("--request-key=${2:?--request-key needs a key}"); rx_key=1; shift ;;
+      --expected-revision) rx+=("--expected-revision=${2:?--expected-revision needs a revision}"); rx_extra=1; shift ;;
+      --operator) rx+=("--operator=${2:?--operator needs a name}"); rx_extra=1; shift ;;
       *) die "resolve: unknown argument $1" ;;
     esac
     shift
   done
+  # Receipt mode: lib/decisions.py owns every check, on the raw values.
+  (( rx_key )) && exec python3 "$DECISIONS_PY" decide resolve "--id=${id}" "${rx[@]}"
+  (( ! rx_extra )) || die "resolve: --expected-revision and --operator need --request-key"
   require_report "$id"
   if [[ -n "$pr" ]]; then
     valid_pr_url "$pr" || die "resolve: --pr must be an http(s) URL with no spaces"
@@ -317,15 +329,21 @@ cmd_resolve() {
 cmd_dismiss() {
   local id="${1:-}"; shift || true
   local reason="" note_text="" number=""
+  local -a rx=(); local rx_key=0 rx_extra=0
   while (( $# )); do
     case "$1" in
-      -r|--reason)  reason="${2:?-r needs a reason}"; shift ;;
-      -m|--message) note_text="${2:?-m needs text}"; shift ;;
-      -f|--finding) number="${2:?-f needs a finding number}"; shift ;;
+      -r|--reason)  reason="${2:?-r needs a reason}"; rx+=("--reason=${reason}"); shift ;;
+      -m|--message) note_text="${2:?-m needs text}"; rx+=("--message=${note_text}"); shift ;;
+      -f|--finding) number="${2:?-f needs a finding number}"; rx+=("--finding=${number}"); shift ;;
+      --request-key) rx+=("--request-key=${2:?--request-key needs a key}"); rx_key=1; shift ;;
+      --expected-revision) rx+=("--expected-revision=${2:?--expected-revision needs a revision}"); rx_extra=1; shift ;;
+      --operator) rx+=("--operator=${2:?--operator needs a name}"); rx_extra=1; shift ;;
       *) die "dismiss: unknown argument $1" ;;
     esac
     shift
   done
+  (( rx_key )) && exec python3 "$DECISIONS_PY" decide dismiss "--id=${id}" "${rx[@]}"
+  (( ! rx_extra )) || die "dismiss: --expected-revision and --operator need --request-key"
   require_report "$id"
   [[ -n "$reason" ]] || die "dismiss: -r <reason> is required, one of: ${DISMISS_REASONS}"
   grep -qw -- "$reason" <<< "$DISMISS_REASONS" \

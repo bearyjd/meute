@@ -366,6 +366,54 @@ test_resolve() {
       "$(meute reports --all 2>/dev/null | grep '2026-08-30')" "actioned"
 }
 
+# Durable decisions (lib/decisions.py): the flags bin/meute hands over on, and
+# `revision` in findings --json. Own report, and state/reports is put back, so
+# no other test sees either.
+test_durable_decisions() {
+  local rid="alpha/audit-durable-2026-09-01" saved="$FIXTURE/state/reports.saved" rc rev out
+  [[ -f "$FIXTURE/state/reports" ]] && cp "$FIXTURE/state/reports" "$saved"
+  cat > "$FIXTURE/reports/${rid}.md" <<'MD'
+---
+repo: alpha
+task: audit-security
+tier: tier2
+lens: input-parsing
+started: 2026-09-01T03:00:00-04:00
+status: ok
+---
+
+## Findings
+
+### [HIGH] First
+- **Location:** `src/one.py:1`
+
+### [LOW] Second
+- **Location:** `src/two.py:2`
+MD
+  rev="$(meute findings --json --all 2>/dev/null | jq -r --arg id "${rid}#1" '.[] | select(.id == $id) | .revision')"
+  is "durable: an undecided finding reads r1:absent" "$rev" "r1:absent"
+
+  out="$(meute resolve "$rid" -f 1 -m "fixed" --request-key shell-key-1 --expected-revision "$rev" 2>/dev/null)"; rc=$?
+  is  "durable: first decision applies" "$rc" "0"
+  has "durable: one JSON receipt on stdout" "$out" '"replayed": false'
+
+  meute resolve "$rid" -f 1 -m "fixed" --request-key shell-key-2 --expected-revision "$rev" >/dev/null 2>&1; rc=$?
+  is "durable: a stale revision is exit 3" "$rc" "3"
+
+  out="$(meute resolve "$rid" -f 1 -m "fixed" --request-key shell-key-1 --expected-revision "$rev" 2>/dev/null)"; rc=$?
+  is  "durable: a retry of the key replays" "$rc" "0"
+  has "durable: ...as a replay" "$out" '"replayed": true'
+
+  meute dismiss "$rid" -f 2 -r wont --request-key shell-key-3 --expected-revision r1:absent >/dev/null 2>&1; rc=$?
+  is "durable: a fragment reason is refused (exit 2)" "$rc" "2"
+  meute dismiss "$rid" -f 2 -r wont-fix --expected-revision r1:absent >/dev/null 2>&1; rc=$?
+  is "durable: --expected-revision without --request-key is exit 1" "$rc" "1"
+
+  rm -f "$FIXTURE"/state/receipts/decisions/*.json "$FIXTURE/reports/${rid}.md" "$FIXTURE/state/reports.lock"
+  rmdir "$FIXTURE/state/receipts/decisions" "$FIXTURE/state/receipts" 2>/dev/null
+  if [[ -f "$saved" ]]; then mv "$saved" "$FIXTURE/state/reports"; else rm -f "$FIXTURE/state/reports"; fi
+}
+
 # Compares against a snapshot taken before the suite ran, rather than demanding a
 # clean tree: the operator may legitimately have uncommitted state, and this must
 # still catch the suite itself writing outside its fixture.
@@ -3416,12 +3464,14 @@ test_web_bind_guard() {
 test_web_invariants() {
   local f bad rc out
   for f in "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" \
-           "$REPO/lib/inbox.py" "$REPO/lib/report.py" "$REPO/lib/finding_status.py"; do
+           "$REPO/lib/inbox.py" "$REPO/lib/report.py" "$REPO/lib/finding_status.py" \
+           "$REPO/lib/receipt_keys.py"; do
     bad="$(python3 - "$f" <<'PY2'
 import ast, sys
 std = sys.stdlib_module_names
-# the only sibling modules the web files may import (never serve/app/model)
-siblings = {"inbox", "report", "finding_status", "runctl", "runprogress"}
+# the only sibling modules the web files may import (never serve/app/model);
+# receipt_keys is stdlib-only and carries the revision `findings --json` reports
+siblings = {"inbox", "report", "finding_status", "receipt_keys", "runctl", "runprogress"}
 tree = ast.parse(open(sys.argv[1]).read())
 bad = []
 for n in ast.walk(tree):
@@ -6309,5 +6359,6 @@ test_p1_7b_verify_hardening
 test_p1_7b_rewritten_rename
 test_p26_unknown_policy_keys
 test_kv_writes_locked
+test_durable_decisions
 printf '\n%s passed, %s failed\n' "$PASS" "$FAILED"
 (( FAILED == 0 ))

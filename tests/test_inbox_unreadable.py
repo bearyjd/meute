@@ -105,6 +105,23 @@ class InboxUnreadableTest(unittest.TestCase):
         self.assertEqual(inbox.ROOT, str(self.root / "nowhere"))
         self.assertEqual(inbox.load_reports(), ([], []))
 
+    def test_non_regular_state_reports_reads_as_no_decisions(self):
+        state = self.root / "state"
+        state.mkdir()
+        for make in (lambda p: p.mkdir(), lambda p: os.mkfifo(p)):
+            with self.subTest(kind=make):
+                target = state / "reports"
+                make(target)
+                result = self.cli("findings", "--all", "--json")
+                self.assertEqual((result.returncode, result.stderr), (0, ""))
+                rows = json.loads(result.stdout)
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(r["revision"] == "r1:absent" for r in rows))
+                if target.is_dir():
+                    target.rmdir()
+                else:
+                    target.unlink()
+
     def test_missing_reports_root_is_simply_empty(self):
         inbox.ROOT = str(self.root / "nowhere")
         self.assertEqual(inbox.scan_report_ids(), ([], []))
