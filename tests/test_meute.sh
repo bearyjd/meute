@@ -3468,8 +3468,9 @@ test_web_invariants() {
     bad="$(python3 - "$f" <<'PY2'
 import ast, sys
 std = sys.stdlib_module_names
-# the only sibling modules the web files may import (never serve/app/model)
-siblings = {"inbox", "report", "finding_status", "runctl", "runprogress"}
+# the only sibling modules the web files may import (never serve/app/model);
+# receipt_keys is stdlib-only and carries the revision `findings --json` reports
+siblings = {"inbox", "report", "finding_status", "receipt_keys", "runctl", "runprogress"}
 tree = ast.parse(open(sys.argv[1]).read())
 bad = []
 for n in ast.walk(tree):
