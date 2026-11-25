@@ -6,13 +6,11 @@ import hashlib
 import io
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
 import sys
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from decisions_helpers import (REPORT_A, REPORT_B, REPORT_EMPTY, SOURCE, Fixture, clean_env,
