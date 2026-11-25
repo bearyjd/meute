@@ -103,6 +103,7 @@ def _severity_cell_row(line: str) -> bool:
     """A table row with a cell that is only a severity: any cell when the row opens with a pipe, else the first.
 
     Later cells of a row without a leading pipe are not read: `"a | critical | b"` in a sentence is prose."""
+    line = line[_prefix_end(line):]  # a row behind a quote or list marker is still a row
     if "|" not in line:
         return False
     cell = SEVERITY_CELL.search if line.lstrip().startswith("|") else SEVERITY_CELL.match

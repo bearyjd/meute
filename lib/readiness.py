@@ -192,7 +192,7 @@ def enrolled_checkout(data: bytes, repo: str, expected: str) -> Path:
     return named[0]
 
 
-def local_git(checkout: Path, *args: str) -> subprocess.CompletedProcess:
+def local_git(checkout: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
     # git -C still honors environment overrides for the repository and refs.
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(
@@ -200,10 +200,9 @@ def local_git(checkout: Path, *args: str) -> subprocess.CompletedProcess:
         GIT_OPTIONAL_LOCKS="0", GIT_CEILING_DIRECTORIES=str(checkout.parent),
     )
     try:
-        return subprocess.run(
-            ["git", "-C", str(checkout), *args], env=env, capture_output=True,
-            text=True, encoding="utf-8", errors="surrogateescape", timeout=10,
-        )
+        decoding = {"text": True, "encoding": "utf-8", "errors": "surrogateescape"} if text else {}
+        return subprocess.run(["git", "-C", str(checkout), *args], env=env, capture_output=True,
+                              timeout=10, **decoding)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise InvalidInput("git_unavailable", str(error)) from error
 
@@ -351,7 +350,7 @@ def validate(
         record = identity["record"]
         result["scope"] = {key: record[key] for key in (*SCOPE, "intent_ref")}
         checkout = identity["checkout"]
-        ctx = Context(root, record, identity["policy"], lambda *args: local_git(checkout, *args))
+        ctx = Context(root, record, identity["policy"], lambda *args, **kwargs: local_git(checkout, *args, **kwargs))
         evaluated, snapshot_state, relied = evaluate(ctx, clock())
         checks.extend((*evaluated, commands_check(record)))
         after_evaluation()

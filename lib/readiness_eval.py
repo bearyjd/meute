@@ -326,10 +326,10 @@ def _blob_evidence(ctx: Context, ref: str, pin: str) -> tuple[bytes | None, str 
     named = ctx.git("rev-parse", "--verify", "--end-of-options", f"{commit}:{ref}")
     if named.returncode or named.stdout.strip() != pin:
         return None, "evidence_blob_mismatch"
-    blob = ctx.git("cat-file", "blob", pin)
+    blob = ctx.git("cat-file", "blob", pin, text=False)  # raw bytes: text mode would turn CRLF into LF
     if blob.returncode:
         return None, "evidence_unreadable"
-    return blob.stdout.encode("utf-8", "surrogateescape"), None
+    return blob.stdout, None
 
 
 def _native_digest(ctx: Context, doc: dict) -> tuple[str | None, str | None]:
