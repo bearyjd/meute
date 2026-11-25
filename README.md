@@ -230,11 +230,16 @@ text returns the same receipt without looking at the revision, even after the
 finding moved (`replayed: true`); the same key with other text is exit 4
 (`key_conflict`). Exit 5 (`indeterminate`) means a pending receipt's row was
 since changed by someone else: read the finding again and use a new key. Exit
-70 or 75 (`busy`) means retry with the SAME key. `-r` must be exactly one of the
+75 (`busy`) means retry with the SAME key; so does exit 70 (internal error, e.g.
+a crash), except `receipt_unreadable` (also 70): the receipt for that key is
+damaged, it is never deleted or rewritten, and every retry with that key fails
+until its owner repairs or removes the file. Exit 2 (`invalid`) is a bad argument
+and writes nothing. `-r` must be exactly one of the
 listed reasons. Receipts live under `state/receipts/decisions/` for 30 days
 (`MEUTE_RECEIPT_TTL_DAYS`, 1-365); `MEUTE_DECISIONS_LOCK_WAIT` (1-60 seconds,
 default 10) bounds the wait for `state/reports.lock`. Without `--request-key`
-both commands behave exactly as before.
+both commands behave exactly as before, except that `--expected-revision` or
+`--operator` given without `--request-key` is now an error (exit 1).
 
 `tui` is a Textual app (PRP-003): `j`/`k` move, `Enter` shows the
 finding with its evidence, `p` promotes, `d` dismisses (a reason is required —

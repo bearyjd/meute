@@ -250,7 +250,7 @@ def public(rec: dict) -> dict:
 
 def gc(ctx: Ctx) -> None:
     """Under the lock: look at most GC_BUDGET entries, drop expired receipts and
-    stale temp files. Unparsable or unknown-version files are skipped, never deleted."""
+    stale temp files. A receipt lookup would call unreadable is skipped, never deleted."""
     try:
         with os.scandir(ctx.receipts) as it:
             entries = list(itertools.islice(it, GC_BUDGET))
@@ -264,8 +264,7 @@ def gc(ctx: Ctx) -> None:
             elif entry.name.endswith(".json"):
                 with open(entry.path, "rb") as fh:
                     rec = json.loads(fh.read().decode("utf-8"))
-                stale = (isinstance(rec, dict) and rec.get("version") == VERSION
-                         and isinstance(rec.get("expires_at"), int) and ctx.now >= rec["expires_at"])
+                stale = _readable(rec) and ctx.now >= rec["expires_at"]
             else:
                 stale = False
             if stale:

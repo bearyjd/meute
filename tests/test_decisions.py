@@ -287,6 +287,18 @@ class CrashTest(Base):
         self.assertEqual(self.fx.rows_for(f"{REPORT_B}#1"), [])
         self.assertEqual(self.fx.resolve(REPORT_B, 1, K1, ABSENT).returncode, 0)
 
+    def test_replay_in_state_written_never_rewrites_the_finding_row(self):
+        self.run_crash("7")
+        self.assertEqual(self.fx.only_receipt()["phase"], "state_written")
+        self.legacy("dismiss", REPORT_B, "-f", "1", "-r", "other", "-m", "someone else")
+        legacy_rows = self.fx.rows_for(f"{REPORT_B}#1")
+        self.assertEqual(len(legacy_rows), 1)
+        retry = self.fx.resolve(REPORT_B, 1, K1, ABSENT)
+        self.assertEqual(retry.returncode, 0, (retry.stdout, retry.stderr))
+        body = parse(retry)
+        self.assertEqual((body["receipt"]["phase"], body["replayed"]), ("complete", True))
+        self.assertEqual(self.fx.rows_for(f"{REPORT_B}#1"), legacy_rows)
+
     def test_pending_receipt_with_a_superseded_row_is_indeterminate_and_kept(self):
         for step in ("5", "6"):
             with self.subTest(step=step):
@@ -568,17 +580,47 @@ class FailClosedTest(Base):
         (self.fx.receipts / "bad.json").write_bytes(b"{nope")
         (self.fx.receipts / "v2.json").write_text(json.dumps({"version": 2, "expires_at": 1}))
         for i in range(3):
-            (self.fx.receipts / f"old{i}.json").write_text(json.dumps({"version": 1, "expires_at": 1}))
+            (self.fx.receipts / f"old{i}.json").write_text(json.dumps(self.good_receipt()))
         self.apply(K1)
         names = sorted(p.name for p in self.fx.receipts.iterdir() if not p.name.startswith(".tmp-"))
         self.assertIn("bad.json", names)
         self.assertIn("v2.json", names)
         self.assertEqual([n for n in names if n.startswith("old")], [])
 
+    MALFORMED = (b'{"version":1,"expires_at":true}', b'{"version":1,"expires_at":5}', b"[]", b"",
+                 b"\xff\xfe", b'{"version":1,"phase":"complete","expires_at":5}')
+
+    def test_gc_never_deletes_a_receipt_it_cannot_read(self):
+        self.fx.receipts.mkdir(parents=True)
+        planted = {f"bad{i}.json": c for i, c in enumerate(self.MALFORMED)}
+        for name, content in planted.items():
+            (self.fx.receipts / name).write_bytes(content)
+        (self.fx.receipts / "expired.json").write_text(json.dumps(self.good_receipt(expires_at=1)))
+        self.apply(K1)
+        for name, content in planted.items():
+            self.assertEqual((self.fx.receipts / name).read_bytes(), content, name)
+        self.assertFalse((self.fx.receipts / "expired.json").exists())
+
+    def test_lookup_of_each_malformed_receipt_is_exit_70_and_kept(self):
+        path = self.fx.receipts / (rk.scope_hash("local", "finding.resolve", K1) + ".json")
+        self.fx.receipts.mkdir(parents=True)
+        for content in self.MALFORMED:
+            with self.subTest(content=content):
+                path.write_bytes(content)
+                proc = self.fx.resolve(REPORT_A, 1, K1, ABSENT, MEUTE_TEST="1", MEUTE_NOW=str(T0 * 3))
+                self.assertEqual(proc.returncode, 70, proc.stdout)
+                self.assertEqual(path.read_bytes(), content)
+
+    def good_receipt(self, **over):
+        rec = {"version": 1, "phase": "complete", "receipt_id": "x", "payload_sha256": "x",
+               "before_revision": "x", "row_state": "x", "row_when": "x", "row_note": "x",
+               "expires_at": 1}
+        return {**rec, **over}
+
     def test_gc_is_bounded_to_fifty_files_and_cleans_old_temp_files(self):
         self.fx.receipts.mkdir(parents=True)
         for i in range(60):
-            (self.fx.receipts / f"old{i:02}.json").write_text(json.dumps({"version": 1, "expires_at": 1}))
+            (self.fx.receipts / f"old{i:02}.json").write_text(json.dumps(self.good_receipt()))
         self.apply(K1)
         left = [p for p in self.fx.receipts.iterdir() if p.name.startswith("old")]
         self.assertEqual(len(left), 10)

@@ -3464,7 +3464,8 @@ test_web_bind_guard() {
 test_web_invariants() {
   local f bad rc out
   for f in "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" \
-           "$REPO/lib/inbox.py" "$REPO/lib/report.py" "$REPO/lib/finding_status.py"; do
+           "$REPO/lib/inbox.py" "$REPO/lib/report.py" "$REPO/lib/finding_status.py" \
+           "$REPO/lib/receipt_keys.py"; do
     bad="$(python3 - "$f" <<'PY2'
 import ast, sys
 std = sys.stdlib_module_names

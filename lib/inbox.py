@@ -170,8 +170,9 @@ def load_reports(root: str | None = None, ids: list[str] | None = None) -> tuple
     rows = _state_rows(root)
     # Revisions come from the raw bytes, not `rows`: the decision path must
     # agree with itself on a row `_state_rows` would have to decode.
-    revisions = receipt_keys.read_rows(
-        os.path.join(ROOT if root is None else root, "state", "reports"))
+    reports_path = os.path.join(ROOT if root is None else root, "state", "reports")
+    # Not a regular file (a directory, a FIFO): no decisions, as _state_rows reads it.
+    revisions = receipt_keys.read_rows(reports_path) if os.path.isfile(reports_path) else {}
     reports: list[dict] = []
     findings: list[dict] = []
     occurrences: list[tuple[str, str, tuple]] = []
