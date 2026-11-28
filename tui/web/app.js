@@ -10,13 +10,16 @@ window.onerror = (msg, src, line) => {
 };
 // pending: a resolve/dismiss whose outcome is unknown (lost reply, busy, 5xx);
 //   Retry resends it unchanged -- same request key, revision and payload.
-// review: finding keys whose decision was refused as stale; no new decision
-//   on one until the operator has selected it, seen its current state and
-//   pressed Reviewed. One entry per finding: a later 409 never clears another.
+// review: {finding key: revision shown in its review box} for findings whose
+//   decision was refused as stale; no new decision on one until the operator
+//   has selected it, seen its current state and pressed Reviewed -- and
+//   Reviewed only acknowledges the revision that was on screen: if the finding
+//   changed again meanwhile, the block stays and shows the newer state. One
+//   entry per finding: a later 409 never clears another.
 // selKey/selRev: the finding selected and the revision /api/inbox listed for
 //   it when it was selected.
 const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false,
-  pending: null, review: new Set(), selKey: null, selRev: null };
+  pending: null, review: new Map(), selKey: null, selRev: null };
 
 // PURE-BEGIN
 // One request key per submitted decision (crypto.getRandomValues works on
@@ -41,6 +44,15 @@ function classifyDecision(status, body) {
   if (error === "receipt_unreadable") return "unreadable";
   if (status === 503 || status >= 500) return "retry";
   return "invalid";
+}
+
+// A finding's decision as the page shows it: disposition, note and revision,
+// so two decisions with the same disposition still read differently.
+function decisionText(f) {
+  if (!f) return "";
+  const label = f.claimed ? "claimed" : f.state;
+  return "state " + label + "  |  note " + (f.note ? JSON.stringify(f.note) : "(none)")
+    + "  |  revision " + (f.revision || "(none)");
 }
 
 function receiptText(r) {
@@ -175,6 +187,7 @@ async function select(i) {
   syncReview();
   $("panel").hidden = false;
   $("panel-title").textContent = f.report + " #" + f.n + "  " + f.title;
+  $("panel-state").textContent = decisionText(f);
   $("panel-body").textContent = "loading...";
   $("resolve-message").value = "";
   $("dismiss-message").value = "";
@@ -272,7 +285,7 @@ async function submitDecision(payload) {
       showPending(payload);
     } else if (kind === "stale") {
       state.pending = null;
-      state.review.add(payload.id + "#" + payload.n);
+      state.review.set(payload.id + "#" + payload.n, null);  // nothing shown yet
       await refresh();
       notice(msg + " (current revision " + body.current_revision + ")", false);
       syncReview();
@@ -298,10 +311,15 @@ function showReceipt(r) {
   $("receipt").textContent = receiptText(r);
 }
 
-// The review box belongs to the selected finding only.
+// The review box belongs to the selected finding only. It shows that
+// finding's current state from the last inbox read, and records the revision
+// it showed: that is the revision a press of Reviewed acknowledges.
 function syncReview() {
   const f = state.rows[state.sel];
-  $("review-box").hidden = !(f && state.review.has(findingKey(f)));
+  const blocked = !!(f && state.review.has(findingKey(f)));
+  $("review-box").hidden = !blocked;
+  $("review-current").textContent = blocked ? "Now: " + decisionText(f) : "";
+  if (blocked) state.review.set(findingKey(f), f.revision || null);
 }
 
 async function retryPending() {
@@ -316,19 +334,30 @@ function discardPending() {
   refresh();
 }
 
-// The operator has looked at the SELECTED changed finding: re-read the inbox,
-// and only once that finding's current state is on the page clear its block
-// and re-select it (new revision, cleared fields), so the next decision is a
-// new one with a new key. Another finding's block is untouched.
+// The operator has looked at the SELECTED changed finding as its review box
+// showed it: re-read the inbox, and only if that finding is still at the
+// revision the box showed clear its block and re-select it (new revision,
+// cleared fields), so the next decision is a new one with a new key. If it
+// changed again, the block stays and the box now shows the newer state.
+// Another finding's block is untouched.
 async function reviewed() {
   if (state.busy) return;
   const f = state.rows[state.sel];
   if (!f || !state.review.has(findingKey(f))) { syncReview(); return; }
   const key = findingKey(f);
+  const acknowledged = state.review.get(key);
+  if (!acknowledged) { syncReview(); return; }  // nothing was shown to acknowledge
   if (!(await refresh())) return;  // still blocked: its current state is unknown
   const i = state.rows.findIndex((r) => findingKey(r) === key);
   if (i < 0) {
     notice("that finding is no longer listed: tick \"show decided\" to review it", false);
+    return;
+  }
+  if ((state.rows[i].revision || null) !== acknowledged) {
+    if (state.sel !== i) await select(i);
+    syncReview();
+    notice("this finding changed again since you reviewed it: review its current state, "
+      + "then press Reviewed", false);
     return;
   }
   state.review.delete(key);

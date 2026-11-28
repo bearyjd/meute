@@ -400,9 +400,9 @@ window.confirm = () => true;
 const q = (id) => document.getElementById(id);
 for (const id of ["retry-box", "review-box", "receipt", "panel"]) q(id).hidden = true;
 
-const finding = (n, rev, state) => ({ report: "alpha/audit-a", n: n, repo: "alpha", severity: "HIGH",
-  title: "T" + n, location: "src/x.py:" + n, lens: "l", date: "d", state: state || "new",
-  revision: rev, inherited: "", hidden: false });
+const finding = (n, rev, state, note) => ({ report: "alpha/audit-a", n: n, repo: "alpha",
+  severity: "HIGH", title: "T" + n, location: "src/x.py:" + n, lens: "l", date: "d",
+  state: state || "new", note: note || "", revision: rev, inherited: "", hidden: false });
 const inbox = { findings: [finding(1, "r1:absent"), finding(2, "r1:absent")],
   dismiss_reasons: ["wont-fix"], status: {}, branches: [], reports: [] };
 let inboxFails = false;
@@ -483,7 +483,32 @@ async function perFinding() {
   out.posts = posts;
 }
 
-({ cut_reply: cutReply, per_finding: perFinding })[process.argv[2]]().then(
+// A second decision lands between the stale refresh and Reviewed, with the
+// same disposition as the first: Reviewed acknowledged the first one only.
+async function changedAgain() {
+  q("show-decided").checked = true;
+  await settle();
+  const revA = "r1:" + "a".repeat(64), revA2 = "r1:" + "d".repeat(64);
+  replies.push({ status: 409, body: stale(revA) });
+  inbox.findings[0] = finding(1, revA, "actioned", "resolved: first note");
+  await resolve(1, "mine");
+  out.shown1 = q("review-current").textContent;
+  inbox.findings[0] = finding(1, revA2, "actioned", "resolved: second note");
+  q("act-reviewed").click(); await settle();
+  out.stillBlocked = !q("review-box").hidden;
+  out.shown2 = q("review-current").textContent;
+  out.notice2 = q("notice").textContent;
+  q("resolve-message").value = "too soon"; q("act-resolve").click(); await settle();
+  out.postsAfterChanged = posts.length;
+  q("act-reviewed").click(); await settle();
+  out.cleared = q("review-box").hidden;
+  out.panelState = q("panel-state").textContent;
+  replies.push({ status: 200, body: receipt("x") });
+  q("resolve-message").value = "mine again"; q("act-resolve").click(); await settle();
+  out.posts = posts;
+}
+
+({ cut_reply: cutReply, per_finding: perFinding, changed_again: changedAgain })[process.argv[2]]().then(
   () => process.stdout.write(JSON.stringify(out)),
   (e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
@@ -527,6 +552,28 @@ class PageHarnessTests(unittest.TestCase):
         self.assertNotEqual(second_a["request_key"], first_a["request_key"])
         self.assertTrue(out["bStillBlocked"])
 
+    def test_reviewed_acknowledges_only_the_revision_it_showed(self):
+        out = self.run_page("changed_again")
+        rev_a, rev_a2 = "r1:" + "a" * 64, "r1:" + "d" * 64
+        # The review box shows disposition AND note, so the two same-disposition
+        # decisions read differently.
+        self.assertIn("actioned", out["shown1"])
+        self.assertIn("first note", out["shown1"])
+        self.assertIn(rev_a, out["shown1"])
+        self.assertTrue(out["stillBlocked"], "Reviewed cleared a block for a revision it never showed")
+        self.assertIn("second note", out["shown2"])
+        self.assertIn(rev_a2, out["shown2"])
+        self.assertIn("changed again", out["notice2"])
+        self.assertEqual(out["postsAfterChanged"], 1)
+        self.assertTrue(out["cleared"])
+        self.assertIn("second note", out["panelState"])
+        self.assertIn(rev_a2, out["panelState"])
+        posts = out["posts"]
+        self.assertEqual(len(posts), 2, posts)
+        self.assertEqual(posts[1]["expected_revision"], rev_a2)
+        self.assertEqual(posts[1]["message"], "mine again")
+        self.assertNotEqual(posts[0]["request_key"], posts[1]["request_key"])
+
 
 # ------------------------------------------------------------ browser ---
 
@@ -567,7 +614,8 @@ DRIVER = r"""
     await until("retry box", () => visible("retry-box"));
     q("act-retry").click();
     await until("receipt", () => visible("receipt") && q("receipt").textContent.includes("receipt "));
-    await until("inbox refresh", () => !visible("retry-box"));
+    // The refresh after success: the decided row leaves the default inbox.
+    await until("inbox refresh", () => !Array.from(rows()).some((tr) => tr.textContent.includes("src/d.py:4")));
     return { receipt: q("receipt").textContent, notice: q("notice").textContent, evidence: evidence };
   }
   async function stale() {
@@ -580,12 +628,24 @@ DRIVER = r"""
     await resolve("too soon");
     await sleep(300);
     const blocked = q("notice").textContent;
+    const shown1 = q("review-current").textContent;
+    // A second CLI decision lands before the operator presses Reviewed.
+    const r = await fetch("/test/concurrent");
+    if (!r.ok) throw new Error("concurrent decision failed: HTTP " + r.status);
+    q("act-reviewed").click();
+    await until("changed again", () => q("notice").textContent.includes("changed again"));
+    const keptBlocked = visible("review-box");
+    const shown2 = q("review-current").textContent;
+    await resolve("still too soon");
+    await sleep(300);
     q("act-reviewed").click();
     await until("re-selected", () => !visible("review-box") && q("resolve-message").value === ""
       && q("panel-body").textContent !== "loading...");
+    const panelState = q("panel-state").textContent;
     await resolve("second try");
     await until("receipt", () => visible("receipt"));
-    return { staleNotice: staleNotice, blocked: blocked, receipt: q("receipt").textContent };
+    return { staleNotice: staleNotice, blocked: blocked, receipt: q("receipt").textContent,
+      shown1: shown1, keptBlocked: keptBlocked, shown2: shown2, panelState: panelState };
   }
   const run = { lost_reply: lostReply, stale: stale }[SCENARIO];
   window.addEventListener("load", () => {
@@ -618,7 +678,7 @@ class BrowserDecisionTests(DecisionWebTestCase):
         self.reports = []
         self.done = threading.Event()
 
-    def _routes(self, scenario, on_post):
+    def _routes(self, scenario, on_post, extra=None):
         def index(h, query):
             if (query.get("t") or [""])[0]:
                 return webserver.get_index(h, query)
@@ -647,12 +707,14 @@ class BrowserDecisionTests(DecisionWebTestCase):
             self.replies.append(reply)
             h.send_json(*reply)
 
-        return {("GET", "/"): index, ("GET", "/test/drive.js"): drive,
-                ("GET", "/test/report"): report, ("POST", "/api/act"): act}
+        routes = {("GET", "/"): index, ("GET", "/test/drive.js"): drive,
+                  ("GET", "/test/report"): report, ("POST", "/api/act"): act}
+        routes.update(extra or {})
+        return routes
 
-    def drive(self, scenario, on_post):
+    def drive(self, scenario, on_post, extra=None):
         from unittest.mock import patch
-        patcher = patch.dict(webserver.ROUTES, self._routes(scenario, on_post))
+        patcher = patch.dict(webserver.ROUTES, self._routes(scenario, on_post, extra))
         patcher.start()
         self.addCleanup(patcher.stop)
         profile = tempfile.mkdtemp(prefix="meute-decide-")
@@ -711,8 +773,15 @@ class BrowserDecisionTests(DecisionWebTestCase):
                 seen["dumps"] = self.inbox.dump_calls
             return webserver.decide(server, args)
 
-        result = self.drive("stale", on_post)
-        self.assertEqual(len(self.posts), 2, self.posts)  # "too soon" never left the page
+        def concurrent(h, query):
+            # Same disposition as the first CLI decision, another note.
+            proc = fx.resolve(REPORT_B, 1, "cli-key-0002", seen["current"], message="cli again")
+            seen["current2"] = fx.revision(REPORT_B, 1)
+            h.send_json(200 if proc.returncode == 0 else 500, {"ok": proc.returncode == 0})
+
+        result = self.drive("stale", on_post, {("GET", "/test/concurrent"): concurrent})
+        # "too soon" and "still too soon" never left the page.
+        self.assertEqual(len(self.posts), 2, self.posts)
         first, second = self.posts
         self.assertEqual(self.replies[0][0], 409)
         self.assertEqual(self.replies[0][1]["error"], "stale_revision")
@@ -720,7 +789,14 @@ class BrowserDecisionTests(DecisionWebTestCase):
         self.assertIn("Reviewed", result["blocked"])
         self.assertNotEqual(first["request_key"], second["request_key"])
         self.assertEqual(first["expected_revision"], rk.ABSENT)
-        self.assertEqual(second["expected_revision"], seen["current"])
+        self.assertNotEqual(seen["current2"], seen["current"])
+        self.assertIn(seen["current"], result["shown1"])
+        self.assertIn("resolved: cli", result["shown1"])
+        self.assertTrue(result["keptBlocked"], "Reviewed cleared a block for a revision it never showed")
+        self.assertIn(seen["current2"], result["shown2"])
+        self.assertIn("resolved: cli again", result["shown2"])
+        self.assertIn(seen["current2"], result["panelState"])
+        self.assertEqual(second["expected_revision"], seen["current2"])
         self.assertEqual(second["message"], "second try")
         self.assertEqual(self.replies[1][0], 200)
         self.assertIn(b"resolved: second try", fx.rows_for(f"{REPORT_B}#1")[0])

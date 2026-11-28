@@ -320,7 +320,10 @@ arrives (the connection drops, even after the status line) or on 503 and
 other 5xx, it shows Retry, which resends the same key, revision and payload.
 On `stale_revision` it reloads the inbox and blocks a new decision on that
 finding until you select it and press Reviewed; each refused finding keeps its
-own block. `GET /api/finding?id=repo/name&n=N` shows a finding's evidence. A
+own block. The block shows the finding's current state, note and revision, and
+Reviewed acknowledges only the revision on screen: if the finding changed again
+in the meantime, the block stays and shows the newer decision. The finding view
+shows the same state, note and revision the next decision is checked against. `GET /api/finding?id=repo/name&n=N` shows a finding's evidence. A
 page reload only reads the current state; it never resubmits. Promote is
 unchanged (no receipt).
 
