@@ -195,9 +195,15 @@ def get_inbox(h: "Handler", query: dict) -> None:
 def get_finding(h: "Handler", query: dict) -> None:
     rid = (query.get("id") or [""])[0]
     raw_n = (query.get("n") or [""])[0]
-    if not valid_id(rid) or not raw_n.isdigit() or int(raw_n) < 1:
+    # The `repo/name` identity /api/inbox lists (the one resolve and dismiss
+    # take), or a bare id as before.
+    if (not (valid_id(rid) or receipt_keys.valid_report_id(rid))
+            or not raw_n.isdigit() or int(raw_n) < 1):
         raise BadRequest("bad id or n")
-    body = h.server.inbox_mod.finding_body(rid, int(raw_n))
+    try:
+        body = h.server.inbox_mod.finding_body(rid, int(raw_n))
+    except (FileNotFoundError, ReportError):
+        return h.send_error_json(404, "finding unavailable")
     h.send_bytes(200, body.encode(), "text/plain; charset=utf-8")
 
 
@@ -219,8 +225,8 @@ def decision_status(code: int, body: dict) -> int:
     """HTTP status for a decisions.run_decide exit code."""
     if code == 0:
         return 200
-    if code == 2:
-        return 500 if body.get("error") == "invalid_config" else 400
+    if code == 2:  # invalid request or invalid_config: the detail says which
+        return 400
     if code in (3, 4, 5):
         return 409
     if code == 75:

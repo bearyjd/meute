@@ -6,7 +6,9 @@ receipts under state/receipts/decisions. Nothing about the decision path is
 mocked. The browser tests (skipped visibly without firefox/chromium) drive
 tui/web/app.js through a lost reply and a stale revision.
 """
+import builtins
 import fcntl
+import io
 import json
 import os
 import shutil
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from decisions_helpers import REPORT_A, REPORT_B, Fixture  # noqa: E402
@@ -44,7 +47,7 @@ class RealInbox:
                 "branches": [], "dismiss_reasons": list(self.DISMISS_REASONS)}
 
     def finding_body(self, rid, n, bounded=False):
-        return f"evidence for {rid}#{n}"
+        return inbox.finding_body(rid, n, bounded=bounded, root=self.root)
 
     def act(self, verb, rid, n, *rest):
         self.calls.append((verb, rid, n, *rest))
@@ -251,6 +254,57 @@ class DecisionRouteTests(DecisionWebTestCase):
         self.assertEqual(path.read_bytes(), b"{not a receipt")
         self.assertEqual(self.fx.rows(), b"")
 
+    def test_invalid_config_is_400_with_its_detail_and_writes_nothing(self):
+        self.server.decisions_env["MEUTE_RECEIPT_TTL_DAYS"] = "abc"
+        status, body = self.decide()
+        self.assertEqual(status, 400, body)
+        self.assertEqual((body["error"], body["var"]), ("invalid_config", "MEUTE_RECEIPT_TTL_DAYS"))
+        self.assertIn("configuration", body["message"])
+        self.assert_nothing_written()
+
+    def test_inbox_state_note_and_revision_come_from_one_snapshot(self):
+        # A CLI dismissal lands right after the inbox has read state/reports
+        # once. Whatever the inbox shows, it must be one version of the file,
+        # so a web decision on what was shown is refused as stale.
+        reports_path = str(self.fx.reports_file)
+        real_open = builtins.open
+        landed = []
+
+        def racing_open(file, mode="r", *a, **kw):
+            if str(file) != reports_path or landed:
+                return real_open(file, mode, *a, **kw)
+            with real_open(file, "rb") as fh:
+                data = fh.read()
+            landed.append(self.fx.dismiss(REPORT_B, 1, "cli-key-race", rk.ABSENT, message="cli"))
+            return io.BytesIO(data) if "b" in mode else io.StringIO(data.decode("utf-8"))
+
+        self.fx.write_rows(b"alpha/audit-a#3\tdismissed\t2026-09-01\tdupe: old\n")
+        with unittest.mock.patch("builtins.open", racing_open):
+            resp, raw = self.request("GET", "/api/inbox")
+        self.assertEqual(landed[0].returncode, 0, landed[0].stderr)
+        f = next(x for x in json.loads(raw)["findings"] if x["report"] == REPORT_B and x["n"] == 1)
+        self.assertEqual((f["state"], f["note"], f["revision"]), ("new", "", rk.ABSENT))
+        status, body = self.decide(rid=REPORT_B, key="web-key-race", rev=f["revision"])
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"], "stale_revision")
+        self.assertIn(b"wont-fix: cli", self.fx.rows_for(f"{REPORT_B}#1")[0])
+
+    def test_evidence_route_takes_the_inbox_identity(self):
+        resp, raw = self.request("GET", f"/api/finding?id={REPORT_B}&n=1")
+        self.assertEqual(resp.status, 200, raw)
+        self.assertIn("### [HIGH] Solo", raw.decode())
+        self.assertIn("src/d.py:4", raw.decode())
+        resp, raw = self.request("GET", f"/api/finding?id={REPORT_A}&n=2")
+        self.assertEqual(resp.status, 200, raw)
+        self.assertIn("### [HIGH] Two", raw.decode())
+        self.assertNotIn("Three", raw.decode())
+        resp, _ = self.request("GET", "/api/finding?id=alpha/missing&n=1")
+        self.assertEqual(resp.status, 404)
+        for q in ("id=alpha/../x&n=1", "id=alpha/./x&n=1", "id=a/b/c&n=1", "id=/x&n=1",
+                  f"id={REPORT_B}&n=0"):
+            resp, _ = self.request("GET", "/api/finding?" + q)
+            self.assertEqual(resp.status, 400, q)
+
     def test_promote_is_unchanged(self):
         resp, raw = self.post_act({"verb": "promote", "id": "r1", "n": 3})
         self.assertEqual(resp.status, 200)
@@ -286,11 +340,13 @@ class ClientLogicTests(unittest.TestCase):
             [409, {"error": "indeterminate"}], [500, {"error": "receipt_unreadable"}],
             [None, None], [503, {"error": "busy"}], [500, {"ok": False, "message": "internal error"}],
             [502, None], [400, {"error": "invalid"}], [403, {"ok": False}],
+            [200, None], [400, None], [409, None], [400, {"error": "invalid_config"}],
         ]
         got = self.run_pure("process.stdout.write(JSON.stringify(%s.map(([s, b]) => classifyDecision(s, b))));"
                             % json.dumps(cases))
         self.assertEqual(got, ["ok", "stale", "conflict", "indeterminate", "unreadable",
-                               "retry", "retry", "retry", "retry", "invalid", "invalid"])
+                               "retry", "retry", "retry", "retry", "invalid", "invalid",
+                               "retry", "retry", "retry", "invalid"])
 
     def test_request_key_matches_server_grammar_and_differs(self):
         got = self.run_pure(
@@ -301,6 +357,175 @@ class ClientLogicTests(unittest.TestCase):
         for key in got:
             self.assertRegex(key, r"^web-[0-9a-f]{32}$")
             self.assertTrue(rk.KEY_RE.fullmatch(key))
+
+
+# ------------------------------------------------------- page harness ---
+
+# The whole of tui/web/app.js under node, against a minimal fake DOM and a
+# scripted fetch: the page's own Resolve/Retry/Reviewed handlers, without a
+# browser. process.argv[1] is app.js, argv[2] the scenario.
+HARNESS = r"""
+"use strict";
+const fs = require("fs");
+const vm = require("vm");
+class El {
+  constructor(id) { this.id = id; this.children = []; this.hidden = false; this.value = "";
+    this._text = ""; this.className = ""; this.listeners = {}; this.selectedIndex = 0;
+    this.classList = { toggle() {}, add() {} }; this.tagName = "DIV"; }
+  set textContent(t) { this._text = String(t); this.children = []; }
+  get textContent() { return this.children.length ? this.children.map((c) => c.textContent).join(" ") : this._text; }
+  appendChild(c) { this.children.push(c); return c; }
+  replaceChildren(...c) { this.children = c; }
+  get firstChild() { return this.children[0]; }
+  addEventListener(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); }
+  click() { (this.listeners.click || []).forEach((f) => f({})); }
+  scrollIntoView() {}
+  closest() { return null; }
+}
+const els = {};
+const tbody = new El("tbody");
+const docListeners = {};
+globalThis.document = {
+  getElementById: (id) => els[id] || (els[id] = new El(id)),
+  querySelector: (sel) => sel.startsWith("meta") ? { content: "tok" }
+    : sel === "#findings-table tbody" ? tbody : new El(sel),
+  querySelectorAll: (sel) => sel === "#findings-table tbody tr" ? tbody.children : [],
+  createElement: (tag) => { const e = new El(); e.tagName = tag.toUpperCase(); return e; },
+  addEventListener: (t, f) => { docListeners[t] = f; },
+  dispatchEvent() {},
+};
+globalThis.window = globalThis;
+globalThis.CustomEvent = class { constructor(t, o) { this.type = t; this.detail = o && o.detail; } };
+window.confirm = () => true;
+const q = (id) => document.getElementById(id);
+for (const id of ["retry-box", "review-box", "receipt", "panel"]) q(id).hidden = true;
+
+const finding = (n, rev, state) => ({ report: "alpha/audit-a", n: n, repo: "alpha", severity: "HIGH",
+  title: "T" + n, location: "src/x.py:" + n, lens: "l", date: "d", state: state || "new",
+  revision: rev, inherited: "", hidden: false });
+const inbox = { findings: [finding(1, "r1:absent"), finding(2, "r1:absent")],
+  dismiss_reasons: ["wont-fix"], status: {}, branches: [], reports: [] };
+let inboxFails = false;
+const posts = [];
+const replies = [];  // queue of {status, body} | {status, cut: true}
+const log = { inboxReads: 0 };
+globalThis.fetch = async (url, opts) => {
+  if (url.startsWith("/api/client")) return { ok: true, status: 200 };
+  if (url === "/api/inbox") {
+    log.inboxReads++;
+    if (inboxFails) return { ok: false, status: 500, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(inbox)) };
+  }
+  if (url.startsWith("/api/finding")) return { ok: true, status: 200, text: async () => "evidence" };
+  if (url === "/api/act") {
+    posts.push(JSON.parse(opts.body));
+    const r = replies.shift();
+    if (!r) throw new TypeError("network");
+    return { ok: r.status < 400, status: r.status,
+      json: async () => { if (r.cut) throw new TypeError("body stream failed"); return r.body; } };
+  }
+  throw new Error("unexpected fetch " + url);
+};
+vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"), { filename: "app.js" });
+
+const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); };
+const row = (n) => tbody.children.find((tr) => tr.textContent.includes("src/x.py:" + n + " "));
+async function pick(n) { row(n).click(); await settle(); }
+async function resolve(n, text) { await pick(n); q("resolve-message").value = text; q("act-resolve").click(); await settle(); }
+const receipt = (key) => ({ ok: true, replayed: false, message: "resolved",
+  receipt: { receipt_id: "rcpt-1", operation: "finding.resolve", finding_key: "k", disposition: "actioned",
+    request_key: key, before_revision: "r1:absent", after_revision: "r1:" + "b".repeat(64), phase: "complete" } });
+const stale = (rev) => ({ ok: false, error: "stale_revision", current_revision: rev, message: "changed: review" });
+const out = {};
+
+async function cutReply() {
+  await settle();
+  replies.push({ status: 200, cut: true });
+  await resolve(1, "fixed");
+  out.afterCut = { retry: !q("retry-box").hidden, notice: q("notice").textContent, receipt: !q("receipt").hidden };
+  // A new decision is refused while one is unconfirmed.
+  q("act-resolve").click(); await settle();
+  out.postsWhilePending = posts.length;
+  replies.push({ status: 200, body: { ...receipt(posts[0].request_key), replayed: true } });
+  q("act-retry").click(); await settle();
+  out.afterRetry = { retry: !q("retry-box").hidden, receipt: q("receipt").textContent };
+}
+
+async function perFinding() {
+  q("show-decided").checked = true;  // a refused finding is listed as decided now
+  await settle();
+  const revA = "r1:" + "a".repeat(64), revB = "r1:" + "c".repeat(64);
+  replies.push({ status: 409, body: stale(revA) });
+  inbox.findings[0] = finding(1, revA, "dismissed");
+  await resolve(1, "first A");
+  out.aBlocked = !q("review-box").hidden;
+  replies.push({ status: 409, body: stale(revB) });
+  inbox.findings[1] = finding(2, revB, "dismissed");
+  await resolve(2, "first B");
+  await pick(1);
+  out.aStillBlocked = !q("review-box").hidden;
+  q("resolve-message").value = "too soon"; q("act-resolve").click(); await settle();
+  out.postsAfterTooSoon = posts.length;
+  // Reviewed while the inbox cannot be read: A stays blocked.
+  inboxFails = true;
+  q("act-reviewed").click(); await settle();
+  inboxFails = false;
+  out.blockedWhenRefreshFails = !q("review-box").hidden;
+  q("resolve-message").value = "still too soon"; q("act-resolve").click(); await settle();
+  out.postsAfterFailedReview = posts.length;
+  q("act-reviewed").click(); await settle();
+  out.aReviewed = q("review-box").hidden;
+  replies.push({ status: 200, body: receipt("x") });
+  q("resolve-message").value = "second A"; q("act-resolve").click(); await settle();
+  await pick(2);
+  out.bStillBlocked = !q("review-box").hidden;
+  q("resolve-message").value = "B too soon"; q("act-resolve").click(); await settle();
+  out.posts = posts;
+}
+
+({ cut_reply: cutReply, per_finding: perFinding })[process.argv[2]]().then(
+  () => process.stdout.write(JSON.stringify(out)),
+  (e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
+"""
+
+
+@unittest.skipUnless(HAS_NODE, "node not installed")
+class PageHarnessTests(unittest.TestCase):
+    """app.js's real handlers (Resolve, Retry, Reviewed) under node."""
+
+    def run_page(self, scenario):
+        app = os.path.join(webserver.WEB_DIR, "app.js")
+        proc = subprocess.run(["node", "-e", HARNESS, app, scenario], capture_output=True, text=True,
+                              timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_reply_cut_after_200_headers_is_unconfirmed_and_retry_resends_it(self):
+        out = self.run_page("cut_reply")
+        self.assertTrue(out["afterCut"]["retry"], out)
+        self.assertFalse(out["afterCut"]["receipt"], out)
+        self.assertIn("not confirmed", out["afterCut"]["notice"])
+        self.assertIn("HTTP 200", out["afterCut"]["notice"])
+        self.assertEqual(out["postsWhilePending"], 1)
+        self.assertFalse(out["afterRetry"]["retry"], out)
+        self.assertIn("receipt rcpt-1", out["afterRetry"]["receipt"])
+
+    def test_stale_review_is_kept_per_finding(self):
+        out = self.run_page("per_finding")
+        self.assertTrue(out["aBlocked"])
+        self.assertTrue(out["aStillBlocked"], "a 409 for finding 2 cleared finding 1's review")
+        self.assertEqual(out["postsAfterTooSoon"], 2)
+        self.assertTrue(out["blockedWhenRefreshFails"])
+        self.assertEqual(out["postsAfterFailedReview"], 2)
+        self.assertTrue(out["aReviewed"])
+        posts = out["posts"]
+        self.assertEqual(len(posts), 3, posts)  # finding 2 is still blocked
+        first_a, first_b, second_a = posts
+        self.assertEqual((first_a["n"], first_b["n"], second_a["n"]), (1, 2, 1))
+        self.assertEqual(second_a["expected_revision"], "r1:" + "a" * 64)
+        self.assertEqual(second_a["message"], "second A")
+        self.assertNotEqual(second_a["request_key"], first_a["request_key"])
+        self.assertTrue(out["bStillBlocked"])
 
 
 # ------------------------------------------------------------ browser ---
@@ -326,20 +551,24 @@ DRIVER = r"""
     const row = () => Array.from(rows()).find((tr) => tr.textContent.includes("src/d.py:4"));
     await until("findings", () => row());
     row().click();
+    // The finding's real evidence, from GET /api/finding, not an error text.
     await until("panel", () => visible("panel") && q("panel-body").textContent !== "loading...");
+    const evidence = q("panel-body").textContent;
+    if (!evidence.includes("### [HIGH] Solo")) throw new Error("no evidence: " + evidence);
+    return evidence;
   }
   async function resolve(text) {
     q("resolve-message").value = text;
     q("act-resolve").click();
   }
   async function lostReply() {
-    await pick();
+    const evidence = await pick();
     await resolve("fixed upstream");
     await until("retry box", () => visible("retry-box"));
     q("act-retry").click();
     await until("receipt", () => visible("receipt") && q("receipt").textContent.includes("receipt "));
     await until("inbox refresh", () => !visible("retry-box"));
-    return { receipt: q("receipt").textContent, notice: q("notice").textContent };
+    return { receipt: q("receipt").textContent, notice: q("notice").textContent, evidence: evidence };
   }
   async function stale() {
     q("show-decided").click();
@@ -465,6 +694,7 @@ class BrowserDecisionTests(DecisionWebTestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["replayed"])
         self.assertIn(body["receipt"]["receipt_id"], result["receipt"])
+        self.assertIn("src/d.py:4", result["evidence"])
         self.assertEqual(len(self.fx.rows_for(f"{REPORT_B}#1")), 1)
         self.assertEqual(len(self.fx.receipt_files()), 1)
         self.assertGreaterEqual(self.inbox.dump_calls, 2)  # refreshed after success

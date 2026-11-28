@@ -23,6 +23,7 @@ invariant is that cron succeeds whether or not any UI exists.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -56,14 +57,24 @@ def _meute(*args: str, check: bool = True) -> subprocess.CompletedProcess:
 
 # ---------------------------------------------------------------- state ---
 
-def _state_rows(root: str | None = None) -> dict[str, tuple[str, str, str]]:
-    """state/reports as {key: (state, when, note)}. Keys are report ids or
-    `report#n` for a single finding -- the same shape bin/meute writes."""
+def _state_snapshot(root: str | None = None) -> tuple[dict[str, tuple[str, str, str]], dict]:
+    """(rows, raw rows) from ONE read of state/reports.
+
+    rows: {key: (state, when, note)} as text; raw rows: receipt_keys.read_rows'
+    bytes shape, from the same bytes, so a finding's displayed state, note and
+    revision can never come from two different versions of the file.
+    """
     path = os.path.join(ROOT if root is None else root, "state", "reports")
+    if not os.path.isfile(path):  # a directory, a FIFO: no decisions
+        return {}, {}
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        return {}, {}
     rows: dict[str, tuple[str, str, str]] = {}
-    if not os.path.isfile(path):
-        return rows
-    with open(path, encoding="utf-8") as fh:
+    # Decoded exactly as open(path, encoding="utf-8") iterates the file.
+    with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8") as fh:
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             # First row for a key wins, as bin/meute's kv_row; a key-only row
@@ -71,7 +82,13 @@ def _state_rows(root: str | None = None) -> dict[str, tuple[str, str, str]]:
             rows.setdefault(parts[0], (parts[1] if len(parts) > 1 else "",
                                        parts[2] if len(parts) > 2 else "",
                                        parts[3] if len(parts) > 3 else ""))
-    return rows
+    return rows, receipt_keys.parse_rows(data)
+
+
+def _state_rows(root: str | None = None) -> dict[str, tuple[str, str, str]]:
+    """state/reports as {key: (state, when, note)}. Keys are report ids or
+    `report#n` for a single finding -- the same shape bin/meute writes."""
+    return _state_snapshot(root)[0]
 
 
 def scan_report_ids(root: str | None = None) -> tuple[list[str], list[str]]:
@@ -167,12 +184,11 @@ def load_reports(root: str | None = None, ids: list[str] | None = None) -> tuple
 
     Reads `root` or else ROOT, and the report ids already scanned there when given.
     """
-    rows = _state_rows(root)
-    # Revisions come from the raw bytes, not `rows`: the decision path must
-    # agree with itself on a row `_state_rows` would have to decode.
-    reports_path = os.path.join(ROOT if root is None else root, "state", "reports")
-    # Not a regular file (a directory, a FIFO): no decisions, as _state_rows reads it.
-    revisions = receipt_keys.read_rows(reports_path) if os.path.isfile(reports_path) else {}
+    # One snapshot: the revision a decision is checked against must be the
+    # revision of the very state and note shown with it. Revisions come from
+    # the raw bytes, not `rows`: the decision path must agree with itself on a
+    # row `_state_rows` would have to decode.
+    rows, revisions = _state_snapshot(root)
     reports: list[dict] = []
     findings: list[dict] = []
     occurrences: list[tuple[str, str, tuple]] = []
@@ -343,13 +359,16 @@ def verify(repo_paths: dict[str, str], only_repo: str = "") -> dict[str, int]:
     return counts
 
 
-def finding_body(rid: str, n: int, *, bounded=False) -> str:
-    """The markdown of one finding, from its `###` header to the next."""
+def finding_body(rid: str, n: int, *, bounded=False, root: str | None = None) -> str:
+    """The markdown of one finding, from its `###` header to the next.
+
+    Reads `root` or else ROOT."""
     if bounded:
         repo, _, name = rid.partition("/")
-        _, body = report_lib.read_bounded(os.path.join(ROOT, "reports"), repo, name)
+        _, body = report_lib.read_bounded(os.path.join(ROOT if root is None else root, "reports"),
+                                          repo, name)
     else:
-        _, body = report_lib.read(report_path(rid))
+        _, body = report_lib.read(report_path(rid, root))
     heads = list(report_lib.FINDING_RE.finditer(body))
     if n < 1 or n > len(heads):
         return ""

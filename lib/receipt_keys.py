@@ -10,7 +10,8 @@ everywhere:
                                              passes `$`)
     scope_hash(operator, operation, key)  -- the receipt's file name
     payload_hash(obj)                     -- canonical-JSON sha256
-    read_rows(path) / revision(rows, key) -- a finding's revision, from bytes
+    read_rows(path) / parse_rows(data)    -- state/reports rows over raw bytes
+    revision(rows, key)                   -- a finding's revision, from those rows
     fs_selftest(state_dir)                -- the storage guarantees receipts rely on
     writes_enabled(state_dir)             -- the default-off owner flag
 """
@@ -70,6 +71,11 @@ def read_rows(path: str) -> dict[bytes, tuple[bytes, bytes, bytes]]:
             data = fh.read()
     except FileNotFoundError:
         return {}
+    return parse_rows(data)
+
+
+def parse_rows(data: bytes) -> dict[bytes, tuple[bytes, bytes, bytes]]:
+    """read_rows over bytes already read (one snapshot for several views)."""
     rows: dict[bytes, tuple[bytes, bytes, bytes]] = {}
     for line in split_lines(data):
         parts = line.split(b"\t")

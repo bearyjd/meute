@@ -10,11 +10,13 @@ window.onerror = (msg, src, line) => {
 };
 // pending: a resolve/dismiss whose outcome is unknown (lost reply, busy, 5xx);
 //   Retry resends it unchanged -- same request key, revision and payload.
-// review: a finding key whose decision was refused as stale; no new decision
-//   on it until the operator has looked at its current state.
-// selRev: the revision /api/inbox listed when the finding was selected.
+// review: finding keys whose decision was refused as stale; no new decision
+//   on one until the operator has selected it, seen its current state and
+//   pressed Reviewed. One entry per finding: a later 409 never clears another.
+// selKey/selRev: the finding selected and the revision /api/inbox listed for
+//   it when it was selected.
 const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false,
-  pending: null, review: null, selRev: null };
+  pending: null, review: new Set(), selKey: null, selRev: null };
 
 // PURE-BEGIN
 // One request key per submitted decision (crypto.getRandomValues works on
@@ -25,15 +27,19 @@ function newRequestKey(rand) {
 }
 
 // What the page does with a resolve/dismiss answer. status is null when no
-// reply arrived (network error, connection dropped).
+// reply arrived (network error, connection dropped); body is null when the
+// reply was cut off after its status line. The server always answers a
+// decision with a JSON object, so no body means the outcome is unknown -- the
+// decision may have committed -- and only the same request may be resent.
 function classifyDecision(status, body) {
-  const error = body && body.error;
-  if (status === 200 && body && body.ok) return "ok";
+  if (status === null || !body || typeof body !== "object") return "retry";
+  const error = body.error;
+  if (status === 200 && body.ok) return "ok";
   if (status === 409 && error === "stale_revision") return "stale";
   if (status === 409 && error === "key_conflict") return "conflict";
   if (status === 409 && error === "indeterminate") return "indeterminate";
   if (error === "receipt_unreadable") return "unreadable";
-  if (status === null || status === 503 || status >= 500) return "retry";
+  if (status === 503 || status >= 500) return "retry";
   return "invalid";
 }
 
@@ -76,7 +82,8 @@ async function postAct(payload) {
   return body;
 }
 
-// A decision POST: {status, body}; status null when no reply arrived.
+// A decision POST: {status, body}; status null when no reply arrived, body
+// null when the reply body did not arrive whole (or was not JSON).
 async function postDecision(payload) {
   let r;
   try {
@@ -106,6 +113,8 @@ window.meuteShowTab = showTab;
 
 // ---- findings -------------------------------------------------------------
 const COLS = ["repo", "severity", "title", "location", "lens", "date", "state"];
+
+function findingKey(f) { return f.report + "#" + f.n; }
 
 // gone, superseded and claimed rows are hidden as decided ones are (D7);
 // `hidden` comes from lib/finding_status.py, the CLI's own rule.
@@ -161,7 +170,9 @@ async function select(i) {
   state.sel = i;
   markSelected();
   const f = state.rows[i];
+  state.selKey = findingKey(f);
   state.selRev = f.revision || null;
+  syncReview();
   $("panel").hidden = false;
   $("panel-title").textContent = f.report + " #" + f.n + "  " + f.title;
   $("panel-body").textContent = "loading...";
@@ -214,11 +225,15 @@ async function act(verb) {
     return;
   }
   if (state.pending) { notice("retry or discard the unconfirmed decision first", false); return; }
-  if (state.review === f.report + "#" + f.n) {
+  if (state.review.has(findingKey(f))) {
     notice("this finding changed: review it, then press Reviewed before deciding again", false);
+    syncReview();
     return;
   }
-  if (!state.selRev) { notice("this finding has no revision yet: reload the inbox", false); return; }
+  if (state.selKey !== findingKey(f) || !state.selRev) {
+    notice("this finding has no revision yet: reload the inbox", false);
+    return;
+  }
   const payload = { verb: verb, id: f.report, n: f.n };
   if (verb === "dismiss") {
     const reason = $("dismiss-reason").value;
@@ -244,7 +259,8 @@ async function submitDecision(payload) {
   try {
     const { status, body } = await postDecision(payload);
     const kind = classifyDecision(status, body);
-    const msg = (body && body.message) || (status === null ? "no reply from the server" : "HTTP " + status);
+    const msg = (body && body.message) || (status === null ? "no reply from the server"
+      : "reply incomplete (HTTP " + status + "); it may have been applied");
     if (kind === "ok") {
       state.pending = null;
       notice(msg, true);
@@ -256,10 +272,10 @@ async function submitDecision(payload) {
       showPending(payload);
     } else if (kind === "stale") {
       state.pending = null;
-      state.review = payload.id + "#" + payload.n;
+      state.review.add(payload.id + "#" + payload.n);
       await refresh();
       notice(msg + " (current revision " + body.current_revision + ")", false);
-      showReview(true);
+      syncReview();
     } else {
       // conflict, indeterminate, unreadable, invalid: nothing to resend.
       state.pending = null;
@@ -282,7 +298,11 @@ function showReceipt(r) {
   $("receipt").textContent = receiptText(r);
 }
 
-function showReview(on) { $("review-box").hidden = !on; }
+// The review box belongs to the selected finding only.
+function syncReview() {
+  const f = state.rows[state.sel];
+  $("review-box").hidden = !(f && state.review.has(findingKey(f)));
+}
 
 async function retryPending() {
   if (state.busy || !state.pending) return;
@@ -296,14 +316,23 @@ function discardPending() {
   refresh();
 }
 
-// The operator has looked at the changed finding: re-read it (new revision,
-// cleared fields) so the next decision is a new one with a new key.
+// The operator has looked at the SELECTED changed finding: re-read the inbox,
+// and only once that finding's current state is on the page clear its block
+// and re-select it (new revision, cleared fields), so the next decision is a
+// new one with a new key. Another finding's block is untouched.
 async function reviewed() {
-  const key = state.review;
-  state.review = null;
-  showReview(false);
-  const i = state.rows.findIndex((f) => f.report + "#" + f.n === key);
-  if (i >= 0) await select(i);
+  if (state.busy) return;
+  const f = state.rows[state.sel];
+  if (!f || !state.review.has(findingKey(f))) { syncReview(); return; }
+  const key = findingKey(f);
+  if (!(await refresh())) return;  // still blocked: its current state is unknown
+  const i = state.rows.findIndex((r) => findingKey(r) === key);
+  if (i < 0) {
+    notice("that finding is no longer listed: tick \"show decided\" to review it", false);
+    return;
+  }
+  state.review.delete(key);
+  await select(i);
 }
 
 // ---- drafts & reports -----------------------------------------------------
@@ -335,13 +364,17 @@ function renderAll() {
     ["repo", "task", "lens", "date", "state", "findings", "summary"]);
 }
 
+// Read /api/inbox (never writes). true when the page now shows it.
 async function refresh() {
   try {
     state.data = await getJSON("/api/inbox");
     renderAll();
+    syncReview();
     beacon("/api/client-ready?page=inbox");
+    return true;
   } catch (e) {
     notice("could not load inbox: " + e.message, false);
+    return false;
   }
 }
 

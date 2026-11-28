@@ -308,17 +308,21 @@ is always `web`, chosen by the server; a body field cannot set it. Answers:
 |---|---|---|
 | 200 | - | `{"ok": true, "receipt": {...}, "replayed": bool}`; a retry with the same key and payload returns the same receipt and applies once |
 | 400 | `invalid` | bad argument (control characters, no such finding); nothing written |
+| 400 | `invalid_config` | the server's receipt settings (`var` names which, e.g. `MEUTE_RECEIPT_TTL_DAYS`) are invalid; nothing written, retrying will not help |
 | 409 | `stale_revision` | the finding changed; `current_revision` is its revision now. Review it, then decide again with a new key |
 | 409 | `key_conflict` | the key was used for a different decision; inspect the current state |
 | 409 | `indeterminate` | an interrupted attempt with this key no longer matches the finding; inspect it, then use a new key |
 | 503 | `busy` | `state/reports.lock` was held; retry with the SAME key |
 | 500 | `receipt_unreadable` | the stored receipt for this key is damaged; it is left untouched |
 
-The page makes one request key per submitted decision. When no reply arrives
-(or on 503 and other 5xx), it shows Retry, which resends the same key,
-revision and payload. On `stale_revision` it reloads the inbox and blocks a new
-decision on that finding until you press Reviewed. A page reload only reads the
-current state; it never resubmits. Promote is unchanged (no receipt).
+The page makes one request key per submitted decision. When no complete reply
+arrives (the connection drops, even after the status line) or on 503 and
+other 5xx, it shows Retry, which resends the same key, revision and payload.
+On `stale_revision` it reloads the inbox and blocks a new decision on that
+finding until you select it and press Reviewed; each refused finding keeps its
+own block. `GET /api/finding?id=repo/name&n=N` shows a finding's evidence. A
+page reload only reads the current state; it never resubmits. Promote is
+unchanged (no receipt).
 
 An authenticated gateway can use the separate managed Fleet listener:
 
