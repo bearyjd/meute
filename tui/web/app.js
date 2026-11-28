@@ -16,8 +16,8 @@ window.onerror = (msg, src, line) => {
 //   Reviewed only acknowledges the revision that was on screen: if the finding
 //   changed again meanwhile, the block stays and shows the newer state. One
 //   entry per finding: a later 409 never clears another.
-// selKey/selRev: the finding selected and the revision /api/inbox listed for
-//   it when it was selected.
+// selKey/selRev: the finding selected and the revision its panel shows (what
+//   a decision sends as expected_revision); kept together by syncSelected.
 const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false,
   pending: null, review: new Map(), selKey: null, selRev: null };
 
@@ -278,7 +278,7 @@ async function submitDecision(payload) {
       state.pending = null;
       notice(msg, true);
       showReceipt(body.receipt);
-      await refresh();
+      await refresh({ key: payload.id + "#" + payload.n, rev: body.receipt.after_revision || null });
     } else if (kind === "retry") {
       state.pending = payload;
       notice("decision not confirmed: " + msg, false);
@@ -334,34 +334,63 @@ function discardPending() {
   refresh();
 }
 
-// The operator has looked at the SELECTED changed finding as its review box
-// showed it: re-read the inbox, and only if that finding is still at the
-// revision the box showed clear its block and re-select it (new revision,
-// cleared fields), so the next decision is a new one with a new key. If it
-// changed again, the block stays and the box now shows the newer state.
-// Another finding's block is untouched.
+// After an inbox read, the selected finding's panel and the revision a
+// decision would send must describe the same version. `decided` is the
+// finding this page just decided ({key, rev: the receipt's after_revision}):
+// if the inbox now shows exactly that, the panel moves to it (state, revision,
+// cleared fields). Any other change to the selected finding puts it under
+// review, so a decision is never sent for a version the panel did not show.
+function syncSelected(decided) {
+  const f = state.rows[state.sel];
+  if (!f || findingKey(f) !== state.selKey) return;
+  const rev = f.revision || null;
+  if (rev === state.selRev) return;
+  if (decided && decided.key === state.selKey && decided.rev && decided.rev === rev) {
+    state.selRev = rev;
+    $("panel-state").textContent = decisionText(f);
+    $("resolve-message").value = "";
+    $("dismiss-message").value = "";
+    $("dismiss-reason").selectedIndex = 0;
+  } else if (!state.review.has(state.selKey)) {
+    state.review.set(state.selKey, null);  // syncReview records what it shows
+  }
+}
+
+// The operator has looked at the changed finding as its review box showed
+// it: re-read the inbox, and only if that finding is still at the revision
+// the box showed clear its block, so the next decision is a new one with a
+// new key. If it changed again, the block stays (the box shows the newer
+// state while that finding is selected). The completion applies to the
+// finding Reviewed was pressed for: if the operator selected another finding
+// while the inbox was being read, that selection and its inputs are kept.
 async function reviewed() {
   if (state.busy) return;
   const f = state.rows[state.sel];
   if (!f || !state.review.has(findingKey(f))) { syncReview(); return; }
   const key = findingKey(f);
+  const label = f.report + " #" + f.n;
   const acknowledged = state.review.get(key);
   if (!acknowledged) { syncReview(); return; }  // nothing was shown to acknowledge
   if (!(await refresh())) return;  // still blocked: its current state is unknown
+  const cur = state.rows[state.sel];
+  const stillSelected = !!(cur && findingKey(cur) === key);
   const i = state.rows.findIndex((r) => findingKey(r) === key);
   if (i < 0) {
-    notice("that finding is no longer listed: tick \"show decided\" to review it", false);
+    notice(label + " is no longer listed: tick \"show decided\" to review it", false);
     return;
   }
   if ((state.rows[i].revision || null) !== acknowledged) {
-    if (state.sel !== i) await select(i);
-    syncReview();
-    notice("this finding changed again since you reviewed it: review its current state, "
+    if (stillSelected) syncReview();
+    notice(label + " changed again since you reviewed it: review its current state, "
       + "then press Reviewed", false);
     return;
   }
   state.review.delete(key);
-  await select(i);
+  if (stillSelected) {
+    await select(i);  // the reviewed version: new revision, cleared fields
+  } else {
+    notice(label + " reviewed: select it to decide again", true);
+  }
 }
 
 // ---- drafts & reports -----------------------------------------------------
@@ -394,10 +423,11 @@ function renderAll() {
 }
 
 // Read /api/inbox (never writes). true when the page now shows it.
-async function refresh() {
+async function refresh(decided) {
   try {
     state.data = await getJSON("/api/inbox");
     renderAll();
+    syncSelected(decided);
     syncReview();
     beacon("/api/client-ready?page=inbox");
     return true;

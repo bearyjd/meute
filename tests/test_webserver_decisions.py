@@ -254,6 +254,29 @@ class DecisionRouteTests(DecisionWebTestCase):
         self.assertEqual(path.read_bytes(), b"{not a receipt")
         self.assertEqual(self.fx.rows(), b"")
 
+    def test_damaged_completed_receipt_is_unreadable_before_and_at_expiry(self):
+        # Valid JSON missing a mandatory field: the retry must not replay it
+        # (a generic 500 offering Retry) nor expire it (deleting it, then stale).
+        rev = self.fx.revision(REPORT_A, 1)
+        status, first = self.decide(rev=rev)
+        self.assertEqual(status, 200, first)
+        path = self.fx.receipts / (rk.scope_hash("web", "finding.resolve", "web-key-0001") + ".json")
+        stored = json.loads(path.read_text())
+        del stored["n"]
+        content = json.dumps(stored).encode()
+        path.write_bytes(content)
+        rows = self.fx.rows()
+        for now in (None, str(stored["expires_at"])):
+            with self.subTest(now=now):
+                if now is not None:
+                    self.server.decisions_env["MEUTE_NOW"] = now
+                status, body = self.decide(rev=rev)
+                self.assertEqual(status, 500, body)
+                self.assertEqual(body["error"], "receipt_unreadable")
+                self.assertEqual(body["message"], webserver.DECISION_MESSAGES["receipt_unreadable"])
+                self.assertEqual(path.read_bytes(), content)
+                self.assertEqual(self.fx.rows(), rows)
+
     def test_invalid_config_is_400_with_its_detail_and_writes_nothing(self):
         self.server.decisions_env["MEUTE_RECEIPT_TTL_DAYS"] = "abc"
         status, body = self.decide()
@@ -406,6 +429,7 @@ const finding = (n, rev, state, note) => ({ report: "alpha/audit-a", n: n, repo:
 const inbox = { findings: [finding(1, "r1:absent"), finding(2, "r1:absent")],
   dismiss_reasons: ["wont-fix"], status: {}, branches: [], reports: [] };
 let inboxFails = false;
+let inboxGate = null;  // a promise the next /api/inbox read waits on
 const posts = [];
 const replies = [];  // queue of {status, body} | {status, cut: true}
 const log = { inboxReads: 0 };
@@ -413,6 +437,7 @@ globalThis.fetch = async (url, opts) => {
   if (url.startsWith("/api/client")) return { ok: true, status: 200 };
   if (url === "/api/inbox") {
     log.inboxReads++;
+    if (inboxGate) { const g = inboxGate; inboxGate = null; await g; }
     if (inboxFails) return { ok: false, status: 500, json: async () => ({}) };
     return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(inbox)) };
   }
@@ -508,7 +533,60 @@ async function changedAgain() {
   out.posts = posts;
 }
 
-({ cut_reply: cutReply, per_finding: perFinding, changed_again: changedAgain })[process.argv[2]]().then(
+// Show decided on: after a successful Resolve the still-selected finding's
+// panel and the revision the next decision sends move to the decided version
+// together. A change made elsewhere to the selected finding blocks it instead.
+async function decidedRefresh() {
+  q("show-decided").checked = true;
+  await settle();
+  const after = "r1:" + "b".repeat(64);
+  replies.push({ status: 200, body: receipt("x") });
+  inbox.findings[0] = finding(1, after, "actioned", "resolved: fixed");
+  await resolve(1, "fixed");
+  out.panelState = q("panel-state").textContent;
+  out.draft = q("resolve-message").value;
+  out.reviewHidden = q("review-box").hidden;
+  replies.push({ status: 200, body: receipt("y") });
+  q("resolve-message").value = "again"; q("act-resolve").click(); await settle();
+  // Finding 2 selected; another surface decides it; a refresh shows that.
+  await pick(2);
+  inbox.findings[1] = finding(2, "r1:" + "e".repeat(64), "dismissed", "elsewhere");
+  q("act-discard").click(); await settle();
+  out.otherBlocked = !q("review-box").hidden;
+  out.otherShown = q("review-current").textContent;
+  q("resolve-message").value = "blind"; q("act-resolve").click(); await settle();
+  out.posts = posts;
+}
+
+// Reviewed on A, then the operator moves to B and types while the inbox read
+// is still pending: the completion clears A's block, B stays selected with
+// its draft.
+async function reviewSwitch() {
+  q("show-decided").checked = true;
+  await settle();
+  const revA = "r1:" + "a".repeat(64);
+  replies.push({ status: 409, body: stale(revA) });
+  inbox.findings[0] = finding(1, revA, "dismissed");
+  await resolve(1, "first A");
+  let release;
+  inboxGate = new Promise((r) => { release = r; });
+  q("act-reviewed").click(); await settle();
+  await pick(2);
+  q("resolve-message").value = "B draft";
+  release(); await settle();
+  out.title = q("panel-title").textContent;
+  out.draft = q("resolve-message").value;
+  out.notice = q("notice").textContent;
+  out.bReview = !q("review-box").hidden;
+  await pick(1);
+  out.aCleared = q("review-box").hidden;
+  replies.push({ status: 200, body: receipt("x") });
+  q("resolve-message").value = "second A"; q("act-resolve").click(); await settle();
+  out.posts = posts;
+}
+
+({ cut_reply: cutReply, per_finding: perFinding, changed_again: changedAgain,
+   decided_refresh: decidedRefresh, review_switch: reviewSwitch })[process.argv[2]]().then(
   () => process.stdout.write(JSON.stringify(out)),
   (e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
@@ -572,6 +650,34 @@ class PageHarnessTests(unittest.TestCase):
         self.assertEqual(len(posts), 2, posts)
         self.assertEqual(posts[1]["expected_revision"], rev_a2)
         self.assertEqual(posts[1]["message"], "mine again")
+        self.assertNotEqual(posts[0]["request_key"], posts[1]["request_key"])
+
+    def test_success_moves_the_selected_panel_and_revision_together(self):
+        out = self.run_page("decided_refresh")
+        after = "r1:" + "b" * 64
+        self.assertIn("actioned", out["panelState"])
+        self.assertIn(after, out["panelState"])
+        self.assertEqual(out["draft"], "")
+        self.assertTrue(out["reviewHidden"])
+        posts = out["posts"]
+        self.assertEqual(len(posts), 2, posts)  # the blind decision on 2 never left the page
+        self.assertEqual(posts[0]["expected_revision"], rk.ABSENT)
+        self.assertEqual(posts[1]["expected_revision"], after)
+        self.assertNotEqual(posts[0]["request_key"], posts[1]["request_key"])
+        self.assertTrue(out["otherBlocked"], "a change made elsewhere was not put under review")
+        self.assertIn("elsewhere", out["otherShown"])
+
+    def test_review_completion_keeps_the_operators_new_selection_and_draft(self):
+        out = self.run_page("review_switch")
+        self.assertIn("#2", out["title"])
+        self.assertEqual(out["draft"], "B draft")
+        self.assertFalse(out["bReview"])
+        self.assertIn("#1 reviewed", out["notice"])
+        self.assertTrue(out["aCleared"])
+        posts = out["posts"]
+        self.assertEqual(len(posts), 2, posts)
+        self.assertEqual((posts[1]["n"], posts[1]["message"]), (1, "second A"))
+        self.assertEqual(posts[1]["expected_revision"], "r1:" + "a" * 64)
         self.assertNotEqual(posts[0]["request_key"], posts[1]["request_key"])
 
 
