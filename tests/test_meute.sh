@@ -3465,13 +3465,14 @@ test_web_invariants() {
   local f bad rc out
   for f in "$REPO/tui/webserver.py" "$REPO/tui/runctl.py" "$REPO/tui/runprogress.py" \
            "$REPO/lib/inbox.py" "$REPO/lib/report.py" "$REPO/lib/finding_status.py" \
-           "$REPO/lib/receipt_keys.py"; do
+           "$REPO/lib/receipt_keys.py" "$REPO/lib/decisions.py"; do
     bad="$(python3 - "$f" <<'PY2'
 import ast, sys
 std = sys.stdlib_module_names
 # the only sibling modules the web files may import (never serve/app/model);
-# receipt_keys is stdlib-only and carries the revision `findings --json` reports
-siblings = {"inbox", "report", "finding_status", "receipt_keys", "runctl", "runprogress"}
+# receipt_keys is stdlib-only and carries the revision `findings --json` reports;
+# decisions (stdlib-only) is the durable resolve/dismiss transaction POST /api/act runs
+siblings = {"inbox", "report", "finding_status", "receipt_keys", "decisions", "runctl", "runprogress"}
 tree = ast.parse(open(sys.argv[1]).read())
 bad = []
 for n in ast.walk(tree):

@@ -295,6 +295,48 @@ header. With the default bind, browse to `127.0.0.1:<port>`; with
 `--host localhost` the browser must use `localhost:<port>` (`127.0.0.1:<port>`
 then returns 403); a non-loopback bind must be browsed at the same address.
 
+Resolve and Dismiss on the web page are durable decisions, the same
+transaction as `meute resolve|dismiss --request-key` above. `POST /api/act`
+with `verb` `resolve` or `dismiss` takes `id` (`repo/name`), `n`, `message`
+(required for resolve), `reason` (dismiss) and two required receipt fields:
+`request_key` (8-128 of `A-Za-z0-9._:-`, one per decision) and
+`expected_revision` (the finding's `revision` from `/api/inbox`). A missing or
+malformed field is 400 and writes nothing. The operator label on the receipt
+is always `web`, chosen by the server; a body field cannot set it. Answers:
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 200 | - | `{"ok": true, "receipt": {...}, "replayed": bool}`; a retry with the same key and payload returns the same receipt and applies once |
+| 400 | `invalid` | bad argument (control characters, no such finding); nothing written |
+| 400 | `invalid_config` | the server's receipt settings (`var` names which, e.g. `MEUTE_RECEIPT_TTL_DAYS`) are invalid; nothing written, retrying will not help |
+| 409 | `stale_revision` | the finding changed; `current_revision` is its revision now. Review it, then decide again with a new key |
+| 409 | `key_conflict` | the key was used for a different decision; inspect the current state |
+| 409 | `indeterminate` | an interrupted attempt with this key no longer matches the finding; inspect it, then use a new key |
+| 503 | `busy` | `state/reports.lock` was held; retry with the SAME key |
+| 500 | `receipt_unreadable` | the stored receipt for this key is damaged (not JSON, or valid JSON missing or mistyping any field it records; `version` must be the integer `1`, not `true` or `1.0`); it is left untouched, never replayed or expired, and Retry is not offered |
+
+The page makes one request key per submitted decision. When no complete reply
+arrives (the connection drops, even after the status line) or on 503 and
+other 5xx, it shows Retry, which resends the same key, revision and payload.
+On `stale_revision` it reloads the inbox and blocks a new decision on that
+finding until you select it and press Reviewed; each refused finding keeps its
+own block. The block shows the finding's current state, note and revision, and
+Reviewed acknowledges only the revision on screen: if the finding changed again
+in the meantime, the block stays and shows the newer decision. If you select
+another finding while Reviewed is still reading the inbox, the block is cleared
+for the reviewed finding only and your new selection and its text are kept. The
+finding view shows the same state, note and revision the next decision is
+checked against: after a successful decision it moves to the decided version,
+and if an inbox reload shows the selected finding changed elsewhere, it is
+blocked for review as above. On `key_conflict`, `indeterminate` and
+`receipt_unreadable` the page keeps the decision's message on screen; if the
+inbox reload after it fails, that failure is shown on its own line. Evidence
+shown for a finding is always that of the current selection, even when an
+inbox reload redraws the table while it loads.
+`GET /api/finding?id=repo/name&n=N` shows a finding's evidence. A
+page reload only reads the current state; it never resubmits. Promote is
+unchanged (no receipt).
+
 An authenticated gateway can use the separate managed Fleet listener:
 
 ```sh

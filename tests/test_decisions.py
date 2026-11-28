@@ -612,10 +612,31 @@ class FailClosedTest(Base):
                 self.assertEqual(path.read_bytes(), content)
 
     def good_receipt(self, **over):
-        rec = {"version": 1, "phase": "complete", "receipt_id": "x", "payload_sha256": "x",
-               "before_revision": "x", "row_state": "x", "row_when": "x", "row_note": "x",
-               "expires_at": 1}
+        rec = {"version": 1, "phase": "complete", "receipt_id": "x", "operation": "finding.resolve",
+               "operator": "local", "request_key": "x", "payload_sha256": "x", "report_id": "x",
+               "n": 1, "finding_key": "x", "expected_revision": "x", "before_revision": "x",
+               "after_revision": "x", "disposition": "x", "row_state": "x", "row_when": "x",
+               "row_note": "x", "created_at": 0, "expires_at": 1}
         return {**rec, **over}
+
+    def test_a_completed_receipt_missing_a_required_field_is_70_and_kept(self):
+        # Valid JSON, damaged schema: neither replay nor expiry may act on it.
+        done = self.apply(K1)["receipt"]
+        path = self.fx.receipts / (rk.scope_hash("local", "finding.resolve", K1) + ".json")
+        original = json.loads(path.read_text())
+        self.assertEqual(original["receipt_id"], done["receipt_id"])
+        for field in ("n", "report_id", "after_revision", "operation", "created_at"):
+            damaged = {k: v for k, v in original.items() if k != field}
+            content = json.dumps(damaged).encode()
+            with self.subTest(field=field):
+                path.write_bytes(content)
+                rows = self.fx.rows()
+                for extra in ({}, dict(MEUTE_TEST="1", MEUTE_NOW=str(original["expires_at"]))):
+                    proc = self.fx.resolve(REPORT_A, 1, K1, ABSENT, **extra)
+                    self.assertEqual(proc.returncode, 70, proc.stdout)
+                    self.assertEqual(parse(proc)["error"], "receipt_unreadable")
+                    self.assertEqual(path.read_bytes(), content)
+                    self.assertEqual(self.fx.rows(), rows)
 
     def test_gc_is_bounded_to_fifty_files_and_cleans_old_temp_files(self):
         self.fx.receipts.mkdir(parents=True)

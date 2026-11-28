@@ -2,7 +2,9 @@
 
     python3 tui/webserver.py --host 127.0.0.1 --port 8642
 
-Every state change goes through inbox.act (-> bin/meute), so the page cannot
+Promote goes through inbox.act (-> bin/meute); resolve and dismiss go through
+decisions.run_decide, the durable-receipt transaction `meute resolve|dismiss
+--request-key` runs, with the server's own operator label. Neither path can
 drift from the CLI. Every request needs an exact Host match and is refused
 when the browser marks it cross-site or same-site (Sec-Fetch-Site): another
 site's <img> or no-cors fetch sends the right Host, and POST /api/plan/start
@@ -36,7 +38,9 @@ from urllib.parse import parse_qs, urlsplit
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("MEUTE_ROOT") or os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "lib"))
+import decisions  # noqa: E402
 import inbox  # noqa: E402
+import receipt_keys  # noqa: E402
 from report import ReportError  # noqa: E402
 
 sys.path.insert(0, HERE)
@@ -55,6 +59,10 @@ PLACEHOLDER = (
 )
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 VERBS = ("promote", "dismiss", "resolve")
+REVISION_RE = re.compile(r"r1:(?:absent|[0-9a-f]{64})")
+# The operator label every web decision's receipt carries. Chosen here, never
+# read from the request: the token proves "the page", not a person.
+WEB_OPERATOR = "web"
 MAX_BODY = 64 * 1024
 # R17: the token is printed as a startup link; opening it sets this cookie, and
 # only a request carrying it gets the page with the token embedded.
@@ -101,27 +109,43 @@ def _text(payload: dict, key: str) -> str:
 
 
 def parse_act(payload: object, reasons: list[str]) -> tuple:
-    """Validate an /api/act body into act() positional args."""
+    """Validate an /api/act body.
+
+    promote: act() positional args, (verb, id, n), exactly as before.
+    resolve / dismiss: (verb, id, n, reason, message, request_key,
+    expected_revision) for decisions.run_decide; the two receipt fields are
+    required, so a malformed request is refused before anything is written.
+    """
     if not isinstance(payload, dict):
         raise BadRequest("body must be a JSON object")
     verb, rid, n = payload.get("verb"), payload.get("id"), payload.get("n")
     if verb not in VERBS:
         raise BadRequest("unknown verb")
-    if not valid_id(rid):
+    if verb == "promote":
+        if not valid_id(rid):
+            raise BadRequest("bad id")
+        if not valid_n(n):
+            raise BadRequest("n must be a positive integer")
+        return (verb, rid, n)
+    if not isinstance(rid, str) or not receipt_keys.valid_report_id(rid):
         raise BadRequest("bad id")
     if not valid_n(n):
         raise BadRequest("n must be a positive integer")
-    if verb == "promote":
-        return (verb, rid, n)
+    key, rev = payload.get("request_key"), payload.get("expected_revision")
+    if not isinstance(key, str) or not receipt_keys.KEY_RE.fullmatch(key):
+        raise BadRequest("request_key must match [A-Za-z0-9._:-]{8,128}")
+    if not isinstance(rev, str) or not REVISION_RE.fullmatch(rev):
+        raise BadRequest("expected_revision must be the finding's revision from /api/inbox")
+    message = _text(payload, "message")
     if verb == "dismiss":
         reason = _text(payload, "reason")
         if reason not in reasons:
             raise BadRequest("reason must be one of the dismiss reasons")
-        return (verb, rid, n, reason, _text(payload, "message"))
-    message = _text(payload, "message")
-    if not message:
-        raise BadRequest("message is required")
-    return (verb, rid, n, message)
+    else:
+        reason = ""
+        if not message:
+            raise BadRequest("message is required")
+    return (verb, rid, n, reason, message, key, rev)
 
 
 # -------------------------------------------------------------- handlers ---
@@ -171,16 +195,67 @@ def get_inbox(h: "Handler", query: dict) -> None:
 def get_finding(h: "Handler", query: dict) -> None:
     rid = (query.get("id") or [""])[0]
     raw_n = (query.get("n") or [""])[0]
-    if not valid_id(rid) or not raw_n.isdigit() or int(raw_n) < 1:
+    # The `repo/name` identity /api/inbox lists (the one resolve and dismiss
+    # take), or a bare id as before.
+    if (not (valid_id(rid) or receipt_keys.valid_report_id(rid))
+            or not raw_n.isdigit() or int(raw_n) < 1):
         raise BadRequest("bad id or n")
-    body = h.server.inbox_mod.finding_body(rid, int(raw_n))
+    try:
+        body = h.server.inbox_mod.finding_body(rid, int(raw_n))
+    except (FileNotFoundError, ReportError):
+        return h.send_error_json(404, "finding unavailable")
     h.send_bytes(200, body.encode(), "text/plain; charset=utf-8")
+
+
+DECISION_MESSAGES = {
+    "invalid": None,  # decisions.py's own detail
+    "invalid_config": "the server's receipt configuration is invalid",
+    "stale_revision": "this finding changed since you loaded it: review its current state, then decide again",
+    "key_conflict": "this request key was already used for a different decision: inspect the finding's current state",
+    "indeterminate": "an earlier attempt with this request key was interrupted and the finding has "
+                     "changed since: inspect its current state before deciding again",
+    "busy": "the state is busy: retry the same request",
+    "receipt_unreadable": "the stored receipt for this request key is unreadable and was left untouched: "
+                          "inspect state/receipts/decisions before retrying",
+    "internal": "internal error: retry the same request",
+}
+
+
+def decision_status(code: int, body: dict) -> int:
+    """HTTP status for a decisions.run_decide exit code."""
+    if code == 0:
+        return 200
+    if code == 2:  # invalid request or invalid_config: the detail says which
+        return 400
+    if code in (3, 4, 5):
+        return 409
+    if code == 75:
+        return 503
+    return 500
+
+
+def decide(server, args: tuple) -> tuple[int, dict]:
+    """(HTTP status, JSON body) for a parsed resolve/dismiss request."""
+    verb, rid, n, reason, message, key, rev = args
+    code, body = decisions.run_decide(
+        server.decisions_root, verb, server.operator, key, rid, str(n), message, None,
+        reason if verb == "dismiss" else None, rev, server.decisions_env)
+    if code == 0:
+        rec = body["receipt"]
+        what = "resolved" if verb == "resolve" else f"dismissed ({reason})"
+        text = f"{what} finding {rec['n']} of {rec['report_id']}" + (" (replayed)" if body["replayed"] else "")
+        return 200, {"ok": True, "message": text, **body}
+    error = body.get("error", "internal")
+    text = DECISION_MESSAGES.get(error) or body.get("detail") or error
+    return decision_status(code, body), {"ok": False, "message": text, **body}
 
 
 def post_act(h: "Handler", query: dict) -> None:
     mod = h.server.inbox_mod
     args = parse_act(h.read_json(), list(mod.DISMISS_REASONS))
-    h.send_json(200, mod.act(*args))
+    if args[0] == "promote":
+        return h.send_json(200, mod.act(*args))
+    h.send_json(*decide(h.server, args))
 
 
 def call_run(h: "Handler", method: str, *args) -> None:
@@ -481,10 +556,13 @@ def validate_fleet_finding(value: str) -> None:
         raise ValueError("expected a finding identity of the form repo/report#number")
 
 
-def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None, *, finding=None):
+def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None, *, finding=None,
+                decisions_root=None, decisions_env=None):
     """Build (server, token). port=0 picks a free port: read server.server_port.
 
     run_mod defaults to a RunController for ROOT; constructing one runs nothing.
+    Resolve/dismiss write receipts and rows under decisions_root (default ROOT),
+    reading their config from decisions_env (default os.environ).
     """
     if finding is not None:
         validate_fleet_finding(finding)
@@ -500,6 +578,9 @@ def make_server(host: str, port: int, inbox_mod=inbox, run_mod=None, *, finding=
     server.client_events = []  # (kind, detail) beacons from the page; see record_client
     server.inbox_mod = inbox_mod
     server.run_mod = run_mod if run_mod is not None else runctl.RunController(ROOT)
+    server.decisions_root = decisions_root or ROOT
+    server.decisions_env = decisions_env
+    server.operator = WEB_OPERATOR
     return server, server.token
 
 

@@ -102,21 +102,28 @@ class ActTests(WebTestCase):
         self.assertEqual(resp.status, 400, payload)
         self.assertEqual(self.inbox.calls, [])
 
+    # A resolve/dismiss body with every receipt field; the 400 cases below
+    # change one field. Durable decisions with real storage are tested in
+    # test_webserver_decisions.py.
+    DECIDE = {"id": "alpha/audit-a", "n": 1, "request_key": "web-key-0001",
+              "expected_revision": "r1:absent"}
+
     def test_dismiss_empty_reason_is_400(self):
-        self.assert400({"verb": "dismiss", "id": "r1", "n": 1, "reason": ""})
-        self.assert400({"verb": "dismiss", "id": "r1", "n": 1})
+        self.assert400({**self.DECIDE, "verb": "dismiss", "reason": ""})
+        self.assert400({**self.DECIDE, "verb": "dismiss"})
 
     def test_dismiss_reason_not_in_dismiss_reasons_is_400(self):
-        self.assert400({"verb": "dismiss", "id": "r1", "n": 1, "reason": "because"})
-
-    def test_dismiss_post_never_calls_dump(self):
-        resp, _ = self.post_act({"verb": "dismiss", "id": "r1", "n": 1, "reason": "wont-fix"})
-        self.assertEqual(resp.status, 200)
-        self.assertEqual(self.inbox.dump_calls, 0)
+        self.assert400({**self.DECIDE, "verb": "dismiss", "reason": "because"})
 
     def test_resolve_empty_message_is_400(self):
-        self.assert400({"verb": "resolve", "id": "r1", "n": 1, "message": "  "})
-        self.assert400({"verb": "resolve", "id": "r1", "n": 1})
+        self.assert400({**self.DECIDE, "verb": "resolve", "message": "  "})
+        self.assert400({**self.DECIDE, "verb": "resolve"})
+
+    def test_decisions_never_reach_inbox_act(self):
+        # Legacy bodies (no receipt fields) are refused, not passed to bin/meute.
+        self.assert400({"verb": "dismiss", "id": "r1", "n": 1, "reason": "wont-fix"})
+        self.assert400({"verb": "resolve", "id": "r1", "n": 2, "message": "fixed"})
+        self.assertEqual(self.inbox.dump_calls, 0)
 
     def test_bad_n_is_400(self):
         for n in (0, -1, "x", True, 1.5, None):
@@ -144,16 +151,6 @@ class ActTests(WebTestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(json.loads(raw), {"ok": True, "message": "done"})
         self.assertEqual(self.inbox.calls, [("promote", "r1", 3)])
-
-    def test_valid_dismiss_passes_reason_and_message(self):
-        resp, _ = self.post_act({"verb": "dismiss", "id": "r1", "n": 2,
-                                 "reason": "wont-fix", "message": "later"})
-        self.assertEqual(resp.status, 200)
-        self.assertEqual(self.inbox.calls, [("dismiss", "r1", 2, "wont-fix", "later")])
-
-    def test_valid_resolve_passes_message(self):
-        self.post_act({"verb": "resolve", "id": "r1", "n": 2, "message": "fixed"})
-        self.assertEqual(self.inbox.calls, [("resolve", "r1", 2, "fixed")])
 
     def test_act_failure_passes_through_200(self):
         self.inbox.result = {"ok": False, "message": "nope"}

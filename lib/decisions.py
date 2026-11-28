@@ -223,11 +223,24 @@ def state_lock(ctx: Ctx):
 
 # -------------------------------------------------------------- receipts ---
 
+RECEIPT_STR_FIELDS = ("receipt_id", "operation", "operator", "request_key", "payload_sha256",
+                      "report_id", "finding_key", "expected_revision", "before_revision",
+                      "after_revision", "disposition", "row_state", "row_when", "row_note")
+
+
+def _int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _readable(rec) -> bool:
-    str_fields = ("receipt_id", "payload_sha256", "before_revision", "row_state", "row_when", "row_note")
-    return (isinstance(rec, dict) and rec.get("version") == VERSION and rec.get("phase") in PHASES
-            and isinstance(rec.get("expires_at"), int) and not isinstance(rec.get("expires_at"), bool)
-            and all(isinstance(rec.get(k), str) for k in str_fields))
+    """Every field a replay, a resume or an expiry reads is present and typed;
+    anything less is unreadable (exit 70) and the file is left untouched."""
+    return (isinstance(rec, dict) and _int(rec.get("version")) and rec["version"] == VERSION
+            and rec.get("phase") in PHASES
+            and rec.get("operation") in OPERATIONS.values()
+            and _int(rec.get("expires_at")) and _int(rec.get("created_at"))
+            and _int(rec.get("n")) and rec["n"] >= 1
+            and all(isinstance(rec.get(k), str) for k in RECEIPT_STR_FIELDS))
 
 
 def load_receipt(path: str):
