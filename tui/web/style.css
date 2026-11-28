@@ -9,6 +9,7 @@ nav button.active { color: #fff; border-bottom: 2px solid #5b9dff; }
 #notice { padding: 6px 16px; min-height: 28px; }
 #notice.ok { color: #6fcf8e; }
 #notice.err { color: #ff7b72; }
+#load-error { padding: 0 16px 6px; color: #ff7b72; }
 main { padding: 0 16px 24px; }
 .toolbar { display: flex; gap: 16px; align-items: center; margin: 8px 0; }
 .toolbar input[type=search] { width: 320px; }

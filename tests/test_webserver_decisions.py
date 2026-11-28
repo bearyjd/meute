@@ -255,27 +255,41 @@ class DecisionRouteTests(DecisionWebTestCase):
         self.assertEqual(self.fx.rows(), b"")
 
     def test_damaged_completed_receipt_is_unreadable_before_and_at_expiry(self):
-        # Valid JSON missing a mandatory field: the retry must not replay it
-        # (a generic 500 offering Retry) nor expire it (deleting it, then stale).
+        # Valid JSON with a missing or mistyped mandatory field: the retry must
+        # not replay it (a generic 500 offering Retry) nor expire it (deleting
+        # it, then stale). A JSON boolean is not the integer version 1.
+        def drop_n(rec):
+            del rec["n"]
+
+        def version_true(rec):
+            rec["version"] = True
+
+        def version_float(rec):
+            rec["version"] = 1.0
+
         rev = self.fx.revision(REPORT_A, 1)
         status, first = self.decide(rev=rev)
         self.assertEqual(status, 200, first)
         path = self.fx.receipts / (rk.scope_hash("web", "finding.resolve", "web-key-0001") + ".json")
-        stored = json.loads(path.read_text())
-        del stored["n"]
-        content = json.dumps(stored).encode()
-        path.write_bytes(content)
+        original = json.loads(path.read_text())
         rows = self.fx.rows()
-        for now in (None, str(stored["expires_at"])):
-            with self.subTest(now=now):
-                if now is not None:
-                    self.server.decisions_env["MEUTE_NOW"] = now
-                status, body = self.decide(rev=rev)
-                self.assertEqual(status, 500, body)
-                self.assertEqual(body["error"], "receipt_unreadable")
-                self.assertEqual(body["message"], webserver.DECISION_MESSAGES["receipt_unreadable"])
-                self.assertEqual(path.read_bytes(), content)
-                self.assertEqual(self.fx.rows(), rows)
+        for damage in (drop_n, version_true, version_float):
+            stored = dict(original)
+            damage(stored)
+            content = json.dumps(stored).encode()
+            path.write_bytes(content)
+            for now in (None, str(original["expires_at"])):
+                with self.subTest(damage=damage.__name__, now=now):
+                    if now is None:
+                        self.server.decisions_env.pop("MEUTE_NOW", None)
+                    else:
+                        self.server.decisions_env["MEUTE_NOW"] = now
+                    status, body = self.decide(rev=rev)
+                    self.assertEqual(status, 500, body)
+                    self.assertEqual(body["error"], "receipt_unreadable")
+                    self.assertEqual(body["message"], webserver.DECISION_MESSAGES["receipt_unreadable"])
+                    self.assertEqual(path.read_bytes(), content)
+                    self.assertEqual(self.fx.rows(), rows)
 
     def test_invalid_config_is_400_with_its_detail_and_writes_nothing(self):
         self.server.decisions_env["MEUTE_RECEIPT_TTL_DAYS"] = "abc"
@@ -430,6 +444,8 @@ const inbox = { findings: [finding(1, "r1:absent"), finding(2, "r1:absent")],
   dismiss_reasons: ["wont-fix"], status: {}, branches: [], reports: [] };
 let inboxFails = false;
 let inboxGate = null;  // a promise the next /api/inbox read waits on
+let evidenceGate = null;  // a promise the next /api/finding read waits on
+let evidenceFails = false;
 const posts = [];
 const replies = [];  // queue of {status, body} | {status, cut: true}
 const log = { inboxReads: 0 };
@@ -441,7 +457,13 @@ globalThis.fetch = async (url, opts) => {
     if (inboxFails) return { ok: false, status: 500, json: async () => ({}) };
     return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(inbox)) };
   }
-  if (url.startsWith("/api/finding")) return { ok: true, status: 200, text: async () => "evidence" };
+  if (url.startsWith("/api/finding")) {
+    const n = new URL(url, "http://x").searchParams.get("n");
+    const fails = evidenceFails;
+    if (evidenceGate) { const g = evidenceGate; evidenceGate = null; await g; }
+    if (fails) return { ok: false, status: 500, text: async () => "" };
+    return { ok: true, status: 200, text: async () => "evidence " + n };
+  }
   if (url === "/api/act") {
     posts.push(JSON.parse(opts.body));
     const r = replies.shift();
@@ -585,8 +607,71 @@ async function reviewSwitch() {
   out.posts = posts;
 }
 
+// A decision answered with a diagnostic (nothing to resend) whose inbox
+// re-read then fails: the diagnostic stays, the read failure shows apart.
+async function diagnosticKept() {
+  await settle();
+  const answers = [
+    [409, { ok: false, error: "indeterminate", message: "inspect current state (indeterminate)" }],
+    [409, { ok: false, error: "key_conflict", message: "key reused (key_conflict)" }],
+    [500, { ok: false, error: "receipt_unreadable", message: "receipt unreadable, kept" }]];
+  out.cases = [];
+  for (const [status, body] of answers) {
+    replies.push({ status: status, body: body });
+    inboxFails = true;
+    await resolve(1, "x");
+    inboxFails = false;
+    out.cases.push({ notice: q("notice").textContent, loadError: q("load-error").textContent,
+      loadErrorShown: !q("load-error").hidden, retry: !q("retry-box").hidden });
+  }
+  q("act-discard").click(); await settle();  // any successful read clears the line
+  out.loadErrorAfter = !q("load-error").hidden;
+}
+
+// Evidence belongs to the selection, not to a row object: Reviewed on A,
+// select B while that inbox read is pending, the read finishes (rerendering
+// the table) before B's evidence answers. Then the same with a failing
+// evidence read, and an older selection's late answer is dropped.
+async function evidenceDuringReview() {
+  q("show-decided").checked = true;
+  await settle();
+  const revA = "r1:" + "a".repeat(64);
+  out.panels = [];
+  for (const fails of [false, true]) {
+    replies.push({ status: 409, body: stale(revA) });
+    inbox.findings[0] = finding(1, revA, "dismissed");
+    await resolve(1, "first A");
+    let releaseInbox, releaseEvidence;
+    inboxGate = new Promise((r) => { releaseInbox = r; });
+    q("act-reviewed").click(); await settle();
+    evidenceGate = new Promise((r) => { releaseEvidence = r; });
+    evidenceFails = fails;
+    row(2).click(); await settle();
+    releaseInbox(); await settle();
+    releaseEvidence(); await settle();
+    evidenceFails = false;
+    out.panels.push({ title: q("panel-title").textContent, body: q("panel-body").textContent });
+    inbox.findings[0] = finding(1, "r1:absent");
+    q("act-discard").click(); await settle();
+  }
+  let releaseOld;
+  evidenceGate = new Promise((r) => { releaseOld = r; });
+  row(1).click(); await settle();
+  await pick(2);
+  releaseOld(); await settle();
+  out.lateOld = { title: q("panel-title").textContent, body: q("panel-body").textContent };
+  evidenceGate = new Promise((r) => { releaseOld = r; });
+  evidenceFails = true;
+  row(1).click(); await settle();
+  evidenceFails = false;
+  await pick(2);
+  releaseOld(); await settle();
+  out.lateOldFailure = { title: q("panel-title").textContent, body: q("panel-body").textContent };
+}
+
 ({ cut_reply: cutReply, per_finding: perFinding, changed_again: changedAgain,
-   decided_refresh: decidedRefresh, review_switch: reviewSwitch })[process.argv[2]]().then(
+   decided_refresh: decidedRefresh, review_switch: reviewSwitch,
+   diagnostic_kept: diagnosticKept, evidence_during_review: evidenceDuringReview })[process.argv[2]]().then(
   () => process.stdout.write(JSON.stringify(out)),
   (e) => { process.stderr.write(String(e && e.stack || e)); process.exit(1); });
 """
@@ -679,6 +764,31 @@ class PageHarnessTests(unittest.TestCase):
         self.assertEqual((posts[1]["n"], posts[1]["message"]), (1, "second A"))
         self.assertEqual(posts[1]["expected_revision"], "r1:" + "a" * 64)
         self.assertNotEqual(posts[0]["request_key"], posts[1]["request_key"])
+
+    def test_decision_diagnostic_survives_a_failed_inbox_refresh(self):
+        out = self.run_page("diagnostic_kept")
+        expected = ("indeterminate", "key_conflict", "unreadable")
+        self.assertEqual(len(out["cases"]), 3, out)
+        for word, case in zip(expected, out["cases"]):
+            with self.subTest(word=word):
+                self.assertIn(word, case["notice"])
+                self.assertNotIn("could not load inbox", case["notice"])
+                self.assertTrue(case["loadErrorShown"], case)
+                self.assertIn("could not load inbox", case["loadError"])
+                self.assertFalse(case["retry"], case)
+        self.assertFalse(out["loadErrorAfter"])
+
+    def test_evidence_survives_an_inbox_rerender_during_review(self):
+        out = self.run_page("evidence_during_review")
+        ok, failed = out["panels"]
+        self.assertIn("#2", ok["title"])
+        self.assertEqual(ok["body"], "evidence 2")
+        self.assertIn("#2", failed["title"])
+        self.assertIn("could not load evidence", failed["body"])
+        self.assertIn("#2", out["lateOld"]["title"])
+        self.assertEqual(out["lateOld"]["body"], "evidence 2")
+        self.assertIn("#2", out["lateOldFailure"]["title"])
+        self.assertEqual(out["lateOldFailure"]["body"], "evidence 2")
 
 
 # ------------------------------------------------------------ browser ---

@@ -19,7 +19,7 @@ window.onerror = (msg, src, line) => {
 // selKey/selRev: the finding selected and the revision its panel shows (what
 //   a decision sends as expected_revision); kept together by syncSelected.
 const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false,
-  pending: null, review: new Map(), selKey: null, selRev: null };
+  pending: null, review: new Map(), selKey: null, selRev: null, selGen: 0 };
 
 // PURE-BEGIN
 // One request key per submitted decision (crypto.getRandomValues works on
@@ -153,6 +153,7 @@ function renderFindings() {
     ? state.rows[state.sel].report + "#" + state.rows[state.sel].n : null;
   state.rows = visibleRows();
   state.sel = keep ? state.rows.findIndex((f) => f.report + "#" + f.n === keep) : -1;
+  if (state.sel < 0) state.selGen++;  // the panel's pending evidence read is void
   const tb = document.querySelector("#findings-table tbody");
   tb.replaceChildren();
   state.rows.forEach((f, i) => {
@@ -182,6 +183,9 @@ async function select(i) {
   state.sel = i;
   markSelected();
   const f = state.rows[i];
+  // Evidence belongs to this selection, not to a row object: an inbox read
+  // that rerenders the table keeps the selection (and its pending read).
+  const gen = ++state.selGen;
   state.selKey = findingKey(f);
   state.selRev = f.revision || null;
   syncReview();
@@ -196,9 +200,9 @@ async function select(i) {
     const r = await fetch("/api/finding?id=" + encodeURIComponent(f.report) + "&n=" + encodeURIComponent(f.n));
     if (!r.ok) throw new Error("HTTP " + r.status);
     const text = await r.text();
-    if (state.rows[state.sel] === f) $("panel-body").textContent = text;
+    if (state.selGen === gen) $("panel-body").textContent = text;
   } catch (e) {
-    $("panel-body").textContent = "could not load evidence: " + e.message;
+    if (state.selGen === gen) $("panel-body").textContent = "could not load evidence: " + e.message;
   }
 }
 
@@ -290,7 +294,8 @@ async function submitDecision(payload) {
       notice(msg + " (current revision " + body.current_revision + ")", false);
       syncReview();
     } else {
-      // conflict, indeterminate, unreadable, invalid: nothing to resend.
+      // conflict, indeterminate, unreadable, invalid: nothing to resend. The
+      // diagnostic stays in the notice; a failed re-read shows on its own line.
       state.pending = null;
       notice(msg, false);
       if (kind !== "invalid") await refresh();
@@ -422,17 +427,24 @@ function renderAll() {
     ["repo", "task", "lens", "date", "state", "findings", "summary"]);
 }
 
-// Read /api/inbox (never writes). true when the page now shows it.
+// Read /api/inbox (never writes). true when the page now shows it. A failed
+// read is reported on its own line, never over a decision's notice.
+function loadError(msg) {
+  $("load-error").hidden = !msg;
+  $("load-error").textContent = msg || "";
+}
+
 async function refresh(decided) {
   try {
     state.data = await getJSON("/api/inbox");
+    loadError(null);
     renderAll();
     syncSelected(decided);
     syncReview();
     beacon("/api/client-ready?page=inbox");
     return true;
   } catch (e) {
-    notice("could not load inbox: " + e.message, false);
+    loadError("could not load inbox: " + e.message + " (the page may not show the current state)");
     return false;
   }
 }

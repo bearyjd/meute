@@ -235,7 +235,8 @@ def _int(value) -> bool:
 def _readable(rec) -> bool:
     """Every field a replay, a resume or an expiry reads is present and typed;
     anything less is unreadable (exit 70) and the file is left untouched."""
-    return (isinstance(rec, dict) and rec.get("version") == VERSION and rec.get("phase") in PHASES
+    return (isinstance(rec, dict) and _int(rec.get("version")) and rec["version"] == VERSION
+            and rec.get("phase") in PHASES
             and rec.get("operation") in OPERATIONS.values()
             and _int(rec.get("expires_at")) and _int(rec.get("created_at"))
             and _int(rec.get("n")) and rec["n"] >= 1

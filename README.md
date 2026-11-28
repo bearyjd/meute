@@ -313,7 +313,7 @@ is always `web`, chosen by the server; a body field cannot set it. Answers:
 | 409 | `key_conflict` | the key was used for a different decision; inspect the current state |
 | 409 | `indeterminate` | an interrupted attempt with this key no longer matches the finding; inspect it, then use a new key |
 | 503 | `busy` | `state/reports.lock` was held; retry with the SAME key |
-| 500 | `receipt_unreadable` | the stored receipt for this key is damaged (not JSON, or valid JSON missing or mistyping any field it records); it is left untouched, never replayed or expired, and Retry is not offered |
+| 500 | `receipt_unreadable` | the stored receipt for this key is damaged (not JSON, or valid JSON missing or mistyping any field it records; `version` must be the integer `1`, not `true` or `1.0`); it is left untouched, never replayed or expired, and Retry is not offered |
 
 The page makes one request key per submitted decision. When no complete reply
 arrives (the connection drops, even after the status line) or on 503 and
@@ -328,7 +328,12 @@ for the reviewed finding only and your new selection and its text are kept. The
 finding view shows the same state, note and revision the next decision is
 checked against: after a successful decision it moves to the decided version,
 and if an inbox reload shows the selected finding changed elsewhere, it is
-blocked for review as above. `GET /api/finding?id=repo/name&n=N` shows a finding's evidence. A
+blocked for review as above. On `key_conflict`, `indeterminate` and
+`receipt_unreadable` the page keeps the decision's message on screen; if the
+inbox reload after it fails, that failure is shown on its own line. Evidence
+shown for a finding is always that of the current selection, even when an
+inbox reload redraws the table while it loads.
+`GET /api/finding?id=repo/name&n=N` shows a finding's evidence. A
 page reload only reads the current state; it never resubmits. Promote is
 unchanged (no receipt).
 
