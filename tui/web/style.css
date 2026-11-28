@@ -54,3 +54,5 @@ progress { appearance: none; -webkit-appearance: none; border: 0; background: #2
 progress::-webkit-progress-bar { background: #2c3038; }
 progress::-webkit-progress-value { background: #3b82f6; }
 progress::-moz-progress-bar { background: #3b82f6; }
+.decision-box { display: flex; gap: 8px; align-items: center; margin: 0 16px 8px; padding: 8px 12px; background: #2a2414; border: 1px solid #8a6d1a; }
+#receipt { margin: 0 16px 8px; padding: 8px 12px; background: #1a1d23; border: 1px solid #2c3038; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; }

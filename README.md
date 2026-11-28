@@ -295,6 +295,31 @@ header. With the default bind, browse to `127.0.0.1:<port>`; with
 `--host localhost` the browser must use `localhost:<port>` (`127.0.0.1:<port>`
 then returns 403); a non-loopback bind must be browsed at the same address.
 
+Resolve and Dismiss on the web page are durable decisions, the same
+transaction as `meute resolve|dismiss --request-key` above. `POST /api/act`
+with `verb` `resolve` or `dismiss` takes `id` (`repo/name`), `n`, `message`
+(required for resolve), `reason` (dismiss) and two required receipt fields:
+`request_key` (8-128 of `A-Za-z0-9._:-`, one per decision) and
+`expected_revision` (the finding's `revision` from `/api/inbox`). A missing or
+malformed field is 400 and writes nothing. The operator label on the receipt
+is always `web`, chosen by the server; a body field cannot set it. Answers:
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 200 | - | `{"ok": true, "receipt": {...}, "replayed": bool}`; a retry with the same key and payload returns the same receipt and applies once |
+| 400 | `invalid` | bad argument (control characters, no such finding); nothing written |
+| 409 | `stale_revision` | the finding changed; `current_revision` is its revision now. Review it, then decide again with a new key |
+| 409 | `key_conflict` | the key was used for a different decision; inspect the current state |
+| 409 | `indeterminate` | an interrupted attempt with this key no longer matches the finding; inspect it, then use a new key |
+| 503 | `busy` | `state/reports.lock` was held; retry with the SAME key |
+| 500 | `receipt_unreadable` | the stored receipt for this key is damaged; it is left untouched |
+
+The page makes one request key per submitted decision. When no reply arrives
+(or on 503 and other 5xx), it shows Retry, which resends the same key,
+revision and payload. On `stale_revision` it reloads the inbox and blocks a new
+decision on that finding until you press Reviewed. A page reload only reads the
+current state; it never resubmits. Promote is unchanged (no receipt).
+
 An authenticated gateway can use the separate managed Fleet listener:
 
 ```sh

@@ -8,7 +8,42 @@ const beacon = (url) => { fetch(url, { keepalive: true }).catch(() => {}); };
 window.onerror = (msg, src, line) => {
   beacon("/api/client-error?msg=" + encodeURIComponent(msg + " @" + src + ":" + line));
 };
-const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false };
+// pending: a resolve/dismiss whose outcome is unknown (lost reply, busy, 5xx);
+//   Retry resends it unchanged -- same request key, revision and payload.
+// review: a finding key whose decision was refused as stale; no new decision
+//   on it until the operator has looked at its current state.
+// selRev: the revision /api/inbox listed when the finding was selected.
+const state = { data: null, rows: [], sel: -1, tab: "findings", busy: false,
+  pending: null, review: null, selRev: null };
+
+// PURE-BEGIN
+// One request key per submitted decision (crypto.getRandomValues works on
+// plain-http tailnet addresses too, where crypto.randomUUID does not).
+function newRequestKey(rand) {
+  const bytes = rand(16);
+  return "web-" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// What the page does with a resolve/dismiss answer. status is null when no
+// reply arrived (network error, connection dropped).
+function classifyDecision(status, body) {
+  const error = body && body.error;
+  if (status === 200 && body && body.ok) return "ok";
+  if (status === 409 && error === "stale_revision") return "stale";
+  if (status === 409 && error === "key_conflict") return "conflict";
+  if (status === 409 && error === "indeterminate") return "indeterminate";
+  if (error === "receipt_unreadable") return "unreadable";
+  if (status === null || status === 503 || status >= 500) return "retry";
+  return "invalid";
+}
+
+function receiptText(r) {
+  if (!r) return "";
+  return ["receipt " + r.receipt_id, r.operation + " " + r.finding_key + " -> " + r.disposition,
+    "request key " + r.request_key, "revision " + r.before_revision + " -> " + r.after_revision,
+    "phase " + r.phase].join("\n");
+}
+// PURE-END
 
 function el(tag, text, cls) {
   const e = document.createElement(tag);
@@ -39,6 +74,23 @@ async function postAct(payload) {
   try { body = await r.json(); } catch (e) { body = null; }
   if (!r.ok) throw new Error((body && body.message) || "HTTP " + r.status);
   return body;
+}
+
+// A decision POST: {status, body}; status null when no reply arrived.
+async function postDecision(payload) {
+  let r;
+  try {
+    r = await fetch("/api/act", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Meute-Token": TOKEN },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    return { status: null, body: null };
+  }
+  let body = null;
+  try { body = await r.json(); } catch (e) { body = null; }
+  return { status: r.status, body: body };
 }
 
 // ---- tabs -----------------------------------------------------------------
@@ -109,6 +161,7 @@ async function select(i) {
   state.sel = i;
   markSelected();
   const f = state.rows[i];
+  state.selRev = f.revision || null;
   $("panel").hidden = false;
   $("panel-title").textContent = f.report + " #" + f.n + "  " + f.title;
   $("panel-body").textContent = "loading...";
@@ -146,30 +199,111 @@ async function act(verb) {
   if (state.busy) return;
   const f = state.rows[state.sel];
   if (!f) { notice("select a finding first", false); return; }
-  const payload = { verb: verb, id: f.report, n: f.n };
   if (verb === "promote") {
     if (!window.confirm("Promote " + f.report + " #" + f.n + "?")) return;
-  } else if (verb === "dismiss") {
+    state.busy = true;
+    try {
+      const res = await postAct({ verb: verb, id: f.report, n: f.n });
+      notice(res.message || (res.ok ? "done" : "failed"), !!res.ok);
+      if (res.ok) await refresh();
+    } catch (e) {
+      notice("action failed: " + e.message, false);
+    } finally {
+      state.busy = false;
+    }
+    return;
+  }
+  if (state.pending) { notice("retry or discard the unconfirmed decision first", false); return; }
+  if (state.review === f.report + "#" + f.n) {
+    notice("this finding changed: review it, then press Reviewed before deciding again", false);
+    return;
+  }
+  if (!state.selRev) { notice("this finding has no revision yet: reload the inbox", false); return; }
+  const payload = { verb: verb, id: f.report, n: f.n };
+  if (verb === "dismiss") {
     const reason = $("dismiss-reason").value;
     if (!reason) { notice("dismiss needs a reason", false); return; }
     payload.reason = reason;
     const m = $("dismiss-message").value.trim();
     if (m) payload.message = m;
-  } else if (verb === "resolve") {
+  } else {
     const m = $("resolve-message").value.trim();
     if (!m) { notice("resolve needs a message", false); return; }
     payload.message = m;
   }
+  payload.expected_revision = state.selRev;
+  payload.request_key = newRequestKey((n) => crypto.getRandomValues(new Uint8Array(n)));
+  await submitDecision(payload);
+}
+
+// Send a decision (first try or Retry: the payload is never rebuilt).
+async function submitDecision(payload) {
   state.busy = true;
+  showPending(null);
+  showReceipt(null);
   try {
-    const res = await postAct(payload);
-    notice(res.message || (res.ok ? "done" : "failed"), !!res.ok);
-    if (res.ok) await refresh();
-  } catch (e) {
-    notice("action failed: " + e.message, false);
+    const { status, body } = await postDecision(payload);
+    const kind = classifyDecision(status, body);
+    const msg = (body && body.message) || (status === null ? "no reply from the server" : "HTTP " + status);
+    if (kind === "ok") {
+      state.pending = null;
+      notice(msg, true);
+      showReceipt(body.receipt);
+      await refresh();
+    } else if (kind === "retry") {
+      state.pending = payload;
+      notice("decision not confirmed: " + msg, false);
+      showPending(payload);
+    } else if (kind === "stale") {
+      state.pending = null;
+      state.review = payload.id + "#" + payload.n;
+      await refresh();
+      notice(msg + " (current revision " + body.current_revision + ")", false);
+      showReview(true);
+    } else {
+      // conflict, indeterminate, unreadable, invalid: nothing to resend.
+      state.pending = null;
+      notice(msg, false);
+      if (kind !== "invalid") await refresh();
+    }
   } finally {
     state.busy = false;
   }
+}
+
+function showPending(payload) {
+  $("retry-box").hidden = !payload;
+  $("retry-what").textContent = payload
+    ? payload.verb + " " + payload.id + " #" + payload.n + " (request key " + payload.request_key + ")" : "";
+}
+
+function showReceipt(r) {
+  $("receipt").hidden = !r;
+  $("receipt").textContent = receiptText(r);
+}
+
+function showReview(on) { $("review-box").hidden = !on; }
+
+async function retryPending() {
+  if (state.busy || !state.pending) return;
+  await submitDecision(state.pending);
+}
+
+function discardPending() {
+  state.pending = null;
+  showPending(null);
+  notice("unconfirmed decision discarded; the inbox shows the current state", false);
+  refresh();
+}
+
+// The operator has looked at the changed finding: re-read it (new revision,
+// cleared fields) so the next decision is a new one with a new key.
+async function reviewed() {
+  const key = state.review;
+  state.review = null;
+  showReview(false);
+  const i = state.rows.findIndex((f) => f.report + "#" + f.n === key);
+  if (i >= 0) await select(i);
 }
 
 // ---- drafts & reports -----------------------------------------------------
@@ -236,5 +370,8 @@ $("show-decided").addEventListener("change", renderFindings);
 $("act-promote").addEventListener("click", () => act("promote"));
 $("act-dismiss").addEventListener("click", () => act("dismiss"));
 $("act-resolve").addEventListener("click", () => act("resolve"));
+$("act-retry").addEventListener("click", retryPending);
+$("act-discard").addEventListener("click", discardPending);
+$("act-reviewed").addEventListener("click", reviewed);
 
 refresh();

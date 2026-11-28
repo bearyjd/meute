@@ -33,7 +33,7 @@ Status: v1 + v2 approved 2026-11-15; implemented on branch feat/web-inbox
 - C. JS SPA (React/Vite). Richest UI, but needs node and a build step; conflicts with the no-daemon, no-dependency stance.
 
 ## Design
-- `tui/webserver.py`: the HTTP server. `GET /` serves the page with the token injected; `GET /api/inbox` returns `inbox.dump()`; `GET /api/finding?id=&n=` returns `finding_body`; `POST /api/act` (JSON: verb, id, n, reason/message) calls `inbox.act` and returns its result.
+- `tui/webserver.py`: the HTTP server. `GET /` serves the page with the token injected; `GET /api/inbox` returns `inbox.dump()`; `GET /api/finding?id=&n=` returns `finding_body`; `POST /api/act` (JSON: verb, id, n, reason/message) calls `inbox.act` and returns its result. (Since roadmap 3.1b, `resolve`/`dismiss` also require `request_key` and `expected_revision` and run `lib/decisions.py`'s durable-receipt transaction instead; see the README's web section. `promote` is unchanged.)
 - `tui/web/index.html` + `app.js` + `style.css`: the page.
 - `bin/meute web` switches to `webserver.py`. The Textual app stays for `meute tui`; textual-serve is kept only if removal is non-trivial (builder's call).
 - Tests: handler tests for token/Host/Origin rejection, verb validation, and that `act` receives exactly the CLI arguments the TUI sends.

@@ -1,12 +1,14 @@
 """Shared fixtures for the tui/webserver.py tests (not a test module itself).
 
 The inbox and run modules are faked; real act(), meute plan and run.sh never run.
+Resolve/dismiss write under an empty temporary MEUTE_ROOT, never this checkout.
 """
 import http.client
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -76,12 +78,18 @@ class WebTestCase(unittest.TestCase):
     def setUp(self):
         self.inbox = FakeInbox()
         self.run = self.run_factory() if self.run_factory else None
-        self.server, self.token = webserver.make_server("127.0.0.1", 0, self.inbox, self.run)
+        self.server, self.token = webserver.make_server(
+            "127.0.0.1", 0, self.inbox, self.run, **self.server_kwargs())
         self.port = self.server.server_port
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        kwargs={"poll_interval": 0.02}, daemon=True)
         self.thread.start()
         self.addCleanup(self._stop)
+
+    def server_kwargs(self):
+        empty = tempfile.TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        return {"decisions_root": empty.name}
 
     def _stop(self):
         self.server.shutdown()

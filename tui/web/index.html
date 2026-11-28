@@ -19,6 +19,17 @@
   <span id="status"></span>
 </header>
 <div id="notice" role="status"></div>
+<div id="retry-box" class="decision-box" hidden>
+  <span>Decision not confirmed: <span id="retry-what"></span>.
+    Retry resends the same request; it is applied at most once.</span>
+  <button type="button" id="act-retry">Retry</button>
+  <button type="button" id="act-discard">Discard</button>
+</div>
+<div id="review-box" class="decision-box" hidden>
+  <span>This finding changed since you loaded it. Review its current state before deciding again.</span>
+  <button type="button" id="act-reviewed">Reviewed</button>
+</div>
+<pre id="receipt" hidden></pre>
 <main>
   <section id="findings" class="tab">
     <div class="toolbar">
